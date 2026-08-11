@@ -15,16 +15,23 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from tests.dashboard_sources import messages_page_source
+
 DASHBOARD = Path("agent_mcp/dashboard")
 
 # Messages-page-parity PR: the detail popup was extracted out of
 # messages-dashboard.tsx into its own <ViewMessageModal> (parity with
-# memories' <ViewMemoryModal>). The modal-content guards below read the
-# modal file; the row-interaction guards still read the dashboard.
-MODAL = "components/dashboard/modals/view-message-modal.tsx"
+# memories' <ViewMemoryModal>). Wave 5 (refactor/w5-messages) then moved
+# that modal into the `messages/` satellite directory alongside the
+# extracted column spec. The modal-content guards below read the modal
+# file; the row-interaction guards read the page + its satellites as one
+# blob (the checkbox/delete cells now live in use-messages-columns.tsx).
+MODAL = "components/dashboard/messages/view-message-modal.tsx"
 
 
 def _read(rel: str) -> str:
+    if rel == "components/dashboard/messages-dashboard.tsx":
+        return messages_page_source()
     return (DASHBOARD / rel).read_text()
 
 

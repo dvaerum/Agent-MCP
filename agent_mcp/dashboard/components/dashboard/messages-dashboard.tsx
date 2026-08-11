@@ -3,7 +3,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react"
 import {
   MessageSquare,
-  Send,
   X,
   Trash2,
   MailOpen,
@@ -14,14 +13,6 @@ import {
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
-import { Label } from "@/components/ui/label"
-import { Badge } from "@/components/ui/badge"
-import {
-  Card,
-  CardContent,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card"
 import {
   Select,
   SelectContent,
@@ -29,25 +20,31 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
-import { apiClient, type Message } from "@/lib/api"
+import { type Message } from "@/lib/api"
 import { cn } from "@/lib/utils"
 import { useDialog } from "@/hooks/use-dialog"
 import { useFilters } from "@/hooks/use-filters"
 import { usePagedQuery } from "@/hooks/use-paged-query"
 import { useServerStore } from "@/lib/stores/server-store"
+import { useSseHealthy } from "@/lib/stores/data-store"
 import { AgentSelect } from "@/components/dashboard/shared/agent-select"
 import { MessageMobileCard } from "@/components/dashboard/messages-mobile-list"
-import {
-  priorityBadgeClass,
-  messageTypeBadgeClass,
-} from "@/components/dashboard/shared/message-badges"
-import { ViewMessageModal } from "@/components/dashboard/modals/view-message-modal"
+import { ViewMessageModal } from "@/components/dashboard/messages/view-message-modal"
 import { DeleteConfirmModal } from "@/components/dashboard/modals/delete-confirm-modal"
+import { ComposeMessageModal } from "@/components/dashboard/messages/compose-message-modal"
+import { MessageDeletePreview } from "@/components/dashboard/messages/message-delete-preview"
+import { MessagesPagination } from "@/components/dashboard/messages/messages-pagination"
+import { useMessagesColumns } from "@/components/dashboard/messages/use-messages-columns"
+import {
+  ALL,
+  MESSAGE_TYPES,
+  PRIORITIES,
+  callMessages,
+} from "@/components/dashboard/messages/messages-api"
 import { toastError, toastSuccess } from "@/components/ui/toast"
 import { DataTablePage } from "@/components/dashboard/shared/data-table-page"
 import type { EmptyStateProps } from "@/components/dashboard/shared/empty-state"
 import type { StatsCardProps } from "@/components/dashboard/shared/stats-card"
-import type { Column } from "@/components/dashboard/shared/responsive-data-table"
 
 interface Filters {
   from: string
@@ -57,21 +54,6 @@ interface Filters {
   read: "" | "true" | "false"
   q: string
 }
-
-const MESSAGE_TYPES = [
-  "text",
-  "system",
-  "notification",
-  "task_update",
-  "assistance_request",
-]
-const PRIORITIES = ["low", "normal", "high", "urgent"]
-
-// Sentinel values for Select dropdowns (Radix Select cannot use ""
-// as an item value). "__all" clears the filter, "__broadcast" picks
-// the broadcast recipient.
-const ALL = "__all"
-const BROADCAST = "__broadcast"
 
 // v5.0.26: pagination footer on the messages list. Per-page size stays
 // at 100 (Dennis explicitly does not want bigger pages — see plan
@@ -88,46 +70,6 @@ const PAGE_SIZE = 100
 // preserved. Paused while the compose form is open so a background
 // refresh can't disrupt an in-progress draft.
 const REFRESH_INTERVAL = 60000 // 1 minute
-
-// Wave 2 (cleanup-wave-2): the ``adminToken()`` helper is gone.
-// Dashboard mutations authenticate via the operator session cookie
-// set on /agent-mcp/login — the browser attaches it to every fetch
-// automatically (the apiClient helper and the local ``callMessages``
-// helper both opt into ``credentials: 'include'``).
-
-// Helper to call /api/messages* under cookie auth.
-// Listing uses POST /api/messages/query because browsers strip bodies
-// from GET requests per the Fetch spec (this was the original bug).
-// Compose stays POST /api/messages; mark-read stays PATCH
-// /api/messages/<id>; delete is DELETE /api/messages/<id>.
-//
-// Wave 2 (cleanup-wave-2): ``credentials: "include"`` ensures the
-// ``agent_mcp_session`` cookie travels with the request even on the
-// dashboard's cross-origin-but-same-site dev URLs; the request body
-// no longer carries a bearer token, so missing the cookie would
-// surface as the backend's 401 login_required envelope.
-async function callMessages(
-  method: "POST" | "PATCH" | "DELETE",
-  pathSuffix: string,
-  body: Record<string, unknown>
-): Promise<unknown> {
-  const base = apiClient.getServerUrl()
-  const res = await fetch(`${base}/messages${pathSuffix}`, {
-    method,
-    headers: {
-      "Content-Type": "application/json",
-      // PR-A: REST endpoints require the strict v1 media type.
-      "Accept": "application/vnd.agent-mcp.v1+json",
-    },
-    body: JSON.stringify(body),
-    credentials: "include",
-  })
-  if (!res.ok) {
-    const txt = await res.text().catch(() => "")
-    throw new Error(txt || `HTTP ${res.status}`)
-  }
-  return res.json()
-}
 
 // A filter control with a small visible label stacked above it, so each
 // dropdown is self-describing before it's opened (the From/To agent
@@ -149,129 +91,16 @@ const FilterField = ({
   </div>
 )
 
-// Preview block shown inside the DeleteConfirmModal `details` slot for
-// the SINGLE-message variant — reproduces the pre-foundation
-// DeleteMessageModal body (participants / SUBJECT / CONTENT PREVIEW /
-// metadata). The bulk variant has no preview (there is no single row to
-// show); it overrides `title` / `description` / `warningText` instead.
-function MessageDeletePreview({ message }: { message: Message }) {
-  const formatContent = (value: string) =>
-    value.length > 120 ? value.substring(0, 120) + "…" : value
-  return (
-    <div className="space-y-3">
-      <div className="text-sm font-medium text-foreground">Message to be deleted:</div>
-      <div className="bg-muted/30 border border-border rounded-lg p-3 space-y-3">
-        {/* Participants */}
-        <div className="flex items-center gap-2 text-sm">
-          <Badge variant="outline">{message.sender_id}</Badge>
-          <span aria-hidden className="text-muted-foreground">→</span>
-          <Badge variant="outline">{message.recipient_id}</Badge>
-        </div>
-        {message.subject && (
-          <div>
-            <div className="text-xs font-medium text-muted-foreground mb-1">SUBJECT</div>
-            <div className="text-sm text-foreground">{message.subject}</div>
-          </div>
-        )}
-        <div>
-          <div className="text-xs font-medium text-muted-foreground mb-1">CONTENT PREVIEW</div>
-          <div className="text-sm text-muted-foreground bg-background border border-border rounded px-2 py-1 font-mono max-h-16 overflow-hidden">
-            {formatContent(message.message_content)}
-          </div>
-        </div>
-        <div className="flex items-center gap-4 text-xs text-muted-foreground pt-2 border-t border-border">
-          <span>{message.timestamp.slice(0, 19)}</span>
-          <span>Type: {message.message_type}</span>
-          <span>Priority: {message.priority}</span>
-        </div>
-      </div>
-    </div>
-  )
-}
-
-/**
- * v5.0.26 pagination footer — « Newest / Newer / Older / Oldest » plus
- * a "Showing N–M of T" range label.
- *
- * One button spec drives both layouts: a single justified row on sm+,
- * and (below sm) the range label stacked above a 4-column grid so the
- * labels stay readable at 375 px. Pre-scaffold these were two separate
- * hand-written copies — one here, one inside messages-mobile-list.tsx —
- * which is the same double-renderer drift the shared table retires.
- */
-function MessagesPagination({
-  rangeStart,
-  rangeEnd,
-  total,
-  onFirstPage,
-  onLastPage,
-  onNewest,
-  onNewer,
-  onOlder,
-  onOldest,
-}: {
-  rangeStart: number
-  rangeEnd: number
-  total: number
-  onFirstPage: boolean
-  onLastPage: boolean
-  onNewest: () => void
-  onNewer: () => void
-  onOlder: () => void
-  onOldest: () => void
-}) {
-  const nav = [
-    {
-      key: "newest",
-      label: "« Newest",
-      onClick: onNewest,
-      disabled: onFirstPage,
-      ariaLabel: "jump to newest page",
-    },
-    { key: "newer", label: "Newer", onClick: onNewer, disabled: onFirstPage },
-    { key: "older", label: "Older", onClick: onOlder, disabled: onLastPage },
-    {
-      key: "oldest",
-      label: "Oldest »",
-      onClick: onOldest,
-      disabled: onLastPage,
-      ariaLabel: "jump to oldest page",
-    },
-  ]
-  const button = (b: (typeof nav)[number]) => (
-    <Button
-      key={b.key}
-      variant="outline"
-      size="sm"
-      onClick={b.onClick}
-      disabled={b.disabled}
-      aria-label={b.ariaLabel}
-    >
-      {b.label}
-    </Button>
-  )
-  const range = `Showing ${rangeStart}–${rangeEnd} of ${total}`
-  return (
-    <>
-      <div className="hidden sm:flex items-center justify-between gap-2">
-        <div className="flex items-center gap-2">{nav.slice(0, 2).map(button)}</div>
-        <div className="text-xs text-muted-foreground tabular-nums">{range}</div>
-        <div className="flex items-center gap-2">{nav.slice(2).map(button)}</div>
-      </div>
-      <div className="block sm:hidden">
-        <div className="text-[11px] text-muted-foreground tabular-nums text-center mb-2">
-          {range}
-        </div>
-        <div className="grid grid-cols-4 gap-2">{nav.map(button)}</div>
-      </div>
-    </>
-  )
-}
-
 export function MessagesDashboard() {
   // Server-online indicator (matches Agents/Tasks/Memories header).
   const { servers, activeServerId } = useServerStore()
   const activeServer = servers.find((s) => s.id === activeServerId)
+
+  // PF-3: the live SSE stream's health. While healthy, the slow
+  // background poll below is skipped — the mcp:resources-updated refetch
+  // covers new inbound messages; the interval is only a fallback for
+  // when SSE is down.
+  const sseHealthy = useSseHealthy()
 
   // v5.0.26: pagination cursor. Total comes from the hook. Declared
   // before `filters` because the useFilters() `onReset` callback below
@@ -300,66 +129,10 @@ export function MessagesDashboard() {
   // so we don't accidentally act on stale rows.
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
 
-  // Compose state.
+  // Compose modal state. `replyTo` seeds the compose form for a reply
+  // (null for a fresh compose); the modal owns the draft fields.
   const [composeOpen, setComposeOpen] = useState(false)
-  const [composeRecipient, setComposeRecipient] = useState("")
-  const [composeContent, setComposeContent] = useState("")
-  const [composeType, setComposeType] = useState("text")
-  const [composePriority, setComposePriority] = useState("normal")
-  const [composing, setComposing] = useState(false)
-  // v5.0.22 subject + reply state.
-  const [composeSubject, setComposeSubject] = useState("")
-  const [composeReplyParentId, setComposeReplyParentId] = useState<string | null>(
-    null,
-  )
-  // feat/reply-as-recipient: when replying, the operator answers AS the
-  // parent message's recipient (e.g. "manager"), back to its sender. This
-  // holds the reply-as identity; null for a fresh compose or when the
-  // operator is replying as themselves (admin — the normal case, which
-  // sends no sender_id override).
-  const [composeReplyAs, setComposeReplyAs] = useState<string | null>(null)
-  const [suggestLoading, setSuggestLoading] = useState(false)
-
-  // Participants drive the Compose recipient dropdown only (needs the
-  // BROADCAST "*" option, which is NOT an agent and is outside
-  // <AgentSelect>'s contract; the hardcoded "admin" entry mirrors
-  // data-store::shouldDisplayAgent so the compose UX matches the rest
-  // of the dashboard).
-  const [liveParticipants, setLiveParticipants] = useState<
-    { agent_id: string; status?: string }[]
-  >([])
-
-  const loadParticipants = async () => {
-    try {
-      const data = await callMessages("POST", "/participants", {}) as { live?: unknown }
-      const live = Array.isArray(data?.live) ? data.live : []
-      setLiveParticipants(live)
-    } catch {
-      // Soft-fail: dropdown just shows the hardcoded admin entry.
-      setLiveParticipants([])
-    }
-  }
-  useEffect(() => {
-    loadParticipants()
-  }, [])
-
-  // Compose recipient list (live-only — admin pinned, then workers).
-  // The currently-selected recipient is always appended if it isn't a
-  // live participant: openReply() can target an agent that has since
-  // gone offline, and a Radix Select with a value that has no matching
-  // <SelectItem> renders a blank trigger. Keeping the selected id in the
-  // list guarantees the value always renders. BROADCAST is its own
-  // hardcoded item, so it's excluded here.
-  const recipientOptions = useMemo(() => {
-    const ids = new Set<string>(["admin"])
-    for (const a of liveParticipants) {
-      if (a.agent_id) ids.add(a.agent_id)
-    }
-    if (composeRecipient && composeRecipient !== BROADCAST) {
-      ids.add(composeRecipient)
-    }
-    return Array.from(ids)
-  }, [liveParticipants, composeRecipient])
+  const [replyTo, setReplyTo] = useState<Message | null>(null)
 
   // Build the spread-filter slice for the POST body. Empty-string
   // fields are dropped; ``read`` is converted from its tri-state string
@@ -400,11 +173,10 @@ export function MessagesDashboard() {
     if (queryError) toastError(queryError, "Failed to load messages")
   }, [queryError])
 
-  // Wrapper that also re-pulls participants + clears selection.
+  // Wrapper that also clears selection.
   const refresh = useCallback(() => {
     refreshQuery()
     setSelectedIds(new Set())
-    void loadParticipants()
   }, [refreshQuery])
 
   // Background refresh so new inbound messages surface without a manual
@@ -412,14 +184,16 @@ export function MessagesDashboard() {
   // — the in-place paged refetch at the current offset/filters — instead
   // of the ``refresh`` wrapper, so a background tick does NOT wipe the
   // user's row selection or reset their page/scroll. Paused while the
-  // compose form is open so it can't disrupt an in-progress draft.
+  // compose form is open so it can't disrupt an in-progress draft, and
+  // (PF-3) skipped entirely while SSE is healthy — the live refetch
+  // below covers that case.
   useEffect(() => {
-    if (composeOpen) return
+    if (composeOpen || sseHealthy) return
     const interval = setInterval(() => {
       refreshQuery()
     }, REFRESH_INTERVAL)
     return () => clearInterval(interval)
-  }, [refreshQuery, composeOpen])
+  }, [refreshQuery, composeOpen, sseHealthy])
 
   // Live refetch on backend mutation. The operator SSE client
   // (lib/mcp-notifications.ts) dispatches a debounced
@@ -486,109 +260,14 @@ export function MessagesDashboard() {
     [messages],
   )
 
-  const send = async () => {
-    if (!composeRecipient || !composeContent) return
-    setComposing(true)
-    try {
-      // BROADCAST sentinel maps to recipient_id="*" on the backend.
-      const recipient =
-        composeRecipient === BROADCAST ? "*" : composeRecipient
-      const body: Record<string, unknown> = {
-        recipient_id: recipient,
-        message_content: composeContent,
-        message_type: composeType,
-        priority: composePriority,
-      }
-      if (composeReplyParentId) {
-        body.parent_message_id = composeReplyParentId
-      } else if (composeSubject.trim()) {
-        body.subject = composeSubject.trim()
-      }
-      // feat/reply-as-recipient: when replying AS an agent (not the
-      // operator's own identity), override the stored sender so the reply
-      // is authored in that agent's voice. The backend validates + audits
-      // this (operator-only). Omitted for a normal send / reply-as-admin.
-      if (composeReplyAs) {
-        body.sender_id = composeReplyAs
-      }
-      await callMessages("POST", "", body)
-      setComposeContent("")
-      setComposeSubject("")
-      setComposeReplyParentId(null)
-      setComposeReplyAs(null)
-      setComposeOpen(false)
-      refresh()
-      toastSuccess("Message sent.")
-    } catch (e) {
-      toastError(e, "Failed to send message")
-    } finally {
-      setComposing(false)
-    }
-  }
-
-  // v5.0.22: ask the backend (which delegates to Ollama if
-  // AGENT_MCP_SUBJECT_MODEL is configured) to propose a subject.
-  const [suggestHint, setSuggestHint] = useState<string | null>(null)
-  const suggestSubject = async () => {
-    if (!composeContent.trim()) return
-    setSuggestLoading(true)
-    setSuggestHint(null)
-    try {
-      const data = await callMessages("POST", "/suggest-subject", {
-        content: composeContent,
-      }) as { subject?: unknown }
-      if (data?.subject) {
-        setComposeSubject(String(data.subject))
-      } else {
-        setSuggestHint(
-          "No suggestion available — type a subject manually " +
-            "(or set AGENT_MCP_SUBJECT_MODEL server-side to enable Ollama).",
-        )
-      }
-    } catch (e) {
-      // Soft-fail — the user can still type a subject manually.
-      toastError(e, "Failed to suggest a subject")
-    } finally {
-      setSuggestLoading(false)
-    }
-  }
-
-  // Open the compose form pre-wired for a reply to the given message.
-  //
-  // feat/reply-as-recipient: a reply is the message's RECIPIENT answering
-  // its SENDER. So we reply AS `parent.recipient_id` (`replyAs`) and send
-  // back TO `parent.sender_id` (`replyTo`). Example: a message
-  // `backend-dev → manager` yields "Reply as manager" sending
-  // `manager → backend-dev`.
-  //
-  // A listed row carries a concrete per-recipient `recipient_id` (the
-  // broadcast fan-out is stored per recipient), so `replyAs` is a real
-  // agent. Guard the degenerate broadcast token "*"/empty: fall back to
-  // the old behavior (reply to the other party as the operator) rather
-  // than compose a message authored by "*".
-  const openReply = (parent: Message) => {
-    const me = "admin" // dashboard runs as admin per ADR-0003
-    const replyAs = parent.recipient_id
-    const replyTo = parent.sender_id
-    const broadcastLike = !replyAs || replyAs === "*"
-    if (broadcastLike) {
-      // Degenerate: no concrete recipient to speak as. Reply to the other
-      // party as the operator (legacy behavior), no sender override.
-      const otherParty = parent.sender_id === me ? parent.recipient_id : parent.sender_id
-      setComposeRecipient(otherParty)
-      setComposeReplyAs(null)
-    } else {
-      setComposeRecipient(replyTo)
-      // Only carry an override when actually acting AS an agent (i.e. the
-      // reply-as identity is not the operator's own identity). Replying as
-      // admin is the normal operator-replying-as-themselves case.
-      setComposeReplyAs(replyAs === me ? null : replyAs)
-    }
-    setComposeSubject("")
-    setComposeContent("")
-    setComposeReplyParentId(parent.message_id)
+  // Open the compose modal pre-wired for a reply to the given message.
+  // The compose modal owns the reply-seeding logic (reply AS the parent's
+  // recipient, back TO its sender); here we just hand it the parent and
+  // open it.
+  const openReply = useCallback((parent: Message) => {
+    setReplyTo(parent)
     setComposeOpen(true)
-  }
+  }, [])
 
   const toggleRead = async (m: Message) => {
     const nextRead = !(m.read === 1 || m.read === true)
@@ -605,25 +284,25 @@ export function MessagesDashboard() {
 
   // ----- bulk selection helpers ----------------------------------
 
-  const toggleOne = (id: string) => {
+  const toggleOne = useCallback((id: string) => {
     setSelectedIds((prev) => {
       const next = new Set(prev)
       if (next.has(id)) next.delete(id)
       else next.add(id)
       return next
     })
-  }
+  }, [])
 
   const allVisibleSelected =
     messages.length > 0 && selectedIds.size === messages.length
 
-  const toggleAllVisible = () => {
-    if (allVisibleSelected) {
-      setSelectedIds(new Set())
-    } else {
-      setSelectedIds(new Set(messages.map((m) => m.message_id)))
-    }
-  }
+  const toggleAllVisible = useCallback(() => {
+    setSelectedIds((prev) =>
+      prev.size === messages.length && messages.length > 0
+        ? new Set()
+        : new Set(messages.map((m) => m.message_id)),
+    )
+  }, [messages])
 
   const bulkMark = async (read: boolean) => {
     if (selectedIds.size === 0) return
@@ -756,344 +435,24 @@ export function MessagesDashboard() {
 
   // Column spec — ONE source for the desktop table (via
   // <ResponsiveDataTable>) and, through `renderMobileCard`, the mobile
-  // card. Cells reproduce the pre-foundation <MessageRow> exactly; the
-  // checkbox + delete cells stopPropagation so they don't also fire the
-  // row-body onClick (open detail).
-  const columns: Column<Message>[] = [
-    {
-      id: "select",
-      headClassName: "w-8",
-      header: (
-        <input
-          type="checkbox"
-          aria-label="select all visible"
-          checked={allVisibleSelected}
-          onChange={toggleAllVisible}
-        />
-      ),
-      cell: (m) => (
-        <input
-          type="checkbox"
-          aria-label={`select message ${m.message_id}`}
-          checked={selectedIds.has(m.message_id)}
-          onChange={() => toggleOne(m.message_id)}
-          onClick={(e) => e.stopPropagation()}
-        />
-      ),
-    },
-    {
-      id: "time",
-      header: "Time",
-      cellClassName: "text-xs font-mono tabular-nums",
-      // Per-row entity glyph (matches memories' <Brain> convention).
-      cell: (m) => (
-        <div className="flex items-center gap-2">
-          <MessageSquare className="h-3 w-3 text-primary flex-shrink-0" />
-          <span>{m.timestamp.slice(0, 19)}</span>
-        </div>
-      ),
-    },
-    {
-      id: "from",
-      header: "From",
-      cellClassName: "max-w-[160px]",
-      cell: (m) => {
-        const isRead = m.read === 1 || m.read === true
-        return (
-          <div className="flex items-center gap-1.5">
-            {/* Leading unread dot — mirrors the mobile treatment so an
-                unread row is scannable at a glance, not just a ✓ column. */}
-            {!isRead && (
-              <span
-                aria-hidden
-                className="h-2 w-2 flex-shrink-0 rounded-full bg-primary"
-              />
-            )}
-            {/* Long agent ids truncate (with a title tooltip) instead of
-                growing the column and forcing table-wide horizontal
-                overflow. */}
-            <Badge
-              variant="outline"
-              className={cn("min-w-0 max-w-full", !isRead && "font-semibold")}
-              title={m.sender_id}
-            >
-              <span className="truncate">{m.sender_id}</span>
-            </Badge>
-          </div>
-        )
-      },
-    },
-    {
-      id: "to",
-      header: "To",
-      cellClassName: "max-w-[160px]",
-      cell: (m) => (
-        <Badge
-          variant="outline"
-          className="min-w-0 max-w-full"
-          title={m.recipient_id}
-        >
-          <span className="truncate">{m.recipient_id}</span>
-        </Badge>
-      ),
-    },
-    {
-      id: "subject",
-      header: "Subject",
-      cellClassName: "text-xs max-w-[200px] truncate",
-      cell: (m) => {
-        const isRead = m.read === 1 || m.read === true
-        const isReply = !!m.parent_message_id
-        return (
-          <span className={cn(!isRead && "font-semibold text-foreground")}>
-            {m.subject && m.subject_is_placeholder ? (
-              // Placeholder: the sender set no subject, so this is an
-              // auto-preview of the body (Phase 1). Shown muted + italic
-              // with an "auto" tag so it reads as a stub, not a real
-              // subject — a generated one fills in on the next backfill
-              // sweep (Phase 2).
-              <span
-                className="italic text-muted-foreground"
-                title="No subject set — auto-preview of the message. A generated subject will fill in shortly."
-              >
-                {m.subject}
-                <span className="ml-1 not-italic text-[10px] font-medium uppercase tracking-wide text-muted-foreground/60">
-                  auto
-                </span>
-              </span>
-            ) : m.subject ? (
-              // Real subject: title reveals the full text on hover when the
-              // cell truncates. (The placeholder branch keeps its own
-              // explanatory title, so we don't clobber it here.)
-              <span title={m.subject}>{m.subject}</span>
-            ) : isReply ? (
-              // v5.0.24 polish: human-readable parent label instead of the
-              // opaque message_id.
-              <span className="text-muted-foreground">
-                ↳ reply to:{" "}
-                <span className="text-foreground">
-                  {labelForParent(m.parent_message_id)}
-                </span>
-              </span>
-            ) : (
-              <span className="text-muted-foreground/50">—</span>
-            )}
-          </span>
-        )
-      },
-    },
-    {
-      id: "type",
-      header: "Type",
-      cellClassName: "text-xs",
-      cell: (m) => (
-        <Badge variant="outline" className={messageTypeBadgeClass(m.message_type)}>
-          {m.message_type}
-        </Badge>
-      ),
-    },
-    {
-      id: "priority",
-      header: "Priority",
-      cellClassName: "text-xs",
-      cell: (m) => (
-        <Badge variant="outline" className={priorityBadgeClass(m.priority)}>
-          {m.priority}
-        </Badge>
-      ),
-    },
-    {
-      id: "read",
-      header: "Read?",
-      // Glyph is silent to screen readers; the sr-only text names the
-      // state so it's announced.
-      cell: (m) => {
-        const isRead = m.read === 1 || m.read === true
-        return (
-          <>
-            <span aria-hidden>{isRead ? "✓" : ""}</span>
-            <span className="sr-only">{isRead ? "read" : "unread"}</span>
-          </>
-        )
-      },
-    },
-    {
-      id: "content",
-      header: "Content",
-      cellClassName: "max-w-[400px] truncate text-xs",
-      cell: (m) => {
-        const isRead = m.read === 1 || m.read === true
-        return (
-          <span
-            className={cn(!isRead && "text-foreground")}
-            title={m.message_content}
-          >
-            {m.message_content}
-          </span>
-        )
-      },
-    },
-    {
-      id: "actions",
-      header: "",
-      headClassName: "w-8",
-      cell: (m) => (
-        <Button
-          variant="ghost"
-          size="sm"
-          aria-label="delete message"
-          className="text-destructive hover:text-destructive hover:bg-destructive/10"
-          onClick={(e) => { e.stopPropagation(); deleteDialog.open(m.message_id) }}
-        >
-          <Trash2 className="h-4 w-4" />
-        </Button>
-      ),
-    },
-  ]
+  // card. Extracted to `useMessagesColumns` (Wave 5, mirrors
+  // `useAgentColumns`).
+  const columns = useMessagesColumns({
+    selectedIds,
+    allVisibleSelected,
+    onToggleAll: toggleAllVisible,
+    onToggleOne: toggleOne,
+    onDelete: (id) => deleteDialog.open(id),
+    labelForParent,
+  })
 
   // Everything between the stats strip and the table card. The scaffold
-  // exposes ONE slot there (`filterBar`), and the compose panel + the
-  // selection toolbar both belong in that band:
-  //   * Compose must stay ABOVE the list — pushing it into `children`
-  //     (below the table) would hide a freshly-opened draft under 100
-  //     rows.
-  //   * The selection toolbar ("N messages / N selected" + bulk
-  //     actions) was the table Card's CardHeader; the scaffold owns the
-  //     card and has no header slot, so it sits directly above it.
+  // exposes ONE slot there (`filterBar`); the filter controls + the
+  // selection toolbar both belong in that band. (The compose form used
+  // to live here as an inline card; Wave 5 moves it into the shared
+  // <FormDialog>-based <ComposeMessageModal>.)
   const filterBar = (
     <div className="w-full space-y-4 sm:space-y-6">
-      {composeOpen && (
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-lg">Compose message</CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            <div className="grid gap-3 md:grid-cols-3">
-              <div>
-                <Label htmlFor="compose-recipient" className="text-xs">Recipient agent_id</Label>
-                <Select
-                  value={composeRecipient}
-                  onValueChange={setComposeRecipient}
-                >
-                  <SelectTrigger id="compose-recipient" aria-label="Recipient agent_id">
-                    <SelectValue placeholder="select agent" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value={BROADCAST}>
-                      (broadcast to all workers)
-                    </SelectItem>
-                    {recipientOptions.map((id) => (
-                      <SelectItem key={id} value={id}>{id}</SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-              <div>
-                <Label htmlFor="compose-type" className="text-xs">Type</Label>
-                <Select value={composeType} onValueChange={setComposeType}>
-                  <SelectTrigger id="compose-type" aria-label="Message type"><SelectValue /></SelectTrigger>
-                  <SelectContent>
-                    {MESSAGE_TYPES.map((t) => (
-                      <SelectItem key={t} value={t}>{t}</SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-              <div>
-                <Label htmlFor="compose-priority" className="text-xs">Priority</Label>
-                <Select value={composePriority} onValueChange={setComposePriority}>
-                  <SelectTrigger id="compose-priority" aria-label="Priority"><SelectValue /></SelectTrigger>
-                  <SelectContent>
-                    {PRIORITIES.map((p) => (
-                      <SelectItem key={p} value={p}>{p}</SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-            </div>
-            {/* v5.0.22: Subject input + Suggest button. Hidden when
-                replying — replies always have subject = NULL per the
-                schema contract. */}
-            {composeReplyParentId ? (
-              <div className="rounded-md border border-muted bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-                {/* feat/reply-as-recipient: make the operator's voice
-                    explicit — they are replying AS the parent's recipient,
-                    back TO its sender. Shown only when acting as an agent
-                    (composeReplyAs set); a plain reply-as-admin keeps the
-                    ordinary "reply to" line. */}
-                {composeReplyAs ? (
-                  <div className="mb-1 font-medium text-foreground">
-                    Replying as {composeReplyAs} → {composeRecipient}
-                  </div>
-                ) : null}
-                ↳ reply to:{" "}
-                <span className="font-medium text-foreground">
-                  {labelForParent(composeReplyParentId)}
-                </span>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="ml-2 h-6 px-2"
-                  onClick={() => {
-                    setComposeReplyParentId(null)
-                    setComposeReplyAs(null)
-                  }}
-                >
-                  Cancel reply
-                </Button>
-              </div>
-            ) : (
-              <div>
-                <Label htmlFor="compose-subject" className="text-xs">Subject</Label>
-                <div className="flex gap-2">
-                  <Input
-                    id="compose-subject"
-                    aria-label="Subject"
-                    placeholder="Subject (optional — Suggest will fill from Ollama)"
-                    value={composeSubject}
-                    onChange={(e) => {
-                      setComposeSubject(e.target.value)
-                      if (suggestHint) setSuggestHint(null)
-                    }}
-                  />
-                  <Button
-                    type="button"
-                    variant="outline"
-                    onClick={suggestSubject}
-                    disabled={suggestLoading || !composeContent.trim()}
-                    title="Ask the configured Ollama model for a subject — POST /api/messages/suggest-subject"
-                  >
-                    {suggestLoading ? "…" : "Suggest"}
-                  </Button>
-                </div>
-                {suggestHint && (
-                  <p className="text-[11px] text-muted-foreground mt-1">
-                    {suggestHint}
-                  </p>
-                )}
-              </div>
-            )}
-            <div>
-              <Label htmlFor="compose-content" className="text-xs">Content</Label>
-              <textarea
-                id="compose-content"
-                aria-label="Content"
-                className="w-full min-h-[100px] rounded-md border border-input bg-background p-2 text-sm"
-                value={composeContent}
-                onChange={(e) => setComposeContent(e.target.value)}
-                placeholder="Your message"
-              />
-            </div>
-            <div className="flex justify-end">
-              <Button onClick={send} disabled={composing || !composeRecipient || !composeContent}>
-                <Send className="h-4 w-4 mr-1" />
-                {composing ? "Sending…" : "Send"}
-              </Button>
-            </div>
-          </CardContent>
-        </Card>
-      )}
-
       {/* Controls — un-boxed filter bar matching Memories/Tasks (no
           Card wrapper). Each control carries a small visible label above
           it so the filters are self-describing before you open them
@@ -1220,18 +579,15 @@ export function MessagesDashboard() {
         onRefresh: refresh,
         refreshing: loading,
         actions: (
-          <Button size="sm" onClick={() => setComposeOpen((v) => !v)}>
-            {composeOpen ? (
-              <>
-                <X className="h-4 w-4 mr-1" />
-                Close
-              </>
-            ) : (
-              <>
-                <Plus className="h-4 w-4 mr-1" />
-                New Message
-              </>
-            )}
+          <Button
+            size="sm"
+            onClick={() => {
+              setReplyTo(null)
+              setComposeOpen(true)
+            }}
+          >
+            <Plus className="h-4 w-4 mr-1" />
+            New Message
           </Button>
         ),
       }}
@@ -1274,6 +630,17 @@ export function MessagesDashboard() {
           onOldest={goOldest}
         />
       )}
+
+      {/* Compose modal — shared <FormDialog> + useAsyncSubmit shell
+          (Wave 5). Opened fresh from the header "New Message" button, or
+          pre-wired for a reply via openReply(). */}
+      <ComposeMessageModal
+        open={composeOpen}
+        onOpenChange={setComposeOpen}
+        parent={replyTo}
+        labelForParent={labelForParent}
+        onSent={refresh}
+      />
 
       {/* Detail modal (extracted <ViewMessageModal>). Mark-read stays
           inline (modal stays open); Delete routes through the confirm

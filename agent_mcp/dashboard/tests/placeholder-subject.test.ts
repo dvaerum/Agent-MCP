@@ -16,6 +16,7 @@
 import { describe, expect, it } from "vitest"
 import { readFileSync } from "node:fs"
 import { resolve } from "node:path"
+import { messagesPageSource } from "./support/messages-source"
 
 const DASHBOARD_ROOT = resolve(__dirname, "..")
 const read = (rel: string) => readFileSync(resolve(DASHBOARD_ROOT, rel), "utf8")
@@ -37,7 +38,10 @@ describe("Message type exposes subject_is_placeholder", () => {
 // ── Desktop table renders placeholders cleverly ───────────────────────
 
 describe("desktop messages table: placeholder subject", () => {
-  const src = read("components/dashboard/messages-dashboard.tsx")
+  // Wave 5 (refactor/w5-messages): the desktop column spec moved into
+  // messages/use-messages-columns.tsx. Read the page + satellites as one
+  // blob so this guard survives the split.
+  const src = messagesPageSource()
 
   it("gates a distinct branch on subject_is_placeholder", () => {
     expect(src).toMatch(/m\.subject\s*&&\s*m\.subject_is_placeholder/)

@@ -14,10 +14,20 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from tests.dashboard_sources import messages_page_source
+
 DASHBOARD = Path("agent_mcp/dashboard")
 
 
 def _read(rel: str) -> str:
+    # Wave 5 (refactor/w5-messages): the Messages page was split from a
+    # single god-file into a page module + a `messages/` satellite
+    # directory. These guards assert properties of the PAGE (its compose
+    # dropdown, its filter bar, its table), not of any one file, so they
+    # read the page and its satellites as one blob — the same idiom the
+    # Agents split established in tests/dashboard_sources.py.
+    if rel == "components/dashboard/messages-dashboard.tsx":
+        return messages_page_source()
     return (DASHBOARD / rel).read_text()
 
 
