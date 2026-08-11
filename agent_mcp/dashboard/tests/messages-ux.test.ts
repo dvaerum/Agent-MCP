@@ -146,36 +146,50 @@ describe("MUX-4: title tooltips on truncated text", () => {
   })
 })
 
-// ── MUX-5: auto-refresh interval ──────────────────────────────────
+// ── MUX-5: live refresh (SSE-driven, W6-followup F3) ──────────────
+//
+// F3 retired the page's own 60s `setInterval` poll AND the
+// `mcp:resources-updated` window listener. The messages list now
+// refreshes through the shared TanStack Query freshness model:
+//   * live: `invalidateMessages()` on the debounced SSE choke point
+//     (`lib/mcp-notifications.ts`) refetches the mounted page in place;
+//   * fallback: `useMessagesQuery`'s `refetchInterval`, gated on SSE
+//     health (PF-3) — 60s only while the stream is down.
 
-describe("MUX-5: background refresh interval", () => {
-  it("defines a REFRESH_INTERVAL and wires a setInterval", () => {
-    expect(/const REFRESH_INTERVAL = /.test(dash)).toBe(true)
+describe("MUX-5: live refresh (SSE-driven)", () => {
+  const notifications = read("lib/mcp-notifications.ts")
+  const messagesQuery = read("lib/queries/messages.ts")
+
+  it("retires the page's own setInterval poll + window listener", () => {
+    expect(/setInterval\(/.test(dash), "page must not run its own poll").toBe(
+      false,
+    )
     expect(
-      /setInterval\([\s\S]{0,60}REFRESH_INTERVAL\)/.test(dash),
-      "must schedule a refresh on REFRESH_INTERVAL",
+      /addEventListener\(/.test(dash),
+      "page must not attach its own window listener",
+    ).toBe(false)
+    expect(dash.includes("REFRESH_INTERVAL")).toBe(false)
+  })
+
+  it("invalidates the messages query on the SSE choke point", () => {
+    expect(
+      /invalidateMessages\(\)/.test(notifications),
+      "the SSE dispatcher must invalidate the messages list",
     ).toBe(true)
   })
 
-  it("refreshes in place (does not reset the cursor)", () => {
-    // The background tick calls refreshQuery (in-place) — never
-    // setCurrentOffset — so the user's page/scroll is preserved.
-    const effect = dash.match(
-      /const interval = setInterval\(\(\) => \{([\s\S]*?)\}, REFRESH_INTERVAL\)/,
-    )
-    expect(effect, "background-refresh interval must exist").not.toBeNull()
-    expect(/refreshQuery\(\)/.test(effect![1]!)).toBe(true)
-    expect(/setCurrentOffset/.test(effect![1]!)).toBe(false)
+  it("keeps an SSE-gated fallback poll on the query (PF-3)", () => {
+    expect(/refetchInterval/.test(messagesQuery)).toBe(true)
+    expect(/sseHealthy/.test(messagesQuery)).toBe(true)
+    expect(/60_?000/.test(messagesQuery)).toBe(true)
   })
 
-  it("pauses while compose is open", () => {
-    // Wave 5 (PF-3): the guard also short-circuits while SSE is healthy
-    // (`if (composeOpen || sseHealthy) return`) — the live refetch covers
-    // that case — so match composeOpen as part of the guard, not the
-    // whole expression.
+  it("refetches the current page in place (offset threaded into the query)", () => {
+    // `offset` is part of the query key, so an invalidation refetches the
+    // SAME page — the page threads `currentOffset` into useMessagesQuery.
     expect(
-      /if \(composeOpen[^)]*\) return/.test(dash),
-      "background refresh must pause while composing",
+      /useMessagesQuery\([\s\S]{0,80}currentOffset/.test(dash),
+      "page must key the query on the current offset",
     ).toBe(true)
   })
 })

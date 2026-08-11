@@ -78,7 +78,11 @@
  */
 
 import { useDataStore, notifyPromptsListChanged } from "./stores/data-store"
-import { invalidateAllData, invalidateTasks } from "./query-client"
+import {
+  invalidateAllData,
+  invalidateTasks,
+  invalidateMessages,
+} from "./query-client"
 import { projectContext } from "./project-context"
 import { eventsUrl } from "./urls"
 
@@ -185,6 +189,15 @@ interface JsonRpcNotification {
 // tight succession of `resources/updated` notifications still collapses
 // to a single tasks refetch (replacing the page's retired
 // `mcp:resources-updated` listener + 60s `setInterval`).
+//
+// W6-followup F3: the messages list is ALSO a separate TanStack Query
+// (`['messages', project, {filters, limit, offset}]`, fetched from
+// `POST /messages/query` — not part of the `/all-data` envelope), so a
+// new inbound message isn't covered by the all-data invalidation either.
+// `invalidateMessages()` joins the SAME debounced tick: one coalesced
+// refetch of the mounted messages page per burst, replacing the Messages
+// page's own retired `mcp:resources-updated` listener + 60s
+// `setInterval`.
 const DASHBOARD_REFRESH_DEBOUNCE_MS = 300
 let _dashboardRefreshTimer: ReturnType<typeof setTimeout> | null = null
 function scheduleDashboardRefresh(): void {
@@ -193,6 +206,7 @@ function scheduleDashboardRefresh(): void {
     _dashboardRefreshTimer = null
     void invalidateAllData()
     void invalidateTasks()
+    void invalidateMessages()
   }, DASHBOARD_REFRESH_DEBOUNCE_MS)
 }
 

@@ -1,60 +1,31 @@
-"""Regression guards for the usePagedQuery<T>() hook + dashboard migration.
+"""Regression guards for the retirement of the ``usePagedQuery<T>`` hook.
 
-PR 5 of the 2026-06-09 architecture review series. Candidate:
-``usePagedQuery<T>`` — single ownership of the paginated-fetch state
-machine (``{data, total, loading, error, refresh, lastFetch}``) that
-the three dashboards each used to hand-roll on top of three
-syntactically-different fetch backends.
+History
+-------
+PR 5 of the 2026-06-09 architecture review introduced ``usePagedQuery`` —
+a single owner of the paginated-fetch state machine
+(``{data, total, loading, error, refresh, lastFetch}``) that the tasks
+and messages dashboards each used to hand-roll. The Wave 6 follow-up then
+moved BOTH consumers onto the shared TanStack Query ``queryClient``:
 
-Pre-migration state-of-the-fork (post PR-4 ``useFilters``):
+- F2 migrated ``tasks-dashboard.tsx`` onto ``useTasksQuery``
+  (``lib/queries/tasks.ts``) — one query per ``['tasks', project,
+  filters]``.
+- F3 migrated ``messages-dashboard.tsx`` onto ``useMessagesQuery``
+  (``lib/queries/messages.ts``) — one query per ``['messages', project,
+  {filters, limit, offset}]``.
 
-- ``messages-dashboard.tsx`` — calls ``POST /api/messages/query`` via
-  a bespoke ``callMessages`` helper, builds the body inline
-  (``{token, limit, offset, ...filters}``), threads four useState
-  vars (``messages``, ``loading``, ``error``, ``total``), wires a
-  refresh effect on ``[filters, currentOffset]``.
-
-- ``tasks-dashboard.tsx`` — wraps ``apiClient.getTasks()`` (GET
-  ``/tasks``, no body) in a private ``useTasksData`` hook that owns
-  the same 4-tuple plus a 30s cache, a 60s background refresh
-  interval, and a connection guard.
-
-- ``agents-dashboard.tsx`` — does NOT have its own fetch. Reads
-  agents out of the global ``useDataStore`` (zustand) which fetches
-  ALL dashboard data in one ``/api/all-data`` round-trip and
-  multiplexes it across the dashboards. The hook is the wrong
-  abstraction for a global-store consumer — see the architecture
-  notes at the top of ``hooks/use-paged-query.ts`` for why
-  agents-dashboard.tsx is intentionally out of scope for this PR.
-
-The hook's contract:
-
-    {
-      data: T[];
-      total: number;
-      loading: boolean;
-      error: Error | null;
-      refresh: () => void;
-      lastFetch: number | null;
-    }
-
-with options:
-
-    {
-      endpoint?: string;                    // default POST target
-      fetchFn?: (signal) => Promise<{...}>; // escape hatch for non-POST
-      filters?: object;                     // spread into POST body
-      limit?: number;
-      offset?: number;
-      token?: string | (() => Promise<string>);
-      cacheMs?: number;                     // 0 = no caching
-      deps?: ReadonlyArray<unknown>;        // extra effect deps
-    }
+With the last consumer gone, ``hooks/use-paged-query.ts`` had no importers
+left, so F3 DELETED it. This guard is repointed — NOT weakened — from
+"the hook exists and both pages use it" to "the hook is gone and both
+pages ride TanStack Query". The single-source-of-truth property the hook
+was created to deliver now lives in the shared ``queryClient``; a
+reintroduction of the bespoke state machine would be the regression.
 
 These tests are text-parse regression guards (same convention as
-``test_dashboard_use_filters_hook.py``); the fork has no jsdom
-infrastructure, so behaviour is verified by ``npm run build`` +
-manual click-through in the live dashboard.
+``test_dashboard_use_filters_hook.py``); the fork verifies behaviour via
+the vitest suites (``tasks-query-*.test.*`` / ``messages-query-*.test.*``)
+plus ``npm run build``.
 """
 
 from __future__ import annotations
@@ -69,251 +40,140 @@ def _read(rel: str) -> str:
     return (DASHBOARD / rel).read_text()
 
 
-# ---------- The hook itself --------------------------------------
+# ---------- The hook is retired ----------------------------------
 
 
-def test_use_paged_query_hook_file_exists() -> None:
-    """``hooks/use-paged-query.ts`` must exist as the home of the hook."""
+def test_use_paged_query_hook_file_is_removed() -> None:
+    """``hooks/use-paged-query.ts`` must be GONE — its last consumer
+    (messages-dashboard) migrated onto TanStack Query in F3, leaving no
+    importers. A resurrected file means the bespoke paginated-fetch state
+    machine crept back alongside the shared ``queryClient``."""
     path = DASHBOARD / "hooks" / "use-paged-query.ts"
-    assert path.is_file(), f"expected hook at {path}"
-
-
-def test_use_paged_query_hook_exports_generic_function() -> None:
-    """The hook must be a generic exported function ``usePagedQuery<T>``."""
-    src = (DASHBOARD / "hooks" / "use-paged-query.ts").read_text()
-    assert re.search(r"export\s+function\s+usePagedQuery\s*<", src), (
-        "expected `export function usePagedQuery<T>(...)` in "
-        "hooks/use-paged-query.ts"
-    )
-    # Must use the same React primitives the other two hooks rely on.
-    assert "useState" in src, (
-        "expected the hook to use React's useState for the data/loading "
-        "state machine"
-    )
-    assert "useEffect" in src, (
-        "expected the hook to use React's useEffect to fire fetches"
-    )
-    assert "useCallback" in src, (
-        "expected useCallback for stable `refresh` identity"
+    assert not path.exists(), (
+        f"expected {path} to be deleted (all consumers migrated to "
+        "TanStack Query); the hand-rolled paginated-fetch hook must not "
+        "be reintroduced"
     )
 
 
-def test_use_paged_query_hook_returns_canonical_shape() -> None:
-    """The hook's return value must expose the canonical 6-field shape."""
-    src = (DASHBOARD / "hooks" / "use-paged-query.ts").read_text()
-    # The six load-bearing return-surface names. We grep for each as a
-    # property-style identifier so the test passes whether the return
-    # is built with shorthand (``{ data, total, ... }``) or explicit
-    # keys (``{ data: …, total: … }``).
-    for member in ("data", "total", "loading", "error", "refresh", "lastFetch"):
-        assert member in src, (
-            f"expected hook to expose `{member}` on its return value"
-        )
-
-
-def test_use_paged_query_hook_uses_abort_controller() -> None:
-    """A slow stale request must not be allowed to overwrite a fresh
-    fast one. The hook must use AbortController to cancel in-flight
-    fetches when filters / offset / endpoint change."""
-    src = (DASHBOARD / "hooks" / "use-paged-query.ts").read_text()
-    assert "AbortController" in src, (
-        "expected hook to use AbortController to cancel stale in-flight "
-        "fetches when inputs change (otherwise a slow request can "
-        "overwrite a fresh fast one)"
-    )
-    # The signal must actually be threaded into fetch().
-    assert "signal" in src, (
-        "expected the AbortController.signal to be threaded into fetch()"
+def test_no_source_imports_use_paged_query() -> None:
+    """No .ts/.tsx source may import the retired hook. A lingering import
+    would fail the build (the file is gone) — this catches it at the grep
+    layer with a clearer message, and pins that neither a real import nor
+    a ``vi.mock`` of the hook survives."""
+    offenders: list[str] = []
+    for path in DASHBOARD.rglob("*.ts*"):
+        if "node_modules" in path.parts:
+            continue
+        text = path.read_text()
+        # A real import / mock of the hook module — NOT the incidental
+        # historical mentions in doc-comments (which describe lineage).
+        if re.search(r"""from\s+['"][^'"]*use-paged-query['"]""", text) or re.search(
+            r"""vi\.mock\(\s*['"][^'"]*use-paged-query['"]""", text
+        ):
+            offenders.append(str(path.relative_to(DASHBOARD)))
+    assert not offenders, (
+        "expected no module to import '@/hooks/use-paged-query' after "
+        f"its removal; still referenced by: {offenders}"
     )
 
 
-def test_use_paged_query_hook_does_post_with_token_and_pagination() -> None:
-    """The default fetch path must POST a JSON body containing
-    ``token`` / ``limit`` / ``offset`` and the spread filters — this
-    is the ``/api/messages/query`` contract messages-dashboard relies
-    on, and the contract any future paginated-query endpoint should
-    follow."""
-    src = (DASHBOARD / "hooks" / "use-paged-query.ts").read_text()
-    # Method MUST be POST — browsers strip bodies from GET (the bug
-    # that birthed /api/messages/query in the first place).
-    assert re.search(r'method\s*:\s*[\'"]POST[\'"]', src), (
-        "expected the default fetch path to use method: 'POST'"
-    )
-    # Body must include token / limit / offset.
-    for key in ("token", "limit", "offset"):
-        assert key in src, (
-            f"expected the POST body construction to reference `{key}`"
-        )
-    # JSON body — Content-Type header + JSON.stringify.
-    assert "application/json" in src, (
-        "expected the POST to set Content-Type: application/json"
-    )
-    assert "JSON.stringify" in src, (
-        "expected the POST body to be JSON.stringify'd"
-    )
+# ---------- Consumer migrations (TanStack Query) -----------------
 
 
-def test_use_paged_query_hook_accepts_fetch_fn_escape_hatch() -> None:
-    """Not every dashboard speaks the POST-with-token contract:
-    tasks-dashboard's ``apiClient.getTasks()`` is a GET ``/tasks``
-    that returns ``Task[]`` directly (no envelope, no total). The
-    hook MUST accept a ``fetchFn`` escape hatch so the same state
-    machine can drive non-POST endpoints without forcing every
-    caller into the messages-shape."""
-    src = (DASHBOARD / "hooks" / "use-paged-query.ts").read_text()
-    assert "fetchFn" in src, (
-        "expected hook to accept a `fetchFn` escape hatch for "
-        "non-POST endpoints (tasks-dashboard's apiClient.getTasks())"
-    )
+def test_messages_dashboard_migrated_to_tanstack_query() -> None:
+    """W6-followup F3: messages-dashboard.tsx no longer rides the
+    hand-rolled ``usePagedQuery`` state machine — the list fetch moved
+    onto the shared TanStack Query client via ``useMessagesQuery`` (see
+    ``lib/queries/messages.ts``), keyed ``['messages', project, {filters,
+    limit, offset}]`` with one SSE invalidation choke point.
 
-
-def test_use_paged_query_hook_supports_cache_ms() -> None:
-    """``cacheMs`` (default 0 = no cache) — preserves the 30s cache
-    tasks-dashboard's pre-migration ``useTasksData`` ran. Without
-    the option the tasks page would re-fetch on every tab focus."""
-    src = (DASHBOARD / "hooks" / "use-paged-query.ts").read_text()
-    assert "cacheMs" in src, (
-        "expected hook to accept a `cacheMs` option for caching "
-        "(tasks-dashboard's pre-migration useTasksData ran a 30s cache)"
-    )
-
-
-def test_use_paged_query_hook_returns_empty_array_safely() -> None:
-    """The hook returns ``[]`` for ``data`` and ``0`` for ``total``
-    when loading or errored — so consumers don't have to special-case
-    ``data === null``."""
-    src = (DASHBOARD / "hooks" / "use-paged-query.ts").read_text()
-    # The initial-state literal MUST be a real empty array (not null /
-    # undefined) so the call-site .map() never crashes.
-    assert re.search(r"useState\s*<[^>]*\bT\[\][^>]*>\s*\(\s*\[\s*\]\s*\)", src) or \
-        re.search(r"useState\s*\(\s*\[\s*\]\s*as\s+T\[\]\s*\)", src), (
-        "expected the data useState to default to [] (never null) so "
-        "consumers don't have to guard .map()"
-    )
-
-
-# ---------- Consumer migrations ----------------------------------
-
-
-def test_messages_dashboard_imports_use_paged_query() -> None:
-    """messages-dashboard.tsx must import the hook after migration."""
+    This guard was previously ``test_messages_dashboard_imports_use_paged_query``
+    (which asserted the OLD import). Repointed — NOT weakened — to the new
+    location: the page must import the TanStack messages query and must
+    NOT re-introduce the retired hook."""
     src = _read("components/dashboard/messages-dashboard.tsx")
-    assert "usePagedQuery" in src, (
-        "expected messages-dashboard.tsx to import usePagedQuery"
+    assert "useMessagesQuery" in src, (
+        "expected messages-dashboard.tsx to import useMessagesQuery (the "
+        "TanStack Query messages-list fetch)"
     )
-    assert "use-paged-query" in src, (
-        "expected messages-dashboard.tsx to reference '@/hooks/use-paged-query'"
+    assert "lib/queries/messages" in src, (
+        "expected messages-dashboard.tsx to reference '@/lib/queries/messages'"
     )
-
-
-def test_messages_dashboard_no_longer_hand_rolls_query_fetch() -> None:
-    """The bespoke ``callMessages('POST', '/query', …)`` listing fetch
-    is the canonical thing this PR consolidates. After migration it
-    must be replaced by the hook — the helper may survive for
-    PATCH/DELETE/compose, but the ``'/query'`` invocation must NOT.
-    """
-    src = _read("components/dashboard/messages-dashboard.tsx")
-    # The exact suffix passed by the pre-migration listing call. If
-    # this substring is still present, the hook isn't owning the
-    # listing fetch.
-    assert "'/query'" not in src and '"/query"' not in src, (
-        "expected the bespoke `callMessages('POST', '/query', …)` "
-        "fetch to be retired in favour of usePagedQuery owning the "
-        "paginated listing"
+    assert "usePagedQuery" not in src, (
+        "expected messages-dashboard.tsx to NOT import usePagedQuery after "
+        "the F3 migration onto TanStack Query"
+    )
+    assert "use-paged-query" not in src, (
+        "expected messages-dashboard.tsx to NOT reference "
+        "'@/hooks/use-paged-query' after the F3 migration"
     )
 
 
 def test_messages_dashboard_no_longer_declares_messages_use_state() -> None:
     """The legacy ``useState<Message[]>([])`` (the rows-of-data slice)
-    must be gone — the hook owns the data array now."""
+    must be gone — the TanStack query owns the messages array now."""
     src = _read("components/dashboard/messages-dashboard.tsx")
     assert not re.search(r"useState\s*<\s*Message\[\]\s*>", src), (
         "expected `useState<Message[]>([])` to be retired in favour "
-        "of usePagedQuery owning the messages array"
+        "of useMessagesQuery owning the messages array"
+    )
+
+
+def test_messages_dashboard_retires_the_page_poll_and_window_listener() -> None:
+    """The pre-migration page ran its own 60s ``setInterval`` background
+    poll and an ``mcp:resources-updated`` window listener to refetch the
+    listing. Both are replaced by the single ``invalidateMessages()`` SSE
+    choke point (``lib/mcp-notifications.ts``); they must be gone from the
+    page so there is ONE freshness path, not three."""
+    src = _read("components/dashboard/messages-dashboard.tsx")
+    # Match actual CODE usage (with the call paren) — a doc-comment that
+    # names the retired mechanism to explain WHY it is gone is fine.
+    assert "setInterval(" not in src, (
+        "expected the 60s setInterval background poll to be retired in "
+        "favour of the SSE-driven invalidateMessages() refetch"
+    )
+    assert "addEventListener(" not in src, (
+        "expected the mcp:resources-updated window listener to be retired "
+        "in favour of the SSE-driven invalidateMessages() refetch"
+    )
+
+
+def test_messages_list_fetch_lives_in_the_api_layer() -> None:
+    """The listing POST to ``/messages/query`` moved out of the retired
+    hook and into the api layer as ``getMessages`` — the same shape
+    ``useTasksQuery`` gets from ``getTasks``. Pin that the api module owns
+    the endpoint + the POST verb (the GET-with-body bug that birthed
+    /messages/query must stay buried)."""
+    api_src = _read("lib/api/messages.ts")
+    assert "getMessages" in api_src, (
+        "expected lib/api/messages.ts to export getMessages (the "
+        "paginated messages-list reader)"
+    )
+    assert "/messages/query" in api_src, (
+        "expected getMessages to POST to '/messages/query'"
+    )
+    assert re.search(r"method\s*:\s*['\"]POST['\"]", api_src), (
+        "expected getMessages to use method: 'POST' (browsers strip GET "
+        "bodies — the original bug)"
     )
 
 
 def test_tasks_dashboard_migrated_to_tanstack_query() -> None:
-    """W6-followup F2 repoint: tasks-dashboard.tsx no longer rides the
-    hand-rolled ``usePagedQuery`` state machine — the list fetch moved
-    onto the shared TanStack Query client via ``useTasksQuery`` (see
-    ``lib/queries/tasks.ts``), matching the ``/all-data`` envelope
-    pattern (one query per ``['tasks', project, filters]``, one SSE
-    invalidation choke point). The in-file ``useTasksData`` wrapper now
-    delegates to that query.
-
-    This guard was previously ``test_tasks_dashboard_imports_use_paged_query``
-    (which asserted the OLD ``usePagedQuery`` import). It is repointed —
-    NOT weakened — to the new location: the page must import the
-    TanStack tasks query and must NOT re-introduce the retired hook.
-    (``messages-dashboard.tsx`` still owns ``usePagedQuery`` — the hook
-    file and its own guards stay put; only the tasks consumer migrated.)
-    """
+    """W6-followup F2 (kept green through F3): tasks-dashboard.tsx rides
+    the TanStack ``useTasksQuery`` and must NOT re-introduce the retired
+    hook."""
     src = _read("components/dashboard/tasks-dashboard.tsx")
     assert "useTasksQuery" in src, (
-        "expected tasks-dashboard.tsx to import useTasksQuery (the "
-        "TanStack Query tasks-list fetch)"
+        "expected tasks-dashboard.tsx to import useTasksQuery"
     )
     assert "lib/queries/tasks" in src, (
         "expected tasks-dashboard.tsx to reference '@/lib/queries/tasks'"
     )
     assert "usePagedQuery" not in src, (
-        "expected tasks-dashboard.tsx to NOT import usePagedQuery after "
-        "the F2 migration onto TanStack Query"
+        "expected tasks-dashboard.tsx to NOT import usePagedQuery"
     )
     assert "use-paged-query" not in src, (
         "expected tasks-dashboard.tsx to NOT reference "
-        "'@/hooks/use-paged-query' after the F2 migration"
-    )
-
-
-def test_tasks_dashboard_useTasksData_no_longer_calls_use_state_directly() -> None:
-    """``useTasksData`` used to call ``useState`` four times (tasks /
-    loading / error / lastFetch). After migration the hook owns the
-    state machine — those four ``useState`` calls inside
-    ``useTasksData`` must be gone (the wrapper can still memoize
-    extras like ``isConnected``, but the fetch state comes from
-    ``usePagedQuery``)."""
-    src = _read("components/dashboard/tasks-dashboard.tsx")
-    # Pre-migration ``useTasksData`` body started with these four
-    # state slots. Specifically these distinctive declarations.
-    forbidden = [
-        "useState<Task[]>([])",
-        "useState<number>(0)",
-    ]
-    leaked = [f for f in forbidden if f in src]
-    assert not leaked, (
-        "expected the hand-rolled useState pattern inside useTasksData "
-        f"to be replaced by usePagedQuery; still present: {leaked}"
-    )
-
-
-def test_tasks_dashboard_no_longer_owns_module_level_cache() -> None:
-    """The module-level ``tasksCache`` Map was duplicated cache
-    plumbing — once the hook owns ``cacheMs``, the call-site Map is
-    redundant. Remove it so there's a single cache implementation
-    in the dashboard codebase."""
-    src = _read("components/dashboard/tasks-dashboard.tsx")
-    # The distinctive module-level cache declaration.
-    assert "const tasksCache = new Map" not in src, (
-        "expected the module-level `tasksCache = new Map(...)` to be "
-        "retired in favour of the hook's `cacheMs` option"
-    )
-
-
-# ---------- Out-of-scope marker ----------------------------------
-
-
-def test_use_paged_query_hook_documents_agents_dashboard_scope() -> None:
-    """agents-dashboard.tsx reads agents out of the global
-    ``useDataStore`` (zustand) — a one-shot ``/api/all-data`` fetch
-    multiplexed across every tab. It is NOT a per-tab paginated
-    query and is intentionally out of scope for this hook. The
-    hook's JSDoc must call this out so a future reader doesn't
-    try to force the migration."""
-    src = (DASHBOARD / "hooks" / "use-paged-query.ts").read_text()
-    assert "useDataStore" in src or "data-store" in src or "agents-dashboard" in src, (
-        "expected the hook's JSDoc to document why agents-dashboard.tsx "
-        "is out of scope (it consumes the global useDataStore, not a "
-        "per-tab paginated query endpoint)"
+        "'@/hooks/use-paged-query'"
     )

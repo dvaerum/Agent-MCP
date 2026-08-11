@@ -81,28 +81,35 @@ def test_listing_uses_post_query_not_get() -> None:
     History: the original bug was a GET with a JSON body — browsers
     strip GET bodies per the Fetch spec, so the listing silently
     failed. The fix was a bespoke ``callMessages('POST', '/query', …)``
-    helper. Post v5.0.31 / PR 5 the listing is owned by
-    ``usePagedQuery<Message>`` (PR 5 of the 2026-06-09 architecture
-    review); the hook's default fetch path is POST + JSON body, and
-    the call-site declares ``endpoint: "/messages/query"``. We
-    therefore now assert via the hook indirection: messages-dashboard
-    declares the endpoint, and the hook itself is the lone owner of
-    the POST verb.
+    helper, later folded into ``usePagedQuery<Message>`` (PR 5). Post
+    W6-followup F3 the listing rides TanStack Query: the page mounts
+    ``useMessagesQuery`` (``lib/queries/messages.ts``), which calls
+    ``getMessages`` in the api layer (``lib/api/messages.ts``) — the lone
+    owner of the ``/messages/query`` endpoint + the POST verb now.
+
+    This guard is repointed through the api-layer indirection (the
+    retired ``use-paged-query.ts`` hook was deleted in F3): the page wires
+    ``useMessagesQuery``, and the POST-to-``/messages/query`` lives in the
+    api module.
     """
     src = _read("components/dashboard/messages-dashboard.tsx")
-    # 1. The call-site declares the right endpoint on the hook.
-    assert '"/messages/query"' in src or "'/messages/query'" in src, (
-        "expected messages-dashboard to wire usePagedQuery with "
-        'endpoint: "/messages/query"'
-    )
-    assert "usePagedQuery" in src, (
+    # 1. The page delegates the listing fetch to the TanStack query.
+    assert "useMessagesQuery" in src, (
         "expected messages-dashboard to delegate the listing fetch to "
-        "usePagedQuery (PR 5, v5.0.31)"
+        "useMessagesQuery (W6-followup F3)"
     )
-    # 2. The hook itself uses POST (not GET) for that endpoint.
-    hook_src = (DASHBOARD / "hooks" / "use-paged-query.ts").read_text()
-    assert '"POST"' in hook_src or "'POST'" in hook_src, (
-        "expected usePagedQuery's default fetch path to use POST "
+    assert "usePagedQuery" not in src, (
+        "expected the retired usePagedQuery hook to be gone from "
+        "messages-dashboard after the F3 migration"
+    )
+    # 2. The api layer is the lone owner of the endpoint + POST verb.
+    api_src = (DASHBOARD / "lib" / "api" / "messages.ts").read_text()
+    assert '"/messages/query"' in api_src or "'/messages/query'" in api_src, (
+        "expected getMessages (lib/api/messages.ts) to POST to "
+        "'/messages/query'"
+    )
+    assert '"POST"' in api_src or "'POST'" in api_src, (
+        "expected getMessages's fetch path to use POST "
         "(the GET-with-body bug must stay buried)"
     )
     # And the original buggy call must be gone.

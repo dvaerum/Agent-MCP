@@ -36,18 +36,22 @@ const reply = {
   read: 1,
 }
 
-// Mutable so individual tests can drive the hook into an error state.
+// Mutable so individual tests can drive the query into an error state.
+// Shape mirrors the subset of the TanStack `useMessagesQuery` result the
+// page reads: `data` is now the `{messages, total}` page envelope, and
+// the fetch state is `isLoading` / `isFetching` / `error` / `refetch` /
+// `dataUpdatedAt` (W6-followup F3 — messages migrated off usePagedQuery).
 const query = {
-  data: [message, reply] as unknown[],
-  total: 2,
-  loading: false,
+  data: { messages: [message, reply] as unknown[], total: 2 },
+  isLoading: false,
+  isFetching: false,
   error: null as Error | null,
-  refresh: () => {},
-  lastFetch: Date.now(),
+  refetch: () => {},
+  dataUpdatedAt: Date.now(),
 }
 
-vi.mock("@/hooks/use-paged-query", () => ({
-  usePagedQuery: () => query,
+vi.mock("@/lib/queries/messages", () => ({
+  useMessagesQuery: () => query,
 }))
 vi.mock("@/lib/stores/server-store", () => ({
   useServerStore: () => ({
@@ -83,8 +87,7 @@ import { MessagesDashboard } from "@/components/dashboard/messages-dashboard"
 beforeEach(() => setMatchMedia(false))
 afterEach(() => {
   cleanup()
-  query.data = [message, reply]
-  query.total = 2
+  query.data = { messages: [message, reply], total: 2 }
   query.error = null
 })
 
@@ -169,8 +172,7 @@ describe("<MessagesDashboard> (scaffold migration)", () => {
 
   it("shows the full error panel when the first load fails empty", () => {
     query.error = new Error("network down")
-    query.data = []
-    query.total = 0
+    query.data = { messages: [], total: 0 }
     render(<MessagesDashboard />)
     expect(screen.getByText(/Connection Error/i)).toBeTruthy()
     expect(screen.queryByRole("heading", { name: "Messages" })).toBeNull()

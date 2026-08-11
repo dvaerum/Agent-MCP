@@ -112,3 +112,52 @@ export function invalidateTasks(): Promise<void> {
     queryKey: [TASKS_KEY, projectContext.projectName ?? "standalone"],
   })
 }
+
+/** Query-key root for the messages list (`POST /messages/query`). */
+export const MESSAGES_KEY = "messages" as const
+
+/**
+ * Stable query key for the messages list, namespaced by project and
+ * keyed on the full request snapshot (`{ filters, limit, offset }`).
+ *
+ * Unlike the tasks list (whose `GET /tasks` returns the WHOLE set, so
+ * page stays a client-side slice OUT of the key — see `tasksQueryKey`),
+ * the messages list is genuinely SERVER-paginated: `POST /messages/query`
+ * takes `limit`/`offset` (default 50, hard-capped at 500 rows per
+ * request) and returns a SEPARATE `total` count. There is no way to pull
+ * "the whole set" in one call once an inbox exceeds 500 rows, so each
+ * page is its own backend round-trip and therefore its own cache entry —
+ * `offset`/`limit` MUST be part of the key or paging couldn't refetch.
+ * `keepPreviousData` (see `useMessagesQuery`) holds the current page's
+ * rows on screen while the next page loads, preserving the old
+ * `usePagedQuery` "no flicker on page step" feel.
+ *
+ * The `params` object is embedded verbatim; React Query hashes it with
+ * sorted keys, so two renders producing an equal snapshot resolve to the
+ * same entry. `invalidateMessages()` prefix-matches on
+ * `[MESSAGES_KEY, project]`, so every page + filter variant is
+ * invalidated at once (a new inbound message must surface no matter
+ * which page/filter the operator is viewing).
+ */
+export const messagesQueryKey = (
+  projectName: string | null,
+  params: object = {},
+) => [MESSAGES_KEY, projectName ?? "standalone", params] as const
+
+/**
+ * Invalidate the active-project messages list across every page + filter
+ * variant, forcing a single refetch of each mounted messages query.
+ * Prefix-matches `[MESSAGES_KEY, project]`.
+ *
+ * Called from the same debounced SSE choke point as `invalidateAllData()`
+ * / `invalidateTasks()` (see `lib/mcp-notifications.ts`) so a new inbound
+ * message surfaces on the Messages page without its own poll — the retired
+ * 60s `setInterval` + `mcp:resources-updated` window listener are replaced
+ * by this one coalesced invalidation. Importable from non-React modules
+ * because `queryClient` is a module singleton.
+ */
+export function invalidateMessages(): Promise<void> {
+  return queryClient.invalidateQueries({
+    queryKey: [MESSAGES_KEY, projectContext.projectName ?? "standalone"],
+  })
+}
