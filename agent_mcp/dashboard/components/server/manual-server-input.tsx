@@ -5,6 +5,7 @@ import { Plus } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { toast, toastError } from "@/components/ui/toast"
 import { useServerStore } from "@/lib/stores/server-store"
 
 export function ManualServerInput() {
@@ -21,7 +22,12 @@ export function ManualServerInput() {
     const portNumber = parseInt(port)
     
     if (isNaN(portNumber) || portNumber < 1 || portNumber > 65535) {
-      alert("Please enter a valid port number (1-65535)")
+      // AX-5: shared toast (role=alert + aria-live) instead of the
+      // native, unannounceable window.alert().
+      toast({
+        variant: "error",
+        description: "Please enter a valid port number (1-65535).",
+      })
       setIsAdding(false)
       return
     }
@@ -48,7 +54,7 @@ export function ManualServerInput() {
       setName("")
       setPort("")
     } catch (error) {
-      console.error("Failed to add server:", error)
+      toastError(error, "Failed to add server")
     } finally {
       setIsAdding(false)
     }

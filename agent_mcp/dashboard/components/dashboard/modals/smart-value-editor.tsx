@@ -228,8 +228,9 @@ export function SmartValueEditor({ value, onChange, className }: SmartValueEdito
       <div className="space-y-3">
         {valueType === 'string' && (
           <div className="space-y-2">
-            <Label className="text-sm">Text Value</Label>
+            <Label htmlFor="sve-string" className="text-sm">Text Value</Label>
             <Textarea
+              id="sve-string"
               value={stringValue}
               onChange={(e) => {
                 setStringValue(e.target.value)
@@ -243,8 +244,9 @@ export function SmartValueEditor({ value, onChange, className }: SmartValueEdito
 
         {valueType === 'number' && (
           <div className="space-y-2">
-            <Label className="text-sm">Number Value</Label>
+            <Label htmlFor="sve-number" className="text-sm">Number Value</Label>
             <Input
+              id="sve-number"
               type="number"
               value={numberValue}
               onChange={(e) => {
@@ -259,9 +261,10 @@ export function SmartValueEditor({ value, onChange, className }: SmartValueEdito
 
         {valueType === 'boolean' && (
           <div className="space-y-2">
-            <Label className="text-sm">Boolean Value</Label>
+            <Label htmlFor="sve-boolean" className="text-sm">Boolean Value</Label>
             <div className="flex items-center gap-3 p-3 border rounded-lg">
               <Switch
+                id="sve-boolean"
                 checked={booleanValue}
                 onCheckedChange={(checked) => {
                   setBooleanValue(checked)

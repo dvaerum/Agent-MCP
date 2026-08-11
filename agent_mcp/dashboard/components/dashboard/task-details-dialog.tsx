@@ -1,7 +1,7 @@
 "use client"
 
 import { Badge } from '@/components/ui/badge'
-import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Separator } from '@/components/ui/separator'
 import { Task } from '@/lib/api'
@@ -42,6 +42,11 @@ export function TaskDetailsDialog({ task, open, onOpenChange }: TaskDetailsDialo
               {task.status.replace(/_/g, ' ')}
             </Badge>
           </DialogTitle>
+          {/* AX-5: Radix warns (and screen readers get no accessible
+              description) when DialogContent has no DialogDescription. */}
+          <DialogDescription className="text-muted-foreground">
+            Full details for this task — status, assignment, description, and dependencies.
+          </DialogDescription>
         </DialogHeader>
 
         <ScrollArea className="max-h-[60vh] pr-4">
