@@ -558,6 +558,15 @@ export const usePromptsCatalogLoading = (): boolean =>
  * started explicitly by `<McpNotificationsProvider>`, which already
  * owns the live-update lifecycle, and the caller holds the stop.
  * `tests/live-update-timer-leaks.test.ts` pins that.
+ *
+ * W4-followup(A) (PF-3): the per-list component pollers should also
+ * consult `useSseHealthy()` and skip their interval fetch while SSE is
+ * up, the same way this data-store poll now does. Agent B call-sites:
+ *   - components/dashboard/tasks-dashboard.tsx    (REFRESH_INTERVAL 60s → GET /tasks)
+ *   - components/dashboard/messages-dashboard.tsx (its 60s list poll)
+ * Each already re-fetches on the `mcp:resources-updated` window event
+ * fired from lib/mcp-notifications.ts, so gating the redundant interval
+ * on `sseHealthy` is safe — SSE churn still drives the refetch.
  */
 const AUTO_REFRESH_INTERVAL_MS = 60000
 let _autoRefreshTimer: ReturnType<typeof setInterval> | null = null

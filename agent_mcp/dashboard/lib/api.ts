@@ -184,6 +184,16 @@ export function normalizeTaskListField(field: unknown): string[] {
  * list-fields become `string[]` regardless of how the backend encoded
  * them. Idempotent — a `Task` that already carries arrays passes
  * through unchanged.
+ *
+ * W4-followup(A): now that `child_tasks` / `depends_on_tasks` are
+ * guaranteed `string[]` at this boundary, the components below can drop
+ * their private `parseJsonField` defensive parses and read the arrays
+ * directly (Agent B):
+ *   - components/dashboard/tasks-dashboard.tsx  (parseJsonField, L141)
+ *   - components/dashboard/task-details-dialog.tsx (parseJsonField, L21;
+ *     `parseJsonField(task.child_tasks) as string[]` → task.child_tasks)
+ *   - components/dashboard/tasks-mobile-list.tsx (already reads
+ *     task.child_tasks.length directly — no change needed)
  */
 export function normalizeTask(raw: RawTask): Task {
   return {
