@@ -49,6 +49,17 @@ interface DataStore {
   lastFetch: number
   isRefreshing: boolean
 
+  // PF-3: live-update SSE stream health. TRUE while the operator
+  // events stream (`lib/mcp-notifications.ts`) is connected and
+  // delivering `resources/updated` notifications; FALSE before the
+  // first connect and whenever the stream drops / reconnects. The
+  // background freshness poll (`startDataStoreAutoRefresh`) consults
+  // this: when SSE is healthy it already pushes every mutation within
+  // ~300ms, so the redundant 60s interval poll is suppressed and only
+  // fires as the fallback while SSE is down. Defaults FALSE so the
+  // poll runs until the stream proves itself up.
+  sseHealthy: boolean
+
   // Prompt-book catalogue (PR #67 + dashboard-prompts-from-rest
   // migration). Source of truth lives in agent_mcp/prompts/catalog.json
   // and is served via GET /api/prompts/catalog. The slice is its own
@@ -86,6 +97,10 @@ interface DataStore {
   }
   updateAgent: (agent: Agent) => void
   updateTask: (task: Task) => void
+  // PF-3: flip the SSE-health flag. Called by the operator-events
+  // stream lifecycle in `lib/mcp-notifications.ts` — true on a
+  // successful connect, false on drop / reconnect / stop.
+  setSseHealthy: (healthy: boolean) => void
   refreshData: () => Promise<void>
   shouldDisplayAgent: (agent: Agent) => boolean
   getActiveAgents: () => Agent[]
@@ -97,6 +112,7 @@ export const useDataStore = create<DataStore>((set, get) => ({
   error: null,
   lastFetch: 0,
   isRefreshing: false,
+  sseHealthy: false,
   promptsCatalog: null,
   promptsCategories: null,
   promptsCatalogLoading: false,
@@ -430,6 +446,13 @@ export const useDataStore = create<DataStore>((set, get) => ({
     }
   },
 
+  setSseHealthy: (healthy: boolean) => {
+    // Cheap guard: only touch the store when the value actually flips,
+    // so subscribers of the `selectSseHealthy` selector don't re-render
+    // on every redundant setter call from the stream lifecycle.
+    if (get().sseHealthy !== healthy) set({ sseHealthy: healthy })
+  },
+
   refreshData: async () => {
     // Force refresh
     await get().fetchAllData(true)
@@ -451,6 +474,73 @@ export const useDataStore = create<DataStore>((set, get) => ({
     return state.data.agents.filter(agent => get().shouldDisplayAgent(agent))
   }
 }))
+
+// -- scoped selectors (PF-4) ---------------------------------------------
+//
+// Narrow, single-slice selector hooks so a component subscribes to
+// EXACTLY the state it renders and re-renders only when THAT slice
+// changes — not on every unrelated `set()` anywhere in the store.
+//
+// The anti-pattern these replace is `const { agents } =
+// useDataStore()` (no selector), which subscribes the component to the
+// WHOLE store object: a `setSseHealthy` flip, a prompts-catalog load, an
+// `isRefreshing` toggle — each re-renders every such consumer. A
+// slice-scoped `useDataStore(selectAgents)` re-renders only when the
+// agents array reference actually changes.
+//
+// Stable empty singletons: returning a fresh `[]` from a selector on
+// every call defeats zustand's reference equality and forces a re-render
+// each time, so the null-data path returns one frozen shared array.
+//
+// W4-followup(A): migrate the components/ consumers off the whole-store
+// subscription to these hooks. Known call-sites to convert (Agent B):
+//   - components/dashboard/agents-dashboard.tsx  → useAgents()
+//   - components/dashboard/tasks-dashboard.tsx   → useTasks()
+//   - components/dashboard/messages-dashboard.tsx (data slice) → useAllData()/useTasks()
+//   - components/dashboard/system-graph*.tsx / overview widgets → useAgents()/useTasks()
+//   - any `useDataStore((s) => ...)` that pulls loading/error/refreshing
+//     → useDataLoading() / useDataError() / useIsRefreshing()
+//   - live-update indicators → useSseHealthy()
+//   - prompt-book consumers → usePromptsCatalog()/usePromptsCategories()
+
+const EMPTY_AGENTS: readonly Agent[] = Object.freeze([])
+const EMPTY_TASKS: readonly Task[] = Object.freeze([])
+
+/** The agents array (stable empty ref when no data is loaded yet). */
+export const useAgents = (): readonly Agent[] =>
+  useDataStore((s) => s.data?.agents ?? EMPTY_AGENTS)
+
+/** The tasks array (stable empty ref when no data is loaded yet). */
+export const useTasks = (): readonly Task[] =>
+  useDataStore((s) => s.data?.tasks ?? EMPTY_TASKS)
+
+/** The whole `AllData` envelope (or null). Prefer the narrower
+ *  `useAgents` / `useTasks` when a component only needs one slice. */
+export const useAllData = (): AllData | null => useDataStore((s) => s.data)
+
+/** Initial-load spinner flag. */
+export const useDataLoading = (): boolean => useDataStore((s) => s.loading)
+
+/** Background-refresh-in-flight flag (distinct from the initial load). */
+export const useIsRefreshing = (): boolean =>
+  useDataStore((s) => s.isRefreshing)
+
+/** Last fetch error message, or null. */
+export const useDataError = (): string | null =>
+  useDataStore((s) => s.error)
+
+/** PF-3 live-update stream health — drives a "live"/"stale" indicator
+ *  without subscribing the component to the data envelope itself. */
+export const useSseHealthy = (): boolean => useDataStore((s) => s.sseHealthy)
+
+/** Prompt-book catalogue slices (churn on a different cadence than the
+ *  hot data, so scope them separately). */
+export const usePromptsCatalog = () =>
+  useDataStore((s) => s.promptsCatalog)
+export const usePromptsCategories = () =>
+  useDataStore((s) => s.promptsCategories)
+export const usePromptsCatalogLoading = (): boolean =>
+  useDataStore((s) => s.promptsCatalogLoading)
 
 // -- background freshness poll -------------------------------------------
 
@@ -484,6 +574,12 @@ export function startDataStoreAutoRefresh(): () => void {
   if (_autoRefreshTimer === null) {
     _autoRefreshTimer = setInterval(() => {
       const store = useDataStore.getState()
+      // PF-3: SSE is the primary freshness path — when its stream is
+      // healthy it pushes every mutation within ~300ms, so this
+      // interval poll is pure redundant load. Suppress it while SSE is
+      // up; fall back to polling only when the stream is down (the
+      // exact case this safety net exists for).
+      if (store.sseHealthy) return
       // A freshness top-up, not the initial load: nothing to refresh
       // until some page has populated the envelope.
       if (store.data) {

@@ -104,6 +104,72 @@ describe("data-store auto-refresh poll", () => {
   })
 })
 
+// PF-3: the 60s freshness poll is the fallback BEHIND the live-update
+// SSE stream. When SSE is healthy it already pushes every mutation, so
+// the interval poll must suppress itself; when SSE is down (its normal
+// safety-net case) the poll must fire.
+describe("data-store auto-refresh SSE gating (PF-3)", () => {
+  afterEach(() => {
+    vi.useRealTimers()
+    // Reset the flag so it doesn't leak into the other suites.
+    useDataStore.setState({ sseHealthy: false })
+  })
+
+  it("suppresses the poll while SSE is healthy", () => {
+    vi.useFakeTimers()
+    const refreshData = vi.fn(async () => {})
+    useDataStore.setState({ refreshData, data: seedData(), sseHealthy: true })
+
+    const stop = startDataStoreAutoRefresh()
+    vi.advanceTimersByTime(180_000)
+    expect(
+      refreshData,
+      "the redundant poll fired while SSE was healthy",
+    ).not.toHaveBeenCalled()
+
+    stop()
+  })
+
+  it("polls when SSE is down and tracks health flips at tick time", () => {
+    vi.useFakeTimers()
+    const refreshData = vi.fn(async () => {})
+    useDataStore.setState({ refreshData, data: seedData(), sseHealthy: false })
+
+    const stop = startDataStoreAutoRefresh()
+
+    // SSE down → poll fires.
+    vi.advanceTimersByTime(60_000)
+    expect(refreshData).toHaveBeenCalledTimes(1)
+
+    // SSE comes up → next tick is suppressed.
+    useDataStore.setState({ sseHealthy: true })
+    vi.advanceTimersByTime(60_000)
+    expect(refreshData).toHaveBeenCalledTimes(1)
+
+    // SSE drops again → poll resumes.
+    useDataStore.setState({ sseHealthy: false })
+    vi.advanceTimersByTime(60_000)
+    expect(refreshData).toHaveBeenCalledTimes(2)
+
+    stop()
+  })
+
+  it("setSseHealthy only writes on an actual flip", () => {
+    useDataStore.setState({ sseHealthy: false })
+    const seen: boolean[] = []
+    const unsub = useDataStore.subscribe((s) => seen.push(s.sseHealthy))
+
+    const { setSseHealthy } = useDataStore.getState()
+    setSseHealthy(false) // no-op — already false
+    setSseHealthy(true) // flip
+    setSseHealthy(true) // no-op — already true
+    setSseHealthy(false) // flip
+
+    unsub()
+    expect(seen).toEqual([true, false])
+  })
+})
+
 describe("operator events subscription teardown", () => {
   afterEach(() => {
     vi.useRealTimers()
@@ -166,5 +232,30 @@ describe("operator events subscription teardown", () => {
       "the connect catch-up must still reach the store",
     ).toHaveBeenCalled()
     handle.stop()
+  })
+
+  // PF-3: the stream lifecycle drives the data-store's sseHealthy flag —
+  // true on a successful connect, false again on stop.
+  it("marks SSE healthy on connect and unhealthy on stop", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+
+    // A body that stays open so the reader doesn't hit `done` and
+    // schedule a reconnect (which would flip health back to false).
+    globalThis.fetch = vi.fn(
+      async () =>
+        new Response(new ReadableStream({ start: () => {} }), {
+          status: 200,
+        }),
+    ) as unknown as typeof fetch
+
+    useDataStore.setState({ sseHealthy: false, refreshData: vi.fn(async () => {}) })
+
+    const handle = openMcpNotificationStream({ url: "/api/events" })
+    await vi.advanceTimersByTimeAsync(1)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(useDataStore.getState().sseHealthy).toBe(true)
+
+    handle.stop()
+    expect(useDataStore.getState().sseHealthy).toBe(false)
   })
 })

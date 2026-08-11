@@ -277,6 +277,10 @@ export function openMcpNotificationStream(
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null
 
   const scheduleReconnect = (): void => {
+    // PF-3: any path that reaches here means the stream is not currently
+    // delivering — mark SSE unhealthy so the data-store's fallback
+    // freshness poll resumes until we reconnect.
+    useDataStore.getState().setSseHealthy(false)
     if (stopped) return
     const delay = Math.min(
       RECONNECT_MAX_DELAY_MS,
@@ -325,6 +329,11 @@ export function openMcpNotificationStream(
       // Successful connection — reset backoff so a later drop starts
       // from 1s again.
       attempt = 0
+
+      // PF-3: the stream is up and about to start delivering
+      // notifications. Mark SSE healthy so the data-store suppresses its
+      // now-redundant 60s fallback poll (SSE pushes every mutation).
+      useDataStore.getState().setSseHealthy(true)
 
       // Catch-up on (re)connect. The operator-events hub is
       // fire-and-forget: any mutation that happened while this stream
@@ -390,6 +399,9 @@ export function openMcpNotificationStream(
   return {
     stop: () => {
       stopped = true
+      // PF-3: the stream is being torn down (unmount / navigate-away /
+      // tab-hidden) — no longer a live freshness source.
+      useDataStore.getState().setSseHealthy(false)
       if (reconnectTimer !== null) {
         clearTimeout(reconnectTimer)
         reconnectTimer = null
