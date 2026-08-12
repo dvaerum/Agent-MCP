@@ -54,6 +54,47 @@ export function systemStatusGuard(data: unknown): SystemStatus {
 }
 
 /**
+ * The `/all-data` bulk envelope exactly as it arrives on the wire —
+ * BEFORE the boundary normalizes the raw task rows (`tasks: RawTask[]`).
+ */
+export interface RawAllData {
+  agents: Agent[]
+  tasks: RawTask[]
+  context: RawContextEntry[]
+  actions: unknown[]
+  file_metadata: unknown[]
+  file_map: Record<string, unknown>
+  timestamp: string
+}
+
+/**
+ * Runtime shape guard for the `/all-data` read boundary (TY-1). This is
+ * the highest-traffic read path — it feeds agents / tasks / context to
+ * every page — yet it used to be a bare trusted cast. A structurally-
+ * wrong 200 (agents/tasks/context missing or renamed) would then sail
+ * through the seam and blow up far away in a consumer's `.find`/`.map`
+ * (e.g. `selectAgent` via the prompt-book Run handler). Asserting the
+ * three consumer-critical fields are arrays makes that fail loudly HERE,
+ * naming the endpoint, rather than deep in the store.
+ */
+export function allDataGuard(data: unknown): RawAllData {
+  if (!isRecord(data)) {
+    throw new ShapeError(
+      `GET /all-data: expected an envelope object, got ${describe(data)}`,
+    )
+  }
+  for (const key of ['agents', 'tasks', 'context'] as const) {
+    if (!Array.isArray(data[key])) {
+      throw new ShapeError(
+        `GET /all-data: expected \`${key}\` to be an array, got ` +
+          `${describe(data[key])}`,
+      )
+    }
+  }
+  return data as unknown as RawAllData
+}
+
+/**
  * System/composition client methods bound to a shared request core.
  * Assembled onto the composed client by `createApiClient()`.
  */
@@ -131,15 +172,11 @@ export function systemApi(core: ApiClient) {
       // The bulk envelope carries raw task rows (child_tasks /
       // depends_on_tasks as JSON strings); TY-2 normalize them to arrays
       // so getAllData() and getTasks() hand back identically-shaped Tasks.
-      const env = await core.request<{
-        agents: Agent[]
-        tasks: RawTask[]
-        context: RawContextEntry[]
-        actions: unknown[]
-        file_metadata: unknown[]
-        file_map: Record<string, unknown>
-        timestamp: string
-      }>('/all-data')
+      const env = await core.request<RawAllData>(
+        '/all-data',
+        {},
+        allDataGuard,
+      )
       return { ...env, tasks: (env.tasks ?? []).map(normalizeTask) }
     },
 

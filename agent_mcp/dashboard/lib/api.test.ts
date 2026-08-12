@@ -3,6 +3,7 @@ import {
   apiClient,
   ApiError,
   ShapeError,
+  allDataGuard,
   buildTasksQuery,
   normalizeTask,
   normalizeTaskListField,
@@ -264,6 +265,111 @@ describe("ApiClient.request shape validation (TY-1)", () => {
 
     const res = await apiClient.getSystemStatus()
     expect(res.server_running).toBe(true)
+  })
+})
+
+// AUDIT AF-A / TY-1: the `/all-data` bulk envelope is the highest-traffic
+// read path (feeds agents/tasks/context to every page) yet used to skip
+// the request<T>() shape guard. A structurally-wrong 200 (agents/tasks/
+// context missing or renamed) must throw a ShapeError at the seam — naming
+// the endpoint — instead of a bare cast that blows up in a consumer's
+// `.find`/`.map` far away.
+describe("allDataGuard (TY-1)", () => {
+  const wellShaped = {
+    agents: [],
+    tasks: [],
+    context: [],
+    actions: [],
+    file_metadata: [],
+    file_map: {},
+    timestamp: "2026-01-01",
+  }
+
+  it("rejects a non-object envelope, naming the endpoint", () => {
+    expect(() => allDataGuard([1, 2, 3])).toThrow(ShapeError)
+    expect(() => allDataGuard(null)).toThrow(/\/all-data/)
+  })
+
+  it("rejects an envelope whose agents field is missing/renamed", () => {
+    // 200 OK, but `agents` absent → the exact break selectAgent hits.
+    const renamed = { ...wellShaped, agents: undefined }
+    expect(() => allDataGuard(renamed)).toThrow(ShapeError)
+    expect(() => allDataGuard(renamed)).toThrow(/agents/)
+  })
+
+  it("rejects an envelope whose tasks/context are not arrays", () => {
+    expect(() => allDataGuard({ ...wellShaped, tasks: "nope" })).toThrow(
+      /tasks/,
+    )
+    expect(() => allDataGuard({ ...wellShaped, context: {} })).toThrow(
+      /context/,
+    )
+  })
+
+  it("accepts a well-shaped envelope unchanged", () => {
+    expect(allDataGuard(wellShaped)).toBe(wellShaped)
+  })
+})
+
+describe("getAllData shape validation (TY-1, end-to-end)", () => {
+  const realFetch = global.fetch
+
+  beforeEach(() => {
+    apiClient.setBaseUrl("/api")
+  })
+
+  afterEach(() => {
+    global.fetch = realFetch
+    vi.restoreAllMocks()
+  })
+
+  it("rejects a 200 /all-data whose agents field is missing", async () => {
+    global.fetch = vi.fn(
+      async () =>
+        fakeResponse(200, {
+          // agents omitted — the malformed envelope the audit flagged.
+          tasks: [],
+          context: [],
+          actions: [],
+          file_metadata: [],
+          file_map: {},
+          timestamp: "x",
+        }),
+    ) as unknown as typeof fetch
+
+    const err = await catchApiError(apiClient.getAllData())
+    expect(err).toBeInstanceOf(ShapeError)
+    expect(err.message).toContain("/all-data")
+  })
+
+  it("normalizes raw task rows on a well-shaped envelope", async () => {
+    global.fetch = vi.fn(
+      async () =>
+        fakeResponse(200, {
+          agents: [],
+          tasks: [
+            {
+              task_id: "t1",
+              title: "T",
+              status: "pending",
+              priority: "medium",
+              created_at: "x",
+              updated_at: "x",
+              child_tasks: '["c1"]',
+              depends_on_tasks: null,
+            },
+          ],
+          context: [],
+          actions: [],
+          file_metadata: [],
+          file_map: {},
+          timestamp: "x",
+        }),
+    ) as unknown as typeof fetch
+
+    const env = await apiClient.getAllData()
+    expect(env.tasks[0]!.child_tasks).toEqual(["c1"])
+    expect(env.tasks[0]!.depends_on_tasks).toEqual([])
   })
 })
 

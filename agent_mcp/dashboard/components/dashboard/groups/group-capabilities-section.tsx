@@ -69,10 +69,25 @@ export function GroupCapabilitiesSection({
     }
   }, [loading])
 
+  // Edit-loss guard: `save()` optimistically writes the PUT result into
+  // local state AND fires a background refetch (invalidateGroupCapabilities).
+  // If the operator toggles a capability within ~1 RTT of Save — before
+  // that refetch resolves — the resync below must NOT clobber the in-flight
+  // edit with the (now-stale) server set. We read the current dirtiness via
+  // a ref rather than a dep so this effect still runs ONLY when a new fetch
+  // result arrives (adding `dirty` to the deps would re-run it on every
+  // toggle and race the optimistic `setLoaded` in save()).
+  const dirtyRef = React.useRef(false)
+
   useEffect(() => {
     if (fetchedCaps !== null) {
+      // `loaded` always tracks server truth (it's what `dirty` diffs
+      // against). Only reconcile the checklist selection when the operator
+      // hasn't diverged — otherwise preserve their in-flight edits.
       setLoaded(fetchedCaps)
-      setSelected(new Set(fetchedCaps))
+      if (!dirtyRef.current) {
+        setSelected(new Set(fetchedCaps))
+      }
     }
   }, [fetchedCaps])
 
@@ -99,6 +114,12 @@ export function GroupCapabilitiesSection({
     }
     return false
   }, [loaded, selected])
+
+  // Keep the ref the resync effect reads in lockstep with the derived
+  // dirty flag. Read-only mirror; it never drives rendering.
+  useEffect(() => {
+    dirtyRef.current = dirty
+  }, [dirty])
 
   const toggleCap = (cap: string) => {
     setSelected((cur) => {
