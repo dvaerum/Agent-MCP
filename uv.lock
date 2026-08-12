@@ -10,7 +10,7 @@ resolution-markers = [
 
 [[package]]
 name = "agent-mcp"
-version = "5.79.0"
+version = "5.80.0"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
