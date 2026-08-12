@@ -20,7 +20,13 @@ import React from "react"
 import { renderHook, waitFor, cleanup } from "@testing-library/react"
 import { QueryClientProvider } from "@tanstack/react-query"
 import { queryClient } from "@/lib/query-client"
-import { useAgents, useAllDataQuery } from "@/lib/queries/all-data"
+import {
+  selectAgent,
+  selectAgentTasks,
+  useAgents,
+  useAllDataQuery,
+  type AllData,
+} from "@/lib/queries/all-data"
 import { dispatchNotification } from "@/lib/mcp-notifications"
 import { useServerStore } from "@/lib/stores/server-store"
 import { apiClient, type Agent } from "@/lib/api"
@@ -81,6 +87,45 @@ describe("all-data query cache", () => {
     // A second consumer of the same key reuses the cache — no new fetch.
     renderHook(() => useAllDataQuery(), { wrapper })
     await waitFor(() => expect(spy).toHaveBeenCalledTimes(1))
+  })
+})
+
+// AUDIT AF-A: selectAgent / selectAgentTasks are reachable imperatively
+// (getAgentTokenCached → prompt-book Run handler) with whatever snapshot
+// the cache holds. A malformed/empty envelope must yield `undefined` / an
+// empty list, never a `Cannot read properties of undefined` TypeError.
+describe("selectAgent / selectAgentTasks robustness (AF-A)", () => {
+  it("returns undefined on an undefined envelope", () => {
+    expect(selectAgent(undefined, "worker1")).toBeUndefined()
+  })
+
+  it("returns undefined (not throw) on an envelope missing agents", () => {
+    // A 200 whose body lost the agents array (backend renamed the field):
+    // the old `data.agents.find(...)` would TypeError here.
+    const malformed = { tasks: [], context: [] } as unknown as AllData
+    expect(() => selectAgent(malformed, "worker1")).not.toThrow()
+    expect(selectAgent(malformed, "worker1")).toBeUndefined()
+    // The Admin-casing branch is guarded too.
+    expect(selectAgent(malformed, "admin")).toBeUndefined()
+  })
+
+  it("still resolves an agent from a well-shaped envelope", () => {
+    const env = {
+      agents: [{ agent_id: "worker1" }, { agent_id: "Admin" }],
+      tasks: [],
+      context: [],
+      actions: [],
+    } as unknown as AllData
+    expect(selectAgent(env, "worker1")!.agent_id).toBe("worker1")
+    // agent_ prefix + Admin/admin casing tolerance survives the hardening.
+    expect(selectAgent(env, "agent_worker1")!.agent_id).toBe("worker1")
+    expect(selectAgent(env, "admin")!.agent_id).toBe("Admin")
+  })
+
+  it("returns [] (not throw) on an envelope missing tasks/actions", () => {
+    const malformed = { agents: [] } as unknown as AllData
+    expect(() => selectAgentTasks(malformed, "worker1")).not.toThrow()
+    expect(selectAgentTasks(malformed, "worker1")).toEqual([])
   })
 })
 

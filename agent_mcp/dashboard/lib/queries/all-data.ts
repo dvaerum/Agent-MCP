@@ -171,15 +171,20 @@ export function selectAgentTasks(
   agentId: string,
 ): Task[] {
   if (!data) return []
-  const assignedTasks = selectTasks(data.tasks, { assignedTo: agentId })
-  const agentActions = selectActions(data.actions as ActionRecord[], {
+  // Defence-in-depth against a malformed envelope that slipped past the
+  // `/all-data` shape guard (or a hand-built `AllData` in a test): treat
+  // missing envelope arrays as empty rather than crashing `.filter`.
+  const tasks = data.tasks ?? []
+  const actions = (data.actions as ActionRecord[] | undefined) ?? []
+  const assignedTasks = selectTasks(tasks, { assignedTo: agentId })
+  const agentActions = selectActions(actions, {
     agentId,
   })
   const workedOnTaskIds = new Set<string>()
   agentActions.forEach((action) => {
     if (typeof action.task_id === "string") workedOnTaskIds.add(action.task_id)
   })
-  const workedOnTasks = selectTasks(data.tasks, {
+  const workedOnTasks = selectTasks(tasks, {
     taskIdIn: workedOnTaskIds,
     notAssignedTo: agentId,
   })
@@ -211,10 +216,13 @@ export function selectAgent(
 ): Agent | undefined {
   if (!data) return undefined
   const normalized = normalizeAgentId(agentId)
+  // `agents?.` guards a malformed/empty envelope: a 200 with the agents
+  // field missing or renamed would otherwise TypeError here — reachable
+  // via getAgentTokenCached() from the prompt-book Run handler.
   if (normalized === "admin") {
-    return data.agents.find((a) => a.agent_id === "Admin")
+    return data.agents?.find((a) => a.agent_id === "Admin")
   }
-  return data.agents.find((a) => a.agent_id === normalized)
+  return data.agents?.find((a) => a.agent_id === normalized)
 }
 
 // ── imperative (non-hook) access ────────────────────────────────────
