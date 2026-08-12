@@ -156,15 +156,6 @@ export const useDataStore = create<DataStore>((set, get) => ({
  *  and gates the `/all-data` query's fallback poll. */
 export const useSseHealthy = (): boolean => useDataStore((s) => s.sseHealthy)
 
-/** Prompt-book catalogue slices (churn on a different cadence than the
- *  hot data, so scope them separately). */
-export const usePromptsCatalog = () =>
-  useDataStore((s) => s.promptsCatalog)
-export const usePromptsCategories = () =>
-  useDataStore((s) => s.promptsCategories)
-export const usePromptsCatalogLoading = (): boolean =>
-  useDataStore((s) => s.promptsCatalogLoading)
-
 /**
  * Handler for MCP `notifications/prompts/list_changed`.
  *

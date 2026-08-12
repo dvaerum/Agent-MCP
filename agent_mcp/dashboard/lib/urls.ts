@@ -66,14 +66,8 @@ export function deriveMount(pathname?: string): string {
 const ROOT = deriveMount()
 const APP = `${ROOT}/app`
 const API = `${ROOT}/api`
-const ASSETS = `${ROOT}/assets`
 const ROUTER_API = `${API}/router`
 const ROUTER_PROJECTS = `${ROUTER_API}/projects`
-
-/** Service descriptor URL — fetch for endpoint discovery. */
-export function descriptorUrl(): string {
-  return `${ROOT}/`
-}
 
 /** Operator login page. Pass ``next`` to preserve the current path
  *  across the bounce — the wizard reads it back as the post-login
@@ -105,15 +99,6 @@ export function apiUrl(projectName: string, rest?: string): string {
   return `${base}/${rest.replace(/^\/+/, "")}`
 }
 
-/** Static asset URL prefix — the value Next.js's assetPrefix bakes
- *  into the bundle (and what the sentinel substitution emits at serve
- *  time). The optional `path` argument is concatenated as-is for
- *  callers that build asset URLs directly (rare). */
-export function assetsUrl(path?: string): string {
-  if (path === undefined) return ASSETS
-  return `${ASSETS}/${path.replace(/^\/+/, "")}`
-}
-
 /** MCP transport URL for a project. Callers that build MCP-client
  *  config strings go through this helper so the URL shape is
  *  centralised. */
@@ -131,13 +116,6 @@ export function eventsUrl(projectName: string, origin: string = ""): string {
 }
 
 // ── Router admin surface (ADR 0014) ────────────────────────────────
-
-/** Public service descriptor / liveness probe. Reachable without an
- *  operator session — every other ``/api/router/...`` route requires
- *  one. */
-export function healthUrl(): string {
-  return `${ROUTER_API}/health`
-}
 
 /** Cross-project overview envelope (consumed by the React overview's
  *  store). */
@@ -158,11 +136,6 @@ export function routerProjectUrl(name: string, query?: string): string {
   const base = `${ROUTER_PROJECTS}/${encodeURIComponent(name)}`
   if (query === undefined) return base
   return `${base}?${query.replace(/^[?&]+/, "")}`
-}
-
-/** ``POST`` to stop a project's backend. */
-export function projectStopUrl(name: string): string {
-  return `${ROUTER_PROJECTS}/${encodeURIComponent(name)}/stop`
 }
 
 /** ``GET`` returns the project's ``.mcp.json`` body with the vendor
@@ -191,13 +164,6 @@ export function projectAliasUrl(name: string, alias: string): string {
     `${ROUTER_PROJECTS}/${encodeURIComponent(name)}` +
     `/aliases/${encodeURIComponent(alias)}`
   )
-}
-
-/** ``POST`` — router-admin create-agent wrapper. Distinct from the
- *  per-project ``POST /api/<project>/agents`` (which the per-project
- *  ``ApiClient`` reaches directly). */
-export function projectAgentsUrl(name: string): string {
-  return `${ROUTER_PROJECTS}/${encodeURIComponent(name)}/agents`
 }
 
 // ── Router admin: users / groups / memberships (Phase 3 Wave 1b) ───

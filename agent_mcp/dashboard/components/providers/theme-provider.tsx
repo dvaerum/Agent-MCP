@@ -8,7 +8,7 @@ interface ThemeProviderProps {
 }
 
 export function ThemeProvider({ children }: ThemeProviderProps) {
-  const { theme, setTheme } = useTheme()
+  const { theme } = useTheme()
 
   useEffect(() => {
     // AX-4: the blocking inline script in app/layout.tsx already applied
@@ -17,30 +17,25 @@ export function ThemeProvider({ children }: ThemeProviderProps) {
     // the cause of the flash). This effect only keeps the class in sync
     // with later theme changes and OS media-query changes — it
     // re-applies idempotently on mount, a no-op against the script.
-    const initializeTheme = () => {
-      const isDark = theme === 'dark' || 
+    const applyTheme = () => {
+      const isDark = theme === 'dark' ||
         (theme === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches)
-      
-      if (isDark) {
-        document.documentElement.classList.add('dark')
-      } else {
-        document.documentElement.classList.remove('dark')
-      }
+
+      document.documentElement.classList.toggle('dark', isDark)
     }
-    
-    initializeTheme()
-    
-    // Listen for system theme changes
+
+    applyTheme()
+
+    // In `system` mode, follow OS theme flips live. AF-B fix: apply the
+    // `dark` class directly here — the previous `setTheme('system')` set
+    // the store to its *current* value, so the effect never re-ran and
+    // the class never re-toggled when the OS theme changed under us.
     if (theme === 'system') {
       const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)')
-      const handleChange = () => {
-        setTheme('system') // This will re-trigger the theme calculation
-      }
-      
-      mediaQuery.addEventListener('change', handleChange)
-      return () => mediaQuery.removeEventListener('change', handleChange)
+      mediaQuery.addEventListener('change', applyTheme)
+      return () => mediaQuery.removeEventListener('change', applyTheme)
     }
-  }, [theme, setTheme])
+  }, [theme])
 
   return <>{children}</>
 }

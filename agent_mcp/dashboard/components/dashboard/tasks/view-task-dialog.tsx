@@ -48,7 +48,7 @@ export function ViewTaskDialog({ task, onOpenChange, onEdit, onDelete }: ViewTas
   const dependencies = task?.depends_on_tasks ?? []
   const childTasks = task?.child_tasks ?? []
   const notes = task ? parseTaskNotes(task.notes) : []
-  const createdBy: string | undefined = task ? (task as unknown as { created_by?: string }).created_by : undefined
+  const createdBy: string | undefined = task?.created_by
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
