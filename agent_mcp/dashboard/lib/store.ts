@@ -71,21 +71,3 @@ export const useDashboard = create<DashboardState>()((set) => ({
   lastUpdated: null,
   setLastUpdated: (date) => set({ lastUpdated: date })
 }))
-
-interface SearchState {
-  query: string
-  setQuery: (query: string) => void
-  results: unknown[]
-  setResults: (results: unknown[]) => void
-  isSearching: boolean
-  setSearching: (searching: boolean) => void
-}
-
-export const useSearch = create<SearchState>()((set) => ({
-  query: '',
-  setQuery: (query) => set({ query }),
-  results: [],
-  setResults: (results) => set({ results }),
-  isSearching: false,
-  setSearching: (searching) => set({ isSearching: searching })
-}))

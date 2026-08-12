@@ -12,6 +12,7 @@ export interface Task {
   status: 'pending' | 'in_progress' | 'completed' | 'cancelled' | 'failed'
   priority: 'low' | 'medium' | 'high'
   assigned_to?: string
+  created_by?: string
   parent_task?: string
   child_tasks?: string[]
   depends_on_tasks?: string[]

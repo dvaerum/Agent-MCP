@@ -1,10 +1,8 @@
 "use client"
 
-import React, { useEffect } from "react"
+import React from "react"
 import { Header } from "./header"
 import { AppSidebar } from "./app-sidebar"
-import { useTheme } from "@/lib/store"
-import { cn } from "@/lib/utils"
 import { SidebarProvider } from "@/components/ui/sidebar"
 
 interface MainLayoutProps {
@@ -12,38 +10,9 @@ interface MainLayoutProps {
 }
 
 export function MainLayout({ children }: MainLayoutProps) {
-  const { setTheme, theme } = useTheme()
-
-  // Initialize theme on mount
-  useEffect(() => {
-    // Set initial theme based on system preference if theme is 'system'
-    if (theme === 'system') {
-      const isDark = window.matchMedia('(prefers-color-scheme: dark)').matches
-      if (isDark) {
-        document.documentElement.classList.add('dark')
-      } else {
-        document.documentElement.classList.remove('dark')
-      }
-    } else {
-      if (theme === 'dark') {
-        document.documentElement.classList.add('dark')
-      } else {
-        document.documentElement.classList.remove('dark')
-      }
-    }
-
-    // Listen for system theme changes
-    const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)')
-    const handleChange = () => {
-      if (theme === 'system') {
-        setTheme('system') // This will trigger the theme update
-      }
-    }
-
-    mediaQuery.addEventListener('change', handleChange)
-    return () => mediaQuery.removeEventListener('change', handleChange)
-  }, [theme, setTheme])
-
+  // Theme (incl. live OS `system`-mode follow) is owned by the app-wide
+  // ThemeProvider in app/layout.tsx — this layout no longer duplicates
+  // that media-query listener (AF-B: the two copies were redundant).
   return (
     <SidebarProvider defaultOpen={true}>
       <div className="relative h-screen bg-background flex overflow-hidden w-full">
@@ -69,48 +38,5 @@ export function MainLayout({ children }: MainLayoutProps) {
         </div>
       </div>
     </SidebarProvider>
-  )
-}
-
-// Add some premium styling for container-fluid
-export function PageContainer({ 
-  children, 
-  className 
-}: { 
-  children: React.ReactNode
-  className?: string 
-}) {
-  return (
-    <div className={cn("space-y-6", className)}>
-      {children}
-    </div>
-  )
-}
-
-export function PageHeader({ 
-  title, 
-  description, 
-  children,
-  className 
-}: { 
-  title: string
-  description?: string
-  children?: React.ReactNode
-  className?: string 
-}) {
-  return (
-    <div className={cn("flex items-center justify-between pb-6", className)}>
-      <div className="space-y-1">
-        <h1 className="text-3xl font-bold tracking-tight">{title}</h1>
-        {description && (
-          <p className="text-muted-foreground">{description}</p>
-        )}
-      </div>
-      {children && (
-        <div className="flex items-center space-x-2">
-          {children}
-        </div>
-      )}
-    </div>
   )
 }

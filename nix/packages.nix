@@ -190,10 +190,10 @@ let
     src = "${src}/agent_mcp/dashboard";
     # Re-set whenever the dashboard's package-lock.json changes
     # upstream (rare). On hash mismatch, nix prints the correct
-    # value; paste it here. Updated 2026-08-11 for the Wave-6
-    # keystone increment 1 — re-added @tanstack/react-query for the
-    # /all-data envelope migration onto TanStack Query.
-    npmDepsHash = "sha256-aWMPkHZcXpk9O4d5sKFTKhSF4wnBqtZRGuAz3+fu8IM=";
+    # value; paste it here. Updated 2026-08-12 for audit AF-B —
+    # dropped 5 dead UI deps (@radix-ui react-avatar/navigation-menu/
+    # progress/slider + react-resizable-panels).
+    npmDepsHash = "sha256-Nvzfff4/ZS4eZRybLKX7xipgCU9eXx1dr7g6zO15ntc=";
     NEXT_PUBLIC_AUTO_CONNECT = "false";
     NEXT_PUBLIC_DEFAULT_SERVER_HOST = "";
     NEXT_PUBLIC_DEFAULT_SERVER_PORT = "";

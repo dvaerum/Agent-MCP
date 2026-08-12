@@ -282,7 +282,7 @@ export function CreatePromptModal({ open, onOpenChange, onCreatePrompt }: Create
             {formData.variables.length > 0 && (
               <div className="space-y-2 max-h-32 overflow-y-auto">
                 {formData.variables.map((variable, index) => (
-                  <div key={index} className="flex items-center gap-2 p-2 bg-muted/30 rounded-lg">
+                  <div key={variable.name} className="flex items-center gap-2 p-2 bg-muted/30 rounded-lg">
                     <div className="flex-1 text-sm">
                       <span className="font-mono text-primary">{variable.name}</span>
                       {variable.required && <span className="text-destructive ml-1">*</span>}
@@ -295,6 +295,7 @@ export function CreatePromptModal({ open, onOpenChange, onCreatePrompt }: Create
                       variant="ghost"
                       size="sm"
                       onClick={() => removeVariable(index)}
+                      aria-label="Remove variable"
                       className="h-6 w-6 p-0 text-destructive hover:text-destructive/80"
                     >
                       ×
