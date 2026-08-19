@@ -48,6 +48,10 @@ Public surface (re-exported via ``__all__``):
   * ``group_is_transitively_sysadmin(group_id, conn=None) -> bool`` —
     whether a fresh member of ``group_id`` would inherit sysadmin.
 
+  * ``group_has_transitive_user_member(group_id, conn=None) -> bool`` —
+    whether any user is reachable under ``group_id``, directly or via
+    nested subgroups (the downward mirror of ``resolve_user_groups``).
+
   * ``group_resolved_project_roles(group_id, conn=None) -> dict`` —
     the project roles a fresh member of ``group_id`` would inherit.
 
@@ -78,6 +82,7 @@ __all__ = [
     "add_group_member",
     "bootstrap_first_operator_as_sysadmin",
     "ensure_group",
+    "group_has_transitive_user_member",
     "group_is_transitively_sysadmin",
     "group_resolved_project_roles",
     "remove_group_member",
@@ -255,6 +260,33 @@ def _group_is_transitively_sysadmin_on(
     )
 
 
+def _group_has_transitive_user_member_on(
+    conn: sqlite3.Connection, group_id: str
+) -> bool:
+    """True iff a user is reachable under ``group_id`` — directly, or via
+    a nested subgroup, transitively (the downward mirror of
+    ``_ancestors_on``'s upward walk).
+
+    Iterative DFS via ``_children_of_group`` + visited-set, same shape as
+    ``_would_create_cycle_on``, so a (theoretically impossible post
+    cycle-detection, but defensive) cycle in the membership DAG can't
+    loop forever.
+    """
+    visited: set[str] = set()
+    stack: list[str] = [group_id]
+    while stack:
+        current = stack.pop()
+        if current in visited:
+            continue
+        visited.add(current)
+        for member_user_id, child_group in _children_of_group(conn, current):
+            if member_user_id is not None:
+                return True
+            if child_group is not None and child_group not in visited:
+                stack.append(child_group)
+    return False
+
+
 def _project_roles_for_groups_on(
     conn: sqlite3.Connection, groups: set[str]
 ) -> dict[str, str]:
@@ -403,6 +435,23 @@ def group_is_transitively_sysadmin(
     i.e. ``group_id`` itself OR any ancestor group is sysadmin-flagged."""
     with _conn_ctx(conn) as c:
         return _group_is_transitively_sysadmin_on(c, group_id)
+
+
+def group_has_transitive_user_member(
+    group_id: str, conn: Optional[sqlite3.Connection] = None
+) -> bool:
+    """True iff at least one user is reachable under ``group_id`` —
+    directly, or nested via nested subgroups (downward closure).
+
+    The group-rooted mirror of ``resolve_user_groups``'s upward walk,
+    used by the last-sysadmin-group lockout guard (R4-F1,
+    ``admin_users_api._is_last_sysadmin_group``) to decide whether an
+    OTHER ``is_sysadmin = 1`` group is a live path to sysadmin (has an
+    actual member) or a dud (no members, so it confers sysadmin on
+    nobody today).
+    """
+    with _conn_ctx(conn) as c:
+        return _group_has_transitive_user_member_on(c, group_id)
 
 
 def resolve_user_project_role(
