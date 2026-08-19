@@ -16,6 +16,7 @@
 //! ```
 
 use serde::Deserialize;
+use unicode_general_category::{get_general_category, GeneralCategory};
 
 /// Cap on how many items we list before summarising the rest — keeps the pane
 /// nudge short.
@@ -76,24 +77,57 @@ pub fn parse_frame(data: &str) -> Result<Frame, serde_json::Error> {
 /// pty. Confirmed live: an ESC/BEL/CSI/OSC-bearing subject reached the pane
 /// unmodified and executed as real terminal control codes.
 ///
-/// This is a byte-level allowlist rather than an ANSI/CSI/OSC grammar
-/// matcher on purpose: a sequence matcher only catches the escape variants
-/// it was written to recognise, while dropping every C0 control byte
-/// (`< 0x20`), DEL (`0x7f`), and the C1 control range (`0x80..=0x9f`, the
-/// 8-bit equivalents of CSI/OSC that don't even need an ESC prefix) removes
-/// ESC itself — so no CSI/OSC introducer, 7-bit or 8-bit, can ever survive,
-/// without having to enumerate escape-sequence grammars that will always
-/// miss variants. Each rendered line is meant to stay on one physical
-/// line, so embedded newlines/tabs are folded to a single space too —
-/// otherwise a subject could inject fake extra nudge lines even without any
-/// escape sequence. Runs of stripped bytes collapse to one space so the
-/// surrounding legible text stays readable.
+/// This is a `char`-level allowlist (over `s.chars()`, i.e. Unicode scalar
+/// values — `&str` is guaranteed valid UTF-8 by Rust's type system, so
+/// invalid/partial UTF-8 can never reach this function in the first place)
+/// rather than an ANSI/CSI/OSC grammar matcher, on purpose: a sequence
+/// matcher only catches the escape variants it was written to recognise,
+/// while dropping every C0 control char (`< 0x20`), DEL (`0x7f`), and the C1
+/// control range (`0x80..=0x9f`, the 8-bit equivalents of CSI/OSC that don't
+/// even need an ESC prefix) removes ESC itself — so no CSI/OSC introducer,
+/// 7-bit or 8-bit, can ever survive, without having to enumerate
+/// escape-sequence grammars that will always miss variants.
+///
+/// The same category-not-enumeration philosophy extends to Unicode
+/// bidi/format characters (R4-F4): every codepoint in the Unicode `Cf`
+/// (Format) general category — the explicit bidi-control block
+/// U+202A–U+202E (LRE/RLE/PDF/LRO/RLO) and U+2066–U+2069 (LRI/RLI/FSI/PDI),
+/// the zero-width block U+200B–U+200F (ZWSP/ZWNJ/ZWJ/LRM/RLM), and U+FEFF
+/// (BOM) — is stripped too. Left unstripped, U+202E (RLO) can visually
+/// reverse trailing pane text (the classic filename/extension-spoofing
+/// trick, e.g. making `evil.exe` display reversed) and ZWSP/ZWJ can smuggle
+/// invisible payloads into the pane; both are well above the 0x9f ceiling
+/// the C0/C1 check covers, so a category-aware pass is needed rather than
+/// widening the range table by hand.
+///
+/// One demonstrated-exploitable codepoint falls outside `Cf`: U+034F
+/// COMBINING GRAPHEME JOINER is classified `Mn` (Mark, nonspacing) by
+/// Unicode, not `Cf`, despite functioning purely as an invisible formatting
+/// control (it carries no visible glyph of its own; its only effect is to
+/// block canonical reordering/normalisation of neighbouring combining
+/// marks) — the general-category taxonomy is a legacy-rendering artifact
+/// here, not a signal that it's meaningful surviving content. It is
+/// stripped explicitly rather than by widening the check to all of
+/// `Mn`/`Mc`/`Me`, which would also catch the combining diacritics that
+/// legitimate non-Latin scripts (Vietnamese, Devanagari, Arabic vowel
+/// marks, …) render with — over-stripping those would break real content
+/// the C0/C1/Cf checks are not meant to touch.
+///
+/// Each rendered line is meant to stay on one physical line, so embedded
+/// newlines/tabs are folded to a single space too — otherwise a subject
+/// could inject fake extra nudge lines even without any escape sequence.
+/// Runs of stripped chars collapse to one space so the surrounding legible
+/// text stays readable.
 fn sanitize_for_pane(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut pending_space = false;
     for ch in s.chars() {
         let cp = ch as u32;
-        let is_control = cp < 0x20 || ch == '\u{7f}' || (0x80..=0x9f).contains(&cp);
+        let is_control = cp < 0x20
+            || ch == '\u{7f}'
+            || (0x80..=0x9f).contains(&cp)
+            || get_general_category(ch) == GeneralCategory::Format
+            || ch == '\u{034f}'; // CGJ — see doc comment above.
         if is_control {
             if !out.is_empty() {
                 pending_space = true;
@@ -261,6 +295,84 @@ mod tests {
         assert!(out.contains("owned"));
         assert!(out.contains("bye"));
         assert!(out.contains("title"));
+    }
+
+    #[test]
+    fn strips_bidi_override_and_zero_width_format_characters_from_subject_and_title() {
+        // R4-F4: sanitize_for_pane's C0/C1/DEL allowlist (R3-F1) does not
+        // touch Unicode Cf-category format characters, which live well above
+        // the 0x9f ceiling. U+202E (RLO) can visually reverse trailing pane
+        // text (the classic filename/extension-spoofing trick), and
+        // ZWSP/ZWJ/CGJ can smuggle invisible payloads into the pane. Both
+        // reach the exact same chokepoint (render_skinny -> inject.rs ->
+        // AoE's /api/sessions/{id}/send -> a live pty) via subject/title.
+        let evil_subject = "safe\u{202E}gnp.exe\u{200B}\u{200D}\u{034F}end";
+        let wire = serde_json::json!({
+            "type": "delivery",
+            "reason": "unread_messages",
+            "unread_count": 1,
+            "task_count": 0,
+            "unread_messages": [
+                {"message_id": "m1", "sender_id": "alice", "subject": evil_subject}
+            ],
+            "open_tasks": [],
+        })
+        .to_string();
+        let f = frame_json(&wire);
+        let out = render_skinny(&f);
+
+        for bad in [
+            '\u{202E}', // RLO
+            '\u{202A}', // LRE
+            '\u{202B}', // RLE
+            '\u{202C}', // PDF
+            '\u{202D}', // LRO
+            '\u{2066}', // LRI
+            '\u{2067}', // RLI
+            '\u{2068}', // FSI
+            '\u{2069}', // PDI
+            '\u{200B}', // ZWSP
+            '\u{200C}', // ZWNJ
+            '\u{200D}', // ZWJ
+            '\u{200E}', // LRM
+            '\u{200F}', // RLM
+            '\u{FEFF}', // BOM
+            '\u{034F}', // CGJ (combining grapheme joiner)
+        ] {
+            assert!(
+                !out.contains(bad),
+                "rendered output still contains bidi/format char {bad:?}: {out:?}"
+            );
+        }
+        // The surrounding legible text should have survived the strip.
+        assert!(out.contains("safe"));
+        assert!(out.contains("gnp.exe"));
+        assert!(out.contains("end"));
+    }
+
+    #[test]
+    fn legitimate_non_ascii_text_renders_unchanged() {
+        // Accented Latin and CJK characters are ordinary letters (category
+        // Ll/Lo, not Cf/Mn) and must survive the filter untouched — the fix
+        // for R4-F4 must not over-strip legitimate non-ASCII content.
+        let f = frame_json(
+            &serde_json::json!({
+                "type": "delivery",
+                "reason": "unread_messages",
+                "unread_count": 1,
+                "task_count": 1,
+                "unread_messages": [
+                    {"message_id": "m1", "sender_id": "alice", "subject": "café résumé déjà vu"}
+                ],
+                "open_tasks": [
+                    {"task_id": "t1", "status": "open", "title": "修复登录页面的问题"}
+                ],
+            })
+            .to_string(),
+        );
+        let out = render_skinny(&f);
+        assert!(out.contains("café résumé déjà vu"));
+        assert!(out.contains("修复登录页面的问题"));
     }
 
     #[test]
