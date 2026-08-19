@@ -27,6 +27,14 @@ What this module pins:
   an empty list, which would mask "I sent the wrong id" bugs).
 * Empty body — PUT with ``{"capabilities": []}`` clears the row
   for the group.
+* R2-F3 (pentest, 2026-08-19) — ``group_capability`` has no project
+  dimension, so only ``system.*`` caps (legitimately global,
+  router-admin verbs) may be granted to a group; a PUT containing
+  ANY non-``system.*`` cap is rejected wholesale (400,
+  ``resource_capability_not_delegable_to_group``) rather than
+  silently accepted and then dropped at resolve time. Resource-tier
+  delegation to a group must go through
+  ``project_membership.role`` instead.
 """
 
 from __future__ import annotations
@@ -219,13 +227,21 @@ async def test_put_then_get_round_trip(
     The handler sorts the GET response alphabetically — the dashboard
     relies on a stable render order — so the assertion uses set
     equality on the values, and a separate assertion on sort order.
+
+    R2-F3: payload uses ``system.*`` caps — resource-tier caps
+    (``tasks.create`` etc.) are no longer group-delegable (see
+    ``test_put_rejects_resource_tier_capability`` below); this test's
+    job is CRUD round-trip mechanics, not cap-value semantics, so any
+    admissible cap set proves the same thing.
     """
     _seed_user("root", is_sysadmin=True)
     client = await aiohttp_client(router_app)
     cookie = await _login(client, "root")
     gid = await _create_group_as_sysadmin(client, cookie, "ops")
 
-    payload_caps = ["tasks.create", "agents.view", "messages.send"]
+    payload_caps = [
+        "system.users.manage", "system.groups.manage", "system.sso.configure",
+    ]
     put_resp = await client.put(
         f"/agent-mcp/api/router/groups/{gid}/capabilities",
         data=json.dumps({"capabilities": payload_caps}),
@@ -263,14 +279,16 @@ async def test_put_replaces_existing_set(
 
     await client.put(
         f"/agent-mcp/api/router/groups/{gid}/capabilities",
-        data=json.dumps({"capabilities": ["tasks.create", "tasks.view"]}),
+        data=json.dumps(
+            {"capabilities": ["system.users.manage", "system.groups.manage"]}
+        ),
         headers=_REST_HEADERS,
         cookies={"agent_mcp_session": cookie},
         allow_redirects=False,
     )
     await client.put(
         f"/agent-mcp/api/router/groups/{gid}/capabilities",
-        data=json.dumps({"capabilities": ["agents.view"]}),
+        data=json.dumps({"capabilities": ["system.sso.configure"]}),
         headers=_REST_HEADERS,
         cookies={"agent_mcp_session": cookie},
         allow_redirects=False,
@@ -283,7 +301,7 @@ async def test_put_replaces_existing_set(
         allow_redirects=False,
     )
     assert resp.status == 200
-    assert (await resp.json())["capabilities"] == ["agents.view"]
+    assert (await resp.json())["capabilities"] == ["system.sso.configure"]
 
 
 async def test_put_empty_list_clears_caps(
@@ -299,7 +317,7 @@ async def test_put_empty_list_clears_caps(
     # Populate first so the clear is observable.
     await client.put(
         f"/agent-mcp/api/router/groups/{gid}/capabilities",
-        data=json.dumps({"capabilities": ["tasks.view"]}),
+        data=json.dumps({"capabilities": ["system.view"]}),
         headers=_REST_HEADERS,
         cookies={"agent_mcp_session": cookie},
         allow_redirects=False,
@@ -359,7 +377,9 @@ async def test_put_unknown_cap_leaves_existing_intact(
     # Set a known good list first.
     await client.put(
         f"/agent-mcp/api/router/groups/{gid}/capabilities",
-        data=json.dumps({"capabilities": ["tasks.view", "agents.view"]}),
+        data=json.dumps(
+            {"capabilities": ["system.view", "system.users.manage"]}
+        ),
         headers=_REST_HEADERS,
         cookies={"agent_mcp_session": cookie},
         allow_redirects=False,
@@ -368,7 +388,7 @@ async def test_put_unknown_cap_leaves_existing_intact(
     bad = await client.put(
         f"/agent-mcp/api/router/groups/{gid}/capabilities",
         data=json.dumps({
-            "capabilities": ["tasks.create", "nonsense.cap"],
+            "capabilities": ["system.groups.manage", "nonsense.cap"],
         }),
         headers=_REST_HEADERS,
         cookies={"agent_mcp_session": cookie},
@@ -384,7 +404,7 @@ async def test_put_unknown_cap_leaves_existing_intact(
     )
     assert resp.status == 200
     assert set((await resp.json())["capabilities"]) == {
-        "tasks.view", "agents.view",
+        "system.view", "system.users.manage",
     }
 
 
@@ -415,7 +435,7 @@ async def test_put_rejects_non_list_body(
 async def test_put_de_duplicates_caller_input(
     aiohttp_client, router_app,
 ) -> None:
-    """``{"capabilities": ["tasks.view", "tasks.view"]}`` is accepted;
+    """``{"capabilities": ["system.view", "system.view"]}`` is accepted;
     the GET response shows only one copy. Matches the repository's
     de-dup contract."""
     _seed_user("root", is_sysadmin=True)
@@ -425,13 +445,13 @@ async def test_put_de_duplicates_caller_input(
 
     resp = await client.put(
         f"/agent-mcp/api/router/groups/{gid}/capabilities",
-        data=json.dumps({"capabilities": ["tasks.view", "tasks.view"]}),
+        data=json.dumps({"capabilities": ["system.view", "system.view"]}),
         headers=_REST_HEADERS,
         cookies={"agent_mcp_session": cookie},
         allow_redirects=False,
     )
     assert resp.status == 200, await resp.text()
-    assert (await resp.json())["capabilities"] == ["tasks.view"]
+    assert (await resp.json())["capabilities"] == ["system.view"]
 
 
 # ── Not-found ──────────────────────────────────────────────────────
@@ -473,16 +493,26 @@ async def test_put_unknown_group_returns_404(
 
 
 # ── Cap surface integration: KNOWN_CAPABILITIES coverage ───────────
+#
+# R2-F3: ``group_capability`` grants are global (no project column), so
+# only ``system.*`` caps — legitimately project-ungated — may be
+# delegated to a group. The pre-fix version of this test asserted a
+# single PUT carrying the FULL ``KNOWN_CAPABILITIES`` set round-tripped;
+# that was the vulnerability's write-side surface (an admin could tick
+# a resource-tier cap like ``memories.create`` for a group and it would
+# silently apply cross-project). It's now split: the ``system.*``
+# subset still round-trips in full, and the non-``system.*`` subset is
+# uniformly rejected with a 400 (not silently accepted-then-ignored).
 
 
-async def test_every_known_capability_round_trips(
+async def test_every_system_capability_round_trips(
     aiohttp_client, router_app,
 ) -> None:
-    """A single PUT carrying every member of ``KNOWN_CAPABILITIES``
-    succeeds, and the GET returns the same set. Catches the
-    "validation rejects a real cap" class of regression — if the
-    KNOWN set ever drifts from what the handler accepts, this test
-    fires immediately."""
+    """A single PUT carrying every ``system.*`` member of
+    ``KNOWN_CAPABILITIES`` succeeds, and the GET returns the same set.
+    Catches the "validation rejects a real system cap" class of
+    regression — if the KNOWN set's system.* subset ever drifts from
+    what the handler accepts, this test fires immediately."""
     from agent_mcp.core.capabilities import KNOWN_CAPABILITIES
 
     _seed_user("root", is_sysadmin=True)
@@ -490,7 +520,8 @@ async def test_every_known_capability_round_trips(
     cookie = await _login(client, "root")
     gid = await _create_group_as_sysadmin(client, cookie, "ops")
 
-    caps = sorted(KNOWN_CAPABILITIES)
+    caps = sorted(c for c in KNOWN_CAPABILITIES if c.startswith("system."))
+    assert caps, "expected at least one system.* capability in KNOWN_CAPABILITIES"
     resp = await client.put(
         f"/agent-mcp/api/router/groups/{gid}/capabilities",
         data=json.dumps({"capabilities": caps}),
@@ -500,3 +531,104 @@ async def test_every_known_capability_round_trips(
     )
     assert resp.status == 200, await resp.text()
     assert set((await resp.json())["capabilities"]) == set(caps)
+
+
+async def test_every_resource_tier_capability_rejected(
+    aiohttp_client, router_app,
+) -> None:
+    """A single PUT carrying every non-``system.*`` member of
+    ``KNOWN_CAPABILITIES`` is rejected wholesale (400) — none of them
+    are group-delegable any more (R2-F3). The response names every
+    offending cap so the dashboard can surface exactly what got
+    rejected."""
+    from agent_mcp.core.capabilities import KNOWN_CAPABILITIES
+
+    _seed_user("root", is_sysadmin=True)
+    client = await aiohttp_client(router_app)
+    cookie = await _login(client, "root")
+    gid = await _create_group_as_sysadmin(client, cookie, "ops")
+
+    caps = sorted(c for c in KNOWN_CAPABILITIES if not c.startswith("system."))
+    assert caps, "expected at least one resource-tier capability in KNOWN_CAPABILITIES"
+    resp = await client.put(
+        f"/agent-mcp/api/router/groups/{gid}/capabilities",
+        data=json.dumps({"capabilities": caps}),
+        headers=_REST_HEADERS,
+        cookies={"agent_mcp_session": cookie},
+        allow_redirects=False,
+    )
+    assert resp.status == 400, await resp.text()
+    body = await resp.json()
+    assert body["success"] is False
+    assert body["error"] == "resource_capability_not_delegable_to_group"
+    assert set(body["non_system"]) == set(caps)
+    # Nothing landed — the group's cap set stays empty.
+    get_resp = await client.get(
+        f"/agent-mcp/api/router/groups/{gid}/capabilities",
+        headers=_REST_HEADERS,
+        cookies={"agent_mcp_session": cookie},
+        allow_redirects=False,
+    )
+    assert (await get_resp.json())["capabilities"] == []
+
+
+async def test_put_rejects_resource_tier_capability(
+    aiohttp_client, router_app,
+) -> None:
+    """The single-cap case (a sysadmin ticking ``memories.create`` for a
+    group in the dashboard UI) gets a clear 400 rather than a grant
+    that silently becomes a no-op downstream — see
+    ``core.capabilities.resolve_capabilities``, which no longer admits
+    non-``system.*`` caps sourced from ``group_capability``."""
+    _seed_user("root", is_sysadmin=True)
+    client = await aiohttp_client(router_app)
+    cookie = await _login(client, "root")
+    gid = await _create_group_as_sysadmin(client, cookie, "ops")
+
+    resp = await client.put(
+        f"/agent-mcp/api/router/groups/{gid}/capabilities",
+        data=json.dumps({"capabilities": ["memories.create"]}),
+        headers=_REST_HEADERS,
+        cookies={"agent_mcp_session": cookie},
+        allow_redirects=False,
+    )
+
+    assert resp.status == 400, await resp.text()
+    body = await resp.json()
+    assert body["success"] is False
+    assert body["error"] == "resource_capability_not_delegable_to_group"
+    assert body["non_system"] == ["memories.create"]
+
+
+async def test_put_mixed_system_and_resource_tier_rejects_whole_request(
+    aiohttp_client, router_app,
+) -> None:
+    """A PUT mixing an admissible ``system.*`` cap with a rejected
+    resource-tier cap fails atomically — the admissible cap does NOT
+    partially land."""
+    _seed_user("root", is_sysadmin=True)
+    client = await aiohttp_client(router_app)
+    cookie = await _login(client, "root")
+    gid = await _create_group_as_sysadmin(client, cookie, "ops")
+
+    resp = await client.put(
+        f"/agent-mcp/api/router/groups/{gid}/capabilities",
+        data=json.dumps(
+            {"capabilities": ["system.users.manage", "tasks.create"]}
+        ),
+        headers=_REST_HEADERS,
+        cookies={"agent_mcp_session": cookie},
+        allow_redirects=False,
+    )
+
+    assert resp.status == 400, await resp.text()
+    body = await resp.json()
+    assert body["non_system"] == ["tasks.create"]
+
+    get_resp = await client.get(
+        f"/agent-mcp/api/router/groups/{gid}/capabilities",
+        headers=_REST_HEADERS,
+        cookies={"agent_mcp_session": cookie},
+        allow_redirects=False,
+    )
+    assert (await get_resp.json())["capabilities"] == []
