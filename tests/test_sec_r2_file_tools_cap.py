@@ -28,7 +28,7 @@ from __future__ import annotations
 import pytest
 
 from agent_mcp.core.principal import Principal
-from agent_mcp.core.tool_result import Invalid, Ok, PermissionDenied
+from agent_mcp.core.tool_result import Ok, PermissionDenied
 from agent_mcp.tools.registry import dispatch_tool_call
 from tests.harness import make_principal, mcp_session
 

@@ -81,7 +81,7 @@ def test_string_json_with_valid_unicode_escapes_is_still_stripped() -> None:
 
 
 def test_bytes_json_with_valid_unicode_escapes_is_still_stripped() -> None:
-    raw = '{"subject": "hello\\u001bworld\\u0007bell\\u0000nul"}'.encode("utf-8")
+    raw = b'{"subject": "hello\\u001bworld\\u0007bell\\u0000nul"}'
     result = sanitize_json_input(raw)
     assert result["subject"] == _CONTROL_STRIPPED
 
