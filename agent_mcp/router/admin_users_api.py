@@ -1780,6 +1780,33 @@ async def replace_group_capabilities_handler(
             extra={"unknown": unknown},
         )
 
+    # SEC R2-F3 (2026-08-19) — ``group_capability`` has no
+    # ``project_name`` column, so a resource-tier (non-``system.*``)
+    # grant here is global across every project the caller can reach,
+    # not scoped to whatever project the operator intended. That's a
+    # confirmed cross-project privilege-escalation primitive (see
+    # ``core.capabilities.resolve_capabilities``, which now only
+    # admits ``system.*`` caps sourced from this table). Rather than
+    # silently accepting a resource-tier grant that becomes a no-op
+    # downstream, fail loud here: resource-tier delegation to a group
+    # already has a correctly project-scoped mechanism —
+    # ``project_membership.role`` (``PROJECT_ROLE_BUNDLES``), set via
+    # the project-membership endpoints, not this one.
+    non_system = [c for c in ordered if not c.startswith("system.")]
+    if non_system:
+        return _error(
+            error="resource_capability_not_delegable_to_group",
+            message=(
+                "group_capability grants are global (no project scope) "
+                "and may only carry system.* capabilities; resource-tier "
+                "capability string(s) "
+                f"{', '.join(repr(c) for c in non_system)} must be "
+                "granted via project_membership.role instead"
+            ),
+            status=400,
+            extra={"non_system": non_system},
+        )
+
     from ..repositories import group_capability_repository as _gcap
 
     # SEC round-4 (AZ-1) — capability-grant privilege amplification

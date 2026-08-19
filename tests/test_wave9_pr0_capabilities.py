@@ -323,8 +323,17 @@ def test_resolve_capabilities_drops_wildcard_from_group_data(monkeypatch):
     repair script, direct SQL), unioning it verbatim would silently
     make every group member a sysadmin. resolve_capabilities must drop
     it — the caller stays a plain operator, not a sysadmin.
+
+    R2-F3: the "legitimate cap survives" half of this test uses a
+    ``system.*`` cap — ``group_capability`` grants have no project
+    dimension, so (per the R2-F3 fix) only ``system.*`` caps sourced
+    from a group row are still admitted; a resource-tier cap like the
+    former ``tasks.assign`` here would now correctly be dropped by the
+    SAME resolver (see ``test_resolve_capabilities_drops_resource_tier_group_capability``
+    in ``tests/test_sec_r2f3_group_cap_project_scope.py``), which would
+    make this assertion fail for an unrelated reason.
     """
-    _patch_group_caps(monkeypatch, {SYSADMIN_WILDCARD, "tasks.assign"})
+    _patch_group_caps(monkeypatch, {SYSADMIN_WILDCARD, "system.groups.manage"})
 
     caps = resolve_capabilities(
         user_id="alice",
@@ -336,8 +345,8 @@ def test_resolve_capabilities_drops_wildcard_from_group_data(monkeypatch):
     )
 
     assert SYSADMIN_WILDCARD not in caps
-    # The legitimate, KNOWN cap from the group still comes through.
-    assert "tasks.assign" in caps
+    # The legitimate, KNOWN, system.* cap from the group still comes through.
+    assert "system.groups.manage" in caps
     # And the wildcard did not smuggle in blanket admit.
     p = make_principal(
         kind="operator_session",
