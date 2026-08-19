@@ -45,14 +45,7 @@ aliases = ["CVE-2026-58203"]
 # advisory affects. Retire on the next nixpkgs pin refresh.
 rationale = "unreachable — no BaseSettings/secrets_dir usage; pending next nixpkgs refresh"
 
-[[accepted]]
-id = "GHSA-g6cj-pr64-35w5"
-package = "cryptography"
-fixed_in = "50.0.0"
-aliases = ["PYSEC-2026-3552", "CVE-2026-69247"]
-# uv.lock pins 50.0.0 (past the fix); the nixpkgs closure still ships 49.0.0.
-# The advisory is a Bleichenbacher timing/error oracle in the PKCS#7 decrypt
-# functions (pkcs7_decrypt_der/pem/smime) reachable only by a service that
-# auto-decrypts untrusted S/MIME EnvelopedData. agent-mcp does none of that
-# (grep: zero pkcs7/smime hits). Retire on the next nixpkgs pin refresh.
-rationale = "unreachable — no PKCS#7/S-MIME decrypt of untrusted data; pending next nixpkgs refresh"
+# GHSA-g6cj-pr64-35w5 (cryptography, PKCS#7/S-MIME timing oracle) retired here:
+# this flake.lock bump moves the nixpkgs pin past cryptography 50.0.0, so the
+# closure no longer ships the vulnerable 49.0.0 — the gate now (correctly)
+# flags a stale entry for an advisory the closure doesn't ship anymore.
