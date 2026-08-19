@@ -37,9 +37,19 @@ pytestmark = pytest.mark.asyncio
 # Each tuple: (id, key). The id is what pytest prints in
 # parametrised-test names — using the codepoint label rather than the
 # raw character makes test output readable.
+# R4-F3: null_byte / control_soh (C0 control range, \x00-\x1F) are
+# deliberately NOT in this list anymore. ``sanitize_json_input``
+# (utils/json_utils.py) now strips those bytes UNCONDITIONALLY at the
+# shared JSON-input chokepoint every REST/MCP body flows through -- so
+# this route never observes them intact; the unsafe-key validator
+# below cannot reject what it never sees. That is a STRONGER guarantee
+# than this file originally pinned (every string field is covered, not
+# just memory keys) via silent normalization instead of rejection. See
+# _CONTROL_BYTE_KEYS + test_create_memory_control_byte_key_is_silently_
+# sanitized below for the pinned new behavior, and
+# test_has_unsafe_unicode_for_identifier_unit for proof the validator
+# itself is unchanged (it still flags these bytes when it sees them).
 _DISALLOWED_KEYS = [
-    ("null_byte",         "a\x00b"),
-    ("control_soh",       "a\x01b"),
     ("del",               "a\x7fb"),
     ("rtl_override",      "config‮drowssap"),   # the spoofing case
     ("zero_width_space",  "a\u200bb"),
@@ -48,6 +58,17 @@ _DISALLOWED_KEYS = [
     ("line_separator",    "a b"),
     ("word_joiner",       "a⁠b"),
     ("deprecated_bidi",   "a⁯b"),
+]
+
+# R4-F3: C0 control bytes are stripped by the JSON-input sanitizer
+# before the unsafe-key validator runs, so a request carrying one no
+# longer 400s -- see test_create_memory_control_byte_key_is_silently_
+# sanitized below. Kept as its own list so the direct-validator unit
+# test (which bypasses the JSON chokepoint entirely) still exercises
+# them.
+_CONTROL_BYTE_KEYS = [
+    ("null_byte",   "a\x00b"),
+    ("control_soh", "a\x01b"),
 ]
 
 
@@ -89,6 +110,54 @@ async def test_create_memory_rejects_unsafe_unicode_key(
             assert row is None, (
                 f"{label}: 400 was returned but the row was committed: {row!r}"
             )
+        finally:
+            sess.close()
+
+
+@pytest.mark.parametrize(
+    "label,bad_key", _CONTROL_BYTE_KEYS, ids=[t[0] for t in _CONTROL_BYTE_KEYS]
+)
+async def test_create_memory_control_byte_key_is_silently_sanitized(
+    tmp_path, label: str, bad_key: str,
+) -> None:
+    """R4-F3: a C0 control byte embedded in ``context_key`` is stripped
+    by the shared JSON-input sanitizer BEFORE this route ever sees it —
+    the request now succeeds with the SANITIZED key, rather than being
+    rejected by the unsafe-key validator (which never observes the raw
+    byte). The invariant this file exists to pin still holds: no raw
+    control byte ever reaches ``project_context.context_key`` — it's
+    just enforced by upstream normalization instead of rejection.
+    """
+    import re
+
+    sanitized_key = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", bad_key)
+
+    async with mcp_session(tmp_path) as admin:
+        r = admin.client.post(
+            "/api/memories",
+            json={"context_key": bad_key, "context_value": "val"},
+            headers={"Authorization": f"Bearer {admin.admin_token}"},
+        )
+        assert r.status_code == 200, (
+            f"{label}: expected 200 (sanitized upstream), "
+            f"got {r.status_code} body={r.text!r}"
+        )
+        from agent_mcp.db.engine import SessionLocal
+        from agent_mcp.db.models import ProjectContext
+
+        sess = SessionLocal()
+        try:
+            row = (
+                sess.query(ProjectContext)
+                .filter(ProjectContext.context_key == sanitized_key)
+                .one_or_none()
+            )
+            assert row is not None, (
+                f"{label}: 200 returned but sanitized key "
+                f"{sanitized_key!r} was not found"
+            )
+            assert "\x00" not in row.context_key
+            assert "\x01" not in row.context_key
         finally:
             sess.close()
 
@@ -224,13 +293,18 @@ async def test_has_unsafe_unicode_for_identifier_unit() -> None:
     """Lightweight unit coverage for the helper. The integration tests
     above hit it through the HTTP path; this guard pins the helper's
     contract so refactors that hide the regex behind a different
-    surface still satisfy the same shape."""
+    surface still satisfy the same shape.
+
+    Includes ``_CONTROL_BYTE_KEYS`` (R4-F3): called directly here, the
+    validator still correctly flags C0 control bytes — it's only the
+    HTTP round-trip that no longer observes them, because the shared
+    JSON-input sanitizer strips them one layer earlier now."""
     from agent_mcp.utils.string_utils import (
         has_unsafe_unicode_for_identifier,
     )
 
     # All disallowed cases reject.
-    for _label, bad_key in _DISALLOWED_KEYS:
+    for _label, bad_key in _DISALLOWED_KEYS + _CONTROL_BYTE_KEYS:
         assert has_unsafe_unicode_for_identifier(bad_key), (
             f"helper must reject {bad_key!r}"
         )

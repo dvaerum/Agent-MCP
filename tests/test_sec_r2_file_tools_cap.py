@@ -142,14 +142,28 @@ async def test_file_tool_denies_viewer_operator(
         ),
     ],
 )
-async def test_file_tool_null_byte_path_fails_closed(
+async def test_file_tool_null_byte_path_is_sanitized_before_dispatch(
     tmp_path, tool_name, arguments
 ) -> None:
-    """R6-F3 class completion: a null-byte filepath makes ``Path.resolve()``
-    raise ``ValueError: embedded null byte``. The tool must map that to a
-    controlled ``Invalid`` result (fail closed), NOT propagate to an
-    unhandled 500. A worker carries ``files.use``; update_file_metadata needs
-    ``system.config.write`` — use a sysadmin-equivalent operator for it."""
+    """R6-F3 class completion (superseded by R4-F3 below the tool
+    layer): a null-byte filepath used to reach ``Path.resolve()``,
+    which raises ``ValueError: embedded null byte`` — the tool mapped
+    that to a controlled ``Invalid`` result (fail closed).
+
+    R4-F3: ``dispatch_tool_call`` now runs EVERY tool argument through
+    ``sanitize_json_input`` unconditionally (``tools/registry.py``),
+    which strips C0 control bytes — including NUL — from every string
+    leaf before the tool implementation ever sees it. So the null byte
+    no longer survives to reach ``Path.resolve()`` at all: the tool
+    receives the already-sanitized path (``/tmp/badpath.txt``) and
+    succeeds normally, rather than failing closed on a byte it never
+    observes. The underlying invariant (no embedded null byte ever
+    reaches ``Path.resolve()`` / any OS call) still holds — it's just
+    enforced one layer earlier now. The tool-level ``Invalid``-on-
+    ``ValueError`` guard (R6-F3) remains in place for any caller that
+    bypasses the JSON chokepoint — see
+    ``test_normalize_filepath_null_byte_still_fails_closed_at_unit_level``
+    below, which pins that guard directly."""
     async with mcp_session(tmp_path):
         if tool_name == "view_file_metadata":
             p = _bearer("alice", role="worker")
@@ -166,11 +180,26 @@ async def test_file_tool_null_byte_path_fails_closed(
                 source_token=None,
             )
         result = await dispatch_tool_call(tool_name, arguments, principal=p)
-        assert isinstance(result, Invalid), (
-            f"{tool_name}: null-byte path should fail closed to Invalid, "
-            f"got {result!r}"
+        assert isinstance(result, Ok), (
+            f"{tool_name}: sanitized (null-byte-stripped) path should "
+            f"succeed, got {result!r}"
         )
-        assert result.field == "filepath"
+        assert result.data.get("filepath") == "/tmp/badpath.txt", (
+            f"{tool_name}: expected the null byte stripped from the "
+            f"filepath, got {result.data!r}"
+        )
+
+
+async def test_normalize_filepath_null_byte_still_fails_closed_at_unit_level() -> None:
+    """R6-F3's tool-level guard is unchanged: a caller that reaches
+    ``_normalize_filepath`` with a raw embedded null byte (bypassing
+    the JSON-body/tool-argument chokepoint dispatch_tool_call sanitizes
+    at — e.g. a future non-JSON code path) still gets ``None`` back,
+    which every caller maps to a controlled ``Invalid``, not an
+    unhandled ``ValueError``."""
+    from agent_mcp.tools.file_metadata_tools import _normalize_filepath
+
+    assert _normalize_filepath("/tmp/bad\x00path.txt", None) is None
 
 
 async def test_worker_can_round_trip_after_cap_gate(tmp_path) -> None:

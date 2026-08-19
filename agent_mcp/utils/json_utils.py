@@ -9,6 +9,40 @@ from ..core.config import logger
 # you'd import it, but 'Any' is fine for now if Starlette isn't a direct dependency here.
 # from starlette.requests import Request # Example
 
+# Control bytes worth stripping from a *parsed* string value: the C0
+# control range excluding tab (\x09), LF (\x0A) and CR (\x0D) — those
+# three are legitimate whitespace (e.g. a multi-line task description)
+# and must survive. This is the exact set Step 3 below has always
+# matched; it's hoisted to module scope so both the post-parse-success
+# path and the already-a-dict/list path can share one definition.
+_CONTROL_BYTE_RE = re.compile(r'[\x00-\x08\x0B\x0C\x0E-\x1F]')
+
+
+def _strip_control_bytes(value: Any) -> Any:
+    """Recursively walk a parsed JSON value and strip C0 control bytes
+    (``_CONTROL_BYTE_RE``) from every string leaf.
+
+    R4-F3: this is the ONLY place sanitization needs to happen now —
+    called unconditionally on every input to ``sanitize_json_input``,
+    whether it arrived as an already-decoded dict/list (the MCP
+    ``tools/call`` path) or as a string/bytes payload that parsed
+    cleanly on the first ``json.loads()`` attempt (the common REST
+    case: standard ``\\u001b``-style escapes are valid JSON and never
+    reach the old malformed-JSON-only fallback cleaning).
+
+    dict keys are left untouched (matches historical behavior — only
+    values were ever sanitized); non-string leaves (numbers, bools,
+    None) pass through unchanged.
+    """
+    if isinstance(value, str):
+        return _CONTROL_BYTE_RE.sub('', value)
+    if isinstance(value, dict):
+        return {k: _strip_control_bytes(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_strip_control_bytes(v) for v in value]
+    return value
+
+
 # --- JSON Sanitization Utility ---
 # Original location: main.py lines 52-123
 def sanitize_json_input(input_data: Union[str, bytes, Dict, List, Any]) -> Union[Dict, List, Any]: # Added bytes to input_data
@@ -21,11 +55,19 @@ def sanitize_json_input(input_data: Union[str, bytes, Dict, List, Any]) -> Union
                     or a Python object (dict, list).
 
     Returns:
-        Properly parsed Python object (dict, list, etc.)
+        Properly parsed Python object (dict, list, etc.), with every
+        string leaf value run through ``_strip_control_bytes`` — this
+        is UNCONDITIONAL (R4-F3): it applies to already-parsed dict/list
+        input, and to string/bytes input regardless of whether the
+        initial ``json.loads()`` succeeded or needed fallback cleaning.
     """
-    # If already a Python object (dict/list), just return it
+    # If already a Python object (dict/list), it's the MCP tools/call
+    # path (the SDK JSON-decodes the JSON-RPC body before this code
+    # ever sees it) — still walk it and strip control bytes from every
+    # string leaf; historically this returned the input completely
+    # unsanitized (R4-F3).
     if isinstance(input_data, (dict, list)):
-        return input_data
+        return _strip_control_bytes(input_data)
 
     # If bytes, decode to string first
     if isinstance(input_data, bytes):
@@ -50,7 +92,13 @@ def sanitize_json_input(input_data: Union[str, bytes, Dict, List, Any]) -> Union
 
     # Step 1: Initial direct parse attempt
     try:
-        return json.loads(input_data_str)
+        # R4-F3: standard JSON Unicode escapes (e.g. backslash-u001b) for
+        # control characters are valid JSON under json.loads()'s default
+        # strict=True — this succeeds on well-formed JSON carrying
+        # escaped control characters, which used to return here
+        # UNSTRIPPED (Step 3 below only ran on the malformed-JSON
+        # fallback path). Strip unconditionally before returning.
+        return _strip_control_bytes(json.loads(input_data_str))
     except json.JSONDecodeError:
         pass # Continue cleaning if direct parse fails
 
@@ -75,14 +123,19 @@ def sanitize_json_input(input_data: Union[str, bytes, Dict, List, Any]) -> Union
 
     # Step 5: Try parsing the aggressively cleaned string
     try:
-        return json.loads(cleaned)
+        # R4-F3: same escaped-control-character gap as Step 1 — strip
+        # unconditionally on the parsed result, not just the raw text
+        # (Step 3 above only catches UNESCAPED control bytes; a
+        # -style escape decodes to a real control char only once
+        # json.loads runs).
+        return _strip_control_bytes(json.loads(cleaned))
     except json.JSONDecodeError as e_cleaned:
         # Step 6: Fallback for potentially nested/escaped JSON or other oddities
         try:
             # Try to find the main JSON object/array within the string
             match = re.search(r'^\s*(\{.*\}|\[.*\])\s*$', cleaned, re.DOTALL)
             if match:
-                return json.loads(match.group(1))
+                return _strip_control_bytes(json.loads(match.group(1)))
         except json.JSONDecodeError:
              pass # If even the extracted part fails, fall through
         except Exception as inner_e:
