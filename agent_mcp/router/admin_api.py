@@ -473,6 +473,30 @@ async def rename_project_handler(req: web.Request) -> web.Response:
                 message=f"name {new_name!r} is an active alias",
                 status=409,
             )
+        # R3-F3 [TOCTOU / 500-hygiene, same idiom as the existence/alias
+        # re-checks just above]: the ``active_conns`` probe near the top of
+        # this handler ran OUTSIDE this lock and is never re-checked — a
+        # client whose stream starts connecting AFTER that check passed but
+        # BEFORE the ``systemctl stop`` below actually runs (a real
+        # wall-clock window: this whole ``async with`` block, plus the
+        # awaited ``to_thread`` stop) lands on a backend socket that gets
+        # killed moments later. Re-validate the SAME guard INSIDE the lock,
+        # immediately before the destructive stop, so a connection that won
+        # the race in that window still gets the clean 409 instead of the
+        # rename proceeding out from under it. (``app._proxy_to_backend``
+        # hardens the same race independently, proxy-side, via a
+        # ``ClientConnectorError`` handler.)
+        conns = _app.active_conns.get(old_name, 0)
+        if conns > 0:
+            return _app._error_envelope(
+                error=_app._ERROR_ACTIVE_SESSIONS,
+                message=(
+                    f"{old_name!r} has {conns} active connection(s); "
+                    f"disconnect them and retry"
+                ),
+                status=409,
+                extra={"active_connections": conns, "agents": []},
+            )
         # OBS-R34-RENAME-ONLOOP [availability]: run the blocking ``systemctl
         # stop`` OFF the event loop (mirrors delete's BL-R7-3).
         # ``_systemctl`` is a synchronous ``subprocess.run`` (~15-150 ms, or
@@ -764,6 +788,33 @@ async def delete_project_handler(req: web.Request) -> web.Response:
     # started the backend between our ``stop`` and our ``unregister``
     # would leave an orphan the reaper only clears after ``IDLE_SEC``.
     async with _app._ensure_lock(name, "backend"):
+        # R3-F3 [TOCTOU / 500-hygiene, mirrors PF-R36-1's inside-lock
+        # existence/alias re-check in ``rename_project_handler`` below]:
+        # the ``active_conns`` probe above ran OUTSIDE this lock and is
+        # never re-checked — a client whose stream starts connecting
+        # AFTER that check passed but BEFORE the ``systemctl stop`` below
+        # actually runs (a real wall-clock window: this whole ``async
+        # with`` block, plus the awaited ``to_thread`` stop) lands on a
+        # backend socket that gets killed moments later. Without a proxy-
+        # side guard that request's UDS connect races the teardown and can
+        # surface as a raw error instead of the clean 409 the guard exists
+        # to give (``app._proxy_to_backend`` now hardens that path too,
+        # independently — see its ``ClientConnectorError`` handler).
+        # Re-validate the SAME guard INSIDE the lock, immediately before
+        # the destructive stop, so a connection that won the race in that
+        # window still gets the clean 409 instead of the destructive op
+        # proceeding out from under it.
+        conns = _app.active_conns.get(name, 0)
+        if conns > 0:
+            return _app._error_envelope(
+                error=_app._ERROR_ACTIVE_SESSIONS,
+                message=(
+                    f"{name!r} has {conns} active connection(s); disconnect "
+                    f"them and retry"
+                ),
+                status=409,
+                extra={"active_connections": conns, "agents": []},
+            )
         # BL-R7-3: run the blocking ``systemctl stop`` OFF the event
         # loop (mirrors the round-6 BL-R6-2b fix in ``_ensure``).
         # ``_systemctl`` is a synchronous ``subprocess.run`` (~15-150 ms,
@@ -908,6 +959,32 @@ async def stop_project_handler(req: web.Request) -> web.Response:
     # it re-acquires the same key, so holding it across the awaited
     # ``to_thread`` stop cannot deadlock (delete/rename do exactly this).
     async with _app._ensure_lock(name, "backend"):
+        # R3-F3 [TOCTOU / 500-hygiene, mirrors the delete/rename inside-
+        # lock ``active_conns`` re-checks (same idiom as PF-R36-1's
+        # existence/alias-collision backstop in ``rename_project_handler``
+        # above)]: the ``active_conns`` probe above ran OUTSIDE this lock
+        # and is never re-checked — a client whose stream starts
+        # connecting AFTER that check passed but BEFORE the ``systemctl
+        # stop`` below actually runs (a real wall-clock window: this whole
+        # ``async with`` block, plus the awaited ``to_thread`` calls) lands
+        # on a backend socket that gets killed moments later. Re-validate
+        # the SAME guard INSIDE the lock, immediately before the
+        # destructive stop, so a connection that won the race in that
+        # window still gets the clean 409 instead of the stop proceeding
+        # out from under it. (``app._proxy_to_backend`` hardens the same
+        # race independently, proxy-side, via a ``ClientConnectorError``
+        # handler.)
+        conns = _app.active_conns.get(name, 0)
+        if conns > 0:
+            return _app._error_envelope(
+                error=_app._ERROR_ACTIVE_SESSIONS,
+                message=(
+                    f"{name!r} has {conns} active connection(s); disconnect "
+                    f"them and retry"
+                ),
+                status=409,
+                extra={"active_connections": conns, "agents": []},
+            )
         # OBS-R34-RENAME-ONLOOP class-sweep: ``_is_active`` and
         # ``_systemctl`` both shell out (blocking ``subprocess.run``), so
         # calling them directly stalls the single aiohttp event loop —
