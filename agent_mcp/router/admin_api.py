@@ -158,6 +158,24 @@ async def create_project_handler(req: web.Request) -> web.Response:
     err = _app._validate_name(name, _app._projects_dict())
     if err is not None:
         if "already" in err:
+            # R1-F1 [cross-tenant existence oracle, class-sweep]: an
+            # "already registered" 409 that echoes the exact candidate
+            # name is a confirmed, deterministic, zero-cost signal that
+            # a project by that name exists — reachable even by a
+            # delegated ``system.projects.manage`` cap holder with NO
+            # membership on the colliding project. Gate it through the
+            # SAME caller-visibility escape hatch every other
+            # per-project route uses (``_deny_cross_tenant_project_read``,
+            # R4-F3/R6-F2): a sysadmin, or a caller who actually holds a
+            # resolved role on the colliding project, still gets the
+            # real 409 below (happy path unchanged); anyone else gets
+            # the SAME uniform 404 ``unknown_project`` the rest of this
+            # API already returns for a hidden project, so a genuinely
+            # free name and a name hidden-but-taken are indistinguishable
+            # to them — no new access or mutation happens either way.
+            denied = _deny_cross_tenant_project_read(req, name)
+            if denied is not None:
+                return denied
             return _app._error_envelope(
                 error=_app._ERROR_ALREADY_REGISTERED, message=err, status=409,
             )
@@ -175,7 +193,14 @@ async def create_project_handler(req: web.Request) -> web.Response:
     # ``resolve_alias`` check, ``_ERROR_ALIAS_COLLISION``, 409, message
     # shape) so create enforces the same invariant as rename / add_alias.
     # An EXPIRED alias returns None here, so it stays reclaimable.
-    if _app._REGISTRY.resolve_alias(name) is not None:
+    alias_owner = _app._REGISTRY.resolve_alias(name)
+    if alias_owner is not None:
+        # R1-F1 class-sweep: an alias collision confirms the ALIAS
+        # OWNER's project exists just as surely as a direct name
+        # collision (above) does — same escape hatch, same reasoning.
+        denied = _deny_cross_tenant_project_read(req, alias_owner)
+        if denied is not None:
+            return denied
         return _app._error_envelope(
             error=_app._ERROR_ALIAS_COLLISION,
             message=f"name {name!r} is an active alias",
@@ -322,6 +347,17 @@ async def rename_project_handler(req: web.Request) -> web.Response:
     err = _app._validate_name(new_name, _app._projects_dict())
     if err is not None:
         if "already" in err:
+            # R1-F1 [cross-tenant existence oracle, class-sweep]: same
+            # escape hatch as ``create_project_handler``'s name-collision
+            # check — a sysadmin or a caller with a resolved role on the
+            # colliding project still gets the real 409 below; a
+            # delegate with no membership on it gets the SAME uniform
+            # 404 ``unknown_project`` the OLD-name check three lines up
+            # (and every other per-project route) already gives, instead
+            # of a confirmed-taken signal for a project hidden from them.
+            denied = _deny_cross_tenant_project_read(req, new_name)
+            if denied is not None:
+                return denied
             return _app._error_envelope(
                 error=_app._ERROR_NAME_TAKEN, message=err, status=409,
             )
@@ -341,7 +377,14 @@ async def rename_project_handler(req: web.Request) -> web.Response:
             message=f"unknown project: {old_name!r}",
             status=404,
         )
-    if _app._REGISTRY.resolve_alias(new_name) is not None:
+    alias_owner = _app._REGISTRY.resolve_alias(new_name)
+    if alias_owner is not None:
+        # R1-F1 class-sweep: same escape hatch as the name-collision
+        # check above — an alias collision confirms the ALIAS OWNER's
+        # project exists just as surely as a direct name collision does.
+        denied = _deny_cross_tenant_project_read(req, alias_owner)
+        if denied is not None:
+            return denied
         return _app._error_envelope(
             error=_app._ERROR_ALIAS_COLLISION,
             message=f"name {new_name!r} is an active alias",
@@ -396,7 +439,17 @@ async def rename_project_handler(req: web.Request) -> web.Response:
                 message=f"unknown project: {old_name!r}",
                 status=404,
             )
-        if _app._REGISTRY.resolve_alias(new_name) is not None:
+        alias_owner = _app._REGISTRY.resolve_alias(new_name)
+        if alias_owner is not None:
+            # R1-F1 class-sweep: the inside-lock TOCTOU re-check mirrors
+            # the outside-lock alias-collision check above — apply the
+            # SAME caller-visibility escape hatch here too, otherwise a
+            # request that cleared the outside-lock gate (colliding
+            # project invisible to the caller) would re-leak the exact
+            # same oracle the instant it reaches this duplicate check.
+            denied = _deny_cross_tenant_project_read(req, alias_owner)
+            if denied is not None:
+                return denied
             return _app._error_envelope(
                 error=_app._ERROR_ALIAS_COLLISION,
                 message=f"name {new_name!r} is an active alias",
@@ -993,6 +1046,21 @@ def _deny_cross_tenant_project_read(
     path (the lifecycle handlers answer ``not_registered``) — the oracle
     only needs closing on the non-member path below, where existing and
     nonexistent must be indistinguishable.
+
+    R1-F1 (class-sweep, create/rename-new-name side): the CREATE and
+    RENAME name/alias-COLLISION checks in ``create_project_handler`` /
+    ``rename_project_handler`` were never swept into this fix — a
+    collision with ANY registered project (or active alias), visible or
+    not, produced the SAME rich ``already_registered`` / ``name_taken`` /
+    ``alias_collision`` 409, so a delegate could enumerate hidden tenant
+    slugs via the 409-vs-201/vs-not-found differential on create/rename
+    alone. Those call sites now run this SAME predicate against the
+    colliding project (or, for an alias hit, its real owner) before
+    surfacing the rich 409: sysadmin / resolved-member collisions are
+    unaffected (still 409, unchanged UX); a non-member's collision with a
+    hidden project instead returns this function's uniform 404, so a
+    genuinely free name and a hidden-but-taken one both look like
+    "unknown" to them rather than confirming the taken name's existence.
     """
     from . import app as _app
     from .admin_users_api import _ERROR_NOT_FOUND, _caller_is_sysadmin, _error
