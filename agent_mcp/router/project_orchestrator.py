@@ -609,6 +609,25 @@ MAX_STREAMS_GLOBAL = int(os.environ.get("AGENT_MCP_MAX_SSE_GLOBAL", "64"))
 _streaming_proxies_global: int = 0
 _streaming_proxies_per_agent: dict[str, int] = {}
 
+# R5-F7 [MEDIUM, availability/DoS-guard]: the check-then-increment below
+# (read both counters, compare to the caps, then mutate them) previously
+# relied on an UNENFORCED invariant — "no `await` happens between the
+# check and the mutation" — to stay atomic against concurrent callers.
+# That's true of the code as written today (confirmed by extensive
+# concurrent-burst testing, both in-process ``asyncio.gather`` and real
+# OS-process ``curl`` bursts against a live bound socket — the cap held
+# at exactly ``MAX_STREAMS_PER_AGENT`` across every trial), but it's an
+# INCIDENTAL guarantee, not a structural one: nothing stops a future edit
+# from inserting an `await` between the check and the mutation (an
+# audit-log call, a metrics push, a DB lookup) and silently reopening the
+# race the R4-F2/R5-F7 pentest rounds were both chasing. An
+# ``asyncio.Lock`` makes the atomicity explicit and enforced regardless
+# of what runs inside the critical section — scoped tightly around JUST
+# the check+increment and the decrement, not the `yield` (the stream's
+# entire lifetime), so admitted streams don't serialize against each
+# other while they're actually proxying.
+_streaming_proxies_lock = asyncio.Lock()
+
 
 @contextlib.asynccontextmanager
 async def _track_streaming_proxy(agent_key: str):
@@ -623,24 +642,28 @@ async def _track_streaming_proxy(agent_key: str):
     overrides applied before import) take effect without re-wiring.
     """
     global _streaming_proxies_global
-    per = _streaming_proxies_per_agent.get(agent_key, 0)
-    if (
-        _streaming_proxies_global >= MAX_STREAMS_GLOBAL
-        or per >= MAX_STREAMS_PER_AGENT
-    ):
+    async with _streaming_proxies_lock:
+        per = _streaming_proxies_per_agent.get(agent_key, 0)
+        admitted = not (
+            _streaming_proxies_global >= MAX_STREAMS_GLOBAL
+            or per >= MAX_STREAMS_PER_AGENT
+        )
+        if admitted:
+            _streaming_proxies_global += 1
+            _streaming_proxies_per_agent[agent_key] = per + 1
+    if not admitted:
         yield False
         return
-    _streaming_proxies_global += 1
-    _streaming_proxies_per_agent[agent_key] = per + 1
     try:
         yield True
     finally:
-        _streaming_proxies_global -= 1
-        remaining = _streaming_proxies_per_agent.get(agent_key, 1) - 1
-        if remaining <= 0:
-            _streaming_proxies_per_agent.pop(agent_key, None)
-        else:
-            _streaming_proxies_per_agent[agent_key] = remaining
+        async with _streaming_proxies_lock:
+            _streaming_proxies_global -= 1
+            remaining = _streaming_proxies_per_agent.get(agent_key, 1) - 1
+            if remaining <= 0:
+                _streaming_proxies_per_agent.pop(agent_key, None)
+            else:
+                _streaming_proxies_per_agent[agent_key] = remaining
 
 
 async def _ensure(name: str, role: str) -> Path:
