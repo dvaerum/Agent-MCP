@@ -219,6 +219,111 @@ async def test_post_mcp_normal_depth_body_still_works(tmp_path) -> None:
         assert isinstance(tools, list) and len(tools) > 0, payload
 
 
+# ---------- pentest R1-F2: non-finite JSON number guard --------------
+#
+# Python's `json` module accepts `Infinity` / `-Infinity` / `NaN` as a
+# non-standard extension, and any numeric literal whose value overflows
+# a double (e.g. `1e400`) parses to `inf`. The MCP SDK's own
+# `JSONRPCMessage.model_validate(...).model_dump(by_alias=True,
+# mode="json", exclude_none=True)` round-trip (`mcp/shared/session.py`,
+# vendored under `.venv`) can't serialise `inf`/`-inf`/`nan` back to
+# JSON, so Pydantic's `Any`-serializer silently coerces them to `None`
+# — and `exclude_none=True` then drops a top-level occurrence outright
+# (a nested-in-list/dict occurrence survives as literal `null`). Either
+# way jsonschema validation in `agent_mcp/tools/registry.py` never sees
+# the caller's actual payload: a required numeric field looks *missing*
+# instead of *wrong-typed*, and an optional one silently falls back to
+# its default. These tests pin the pre-parse guard
+# (`_body_has_nonfinite_number` + `_MCP_NONFINITE_GUARD_BODY` in
+# `agent_mcp/app/main_app.py`) that rejects such a body with a clean
+# 400 before the SDK's round-trip ever runs — the same choke point as
+# the depth guard above.
+
+
+async def test_post_mcp_top_level_infinity_argument_returns_400(tmp_path) -> None:
+    """A bare `Infinity` JSON-RPC tool argument (top-level) must be
+    cleanly rejected, not silently dropped by the SDK's serializer."""
+    async with mcp_session(tmp_path) as admin:
+        r = _post_mcp_raw(
+            admin.client,
+            b'{"jsonrpc":"2.0","id":1,"method":"tools/call","params":'
+            b'{"name":"x","arguments":{"interval_seconds": Infinity}}}',
+            headers={"Authorization": f"Bearer {admin.admin_token}"},
+        )
+        assert r.status_code == 400, r.text
+        payload = r.json()
+        assert payload.get("jsonrpc") == "2.0", payload
+        assert payload["error"]["code"] == -32602, payload
+        assert payload["error"]["message"] == "Invalid params", payload
+
+
+async def test_post_mcp_nested_negative_infinity_in_list_returns_400(
+    tmp_path,
+) -> None:
+    """`-Infinity` nested inside a list argument must also be rejected
+    — this is the case that survives the SDK's `exclude_none=True` as a
+    literal `null` rather than vanishing, so it needs its own coverage."""
+    async with mcp_session(tmp_path) as admin:
+        r = _post_mcp_raw(
+            admin.client,
+            b'{"jsonrpc":"2.0","id":1,"method":"tools/call","params":'
+            b'{"name":"x","arguments":{"values":[1, -Infinity, 2]}}}',
+            headers={"Authorization": f"Bearer {admin.admin_token}"},
+        )
+        assert r.status_code == 400, r.text
+        payload = r.json()
+        assert payload["error"]["code"] == -32602, payload
+
+
+async def test_post_mcp_nested_nan_in_dict_returns_400(tmp_path) -> None:
+    """`NaN` nested inside a dict-valued argument must be rejected."""
+    async with mcp_session(tmp_path) as admin:
+        r = _post_mcp_raw(
+            admin.client,
+            b'{"jsonrpc":"2.0","id":1,"method":"tools/call","params":'
+            b'{"name":"x","arguments":{"nested":{"count": NaN}}}}',
+            headers={"Authorization": f"Bearer {admin.admin_token}"},
+        )
+        assert r.status_code == 400, r.text
+        payload = r.json()
+        assert payload["error"]["code"] == -32602, payload
+
+
+async def test_post_mcp_out_of_range_exponent_literal_returns_400(
+    tmp_path,
+) -> None:
+    """An out-of-double-range exponent literal (`1e400`) parses to
+    `inf` and must be rejected the same as a literal `Infinity`."""
+    async with mcp_session(tmp_path) as admin:
+        r = _post_mcp_raw(
+            admin.client,
+            b'{"jsonrpc":"2.0","id":1,"method":"tools/call","params":'
+            b'{"name":"x","arguments":{"limit": 1e400}}}',
+            headers={"Authorization": f"Bearer {admin.admin_token}"},
+        )
+        assert r.status_code == 400, r.text
+        payload = r.json()
+        assert payload["error"]["code"] == -32602, payload
+
+
+async def test_post_mcp_finite_numeric_argument_is_accepted(tmp_path) -> None:
+    """No-regression check: an ordinary finite numeric argument must
+    NOT be rejected by the non-finite-number guard."""
+    async with mcp_session(tmp_path) as admin:
+        r = _post_mcp_raw(
+            admin.client,
+            b'{"jsonrpc":"2.0","id":1,"method":"tools/call","params":'
+            b'{"name":"x","arguments":{"limit": 10, "ratio": -3.5e2}}}',
+            headers={"Authorization": f"Bearer {admin.admin_token}"},
+        )
+        # The tool ("x") doesn't exist, so this may come back as an
+        # in-band JSON-RPC error — the point under test is that it is
+        # NOT rejected by the non-finite guard (400 with code -32602).
+        assert r.status_code not in (400, 500), r.text
+        payload = _extract_jsonrpc_result(r)
+        assert payload.get("id") == 1, payload
+
+
 # ---------- GET /mcp -------------------------------------------------
 
 
