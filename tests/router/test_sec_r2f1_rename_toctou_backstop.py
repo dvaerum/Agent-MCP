@@ -478,6 +478,9 @@ async def test_create_delegate_register_project_name_taken_backstop_gets_uniform
     text = json.dumps(body).lower()
     assert "already" not in text
     assert "registered" not in text
+    from agent_mcp.router import group_resolver
+
+    assert group_resolver.resolve_user_project_role(alice_id, _HIDDEN) is None
 
 
 async def test_create_delegate_register_alias_collision_backstop_gets_uniform_404(
@@ -527,6 +530,9 @@ async def test_create_delegate_register_alias_collision_backstop_gets_uniform_40
     assert body["success"] is False
     assert body["error"] == "not_found"
     assert "alias" not in json.dumps(body).lower()
+    from agent_mcp.router import group_resolver
+
+    assert group_resolver.resolve_user_project_role(alice_id, _HIDDEN) is None
 
 
 async def test_create_sysadmin_register_backstop_still_gets_real_409(
