@@ -31,6 +31,18 @@ updates:
           - "minor"
           - "patch"
 
+  # aoe-bridge (Rust) deps in aoe-bridge/Cargo.toml + Cargo.lock.
+  - package-ecosystem: "cargo"
+    directory: "/aoe-bridge"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
   # GitHub Actions pinned by SHA in workflows/ci.yml. Dependabot scans
   # /.github/workflows when directory is "/".
   - package-ecosystem: "github-actions"
