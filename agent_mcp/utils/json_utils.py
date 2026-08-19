@@ -12,10 +12,20 @@ from ..core.config import logger
 # Control bytes worth stripping from a *parsed* string value: the C0
 # control range excluding tab (\x09), LF (\x0A) and CR (\x0D) — those
 # three are legitimate whitespace (e.g. a multi-line task description)
-# and must survive. This is the exact set Step 3 below has always
-# matched; it's hoisted to module scope so both the post-parse-success
-# path and the already-a-dict/list path can share one definition.
-_CONTROL_BYTE_RE = re.compile(r'[\x00-\x08\x0B\x0C\x0E-\x1F]')
+# and must survive — plus DEL (\x7F) and the full C1 range
+# (\x80-\x9F). R5-F8: C1 includes CSI (U+009B) and OSC (U+009D), the
+# 8-bit single-character equivalents of ESC[ / ESC] — the exact same
+# terminal-injection primitive R3-F1/R4-F3 strip via the C0 ESC byte,
+# except U+0080-U+009F are ordinary legal JSON string content per RFC
+# 8259 (only U+0000-U+001F must be escaped), so they need no ESC byte
+# and no JSON escaping to reach a string leaf here. This mirrors
+# aoe-bridge/src/render.rs's sanitize_for_pane, which already treats
+# C0+DEL+C1 as one control class. This is the exact set Step 3 below
+# has always matched; it's hoisted to module scope so both the
+# post-parse-success path and the already-a-dict/list path can share
+# one definition — keep the two in sync (Step 3 reuses this pattern
+# rather than duplicating it, so they cannot drift apart again).
+_CONTROL_BYTE_RE = re.compile(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]')
 
 
 def _strip_control_bytes(value: Any) -> Any:
@@ -115,8 +125,12 @@ def sanitize_json_input(input_data: Union[str, bytes, Dict, List, Any]) -> Union
     cleaned = cleaned.replace('\r\n', '').replace('\n', '').replace('\r', '')
 
     # Step 3: Remove Control Characters (excluding tab \t)
-    # Using repr() to make them visible for regex, then stripping quotes.
-    cleaned = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F]', '', cleaned)
+    # R5-F8: reuses _CONTROL_BYTE_RE (module scope) instead of a second
+    # copy of the character class — the R4-F3 fallout was exactly this
+    # pattern existing twice and drifting apart (C0-only here, C0+C1+DEL
+    # there); one shared pattern object makes that class of bug structurally
+    # impossible to reintroduce.
+    cleaned = _CONTROL_BYTE_RE.sub('', cleaned)
 
     # Step 4: Remove problematic Unicode (Zero-width spaces, BOM, line/paragraph separators)
     cleaned = re.sub(r'[\u200B-\u200F\uFEFF\u2028\u2029]', '', cleaned)
