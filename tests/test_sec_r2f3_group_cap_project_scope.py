@@ -46,7 +46,6 @@ from agent_mcp.core.capabilities import PROJECT_ROLE_BUNDLES, SYSADMIN_WILDCARD
 from agent_mcp.core.tool_result import Ok, PermissionDenied
 from tests.harness import make_principal, mcp_session
 
-
 # ── helpers ──────────────────────────────────────────────────────────
 
 
