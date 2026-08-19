@@ -49,8 +49,13 @@ pytestmark = pytest.mark.asyncio
 # sanitized below for the pinned new behavior, and
 # test_has_unsafe_unicode_for_identifier_unit for proof the validator
 # itself is unchanged (it still flags these bytes when it sees them).
+#
+# R5-F8: DEL (\x7F) moved out of this list to _CONTROL_BYTE_KEYS below
+# for the same reason -- _CONTROL_BYTE_RE now covers DEL + the C1
+# range (\x80-\x9F) alongside C0, so DEL (and C1 bytes like CSI
+# \x9B) are silently sanitized upstream too, same as
+# null_byte/control_soh.
 _DISALLOWED_KEYS = [
-    ("del",               "a\x7fb"),
     ("rtl_override",      "config‮drowssap"),   # the spoofing case
     ("zero_width_space",  "a\u200bb"),
     ("bom",               "a﻿b"),
@@ -60,15 +65,16 @@ _DISALLOWED_KEYS = [
     ("deprecated_bidi",   "a⁯b"),
 ]
 
-# R4-F3: C0 control bytes are stripped by the JSON-input sanitizer
-# before the unsafe-key validator runs, so a request carrying one no
-# longer 400s -- see test_create_memory_control_byte_key_is_silently_
-# sanitized below. Kept as its own list so the direct-validator unit
-# test (which bypasses the JSON chokepoint entirely) still exercises
-# them.
+# R4-F3/R5-F8: control bytes (C0, DEL, C1) are stripped by the
+# JSON-input sanitizer before the unsafe-key validator runs, so a
+# request carrying one no longer 400s -- see
+# test_create_memory_control_byte_key_is_silently_sanitized below.
+# Kept as its own list so the direct-validator unit test (which
+# bypasses the JSON chokepoint entirely) still exercises them.
 _CONTROL_BYTE_KEYS = [
     ("null_byte",   "a\x00b"),
     ("control_soh", "a\x01b"),
+    ("del",         "a\x7fb"),
 ]
 
 
@@ -120,17 +126,22 @@ async def test_create_memory_rejects_unsafe_unicode_key(
 async def test_create_memory_control_byte_key_is_silently_sanitized(
     tmp_path, label: str, bad_key: str,
 ) -> None:
-    """R4-F3: a C0 control byte embedded in ``context_key`` is stripped
-    by the shared JSON-input sanitizer BEFORE this route ever sees it —
-    the request now succeeds with the SANITIZED key, rather than being
-    rejected by the unsafe-key validator (which never observes the raw
-    byte). The invariant this file exists to pin still holds: no raw
-    control byte ever reaches ``project_context.context_key`` — it's
-    just enforced by upstream normalization instead of rejection.
-    """
-    import re
+    """R4-F3/R5-F8: a control byte (C0, DEL, or C1) embedded in
+    ``context_key`` is stripped by the shared JSON-input sanitizer
+    BEFORE this route ever sees it — the request now succeeds with the
+    SANITIZED key, rather than being rejected by the unsafe-key
+    validator (which never observes the raw byte). The invariant this
+    file exists to pin still holds: no raw control byte ever reaches
+    ``project_context.context_key`` — it's just enforced by upstream
+    normalization instead of rejection.
 
-    sanitized_key = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", bad_key)
+    Reuses the production ``_CONTROL_BYTE_RE`` rather than a third copy
+    of the character class, so this test can't silently drift out of
+    sync with what the sanitizer actually strips (the R5-F8 bug class).
+    """
+    from agent_mcp.utils.json_utils import _CONTROL_BYTE_RE
+
+    sanitized_key = _CONTROL_BYTE_RE.sub("", bad_key)
 
     async with mcp_session(tmp_path) as admin:
         r = admin.client.post(
