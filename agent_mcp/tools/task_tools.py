@@ -5668,6 +5668,8 @@ def register_task_tools():
                 "priority": {
                     "type": "string",
                     "description": "Task priority (default: medium).",
+                    "enum": ["low", "medium", "high"],
+                    "default": "medium",
                 },
                 "assigned_to": {
                     "type": "string",
@@ -6113,6 +6115,23 @@ async def create_task_tool_impl(
     raw_title = arguments.get("task_title")
     description = arguments.get("task_description", "")
     priority = arguments.get("priority", "medium")
+    # SEC (pentest R2-F2) defense-in-depth: the inputSchema's ``enum``
+    # already rejects this at the jsonschema-validation layer both
+    # ``dispatch_tool_call`` callers (the MCP tool AND the
+    # ``POST /api/tasks`` REST adapter) go through — but a direct
+    # in-process caller of this impl (tests, a future internal caller)
+    # bypasses that layer, so re-check here too. Same enum every
+    # sibling priority field in this module enforces (``assign_task``,
+    # ``create_self_task``, ``update_task``, ``update_task_status``,
+    # ``bulk_task_operations``).
+    if priority not in ("low", "medium", "high"):
+        return Invalid(
+            field="priority",
+            message=(
+                f"Invalid priority {priority!r}: must be one of "
+                "'low', 'medium', 'high'."
+            ),
+        )
     assigned_to = arguments.get("assigned_to")  # nullable
     # R16-F1: collapse an empty / whitespace parent to None at the earliest
     # point so a blank parent runs the single-root guard (clean 409) / the
