@@ -123,6 +123,26 @@ jobs:
       - name: Test
         run: cargo test --locked
 
+      - name: Install cargo-audit
+        # taiki-e/install-action fetches a prebuilt binary instead of
+        # compiling cargo-audit from source, keeping this step seconds
+        # rather than minutes.
+        uses: taiki-e/install-action@899b013517f9e7774591216672bf75a46bb9a481 # v2.9.4
+        with:
+          tool: cargo-audit
+
+      - name: Audit (cargo-audit)
+        # R3-F2: aoe-bridge (140 transitive crates) had no dependency-audit
+        # coverage — Python (pip-audit) and the dashboard (npm audit) both
+        # already gate on advisories, Rust did not. Fails on ANY advisory in
+        # the locked tree, same fail-on-any posture as pip-audit below (no
+        # --audit-level knob to soften it, unlike npm audit's HIGH/CRITICAL
+        # threshold). No allowlist file exists yet — if an unfixable
+        # advisory ever needs one, add it with a documented rationale the
+        # way nix/audit/closure-advisory-allowlist.toml does for the
+        # nix-closure gate, not a silent --ignore.
+        run: cargo audit
+
   dashboard:
     # Job display name is load-bearing: branch protection matches
     # required status checks by name, so renaming it would silently stop
