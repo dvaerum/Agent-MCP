@@ -959,6 +959,47 @@ async def _create_unassigned_tasks(
             cursor = u.cursor
 
             if tasks:
+                # R5-F5: single-root guard for the BULK path. The
+                # single-item create paths (create_task, create_self_task,
+                # assign_task Mode 1) all run ``_single_root_conflict``
+                # before their one INSERT; this bulk path ran no such
+                # check at all, so the partial UNIQUE index
+                # (``idx_tasks_single_root``) threw an IntegrityError on
+                # the 2nd parentless task in the batch (or the 1st, when
+                # a root already existed) — caught by the generic
+                # ``except Exception`` below and rendered as the opaque
+                # "Operation failed" (SEC-R8-1) instead of a clean
+                # Conflict. Two things the single-item guard doesn't need
+                # to reason about but a BATCH does:
+                #   (a) a root already exists in the DB -> any parentless
+                #       task in the batch conflicts (reuse the shared
+                #       helper, which sees this transaction's own writes
+                #       too);
+                #   (b) no root exists yet, but the batch ITSELF asks for
+                #       more than one parentless task -> conflict, since
+                #       only the first would win the DB's partial UNIQUE
+                #       index (first commit wins, second raises) — surface
+                #       that explicitly instead of letting the 2nd INSERT
+                #       hit the constraint.
+                parentless_count = sum(
+                    1 for t in tasks if not t.get("parent_task_id")
+                )
+                if parentless_count > 0:
+                    conflict = _single_root_conflict(cursor)
+                    if conflict is not None:
+                        return conflict
+                    if parentless_count > 1:
+                        return Conflict(
+                            reason=(
+                                "Cannot create more than one root task in a "
+                                "single batch. This batch has "
+                                f"{parentless_count} tasks without a "
+                                "parent_task_id; at most one task per batch "
+                                "may omit parent_task_id (it becomes the "
+                                "root). Give the rest a parent_task_id."
+                            )
+                        )
+
                 # Multiple unassigned task creation. arch-deepening R4
                 # #7: this used to mint
                 # ``task_{int(now().timestamp()*1000)}_{i}`` — same-
@@ -1005,6 +1046,13 @@ async def _create_unassigned_tasks(
                     )
 
             elif task_title and task_description:
+                # R5-F5: same single-root guard as the bulk branch above,
+                # for the single-item (no ``tasks`` array) shape of Mode 0.
+                if parent_task_id_arg is None:
+                    conflict = _single_root_conflict(cursor)
+                    if conflict is not None:
+                        return conflict
+
                 # Single unassigned task creation. arch-deepening R4
                 # #7: previously minted
                 # ``task_{int(now().timestamp()*1000)}`` — two calls
@@ -1365,6 +1413,33 @@ async def _create_and_assign_multiple_tasks(
             # Validate agent exists and is not terminated.
             if not _agent_assignable(cursor, target_agent_id):
                 return NotFound(resource="agent", identifier=target_agent_id)
+
+            # R5-F5: single-root guard for the BULK create-and-assign
+            # path (Mode 2) — mirrors the guard added to
+            # ``_create_unassigned_tasks``'s ``tasks`` branch (Mode 0).
+            # See that function's comment for the full rationale; same
+            # two cases apply here: an existing DB root conflicts with
+            # any parentless task in the batch, and a batch with more
+            # than one parentless task conflicts with itself before
+            # either INSERT hits the partial UNIQUE index.
+            parentless_count = sum(
+                1 for t in tasks if not t.get("parent_task_id")
+            )
+            if parentless_count > 0:
+                conflict = _single_root_conflict(cursor)
+                if conflict is not None:
+                    return conflict
+                if parentless_count > 1:
+                    return Conflict(
+                        reason=(
+                            "Cannot create more than one root task in a "
+                            "single batch. This batch has "
+                            f"{parentless_count} tasks without a "
+                            "parent_task_id; at most one task per batch "
+                            "may omit parent_task_id (it becomes the "
+                            "root). Give the rest a parent_task_id."
+                        )
+                    )
 
             created_tasks = []
             created_at = datetime.datetime.now().isoformat()
