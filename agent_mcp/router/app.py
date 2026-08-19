@@ -2781,6 +2781,24 @@ def make_app(
     # (the home-manager module owns the canonical config).
     from . import admin_sso_api
     admin_sso_api.register_admin_sso_routes(app)
+    # R5-F6: every admin route above is registered as an EXACT path
+    # (no ``{rest:.*}`` tail). aiohttp resources match the URL
+    # literally, so ``GET /agent-mcp/api/router/projects/`` (note the
+    # trailing slash) does NOT resolve to the ``.../projects`` resource
+    # above — it falls through past this whole block to the generic
+    # per-project catch-all mounted below (``backend_api_handler``),
+    # which treats ``router`` as a PROJECT NAME. That fallthrough
+    # currently dead-ends in a 404 only because ``router`` is a member
+    # of ``_RESERVED_NAMES`` — an unrelated naming-collision guard, not
+    # a structural denial of the fallthrough itself. Register an
+    # explicit trailing-slash alias for every admin route so the SAME
+    # route-specific (correctly capability-gated) handler serves the
+    # trailing-slash form too, closing the fallthrough at its source
+    # instead of relying on the reserved-name side effect. Must run
+    # BEFORE the catch-all is mounted (below) so aiohttp's source-order
+    # dispatcher tries these aliases first — same requirement
+    # ``_add_root_aliases`` documents for its own tail-match aliases.
+    _add_admin_trailing_slash_aliases(app)
 
     # Phase 1 PR C: login + setup-wizard routes. Registered AFTER the
     # /api routes so a project literally named "login" can't shadow
@@ -2826,6 +2844,38 @@ def make_app(
     _add_root_aliases(app)
 
     return app
+
+
+_ADMIN_API_PREFIX = mount.INTERNAL_MOUNT + "/api/router/"
+
+
+def _add_admin_trailing_slash_aliases(app: web.Application) -> None:
+    """Register a trailing-slash alias for every admin route registered
+    so far (R5-F6).
+
+    Called from ``make_app()`` right after ``admin_api`` /
+    ``admin_users_api`` / ``admin_sso_api`` wire their exact-path
+    ``/agent-mcp/api/router/...`` routes, and BEFORE the generic
+    per-project catch-all (``/agent-mcp/api/{name}/{rest:.*}``) is
+    mounted — so each alias resource lands ahead of the catch-all in
+    aiohttp's source-order dispatcher, exactly like ``_add_root_aliases``
+    requires for its own explicit tail-match aliases below.
+
+    None of the admin routes use a ``{rest:.*}`` tail pattern (they're
+    all exact paths or single dynamic segments — see ``admin_api.py`` /
+    ``admin_users_api.py`` / ``admin_sso_api.py``), so a plain
+    ``canonical + "/"`` re-registration is safe: it can't accidentally
+    swallow a longer, more-specific sibling path the way a tail-match
+    alias could.
+    """
+    for route in list(app.router.routes()):
+        resource = route.resource
+        if resource is None:
+            continue
+        canonical = resource.canonical
+        if not canonical.startswith(_ADMIN_API_PREFIX) or canonical.endswith("/"):
+            continue
+        app.router.add_route(route.method, canonical + "/", route.handler)
 
 
 def _add_root_aliases(app: web.Application) -> None:
