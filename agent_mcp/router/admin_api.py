@@ -237,6 +237,24 @@ async def create_project_handler(req: web.Request) -> web.Response:
         # server-side, hand back a generic message under the existing
         # discriminator so the caller still sees ``already_registered``.
         logger.warning("register %r failed: %s", name, e)
+        # R2-F1 [cross-tenant existence oracle, TOCTOU backstop,
+        # class-sweep]: this branch is ``create``'s own atomic-write
+        # backstop for the SAME oracle the outside-lock name/alias
+        # checks above already gate — apply the identical escape
+        # hatch here too. Not currently race-reachable (``register()``
+        # has no ``await`` between the outside checks above and the
+        # atomic write, so the window is effectively zero today), but
+        # fix it anyway for defense-in-depth / consistency, and so it
+        # stays correct if that ever changes. ``register`` raises this
+        # for either a direct name collision (``name`` itself is the
+        # colliding project) or an active-alias collision (the ALIAS
+        # OWNER is the colliding project) — ``resolve_alias`` returns
+        # ``None`` for the former, so falling back to ``name`` covers
+        # both without needing to distinguish the exception subtype.
+        colliding = _app._REGISTRY.resolve_alias(name) or name
+        denied = _deny_cross_tenant_project_read(req, colliding)
+        if denied is not None:
+            return denied
         return _app._error_envelope(
             error=_app._ERROR_ALREADY_REGISTERED,
             message="project name is already registered",
@@ -534,13 +552,34 @@ async def rename_project_handler(req: web.Request) -> web.Response:
                 # new_name is a registered PROJECT (concurrent rename/create
                 # to the same new name won the atomic write). This is the
                 # PF-R37-1 edge: 409, not 500.
+                # R2-F1 [cross-tenant existence oracle, TOCTOU backstop,
+                # class-sweep]: same escape hatch as the outside-lock
+                # name-collision check above — two renames with DIFFERENT
+                # old_names racing the SAME new_name never serialise on
+                # ``_ensure_lock`` (it keys on old_name), so THIS atomic
+                # write is the only backstop for that race. Without the
+                # gate, winning/losing the race reopens the R1-F1 oracle
+                # probabilistically instead of via a static lookup.
+                denied = _deny_cross_tenant_project_read(req, new_name)
+                if denied is not None:
+                    return denied
                 return _app._error_envelope(
                     error=_app._ERROR_NAME_TAKEN,
                     message="project name is already registered",
                     status=409,
                 )
             if isinstance(e, _registry.AliasCollision):
-                # new_name became a currently-active alias of another project.
+                # new_name became a currently-active alias of another
+                # project. R2-F1 class-sweep: same escape hatch as the
+                # inside-lock alias RE-check three lines above — resolve
+                # the alias OWNER the identical way and gate against it,
+                # since that's what confirms existence for a collision
+                # discovered via alias rather than a direct name hit.
+                alias_owner = _app._REGISTRY.resolve_alias(new_name)
+                if alias_owner is not None:
+                    denied = _deny_cross_tenant_project_read(req, alias_owner)
+                    if denied is not None:
+                        return denied
                 return _app._error_envelope(
                     error=_app._ERROR_ALIAS_COLLISION,
                     message=f"name {new_name!r} is an active alias",
