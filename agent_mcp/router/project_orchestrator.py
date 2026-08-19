@@ -575,21 +575,31 @@ async def _track_connection(name: str):
             _gc(name)
 
 
-# ── SSE (GET /mcp) concurrency caps (R8-F2) ─────────────────────────
+# ── SSE (GET /mcp, and streaming POST /mcp) concurrency caps (R8-F2,
+#    R4-F2) ────────────────────────────────────────────────────────
 # The backend's ``GET /mcp`` handler returns an INFINITE
-# ``text/event-stream`` (a ``: ping`` heartbeat forever). Each admitted
-# stream therefore pins a router→backend UDS connection + proxy task +
-# a slot in ``active_conns`` for the whole lifetime of the stream. The
-# router streams these (``_proxy_to_backend``) and tears the upstream
-# down on client disconnect, but WITHOUT a cap a single valid agent
-# bearer could still open unbounded concurrent streams — exhausting the
+# ``text/event-stream`` (a ``: ping`` heartbeat forever), and a
+# ``POST /mcp`` ``wait_for_events`` call can ALSO come back as an
+# indefinite ``text/event-stream`` hold (the uncapped heartbeat-hold
+# branch of ``client_hold_strategy``) — the modality real agents use
+# for their resting wake-loop connection. Each admitted stream, either
+# shape, pins a router→backend UDS connection + proxy task + a slot in
+# ``active_conns`` for the whole lifetime of the stream. The router
+# streams these (``_proxy_to_backend``) and tears the upstream down on
+# client disconnect, but WITHOUT a cap a single valid agent bearer
+# could still open unbounded concurrent streams — exhausting the
 # router's fd/task budget and pinning backends against the idle reaper
 # (which only stops a project when ``active_conns == 0``). Cap both the
 # per-agent (per-bearer) and the global count of simultaneous streaming
 # proxies; over the cap the caller returns a clean 429 instead of
-# hanging. Defaults are generous for legitimate use (a client keeps
-# roughly one notification stream per session) but finite; override via
-# env for unusual deployments.
+# hanging. GET is admission-checked before the upstream connect (the
+# verb/path alone identifies it); POST is admission-checked
+# retroactively in ``_proxy_to_backend`` the instant the upstream's
+# Content-Type confirms it's actually streaming, since that's the
+# earliest point a POST's streaming-ness is knowable. Defaults are
+# generous for legitimate use (a client keeps roughly one notification
+# stream per session) but finite; override via env for unusual
+# deployments.
 MAX_STREAMS_PER_AGENT = int(os.environ.get("AGENT_MCP_MAX_SSE_PER_AGENT", "4"))
 MAX_STREAMS_GLOBAL = int(os.environ.get("AGENT_MCP_MAX_SSE_GLOBAL", "64"))
 
