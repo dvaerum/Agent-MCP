@@ -68,10 +68,19 @@
     "low-risk here: postcss is a patch bump, and sharp is never",
     "exercised at all because next.config.ts sets output:'export' with",
     "images.unoptimized. Drop these once next ships a 15.5.x that",
-    "resolves the patched versions, or when the next@16 migration lands."
+    "resolves the patched versions, or when the next@16 migration lands.",
+    "nanoid <3.3.18 (GHSA-2v37-7h3g-55p8, custom generators loop",
+    "indefinitely when size=0) is pulled in transitively by postcss",
+    "(itself already overridden above) via both @tailwindcss/postcss",
+    "and next. postcss's own package.json already declares",
+    "\"nanoid\": \"^3.3.17\", so this override is a patch bump within",
+    "postcss's own accepted range — pure lockfile staleness, not a",
+    "postcss-vs-nanoid version conflict. Drop once postcss ships a",
+    "release that resolves nanoid>=3.3.18 on its own."
   ],
   "overrides": {
     "postcss": "^8.5.26",
-    "sharp": "^0.35.3"
+    "sharp": "^0.35.3",
+    "nanoid": "^3.3.18"
   }
 }
