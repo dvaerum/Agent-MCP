@@ -3,6 +3,7 @@ import asyncio
 import contextlib
 import contextvars
 import json
+import math
 import os
 from contextlib import asynccontextmanager
 from typing import List, Optional
@@ -1100,6 +1101,117 @@ def _body_nesting_exceeds(body: bytes, limit: int) -> bool:
     return False
 
 
+# --- MCP pre-parse non-finite-number guard (pentest R1-F2) -----------
+#
+# The vendored `mcp` SDK round-trips every JSON-RPC request through
+# Pydantic on its way to a `CallToolRequest`
+# (`mcp/shared/session.py`, `JSONRPCMessage.model_validate(raw)
+# .model_dump(by_alias=True, mode="json", exclude_none=True)`).
+# Python's `json` module accepts `Infinity` / `-Infinity` / `NaN` as a
+# non-standard extension, and Pydantic's `Any`-serializer can't turn
+# those (or an out-of-double-range literal like `1e400`, which parses
+# to `inf`) back into valid JSON — it silently coerces them to `None`.
+# `exclude_none=True` then drops a top-level occurrence outright; a
+# nested-in-list/dict occurrence survives as literal `null`. Either
+# way, `agent_mcp/tools/registry.py`'s jsonschema validation never
+# sees the caller's actual payload: a required numeric field looks
+# *missing* instead of *wrong-typed*, and an optional one silently
+# falls back to its default — a normal bad type (`1.5`, `true`,
+# `[1,2,3]`) is correctly rejected, but this class of bad numeric
+# value vanishes without a trace.
+#
+# Same fix shape as the depth guard above: scan the raw, undrained
+# body ourselves and reject before the SDK's `model_dump(mode="json")`
+# round-trip ever runs. This can't be a full `json.loads` + recursive
+# `math.isfinite` walk — the depth guard already established the body
+# may be nested right up to `_MCP_MAX_BODY_NESTING_DEPTH` (chosen near
+# Python's own recursion limit), so parsing it here would risk exactly
+# the `RecursionError` the depth guard exists to avoid. Instead this
+# does a single byte-scan pass, string-literal-aware the same way
+# `_body_nesting_exceeds` is.
+_MCP_NONFINITE_GUARD_BODY = json.dumps({
+    "jsonrpc": "2.0",
+    "id": "server-error",  # mirrors the SDK's own id for parse-stage errors
+    "error": {"code": -32602, "message": _JSONRPC_TERSE_MESSAGES[-32602]},
+}).encode("utf-8")
+
+#: Bare (unquoted) tokens `json.loads` accepts as non-standard numeric
+#: literals. Checked longest-prefix-first so `-Infinity` isn't missed
+#: in favour of a partial `Infinity` match at the wrong offset.
+_NONFINITE_LITERALS = (b"-Infinity", b"Infinity", b"NaN")
+
+#: Byte values that can appear in a JSON number token (sign, digits,
+#: decimal point, exponent marker/sign).
+_JSON_NUMBER_BYTES = frozenset(b"-+.eE0123456789")
+
+
+def _is_nonfinite_number_token(token: bytes) -> bool:
+    """True if `token` is a valid float literal that overflows to a
+    non-finite double (e.g. the digits of `1e400`, which parse to
+    `inf`). Anything that isn't a valid `float()` literal (a lone
+    `-`, a `,` swept up between numbers, ...) is not our concern here
+    — a malformed body is left for the SDK's own parse-error handling.
+    """
+    try:
+        value = float(token)
+    except ValueError:
+        return False
+    return not math.isfinite(value)
+
+
+def _body_has_nonfinite_number(body: bytes) -> bool:
+    """True if the JSON `body` contains a non-finite number outside any
+    string literal: a bare `Infinity` / `-Infinity` / `NaN` token, or a
+    numeric literal whose value overflows a double (`1e400`).
+
+    Single byte-scan pass, tracking string-literal state the same way
+    `_body_nesting_exceeds` does, so bracket/quote-aware but no full
+    JSON parse (see the module comment above for why).
+    """
+    in_string = False
+    escaped = False
+    number_run_start = -1
+    n = len(body)
+    i = 0
+    while i < n:
+        ch = body[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == 0x5C:  # backslash
+                escaped = True
+            elif ch == 0x22:  # closing quote
+                in_string = False
+            i += 1
+            continue
+        if ch == 0x22:  # opening quote
+            if number_run_start != -1:
+                if _is_nonfinite_number_token(body[number_run_start:i]):
+                    return True
+                number_run_start = -1
+            in_string = True
+            i += 1
+            continue
+        if ch in _JSON_NUMBER_BYTES:
+            if number_run_start == -1:
+                number_run_start = i
+            i += 1
+            continue
+        if number_run_start != -1:
+            if _is_nonfinite_number_token(body[number_run_start:i]):
+                return True
+            number_run_start = -1
+        for literal in _NONFINITE_LITERALS:
+            if body[i:i + len(literal)] == literal:
+                return True
+        i += 1
+    if number_run_start != -1 and _is_nonfinite_number_token(
+        body[number_run_start:]
+    ):
+        return True
+    return False
+
+
 def _replay_receive(raw_receive, body: bytes, disconnected: bool):
     """Build an ASGI `receive` callable that replays an already-drained
     body exactly once, then delegates to the real channel.
@@ -1198,6 +1310,12 @@ class _McpAsgiApp:
                 # for the SDK's own -32700 handling — its exact bytes
                 # are replayed unchanged via the synthetic `receive`.
                 await _send_simple_response(send, 400, _MCP_DEPTH_GUARD_BODY)
+                return
+            if not disconnected and _body_has_nonfinite_number(body):
+                # Infinity/-Infinity/NaN/1e400 → clean 400 before the SDK's
+                # model_dump(mode="json") round-trip silently coerces it to
+                # null and (for a top-level argument) drops it outright.
+                await _send_simple_response(send, 400, _MCP_NONFINITE_GUARD_BODY)
                 return
             # Event-loop long-hold: capture the client's clientInfo from an
             # `initialize` POST so the wait_for_events hold-strategy resolver

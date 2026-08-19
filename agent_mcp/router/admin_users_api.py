@@ -62,7 +62,7 @@ from typing import Any, Iterable
 
 from aiohttp import web
 
-from . import identity
+from . import group_resolver, identity
 from .router_store import store
 from .single_tenant import bypasses_operator_gate
 
@@ -354,6 +354,53 @@ def _is_last_sysadmin(conn: sqlite3.Connection, user_id: str) -> bool:
         (user_id,),
     ).fetchone()
     return others is None
+
+
+def _is_last_sysadmin_group(conn: sqlite3.Connection, group_id: str) -> bool:
+    """True iff clearing/deleting ``group_id``'s OWN ``is_sysadmin = 1``
+    grant would leave the deployment with zero sysadmins.
+
+    R4-F1: the group-conferred sibling of ``_is_last_sysadmin``. A
+    sysadmin-flagged group confers sysadmin transitively to every
+    member (``group_resolver``'s upward closure, same mechanism the
+    AZ-1/AZ-2 amplification guards rely on), so ``edit_group_handler``
+    clearing the flag or ``delete_group_handler`` deleting the group
+    is itself a sysadmin-DEMOTE-or-DELETE in disguise for every one of
+    its members — it must be guarded exactly like the direct-flag path,
+    just computed over the transitive closure instead of one row.
+
+    Unions two live paths to sysadmin, ignoring ``group_id``'s own
+    grant (the one about to be removed):
+      * any user holding the DIRECT ``users.is_sysadmin`` flag — that
+        stays true regardless of any group's flag;
+      * any OTHER ``is_sysadmin = 1`` group (``group_id`` excluded)
+        that currently has at least one user reachable in its downward
+        membership closure (``group_resolver.
+        group_has_transitive_user_member`` — the same graph traversal
+        machinery ``resolve_user_project_role``/AZ-1/AZ-2 already rely
+        on). A sysadmin-flagged group with ZERO current members confers
+        sysadmin on nobody today, so it does not count as a live other
+        path — it would not stop the system's sysadmin count hitting
+        zero.
+
+    Caller must hold the write lock (``BEGIN IMMEDIATE``) across this
+    check and the mutating statement, mirroring ``_is_last_sysadmin``'s
+    TOCTOU-safe usage in ``edit_user_handler``/``delete_user_handler``.
+    """
+    if conn.execute(
+        "SELECT 1 FROM users WHERE is_sysadmin = 1 LIMIT 1"
+    ).fetchone() is not None:
+        return False
+    other_groups = conn.execute(
+        "SELECT group_id FROM groups WHERE is_sysadmin = 1 AND group_id != ?",
+        (group_id,),
+    ).fetchall()
+    for row in other_groups:
+        if group_resolver.group_has_transitive_user_member(
+            row["group_id"], conn=conn,
+        ):
+            return False
+    return True
 
 
 def _last_sysadmin_error(verb: str) -> web.Response:
@@ -1032,25 +1079,42 @@ async def edit_group_handler(req: web.Request) -> web.Response:
             message="no editable fields supplied",
             status=400,
         )
+    # Demotion = clearing an existing group sysadmin bit. Guarded below
+    # against zeroing the deployment's sysadmin count (R4-F1: the
+    # group-conferred sibling of edit_user_handler's last-sysadmin
+    # lockout).
+    demoting = "is_sysadmin" in body and not is_sysadmin_val
     conn = _connect()
+    # Manual transaction so the last-sysadmin-group check and the UPDATE
+    # are atomic under one write-lock — mirrors edit_user_handler's
+    # BEGIN IMMEDIATE idiom so two peers racing to clear the last two
+    # sysadmin-granting groups can't both pass the check.
+    conn.isolation_level = None
     try:
+        conn.execute("BEGIN IMMEDIATE")
         existing = conn.execute(
-            "SELECT 1 FROM groups WHERE group_id = ?", (group_id,),
+            "SELECT is_sysadmin FROM groups WHERE group_id = ?", (group_id,),
         ).fetchone()
         if existing is None:
+            conn.execute("ROLLBACK")
             return _error(
                 error=_ERROR_NOT_FOUND,
                 message=f"unknown group_id: {group_id!r}",
                 status=404,
             )
+        if demoting and existing["is_sysadmin"] and _is_last_sysadmin_group(
+            conn, group_id,
+        ):
+            conn.execute("ROLLBACK")
+            return _last_sysadmin_error("demote")
         params.append(group_id)
         try:
             conn.execute(
                 f"UPDATE groups SET {', '.join(sets)} WHERE group_id = ?",
                 params,
             )
-            conn.commit()
         except sqlite3.IntegrityError:
+            conn.execute("ROLLBACK")
             return _error(
                 error=_ERROR_CONFLICT,
                 message="group name already taken",
@@ -1062,6 +1126,7 @@ async def edit_group_handler(req: web.Request) -> web.Response:
             (group_id,),
         ).fetchone()
         member_count = _group_member_count(conn, group_id)
+        conn.execute("COMMIT")
     finally:
         conn.close()
     return _success({"group": _group_public_row(row, member_count)})
@@ -1077,12 +1142,19 @@ async def delete_group_handler(req: web.Request) -> web.Response:
     _ensure_wave1a_schema()
     group_id = req.match_info["group_id"]
     conn = _connect()
+    # Manual transaction: the last-sysadmin-group check + DELETE must be
+    # atomic so two racing deletes can't each remove the final two
+    # sysadmin-granting groups (BEGIN IMMEDIATE serialises; the loser is
+    # rejected). Mirrors delete_user_handler's idiom.
+    conn.isolation_level = None
     try:
+        conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
             "SELECT is_sysadmin FROM groups WHERE group_id = ?",
             (group_id,),
         ).fetchone()
         if row is None:
+            conn.execute("ROLLBACK")
             return _error(
                 error=_ERROR_NOT_FOUND,
                 message=f"unknown group_id: {group_id!r}",
@@ -1095,9 +1167,16 @@ async def delete_group_handler(req: web.Request) -> web.Response:
         # group it cannot DEMOTE — destroying the group-conferred sysadmin
         # grant to every member, superseding the demote guard (AZ-R10-1).
         if row["is_sysadmin"] and not _caller_is_sysadmin(req):
+            conn.execute("ROLLBACK")
             return _forbid_sysadmin_write(req)
+        # R4-F1: deleting the deployment's LAST sysadmin-granting group
+        # zeroes the sysadmin count exactly like demoting/deleting the
+        # last direct-flag sysadmin — same guard, same 409 shape.
+        if row["is_sysadmin"] and _is_last_sysadmin_group(conn, group_id):
+            conn.execute("ROLLBACK")
+            return _last_sysadmin_error("delete")
         conn.execute("DELETE FROM groups WHERE group_id = ?", (group_id,))
-        conn.commit()
+        conn.execute("COMMIT")
     finally:
         conn.close()
     return _success({"deleted": group_id})
@@ -1778,6 +1857,33 @@ async def replace_group_capabilities_handler(
             ),
             status=400,
             extra={"unknown": unknown},
+        )
+
+    # SEC R2-F3 (2026-08-19) — ``group_capability`` has no
+    # ``project_name`` column, so a resource-tier (non-``system.*``)
+    # grant here is global across every project the caller can reach,
+    # not scoped to whatever project the operator intended. That's a
+    # confirmed cross-project privilege-escalation primitive (see
+    # ``core.capabilities.resolve_capabilities``, which now only
+    # admits ``system.*`` caps sourced from this table). Rather than
+    # silently accepting a resource-tier grant that becomes a no-op
+    # downstream, fail loud here: resource-tier delegation to a group
+    # already has a correctly project-scoped mechanism —
+    # ``project_membership.role`` (``PROJECT_ROLE_BUNDLES``), set via
+    # the project-membership endpoints, not this one.
+    non_system = [c for c in ordered if not c.startswith("system.")]
+    if non_system:
+        return _error(
+            error="resource_capability_not_delegable_to_group",
+            message=(
+                "group_capability grants are global (no project scope) "
+                "and may only carry system.* capabilities; resource-tier "
+                "capability string(s) "
+                f"{', '.join(repr(c) for c in non_system)} must be "
+                "granted via project_membership.role instead"
+            ),
+            status=400,
+            extra={"non_system": non_system},
         )
 
     from ..repositories import group_capability_repository as _gcap

@@ -190,10 +190,9 @@ let
     src = "${src}/agent_mcp/dashboard";
     # Re-set whenever the dashboard's package-lock.json changes
     # upstream (rare). On hash mismatch, nix prints the correct
-    # value; paste it here. Updated 2026-08-12 for audit AF-B —
-    # dropped 5 dead UI deps (@radix-ui react-avatar/navigation-menu/
-    # progress/slider + react-resizable-panels).
-    npmDepsHash = "sha256-Nvzfff4/ZS4eZRybLKX7xipgCU9eXx1dr7g6zO15ntc=";
+    # value; paste it here. Updated 2026-08-19 for pentest-all R1-F3 —
+    # nanoid override (^3.3.18) closing GHSA-2v37-7h3g-55p8.
+    npmDepsHash = "sha256-LhcOeeLIbG5Jezjc7UVZSWzywvMxyV6xttoBHytqoeI=";
     NEXT_PUBLIC_AUTO_CONNECT = "false";
     NEXT_PUBLIC_DEFAULT_SERVER_HOST = "";
     NEXT_PUBLIC_DEFAULT_SERVER_PORT = "";

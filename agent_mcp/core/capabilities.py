@@ -288,7 +288,38 @@ def resolve_capabilities(
                 # above, never sourced from a group row; intersect with
                 # KNOWN_CAPABILITIES (which excludes ``"*"``) so any
                 # non-known string is dropped.
-                caps |= _gcap_fetch(gid) & KNOWN_CAPABILITIES
+                #
+                # SEC R2-F3 (2026-08-19): ``group_capability`` has no
+                # ``project_name`` column — a grant is global to every
+                # project the caller can reach, unlike
+                # ``PROJECT_ROLE_BUNDLES`` (sourced from
+                # ``project_membership.role``, which IS correctly
+                # project-scoped via ``group_resolver``). Unioning a
+                # resource-tier cap (e.g. ``memories.create``) from a
+                # group row therefore lets an admin's grant intended
+                # for project A silently authorise the SAME caller in
+                # unrelated project B — a cross-project privilege
+                # escalation confirmed live against the ``/mcp`` wire
+                # (REST is separately gated by
+                # ``require_operator_session_middleware``, but ``/mcp``
+                # delegates authz entirely to each tool's bare
+                # ``has_capability`` check). ``system.*`` caps have no
+                # project dimension to violate — they're deployment-
+                # wide router-admin verbs by design (see
+                # ``Principal.has_capability``'s own ``system.``
+                # short-circuit) — so only THOSE are admitted from a
+                # group row. Resource-tier (non-``system.*``) caps must
+                # flow only through the already project-scoped
+                # ``PROJECT_ROLE_BUNDLES`` path below. The write side
+                # (``admin_users_api.replace_group_capabilities_handler``)
+                # mirrors this by rejecting non-``system.*`` grants to a
+                # group outright, so this filter should never actually
+                # need to drop a row in a healthy deploy — it's here as
+                # the authoritative enforcement point regardless.
+                caps |= {
+                    cap for cap in (_gcap_fetch(gid) & KNOWN_CAPABILITIES)
+                    if cap.startswith("system.")
+                }
         except Exception:  # pragma: no cover - router.db not available
             # Tests / per-project backend / cold-start paths reach
             # here. The bundle (resolved below) is still applied; only

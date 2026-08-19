@@ -218,11 +218,16 @@ async def create_task_api_route(
 
     # F004 (verify-all-v6 MUTATING #3): distinguish an absent title from
     # one whose content was stripped to empty by the JSON-input sanitizer
-    # (utils/json_utils.py removes NULL/control bytes and zero-width
-    # Unicode BEFORE the JSON parse — a body like ``{"task_title":"\x00"}``
-    # arrives here as ``{"task_title":""}``). This distinction depends on
-    # the raw HTTP body + sanitizer, so it stays a wire-level concern here
-    # rather than in the tool. Whitespace-only titles are also rejected.
+    # (utils/json_utils.py::sanitize_json_input unconditionally strips
+    # NULL/control bytes from every string leaf of the PARSED body,
+    # after the JSON parse completes -- R4-F3: this now also covers a
+    # title made of standard JSON Unicode-escaped control characters
+    # (backslash-u001b, backslash-u0000, etc), which parse successfully
+    # as valid JSON and previously bypassed sanitization entirely. Such
+    # a title arrives here already reduced to the empty string. This
+    # distinction depends on the raw HTTP body + sanitizer, so it stays
+    # a wire-level concern here rather than in the tool. Whitespace-only
+    # titles are also rejected.
     if raw_title is None:
         return JSONResponse(
             {"error": "task_title is required"}, status_code=400

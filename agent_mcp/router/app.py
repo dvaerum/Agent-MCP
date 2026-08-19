@@ -105,7 +105,13 @@ import time
 from pathlib import Path
 from urllib.parse import quote
 
-from aiohttp import ClientSession, ClientTimeout, UnixConnector, web
+from aiohttp import (
+    ClientConnectorError,
+    ClientSession,
+    ClientTimeout,
+    UnixConnector,
+    web,
+)
 
 from . import project_registry  # sibling module — see ./project_registry.py
 from . import mount  # ADR-0020: per-request external prefix/origin
@@ -782,16 +788,29 @@ async def _proxy_to_backend(
     # decrements `active_conns` — so ONE abandoned SSE pins the backend
     # against the idle reaper for the agent bearer's whole lifetime.
     # Detect streaming up front (the SSE verb/path) and cap concurrency
-    # BEFORE opening the upstream; the response Content-Type is a
-    # belt-and-suspenders second signal below for any streaming POST.
-    # /mcp, the ADR-0021 delivery stream, and the operator dashboard SSE
-    # (/api/<project>/events → backend /api/events) are all long-lived,
-    # infinite text/event-stream responses. Each gets the concurrency cap
-    # + the structural streaming anchor here, so keep-alive doesn't depend
-    # solely on sniffing the response Content-Type (a backend content-type
+    # BEFORE opening the upstream. /mcp, the ADR-0021 delivery stream,
+    # and the operator dashboard SSE (/api/<project>/events → backend
+    # /api/events) are all long-lived, infinite text/event-stream
+    # responses. Each gets the concurrency cap + the structural
+    # streaming anchor here, so keep-alive doesn't depend solely on
+    # sniffing the response Content-Type (a backend content-type
     # regression would otherwise buffer it → pin active_conns against the
     # idle reaper) AND each holds a slot so a client can't open unbounded
     # concurrent streams (R8-F2 for the agent SSE, R14-F2 for operator SSE).
+    #
+    # R4-F2: this verb/path pre-check can only cover GET, because for a
+    # POST the streaming-ness of the response isn't knowable until the
+    # upstream's Content-Type header lands (below). But `POST /mcp`
+    # `tools/call` → `wait_for_events` can ALSO come back as an
+    # indefinite `text/event-stream` hold (the backend's
+    # `_HEARTBEAT_NO_CAP` branch) — the modality real agents use for
+    # their resting wake-loop connection. Left uncapped here, that path
+    # made `MAX_STREAMS_GLOBAL` unenforced for the common case. The
+    # `is_streaming` check just below (now genuinely a second signal,
+    # not just Content-Type sniffing for the pump choice) retroactively
+    # acquires the SAME cap for a POST the instant streaming is
+    # confirmed — see the `is_streaming and not is_stream_request`
+    # branch a few lines down.
     is_stream_request = req.method == "GET" and backend_path in (
         "/mcp",
         "/api/delivery/stream",
@@ -809,52 +828,100 @@ async def _proxy_to_backend(
                 # cleanly instead of hanging or leaking another pinned
                 # upstream. See `_po._track_streaming_proxy`.
                 return _too_many_streams_response()
-            async with ClientSession(
-                connector=connector, timeout=timeout,
-            ) as sess:
-                async with sess.request(
-                    req.method,
-                    url,
-                    headers=headers,
-                    data=req_body,
-                    params=req.rel_url.query,
-                ) as up:
-                    last_active[(name, "backend")] = time.time()
-                    ctype = up.headers.get("Content-Type", "")
-                    is_streaming = (
-                        is_stream_request
-                        or ctype.startswith("text/event-stream")
-                    )
-                    out_headers = {
-                        k: v for k, v in up.headers.items()
-                        if k.lower()
-                        not in ("transfer-encoding", "content-length")
-                    }
-                    if is_streaming:
-                        # Framing-preserving pump: forward chunks as they
-                        # arrive so bytes flow to the client incrementally
-                        # instead of buffering an unbounded body. The
-                        # upstream's lifetime is tied to the client —
-                        # returning from here (client gone, or upstream
-                        # ended) exits the `async with sess.request(...)`
-                        # scope, closes `up`, and lets `_track_connection`
-                        # decrement so the reaper works again.
-                        return await _stream_upstream_to_client(
-                            req, up, name, out_headers,
+            try:
+                async with ClientSession(
+                    connector=connector, timeout=timeout,
+                ) as sess:
+                    async with sess.request(
+                        req.method,
+                        url,
+                        headers=headers,
+                        data=req_body,
+                        params=req.rel_url.query,
+                    ) as up:
+                        last_active[(name, "backend")] = time.time()
+                        ctype = up.headers.get("Content-Type", "")
+                        is_streaming = (
+                            is_stream_request
+                            or ctype.startswith("text/event-stream")
                         )
-                    # Pure pass-through for terminating responses: read
-                    # the full upstream body and hand it back as a
-                    # complete `web.Response`. aiohttp then serialises a
-                    # correct Content-Length with no chunked-transfer
-                    # involvement, so strict HTTP clients (curl, Claude
-                    # Code's MCP client) see a cleanly-terminated
-                    # transfer. A client that drops mid-`await up.read()`
-                    # raises ConnectionResetError out of this scope, which
-                    # tears the upstream down via the same context exit.
-                    body = await up.read()
-                    return web.Response(
-                        body=body, status=up.status, headers=out_headers,
-                    )
+                        out_headers = {
+                            k: v for k, v in up.headers.items()
+                            if k.lower()
+                            not in ("transfer-encoding", "content-length")
+                        }
+                        if is_streaming:
+                            # Framing-preserving pump: forward chunks as they
+                            # arrive so bytes flow to the client incrementally
+                            # instead of buffering an unbounded body. The
+                            # upstream's lifetime is tied to the client —
+                            # returning from here (client gone, or upstream
+                            # ended) exits the `async with sess.request(...)`
+                            # scope, closes `up`, and lets `_track_connection`
+                            # decrement so the reaper works again.
+                            if is_stream_request:
+                                # GET SSE path: already admitted (and
+                                # holding a slot) via `stream_cap` above,
+                                # before the upstream was even opened.
+                                return await _stream_upstream_to_client(
+                                    req, up, name, out_headers,
+                                )
+                            # R4-F2: a POST whose response turned out to
+                            # be streaming (e.g. `wait_for_events`'s
+                            # uncapped heartbeat hold) was NOT admission-
+                            # checked above — acquire the identical cap
+                            # now, keyed the same way as the GET path,
+                            # now that the upstream's Content-Type has
+                            # confirmed it needs one. Reject (429) if
+                            # already saturated instead of holding an
+                            # unbounded number of these indefinite
+                            # POST-based streams open; exiting this
+                            # `async with` on either path releases the
+                            # upstream via the enclosing `sess.request`
+                            # scope, same as the pre-check rejection.
+                            async with _po._track_streaming_proxy(
+                                _sse_agent_key(req, headers),
+                            ) as post_admitted:
+                                if not post_admitted:
+                                    return _too_many_streams_response()
+                                return await _stream_upstream_to_client(
+                                    req, up, name, out_headers,
+                                )
+                        # Pure pass-through for terminating responses: read
+                        # the full upstream body and hand it back as a
+                        # complete `web.Response`. aiohttp then serialises a
+                        # correct Content-Length with no chunked-transfer
+                        # involvement, so strict HTTP clients (curl, Claude
+                        # Code's MCP client) see a cleanly-terminated
+                        # transfer. A client that drops mid-`await up.read()`
+                        # raises ConnectionResetError out of this scope, which
+                        # tears the upstream down via the same context exit.
+                        body = await up.read()
+                        return web.Response(
+                            body=body, status=up.status, headers=out_headers,
+                        )
+            except ClientConnectorError as exc:
+                # R3-F3 [defense-in-depth / 500-hygiene]: `sess.request(...)`
+                # performs the UDS `connect()` lazily on `__aenter__`, so a
+                # backend that vanished between `_ensure`'s socket-path
+                # resolution above and THIS connect — killed by a concurrent
+                # delete/rename/stop's `systemctl stop` (the admin_api.py
+                # active_conns TOCTOU class-sweep — this is the independent
+                # backstop for the same race, from the proxy side), or
+                # crashed/restarted for any other reason — raises
+                # `UnixClientConnectorError`, a `ClientConnectorError`
+                # subclass. Confirmed by direct repro against a real UDS:
+                # BOTH a missing socket file and an actively-refused connect
+                # (socket path exists, nothing listening) land here
+                # identically. Previously uncaught, so it fell through to
+                # aiohttp's generic handler as a raw unhandled 500 + full
+                # server traceback. A gone backend is neither a client fault
+                # nor a genuine server bug — answer with a clean, retryable
+                # 502 instead.
+                log.warning(
+                    "backend connect failed for project %s: %s", name, exc,
+                )
+                return _backend_unavailable_response()
 
 
 def _sse_agent_key(req: web.Request, headers: dict[str, str]) -> str:
@@ -886,6 +953,20 @@ def _sse_agent_key(req: web.Request, headers: dict[str, str]) -> str:
     if not auth:
         return "anon"
     return hashlib.sha256(auth.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def _backend_unavailable_response() -> web.Response:
+    """Clean 502 for a backend that vanished between `_ensure` and the
+    proxy's UDS connect (R3-F3): reaped by a concurrent delete/rename/
+    stop, or crashed/restarted for any other reason. Fixed,
+    project-agnostic body — never reflect the raw aiohttp connector
+    exception (socket path, OS errno text) into the client envelope.
+    """
+    return web.Response(
+        status=502,
+        headers={"Retry-After": "2"},
+        text="Backend temporarily unavailable; retry shortly.",
+    )
 
 
 def _too_many_streams_response() -> web.Response:
