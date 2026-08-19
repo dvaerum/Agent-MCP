@@ -100,15 +100,25 @@ pub fn parse_frame(data: &str) -> Result<Frame, serde_json::Error> {
 /// the C0/C1 check covers, so a category-aware pass is needed rather than
 /// widening the range table by hand.
 ///
-/// One demonstrated-exploitable codepoint falls outside `Cf`: U+034F
-/// COMBINING GRAPHEME JOINER is classified `Mn` (Mark, nonspacing) by
-/// Unicode, not `Cf`, despite functioning purely as an invisible formatting
-/// control (it carries no visible glyph of its own; its only effect is to
-/// block canonical reordering/normalisation of neighbouring combining
-/// marks) — the general-category taxonomy is a legacy-rendering artifact
-/// here, not a signal that it's meaningful surviving content. It is
-/// stripped explicitly rather than by widening the check to all of
-/// `Mn`/`Mc`/`Me`, which would also catch the combining diacritics that
+/// Some demonstrated-exploitable codepoints fall outside `Cf`, all
+/// classified `Mn` (Mark, nonspacing) by Unicode despite functioning purely
+/// as invisible formatting controls — the general-category taxonomy is a
+/// legacy-rendering artifact here, not a signal that it's meaningful
+/// surviving content:
+///
+/// - U+034F COMBINING GRAPHEME JOINER (CGJ) carries no visible glyph of its
+///   own; its only effect is to block canonical reordering/normalisation of
+///   neighbouring combining marks.
+/// - U+FE00–U+FE0F (Variation Selectors 1–16) and U+E0100–U+E01EF
+///   (Variation Selectors 17–256, supplement plane) also carry no glyph of
+///   their own: each only ever modifies/annotates the glyph of the
+///   preceding character, or renders as nothing at all when unpaired. That
+///   is up to 256 distinct codepoints across both blocks — a full smuggled
+///   byte per character, a documented real-world "invisible Unicode"
+///   data-hiding technique (R5-F9).
+///
+/// These are stripped explicitly rather than by widening the check to all
+/// of `Mn`/`Mc`/`Me`, which would also catch the combining diacritics that
 /// legitimate non-Latin scripts (Vietnamese, Devanagari, Arabic vowel
 /// marks, …) render with — over-stripping those would break real content
 /// the C0/C1/Cf checks are not meant to touch.
@@ -127,7 +137,9 @@ fn sanitize_for_pane(s: &str) -> String {
             || ch == '\u{7f}'
             || (0x80..=0x9f).contains(&cp)
             || get_general_category(ch) == GeneralCategory::Format
-            || ch == '\u{034f}'; // CGJ — see doc comment above.
+            || ch == '\u{034f}' // CGJ — see doc comment above.
+            || (0xfe00..=0xfe0f).contains(&cp) // Variation Selectors 1-16
+            || (0xe0100..=0xe01ef).contains(&cp); // Variation Selectors 17-256
         if is_control {
             if !out.is_empty() {
                 pending_space = true;
@@ -347,6 +359,52 @@ mod tests {
         // The surrounding legible text should have survived the strip.
         assert!(out.contains("safe"));
         assert!(out.contains("gnp.exe"));
+        assert!(out.contains("end"));
+    }
+
+    #[test]
+    fn strips_variation_selectors_from_subject_and_title() {
+        // R5-F9: Unicode Variation Selectors (U+FE00-U+FE0F, and the
+        // supplement plane U+E0100-U+E01EF) are general category `Mn`
+        // (Mark, nonspacing) — the exact same category as U+034F CGJ, which
+        // R4-F4 already special-cases as an explicit exception because `Mn`
+        // as a whole is not stripped (it would over-strip legitimate
+        // combining diacritics). Like CGJ, variation selectors carry no
+        // glyph of their own: they either modify the glyph of the preceding
+        // character or render as nothing when unpaired. Up to 256 distinct
+        // codepoints across both blocks means a full byte can be smuggled
+        // invisibly per character, reaching the same render_skinny ->
+        // inject.rs -> AoE /api/sessions/{id}/send -> live pty chokepoint.
+        let evil_subject = "safe\u{FE0F}\u{FE01}mid\u{E0100}\u{E01EF}end";
+        let wire = serde_json::json!({
+            "type": "delivery",
+            "reason": "unread_messages",
+            "unread_count": 1,
+            "task_count": 0,
+            "unread_messages": [
+                {"message_id": "m1", "sender_id": "alice", "subject": evil_subject}
+            ],
+            "open_tasks": [],
+        })
+        .to_string();
+        let f = frame_json(&wire);
+        let out = render_skinny(&f);
+
+        for bad in [
+            '\u{FE00}', // VARIATION SELECTOR-1 (start of BMP block)
+            '\u{FE0F}', // VARIATION SELECTOR-16 (end of BMP block, e.g. emoji-style VS)
+            '\u{FE01}',
+            '\u{E0100}', // VARIATION SELECTOR-17 (start of supplement block)
+            '\u{E01EF}', // VARIATION SELECTOR-256 (end of supplement block)
+        ] {
+            assert!(
+                !out.contains(bad),
+                "rendered output still contains variation selector {bad:?}: {out:?}"
+            );
+        }
+        // The surrounding legible text should have survived the strip.
+        assert!(out.contains("safe"));
+        assert!(out.contains("mid"));
         assert!(out.contains("end"));
     }
 
