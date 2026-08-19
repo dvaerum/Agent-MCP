@@ -36,9 +36,10 @@ stream from the JSON Accept-version gate).
 
 from __future__ import annotations
 
+import asyncio
 import json
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
@@ -57,6 +58,34 @@ router = APIRouter(prefix="/api", tags=["events"])
 # forever.
 PING_SECONDS = 15
 
+# How often an OPEN operator stream re-checks that its session is still
+# valid (R5-F1). Mirrors the delivery stream's REVALIDATE_SECONDS
+# (delivery.py, R13-F2) and the GET /mcp pump's per-heartbeat
+# `_bearer_is_active` re-check (main_app.py:1336, AC-R29-1): a stream
+# authenticates ONCE at open, then this loop pumps indefinitely, so a
+# revoked cookie / dropped project membership must tear it down rather
+# than survive it. Kept ≤ PING_SECONDS so revocation latency never
+# exceeds one keepalive interval.
+REVALIDATE_SECONDS = PING_SECONDS
+
+
+async def _still_authorized(request: Request) -> bool:
+    """True iff ``request``'s caller would still pass
+    :func:`require_operator_session` right now.
+
+    Re-runs the SAME gate the stream opened with — session validity
+    (cookie path: is the session row still live?) AND project
+    membership/role (a viewer/membership change is re-enforced, not just
+    initial login) — swallowing the 401/403 it raises into a bool so the
+    generator loop can close cleanly instead of propagating an exception
+    into an already-open SSE body.
+    """
+    try:
+        await require_operator_session(request)
+        return True
+    except HTTPException:
+        return False
+
 
 @router.get("/events")
 async def operator_events_stream(
@@ -71,11 +100,28 @@ async def operator_events_stream(
         sub = operator_events.subscribe(user_id=user_id)
         try:
             while True:
-                # EventSourceResponse cancels this coroutine on client
-                # disconnect, so a blocked get() unblocks into the
-                # finally below; pings are emitted by sse-starlette
+                # R5-F1: re-validate before every wait — teardown on
+                # revocation. EventSourceResponse cancels this coroutine
+                # on client disconnect (a blocked get() unblocks into the
+                # finally below); pings are emitted by sse-starlette
                 # independently of this loop.
-                item = await sub.queue.get()
+                if not await _still_authorized(request):
+                    return
+                try:
+                    # Bounded wait so revocation is noticed within
+                    # REVALIDATE_SECONDS even when no event arrives; on
+                    # timeout we loop back to the liveness check above.
+                    item = await asyncio.wait_for(
+                        sub.queue.get(), timeout=REVALIDATE_SECONDS
+                    )
+                except asyncio.TimeoutError:
+                    continue
+                # Re-validate post-dequeue: an event may have been
+                # queued before revocation and only reach the front of
+                # the FIFO afterwards — never wire it to a caller who is
+                # no longer authorized.
+                if not await _still_authorized(request):
+                    return
                 yield {"data": json.dumps(item)}
         finally:
             operator_events.unsubscribe(sub)
