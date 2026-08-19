@@ -444,9 +444,9 @@ def group_has_transitive_user_member(
     directly, or nested via nested subgroups (downward closure).
 
     The group-rooted mirror of ``resolve_user_groups``'s upward walk,
-    used by the last-sysadmin-group lockout guard (R4-F1,
-    ``admin_users_api._is_last_sysadmin_group``) to decide whether an
-    OTHER ``is_sysadmin = 1`` group is a live path to sysadmin (has an
+    used by the deployment-wide sysadmin-lockout guard (R4-F1 → R5-F4,
+    ``admin_users_api._no_sysadmin_would_remain``) to decide whether an
+    ``is_sysadmin = 1`` group is a live path to sysadmin (has an
     actual member) or a dud (no members, so it confers sysadmin on
     nobody today).
     """

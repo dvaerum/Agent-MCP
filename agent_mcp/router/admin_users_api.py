@@ -356,46 +356,45 @@ def _is_last_sysadmin(conn: sqlite3.Connection, user_id: str) -> bool:
     return others is None
 
 
-def _is_last_sysadmin_group(conn: sqlite3.Connection, group_id: str) -> bool:
-    """True iff clearing/deleting ``group_id``'s OWN ``is_sysadmin = 1``
-    grant would leave the deployment with zero sysadmins.
+def _no_sysadmin_would_remain(conn: sqlite3.Connection) -> bool:
+    """True iff, given the CURRENT (possibly not-yet-committed) state of
+    ``conn``, no user in the deployment has effective sysadmin access —
+    neither the direct ``users.is_sysadmin`` flag nor transitively via
+    any ``is_sysadmin = 1`` group's downward membership closure.
 
-    R4-F1: the group-conferred sibling of ``_is_last_sysadmin``. A
-    sysadmin-flagged group confers sysadmin transitively to every
-    member (``group_resolver``'s upward closure, same mechanism the
-    AZ-1/AZ-2 amplification guards rely on), so ``edit_group_handler``
-    clearing the flag or ``delete_group_handler`` deleting the group
-    is itself a sysadmin-DEMOTE-or-DELETE in disguise for every one of
-    its members — it must be guarded exactly like the direct-flag path,
-    just computed over the transitive closure instead of one row.
+    R5-F4: the general, transitive-graph-aware sibling of
+    ``_is_last_sysadmin`` (R4-F1's ``_is_last_sysadmin_group`` folded
+    into this). R4-F1 guarded exactly two vectors — clearing a group's
+    OWN ``is_sysadmin`` flag, deleting an ``is_sysadmin = 1`` group row
+    — by asking "would removing THIS ONE row's grant zero the count",
+    computed by excluding that one row and checking what's left. That
+    shape only covers a mutation that wipes an entire row's
+    contribution; it says nothing about draining a sysadmin group's
+    sole live MEMBER (the group row survives, flag and all — just
+    empty), or a cascade that severs an unflagged intermediate group's
+    only path up to a flagged ANCESTOR (that intermediate group's own
+    row was never inspected).
 
-    Unions two live paths to sysadmin, ignoring ``group_id``'s own
-    grant (the one about to be removed):
-      * any user holding the DIRECT ``users.is_sysadmin`` flag — that
-        stays true regardless of any group's flag;
-      * any OTHER ``is_sysadmin = 1`` group (``group_id`` excluded)
-        that currently has at least one user reachable in its downward
-        membership closure (``group_resolver.
-        group_has_transitive_user_member`` — the same graph traversal
-        machinery ``resolve_user_project_role``/AZ-1/AZ-2 already rely
-        on). A sysadmin-flagged group with ZERO current members confers
-        sysadmin on nobody today, so it does not count as a live other
-        path — it would not stop the system's sysadmin count hitting
-        zero.
-
-    Caller must hold the write lock (``BEGIN IMMEDIATE``) across this
-    check and the mutating statement, mirroring ``_is_last_sysadmin``'s
-    TOCTOU-safe usage in ``edit_user_handler``/``delete_user_handler``.
+    Rather than re-deriving a bespoke "what changed" exclusion per
+    call site, this instead re-evaluates the invariant directly against
+    whatever the caller has ALREADY done to ``conn`` — an UPDATE, a
+    DELETE, an ``ON DELETE CASCADE`` — so it catches every shape of
+    mutation that can shrink the deployment's effective sysadmin
+    population to zero, not just clear-the-flag / delete-the-row.
+    Callers run their mutation FIRST inside a ``BEGIN IMMEDIATE``, call
+    this, and ``ROLLBACK`` (returning the same 409 ``_last_sysadmin_error``
+    shape ``_is_last_sysadmin`` already uses) when it returns True;
+    ``COMMIT`` otherwise. Mirrors ``_is_last_sysadmin``'s TOCTOU-safe
+    usage in ``edit_user_handler``/``delete_user_handler``.
     """
     if conn.execute(
         "SELECT 1 FROM users WHERE is_sysadmin = 1 LIMIT 1"
     ).fetchone() is not None:
         return False
-    other_groups = conn.execute(
-        "SELECT group_id FROM groups WHERE is_sysadmin = 1 AND group_id != ?",
-        (group_id,),
+    sysadmin_groups = conn.execute(
+        "SELECT group_id FROM groups WHERE is_sysadmin = 1"
     ).fetchall()
-    for row in other_groups:
+    for row in sysadmin_groups:
         if group_resolver.group_has_transitive_user_member(
             row["group_id"], conn=conn,
         ):
@@ -933,10 +932,20 @@ async def delete_user_handler(req: web.Request) -> web.Response:
         if row["is_sysadmin"] and not _caller_is_sysadmin(req):
             conn.execute("ROLLBACK")
             return _forbid_sysadmin_write(req)
-        if row["is_sysadmin"] and _is_last_sysadmin(conn, user_id):
+        conn.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+        # R5-F4: re-evaluate the GLOBAL invariant AFTER the delete has
+        # already cascaded away this user's ``group_membership`` rows. The
+        # old pre-delete check (``_is_last_sysadmin``) only ever looked at
+        # THIS user's own direct flag, so deleting a user whose sysadmin
+        # came SOLELY via being a sysadmin-group's only live member sailed
+        # through unguarded — their cascading group_membership row was
+        # never consulted. The post-delete check catches that the same way
+        # it catches the direct-flag case (``_is_last_sysadmin`` stays the
+        # canonical direct-flag check for edit_user_handler's demote path,
+        # which never touches group_membership).
+        if _no_sysadmin_would_remain(conn):
             conn.execute("ROLLBACK")
             return _last_sysadmin_error("delete")
-        conn.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
         conn.execute("COMMIT")
     finally:
         conn.close()
@@ -1080,15 +1089,15 @@ async def edit_group_handler(req: web.Request) -> web.Response:
             status=400,
         )
     # Demotion = clearing an existing group sysadmin bit. Guarded below
-    # against zeroing the deployment's sysadmin count (R4-F1: the
+    # against zeroing the deployment's sysadmin count (R4-F1 → R5-F4: the
     # group-conferred sibling of edit_user_handler's last-sysadmin
     # lockout).
     demoting = "is_sysadmin" in body and not is_sysadmin_val
     conn = _connect()
-    # Manual transaction so the last-sysadmin-group check and the UPDATE
-    # are atomic under one write-lock — mirrors edit_user_handler's
-    # BEGIN IMMEDIATE idiom so two peers racing to clear the last two
-    # sysadmin-granting groups can't both pass the check.
+    # Manual transaction so the lockout check and the UPDATE are atomic
+    # under one write-lock — mirrors edit_user_handler's BEGIN IMMEDIATE
+    # idiom so two peers racing to clear the last two sysadmin-granting
+    # groups can't both pass the check.
     conn.isolation_level = None
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -1102,11 +1111,6 @@ async def edit_group_handler(req: web.Request) -> web.Response:
                 message=f"unknown group_id: {group_id!r}",
                 status=404,
             )
-        if demoting and existing["is_sysadmin"] and _is_last_sysadmin_group(
-            conn, group_id,
-        ):
-            conn.execute("ROLLBACK")
-            return _last_sysadmin_error("demote")
         params.append(group_id)
         try:
             conn.execute(
@@ -1120,6 +1124,16 @@ async def edit_group_handler(req: web.Request) -> web.Response:
                 message="group name already taken",
                 status=409,
             )
+        # R5-F4: re-evaluate the GLOBAL invariant AFTER the UPDATE has
+        # already cleared the flag — the transitive-graph-aware sibling of
+        # the old pre-mutation single-row check. Renaming a group can't
+        # affect the membership graph, so this only ever fires on an
+        # actual demotion.
+        if demoting and existing["is_sysadmin"] and _no_sysadmin_would_remain(
+            conn,
+        ):
+            conn.execute("ROLLBACK")
+            return _last_sysadmin_error("demote")
         row = conn.execute(
             "SELECT group_id, name, is_sysadmin, created_at "
             "FROM groups WHERE group_id = ?",
@@ -1160,22 +1174,40 @@ async def delete_group_handler(req: web.Request) -> web.Response:
                 message=f"unknown group_id: {group_id!r}",
                 status=404,
             )
-        # Deleting a sysadmin-flagged group is sysadmin-only, mirroring
-        # the demote guard in edit_group_handler (clearing the group's
-        # is_sysadmin bit is _forbid_sysadmin_write, 403). Without this, a
-        # delegate with only system.groups.manage could DELETE a sysadmin
-        # group it cannot DEMOTE — destroying the group-conferred sysadmin
-        # grant to every member, superseding the demote guard (AZ-R10-1).
-        if row["is_sysadmin"] and not _caller_is_sysadmin(req):
+        # Deleting a sysadmin group is sysadmin-only, mirroring the demote
+        # guard in edit_group_handler (clearing the group's is_sysadmin bit
+        # is _forbid_sysadmin_write, 403). Without this, a delegate with
+        # only system.groups.manage could DELETE a sysadmin group it cannot
+        # DEMOTE — destroying the group-conferred sysadmin grant to every
+        # member, superseding the demote guard (AZ-R10-1).
+        #
+        # R5-F4: gate on the group's TRANSITIVE sysadmin status (itself OR
+        # any ancestor that references it via member_group_id), not just
+        # its own ``is_sysadmin`` column — an unflagged intermediate group
+        # that is the sole path up to a flagged ancestor confers sysadmin
+        # on its members exactly like a directly-flagged group does, and
+        # the add/remove-member siblings already gate on the transitive
+        # resolver (``store.group_is_transitively_sysadmin``); this gate
+        # was the odd one out, keyed on the local column.
+        if not _caller_is_sysadmin(
+            req
+        ) and store.group_is_transitively_sysadmin(group_id, conn=conn):
             conn.execute("ROLLBACK")
             return _forbid_sysadmin_write(req)
-        # R4-F1: deleting the deployment's LAST sysadmin-granting group
-        # zeroes the sysadmin count exactly like demoting/deleting the
-        # last direct-flag sysadmin — same guard, same 409 shape.
-        if row["is_sysadmin"] and _is_last_sysadmin_group(conn, group_id):
+        conn.execute("DELETE FROM groups WHERE group_id = ?", (group_id,))
+        # R4-F1 → R5-F4: re-evaluate the GLOBAL invariant AFTER the delete
+        # has already cascaded away this group's ``group_membership`` rows
+        # — both the row where it was a PARENT (its own members) and any
+        # row where it was itself a MEMBER of an ancestor group. The old
+        # pre-delete check only ever inspected this group's own
+        # ``is_sysadmin`` column, so deleting an unflagged intermediate
+        # group that was an ancestor's sole live path to sysadmin sailed
+        # through with zero lockout check consulted; the post-delete check
+        # catches that cascade the same way it catches the direct-flag
+        # case.
+        if _no_sysadmin_would_remain(conn):
             conn.execute("ROLLBACK")
             return _last_sysadmin_error("delete")
-        conn.execute("DELETE FROM groups WHERE group_id = ?", (group_id,))
         conn.execute("COMMIT")
     finally:
         conn.close()
@@ -1412,7 +1444,14 @@ async def remove_group_member_handler(req: web.Request) -> web.Response:
     parent_group_id = req.match_info["group_id"]
     member_id = req.match_info["member_id"]
     conn = _connect()
+    # Manual transaction (R5-F4): the lockout check below must see the
+    # DELETE's effect before deciding whether to keep it, and two racing
+    # removals that would each independently look safe but together zero
+    # the count must not both pass — BEGIN IMMEDIATE serialises them.
+    # Mirrors delete_user_handler / delete_group_handler's idiom.
+    conn.isolation_level = None
     try:
+        conn.execute("BEGIN IMMEDIATE")
         # AZ-R12-1 (revoke mirror of add_group_member_handler's three
         # amplification guards): removing a member STRIPS the authority the
         # parent group confers on that member — the symmetric operation of
@@ -1426,16 +1465,19 @@ async def remove_group_member_handler(req: web.Request) -> web.Response:
         #   * a project role above the delegate's own.
         if not _caller_is_sysadmin(req):
             if store.group_is_transitively_sysadmin(parent_group_id, conn=conn):
+                conn.execute("ROLLBACK")
                 return _forbid_sysadmin_membership(req)
             inherited = _group_resolved_capabilities(conn, parent_group_id)
             lacked = _caps_caller_lacks(req, inherited)
             if lacked:
+                conn.execute("ROLLBACK")
                 return _forbid_cap_amplification(req, lacked)
             for project, role in store.group_resolved_project_roles(
                 parent_group_id, conn=conn,
             ).items():
                 denied = _membership_grant_denied(req, project, role)
                 if denied is not None:
+                    conn.execute("ROLLBACK")
                     return denied
         cur = conn.execute(
             "DELETE FROM group_membership "
@@ -1444,6 +1486,7 @@ async def remove_group_member_handler(req: web.Request) -> web.Response:
             (parent_group_id, member_id, member_id),
         )
         if cur.rowcount == 0:
+            conn.execute("ROLLBACK")
             return _error(
                 error=_ERROR_NOT_FOUND,
                 message=(
@@ -1452,7 +1495,18 @@ async def remove_group_member_handler(req: web.Request) -> web.Response:
                 ),
                 status=404,
             )
-        conn.commit()
+        # R5-F4 vector 1: draining a sysadmin group's SOLE remaining live
+        # member has the identical end-state as clearing the group's flag
+        # or deleting the group outright (zero people the group actually
+        # grants sysadmin to) but, unlike those two, had NO last-sysadmin
+        # check at all — only the unrelated amplification guard above,
+        # which a sysadmin caller bypasses entirely. Re-evaluate the
+        # GLOBAL invariant after the removal; reject with the same 409
+        # shape the other three vectors use if it would zero the count.
+        if _no_sysadmin_would_remain(conn):
+            conn.execute("ROLLBACK")
+            return _last_sysadmin_error("remove")
+        conn.execute("COMMIT")
     finally:
         conn.close()
     return _success({"removed": member_id})
