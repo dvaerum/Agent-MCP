@@ -300,13 +300,23 @@ def test_committed_allowlist_parses() -> None:
 def test_committed_allowlist_makes_the_known_divergence_green_and_honest() -> None:
     """The seeded allowlist accepts today's real closure advisories and nothing
     stale — proving the gate CATCHES the divergence (they are found) while
-    staying green (they are accepted with rationale). This uses the real OSV
-    two-record shape for cryptography to prove aliased duplicates reconcile."""
+    staying green (they are accepted with rationale).
+
+    R5-F2: this flake.lock bump moves the nixpkgs pin past cryptography
+    50.0.0, so GHSA-g6cj-pr64-35w5 is genuinely fixed and its allowlist entry
+    was retired (the gate correctly flagged it as stale, per its own
+    self-retiring design). pydantic-settings remains the one real, still-
+    shipping divergence — filter the shared synthetic fixture down to just
+    that advisory rather than the full 2026-08-09 snapshot, so this test
+    keeps proving "the committed allowlist matches the CURRENT real closure",
+    not a stale historical one.
+    """
     entries = audit.load_allowlist(ALLOWLIST.read_text())
-    unaccepted, stale = audit.reconcile(_sample_found(), entries)
+    still_shipping = [a for a in _sample_found() if a.package == "pydantic-settings"]
+    unaccepted, stale = audit.reconcile(still_shipping, entries)
     assert unaccepted == [], (
-        "the seeded allowlist should accept the known pydantic-settings + "
-        f"cryptography closure advisories; unaccepted={unaccepted}"
+        "the seeded allowlist should accept the known pydantic-settings "
+        f"closure advisory; unaccepted={unaccepted}"
     )
     assert stale == [], (
         "seeded allowlist entries must correspond to advisories actually "
