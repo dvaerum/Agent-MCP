@@ -85,7 +85,7 @@ def test_string_json_with_raw_c1_bytes_is_stripped() -> None:
 
 
 def test_bytes_json_with_raw_c1_bytes_is_stripped() -> None:
-    raw = 'before\x9bafter\x9dend'.encode("utf-8")
+    raw = "before\x9bafter\x9dend".encode()
     payload = ('{"subject": "' + raw.decode("utf-8") + '"}').encode("utf-8")
     result = sanitize_json_input(payload)
     assert result["subject"] == _C1_STRIPPED
