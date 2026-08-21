@@ -726,6 +726,17 @@ async def create_user_handler(req: web.Request) -> web.Response:
     """
     _ensure_wave1a_schema()
     body = await _json_body(req)
+    # R6-F2: ``_json_body`` just awaited on ``req.read()`` — a genuine
+    # yield point a slow-drip caller can hold open while a concurrent
+    # request revokes their capability. Re-check against a LIVE DB read
+    # (and refresh ``req['principal']``/``req['is_sysadmin']``) before
+    # trusting the caller for the `_caller_is_sysadmin` check below or the
+    # write itself.
+    from .perm_gates import revalidate_capability_or_403
+
+    denied = await revalidate_capability_or_403(req, "system.users.manage")
+    if denied is not None:
+        return denied
     # PF-R8-1: reject a non-string ``username`` BEFORE ``.strip()`` — a
     # JSON dict/list makes ``(x or "").strip()`` raise AttributeError →
     # uncaught 500. ``_validate_username``'s isinstance check runs only
@@ -818,6 +829,14 @@ async def edit_user_handler(req: web.Request) -> web.Response:
     _ensure_wave1a_schema()
     user_id = req.match_info["user_id"]
     body = await _json_body(req)
+    # R6-F2: re-check against a LIVE DB read post-body-read (see
+    # create_user_handler's comment for the full race description) before
+    # trusting the caller for the ``is_sysadmin`` write guard below.
+    from .perm_gates import revalidate_capability_or_403
+
+    denied = await revalidate_capability_or_403(req, "system.users.manage")
+    if denied is not None:
+        return denied
     # Setting OR clearing the sysadmin bit is sysadmin-only.
     if "is_sysadmin" in body and not _caller_is_sysadmin(req):
         return _forbid_sysadmin_write(req)
@@ -990,6 +1009,14 @@ async def create_group_handler(req: web.Request) -> web.Response:
     """
     _ensure_wave1a_schema()
     body = await _json_body(req)
+    # R6-F2: re-check against a LIVE DB read post-body-read (see
+    # create_user_handler's comment for the full race description) before
+    # trusting the caller for the ``is_sysadmin`` write guard below.
+    from .perm_gates import revalidate_capability_or_403
+
+    denied = await revalidate_capability_or_403(req, "system.groups.manage")
+    if denied is not None:
+        return denied
     # PF-R8-1: reject a non-string ``name`` BEFORE ``.strip()`` (see
     # create_user_handler). ``allow_none=True`` defers the required-field
     # message to ``_validate_group_name``.
@@ -1047,6 +1074,14 @@ async def edit_group_handler(req: web.Request) -> web.Response:
     _ensure_wave1a_schema()
     group_id = req.match_info["group_id"]
     body = await _json_body(req)
+    # R6-F2: re-check against a LIVE DB read post-body-read (see
+    # create_user_handler's comment for the full race description) before
+    # trusting the caller for the ``is_sysadmin`` write guard below.
+    from .perm_gates import revalidate_capability_or_403
+
+    denied = await revalidate_capability_or_403(req, "system.groups.manage")
+    if denied is not None:
+        return denied
     # Setting OR clearing the sysadmin bit is sysadmin-only.
     if "is_sysadmin" in body and not _caller_is_sysadmin(req):
         return _forbid_sysadmin_write(req)
@@ -1292,6 +1327,15 @@ async def add_group_member_handler(req: web.Request) -> web.Response:
     _ensure_wave1a_schema()
     parent_group_id = req.match_info["group_id"]
     body = await _json_body(req)
+    # R6-F2: re-check against a LIVE DB read post-body-read (see
+    # create_user_handler's comment for the full race description) before
+    # trusting the caller for the amplification guards below (all of
+    # which read ``req['principal']``/``_caller_is_sysadmin``).
+    from .perm_gates import revalidate_capability_or_403
+
+    denied = await revalidate_capability_or_403(req, "system.groups.manage")
+    if denied is not None:
+        return denied
     member_user_id = body.get("user_id")
     member_group_id = body.get("group_id")
     # PF-R7-1: reject structured JSON types before the write lock — a dict/list
@@ -1636,6 +1680,15 @@ async def add_project_membership_handler(req: web.Request) -> web.Response:
     if denied is not None:
         return denied
     body = await _json_body(req)
+    # R6-F2: re-check against a LIVE DB read post-body-read (see
+    # create_user_handler's comment for the full race description) before
+    # trusting the caller for the ``_membership_grant_denied`` role-rank
+    # guard below (which reads ``req['principal']``).
+    from .perm_gates import revalidate_capability_or_403
+
+    denied = await revalidate_capability_or_403(req, "system.projects.manage")
+    if denied is not None:
+        return denied
     user_id = body.get("user_id")
     group_id = body.get("group_id")
     role = body.get("role", "operator")
@@ -1725,6 +1778,15 @@ async def change_project_membership_role_handler(
         )
     kind, target_id = parsed
     body = await _json_body(req)
+    # R6-F2: re-check against a LIVE DB read post-body-read (see
+    # create_user_handler's comment for the full race description) before
+    # trusting the caller for the ``_membership_grant_denied`` role-rank
+    # guards below (which read ``req['principal']``).
+    from .perm_gates import revalidate_capability_or_403
+
+    denied = await revalidate_capability_or_403(req, "system.projects.manage")
+    if denied is not None:
+        return denied
     role = body.get("role")
     if role is None:
         return _error(
@@ -1872,6 +1934,17 @@ async def replace_group_capabilities_handler(
         conn.close()
 
     body = await _json_body(req)
+    # R6-F2: re-check against a LIVE DB read post-body-read (see
+    # create_user_handler's comment for the full race description) before
+    # trusting the caller for the ``_caps_caller_lacks`` amplification
+    # guard below (which reads ``req['principal']``).
+    from .perm_gates import revalidate_capability_or_403
+
+    denied = await revalidate_capability_or_403(
+        req, "system.groups.capabilities.manage",
+    )
+    if denied is not None:
+        return denied
     raw_caps = body.get("capabilities")
     if not isinstance(raw_caps, list):
         return _error(
