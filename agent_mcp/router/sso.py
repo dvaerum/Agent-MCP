@@ -1166,17 +1166,26 @@ def _cookie_secure_flag(request: web.Request) -> bool:
     ``AGENT_MCP_REQUIRE_SECURE_COOKIES`` is set the flag is always
     True so no SSO session / flow cookie is ever issued without
     ``Secure``.
+
+    Honours ``X-Forwarded-Proto`` only when the direct peer is a
+    trusted proxy (``rate_limit.request_from_trusted_proxy``) — the
+    header is client-settable, so an untrusted peer must not drive the
+    Secure decision (R6-F3, pentest-all round 6: OBS7 class-sweep miss
+    — this module's docstring already claimed the "same heuristic" as
+    ``login.cookie_secure_flag`` but never actually applied the gate).
     """
     require = os.environ.get("AGENT_MCP_REQUIRE_SECURE_COOKIES")
     if require is not None and require.strip().lower() in (
         "1", "true", "yes", "on",
     ):
         return True
-    forwarded = request.headers.get("X-Forwarded-Proto", "").lower()
-    if forwarded == "https":
-        return True
-    if forwarded == "http":
-        return False
+    from agent_mcp.router.rate_limit import request_from_trusted_proxy
+    if request_from_trusted_proxy(request):
+        forwarded = request.headers.get("X-Forwarded-Proto", "").lower()
+        if forwarded == "https":
+            return True
+        if forwarded == "http":
+            return False
     return request.url.scheme == "https"
 
 
