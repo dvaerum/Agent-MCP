@@ -102,6 +102,7 @@ import logging
 import os
 import re
 import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from urllib.parse import quote
 
@@ -669,7 +670,9 @@ async def _proxy_to_backend(
     req: web.Request, name: str, backend_path: str,
     *, alias_info: tuple[str, str] | None = None,
     inject_bearer: str | None = None,
-    inject_header: tuple[str, str] | None = None,
+    inject_header_resolver: (
+        Callable[[], Awaitable[tuple[str, str] | None]] | None
+    ) = None,
 ) -> web.StreamResponse:
     """Proxy `req` to the backend for `name`, asking it for `backend_path`.
 
@@ -684,14 +687,24 @@ async def _proxy_to_backend(
     rewrite that this function used to do — the /mcp endpoint is
     URL-stable, so request and response are forwarded verbatim.
 
-    ``inject_header`` is the retire-system-token Wave 2 hook for the
-    dashboard's cookie-authenticated MCP path: the cookie path in
-    ``backend_mcp_handler`` signs a per-request
-    ``X-Agent-MCP-Forwarded-Operator`` header here and we attach it to
-    the upstream request so the backend's ``AuthHeaderMiddleware``
-    (Wave 1) verifies the HMAC against the per-project key. A
-    caller-supplied header of the same name is replaced — the router
-    is the only authoritative signer.
+    ``inject_header_resolver`` is the retire-system-token Wave 2 hook
+    for the dashboard's cookie-authenticated MCP path, R7-F3-hardened:
+    the cookie path in ``backend_mcp_handler`` passes an async closure
+    that (re-)signs the per-request ``X-Agent-MCP-Forwarded-Operator``
+    header from a LIVE DB read. The resolver is invoked HERE, AFTER
+    ``req_body = await req.read()`` below — the genuine client-paced
+    yield point — so a role demotion (or membership revocation)
+    committed while this request's body was still in flight is picked
+    up before the header is attached, not before. Attaching it earlier
+    (R7-F3, HIGH, live-exploited) let a slow-drip caller hold the read
+    open, get demoted mid-flight by a concurrent request, then resume
+    and have the STALE pre-demotion role forwarded and trusted for the
+    header's full 30 s TTL. A resolver that returns ``None`` (the
+    caller lost project membership entirely between entry and now)
+    aborts the proxy with a 401 rather than forwarding an absent/stale
+    header. A caller-supplied header of the same name is stripped
+    unconditionally above — the router is the only authoritative
+    signer.
 
     ``inject_bearer`` predates Wave 2 (PR #207 cookie→bearer path).
     Wave 2 stopped using it; the parameter survives so Wave 3 can
@@ -714,7 +727,8 @@ async def _proxy_to_backend(
     # the bad HMAC before even reading Authorization) and (b) — in a
     # key-compromise scenario — let an attacker re-attribute requests
     # through the bearer path. Defense-in-depth: strip first, optionally
-    # re-inject below when ``inject_header`` is set.
+    # re-inject below (R7-F3: AFTER the body-read yield point, once
+    # ``inject_header_resolver`` has been invoked) when it resolves.
     from ..app import forwarding_header as _fh
     _forwarding_header_lower = _fh.HEADER_NAME.lower()
     headers = {
@@ -731,20 +745,6 @@ async def _proxy_to_backend(
             if k.lower() == "authorization":
                 headers.pop(k, None)
         headers["Authorization"] = f"Bearer {inject_bearer}"
-    if inject_header is not None:
-        # The router OWNS the forwarding header. Any client-supplied
-        # value was already stripped during the headers-dict
-        # construction above; here we just attach the router-signed
-        # value. We do NOT re-strip by inject_header[0] because the
-        # initial copy already removed every header that could carry
-        # the name (case-insensitive), but defensively pop anyway in
-        # case a future caller passes a different inject_header name.
-        h_name, h_value = inject_header
-        wanted_lower = h_name.lower()
-        for k in list(headers.keys()):
-            if k.lower() == wanted_lower:
-                headers.pop(k, None)
-        headers[h_name] = h_value
     # Phase 1b: if this request arrived on an alias URL, tell the
     # backend so it can later (Phase 1c) inject a deprecation warning
     # into the MCP `serverInfo.instructions` field. The header shape
@@ -780,6 +780,39 @@ async def _proxy_to_backend(
             name, exc,
         )
         return _client_gone_response()
+    # R7-F3 (HIGH, live-exploited): resolve + attach the forwarding
+    # header HERE — immediately after the body-read yield point above,
+    # not before it. The pre-fix code signed this header (from a DB
+    # read of the caller's role) BEFORE ``await req.read()``; a
+    # slow-drip caller could hold that read open, get demoted by a
+    # concurrent request while paused, then resume and have the STALE
+    # pre-demotion role forwarded and trusted for the header's full
+    # 30 s TTL. Calling the resolver here instead makes the signed role
+    # reflect the LIVE DB state at the moment the header is actually
+    # attached to the upstream request — the same "re-check right
+    # before it matters" shape as R6-F2's ``revalidate_capability_or_403``.
+    # A resolver that returns ``None`` means the caller lost project
+    # membership (or their session) entirely between entry and now;
+    # abort with 401 rather than forward the request header-less or
+    # with a stale value.
+    if inject_header_resolver is not None:
+        resolved_header = await inject_header_resolver()
+        if resolved_header is None:
+            raise _unauthorized()
+        # The router OWNS the forwarding header. Any client-supplied
+        # value was already stripped during the headers-dict
+        # construction above; here we just attach the freshly-signed
+        # value. We do NOT re-strip by resolved_header[0] because the
+        # initial copy already removed every header that could carry
+        # the name (case-insensitive), but defensively pop anyway in
+        # case a future caller's resolver returns a different header
+        # name.
+        h_name, h_value = resolved_header
+        wanted_lower = h_name.lower()
+        for k in list(headers.keys()):
+            if k.lower() == wanted_lower:
+                headers.pop(k, None)
+        headers[h_name] = h_value
     # R8-F2: `GET /mcp` is the SSE verb/path — the backend answers it
     # with an INFINITE `text/event-stream` (a `: ping` heartbeat every
     # 15 s, forever). Buffering that with `await up.read()` never
@@ -1295,14 +1328,35 @@ async def backend_mcp_handler(req: web.Request) -> web.StreamResponse:
         exc = await _floored_unauthorized(t0)
         raise exc from None
 
-    forwarding_header: tuple[str, str] | None = None
+    forwarding_header_resolver: (
+        Callable[[], Awaitable[tuple[str, str] | None]] | None
+    ) = None
     if bearer is None:
         # No bearer header — try the operator-session cookie. The
         # dashboard's SSE subscription drops the bearer in favour of
         # the cookie (Wave 2, cleanup/wave-2-strip-frontend-admin-token).
-        forwarding_header = await _forwarding_header_from_cookie(req, real_name)
-        if forwarding_header is None:
+        #
+        # This entry-time resolution is an early UX/DoS-avoidance gate
+        # ONLY (401 fast for no-cookie / non-member / bad session,
+        # before we pay for a body read + backend spawn) — it is NOT
+        # the value actually forwarded upstream. R7-F3 (HIGH,
+        # live-exploited): the header attached to the outgoing request
+        # is resolved AGAIN from a live DB read inside
+        # ``_proxy_to_backend``, immediately after its body-read yield
+        # point, via the closure below. Mirrors R6-F2's shape (entry
+        # gate once via the middleware, a live re-check again right
+        # before the write/attach that matters) — signing here and
+        # trusting that stale snapshot after the body-read await let a
+        # slow-drip caller's pre-demotion role survive a concurrent
+        # revocation.
+        entry_forwarding_header = await _forwarding_header_from_cookie(
+            req, real_name,
+        )
+        if entry_forwarding_header is None:
             raise await _floored_unauthorized(t0)
+
+        async def forwarding_header_resolver() -> tuple[str, str] | None:
+            return await _forwarding_header_from_cookie(req, real_name)
     # When ``bearer`` is set, the request is forwarded to the backend
     # WITHOUT a router-side validity check. The backend's
     # ``AuthHeaderMiddleware`` (see ``agent_mcp.app.main_app``) gates
@@ -1335,11 +1389,21 @@ async def backend_mcp_handler(req: web.Request) -> web.StreamResponse:
         req["resolved_via_alias"] = name
         req["resolved_project"] = real_name
         alias_info = (name, alias_entry.get("expires_at", ""))
+    # R7-F3: if ``forwarding_header_resolver`` re-runs post-body-read and
+    # finds the caller no longer a project member at all (session
+    # revoked / membership pulled while the body was in flight),
+    # ``_proxy_to_backend`` raises ``web.HTTPUnauthorized`` — genuinely
+    # unauthenticated at the moment that matters, not just a pre-auth
+    # timing case. It propagates unmodified (no flooring needed): the
+    # caller already cleared the entry-time membership gate above, so
+    # this case carries no project-existence signal to protect against
+    # (unlike the 404-collapse and 413-collapse branches below, which
+    # fire for callers that never authenticated at all).
     try:
         resp = await _proxy_to_backend(
             req, real_name, "/mcp",
             alias_info=alias_info,
-            inject_header=forwarding_header,
+            inject_header_resolver=forwarding_header_resolver,
         )
     except web.HTTPRequestEntityTooLarge:
         # SEC FINDING 2: the request body is read inside
@@ -1414,9 +1478,14 @@ async def _forwarding_header_from_cookie(
     status the bearer path would surface when ``_proxy_to_backend``
     calls ``_ensure`` itself.
 
-    The returned tuple is fed into ``_proxy_to_backend``'s
-    ``inject_header`` parameter; the backend's ``AuthHeaderMiddleware``
-    verifies the HMAC against ``g.forwarding_hmac_key`` (same per-
+    R7-F3: this function is called TWICE per cookie-authenticated
+    request — once at ``backend_mcp_handler`` entry (a cheap early
+    401 gate) and once more from the closure passed as
+    ``_proxy_to_backend``'s ``inject_header_resolver`` parameter,
+    invoked AFTER the body-read yield point so the actually-forwarded
+    role reflects the caller's LIVE state, not the entry-time
+    snapshot. The backend's ``AuthHeaderMiddleware`` verifies the HMAC
+    against ``g.forwarding_hmac_key`` (same per-
     project key the router-side ``_po.get_forwarding_hmac_key``
     returns).
 
