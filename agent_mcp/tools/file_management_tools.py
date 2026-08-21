@@ -18,6 +18,9 @@ from typing import Any, Dict, Optional
 from .registry import register_tool
 from ..core.config import logger
 from ..core import globals as g
+# R8-F1: explicit maxLength bound for the path-shaped filepath field.
+# See core/schema_limits.py for the rationale.
+from ..core.schema_limits import PATH_MAX_LEN
 from ..core.principal import Principal
 from ..repositories import agent_repo
 from ..core.tool_result import (
@@ -316,7 +319,7 @@ def register_file_management_tools():
         input_schema={ # From main.py:1826-1839
             "type": "object",
             "properties": {
-                "filepath": {"type": "string", "description": "Path to the file to check (can be relative to agent's CWD or absolute)"}
+                "filepath": {"type": "string", "description": "Path to the file to check (can be relative to agent's CWD or absolute)", "maxLength": PATH_MAX_LEN}
             },
             "required": ["filepath"],
             "additionalProperties": False
@@ -330,7 +333,7 @@ def register_file_management_tools():
         input_schema={ # From main.py:1842-1858
             "type": "object",
             "properties": {
-                "filepath": {"type": "string", "description": "Path to the file to update (can be relative or absolute)"},
+                "filepath": {"type": "string", "description": "Path to the file to update (can be relative or absolute)", "maxLength": PATH_MAX_LEN},
                 "status": {
                     "type": "string",
                     "description": "New status for the file.",

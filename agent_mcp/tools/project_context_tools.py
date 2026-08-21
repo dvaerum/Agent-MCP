@@ -283,6 +283,11 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from .registry import register_tool
 from ..core.config import logger
+# R8-F1: explicit maxLength bound for the identifier-shaped
+# context_key / backup_name fields. See core/schema_limits.py for the
+# rationale; context_value / description are free-text and inherit
+# DEFAULT_STRING_MAX_LEN from the dispatcher's generic backstop.
+from ..core.schema_limits import IDENTIFIER_MAX_LEN
 from ..core import globals as g  # Not directly used here, but auth uses it
 from ..core.principal import Principal
 from ..core.tool_result import (
@@ -2065,6 +2070,7 @@ def register_project_context_tools():
                 "context_key": {
                     "type": "string",
                     "description": "Exact key to view (optional). If provided, search_query is ignored.",
+                    "maxLength": IDENTIFIER_MAX_LEN,
                 },
                 "search_query": {
                     "type": "string",
@@ -2112,6 +2118,13 @@ def register_project_context_tools():
                 "context_key": {
                     "type": "string",
                     "description": "The exact key for the context entry (e.g., 'api.service_x.url').",
+                    # NOT schema-capped: FLAG-R17-2's `_context_key_length_error`
+                    # (below, via `_check_write_authorization` -- every
+                    # write/delete path funnels through it) already
+                    # bounds this to the same 256 chars with its own
+                    # tested message; a schema-level maxLength would
+                    # fire first and pre-empt it (see
+                    # tests/test_flag_r17_context_key_maxlen.py).
                 },
                 "context_value": {
                     "description": "The JSON-serializable value to set (e.g., string, number, list, dict).",
@@ -2144,6 +2157,8 @@ def register_project_context_tools():
                 "context_key": {
                     "type": "string",
                     "description": "The exact key for the new context entry (e.g., 'api.service_x.url').",
+                    # NOT schema-capped: see the identical note on
+                    # update_project_context's context_key above.
                 },
                 "context_value": {
                     "description": "The JSON-serializable value to set (e.g., string, number, list, dict).",
@@ -2182,6 +2197,9 @@ def register_project_context_tools():
                             "context_key": {
                                 "type": "string",
                                 "description": "The context key to update",
+                                # NOT schema-capped: see the identical
+                                # note on update_project_context's
+                                # context_key above.
                             },
                             "context_value": {
                                 "description": "The new value (any JSON-serializable type)",
@@ -2268,6 +2286,9 @@ def register_project_context_tools():
                 "context_key": {
                     "type": "string",
                     "description": "Single context key to delete (alternative to context_keys)",
+                    # NOT schema-capped: see the identical note on
+                    # update_project_context's context_key above --
+                    # delete is a write/delete path too.
                 },
                 "context_keys": {
                     "type": "array",

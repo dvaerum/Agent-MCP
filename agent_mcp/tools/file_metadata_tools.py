@@ -24,6 +24,9 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from .registry import register_tool
+# R8-F1: explicit maxLength bound for the path-shaped filepath field.
+# See core/schema_limits.py for the rationale.
+from ..core.schema_limits import PATH_MAX_LEN
 from ..core.config import logger
 from ..core.principal import Principal
 from ..repositories import agent_repo
@@ -380,6 +383,7 @@ def register_file_metadata_tools():
                 "filepath": {
                     "type": "string",
                     "description": "Path to the file (can be relative to agent's CWD or absolute)",
+                    "maxLength": PATH_MAX_LEN,
                 },
             },
             "required": ["filepath"],
@@ -397,6 +401,7 @@ def register_file_metadata_tools():
                 "filepath": {
                     "type": "string",
                     "description": "Path to the file (can be relative or absolute)",
+                    "maxLength": PATH_MAX_LEN,
                 },
                 "metadata": {
                     "type": "object",

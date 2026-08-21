@@ -9,6 +9,13 @@ from typing import List, Dict, Any, Optional
 
 from .registry import register_tool
 from . import access as _access  # Canonical home for _get_config_bool
+# R8-F1: explicit maxLength bounds for identifier/title-shaped schema
+# properties (task_id, agent_id, task_title, ...). See
+# core/schema_limits.py for the full rationale; free-text fields
+# (task_description, notes, coordination_notes, ...) inherit
+# DEFAULT_STRING_MAX_LEN from the dispatcher's generic backstop
+# instead of a hand-declared bound here.
+from ..core.schema_limits import IDENTIFIER_MAX_LEN, TITLE_MAX_LEN
 from ..core.config import logger, ENABLE_TASK_PLACEMENT_RAG, ALLOW_RAG_OVERRIDE
 from ..core import globals as g
 from ..core.auth import get_agent_id
@@ -5039,6 +5046,7 @@ def register_task_tools():
                 "agent_token": {
                     "type": "string",
                     "description": "Agent token to assign the task(s) TO (admin/manager targeting another agent). WORKERS self-claiming an unassigned task do NOT set this — just pass task_ids=[...] and you self-claim as the authenticated caller. Omit with task_title (no task_ids) to file NEW task(s) unassigned into the claimable pool.",
+                    "maxLength": IDENTIFIER_MAX_LEN,
                 },
                 "agent_id": {
                     "type": "string",
@@ -5048,11 +5056,13 @@ def register_task_tools():
                         "must use `agent_token`. Ignored (no error) when "
                         "`agent_token` is also provided."
                     ),
+                    "maxLength": IDENTIFIER_MAX_LEN,
                 },
                 # Mode 1: Single task creation (existing behavior)
                 "task_title": {
                     "type": "string",
                     "description": "Title of the task (Mode 1: single task creation)",
+                    "maxLength": TITLE_MAX_LEN,
                 },
                 "task_description": {
                     "type": "string",
@@ -5067,11 +5077,12 @@ def register_task_tools():
                 "depends_on_tasks": {
                     "type": "array",
                     "description": "List of task IDs this task depends on (Mode 1 only)",
-                    "items": {"type": "string"},
+                    "items": {"type": "string", "maxLength": IDENTIFIER_MAX_LEN},
                 },
                 "parent_task_id": {
                     "type": "string",
                     "description": "ID of the parent task (Mode 1 only)",
+                    "maxLength": IDENTIFIER_MAX_LEN,
                 },
                 # Mode 2: Multiple task creation
                 "tasks": {
@@ -5080,7 +5091,11 @@ def register_task_tools():
                     "items": {
                         "type": "object",
                         "properties": {
-                            "title": {"type": "string", "description": "Task title"},
+                            "title": {
+                                "type": "string",
+                                "description": "Task title",
+                                "maxLength": TITLE_MAX_LEN,
+                            },
                             "description": {
                                 "type": "string",
                                 "description": "Task description",
@@ -5094,6 +5109,7 @@ def register_task_tools():
                             "parent_task_id": {
                                 "type": "string",
                                 "description": "Parent task ID for this task",
+                                "maxLength": IDENTIFIER_MAX_LEN,
                             },
                         },
                         "required": ["title", "description"],
@@ -5104,7 +5120,7 @@ def register_task_tools():
                 "task_ids": {
                     "type": "array",
                     "description": "Array of existing task IDs to assign to agent (Mode 3: existing task assignment)",
-                    "items": {"type": "string"},
+                    "items": {"type": "string", "maxLength": IDENTIFIER_MAX_LEN},
                 },
                 # Smart coordination features (apply to all modes)
                 "auto_suggest_parent": {
@@ -5170,7 +5186,11 @@ def register_task_tools():
         input_schema={  # From main.py:1727-1750
             "type": "object",
             "properties": {
-                "task_title": {"type": "string", "description": "Title of the task"},
+                "task_title": {
+                    "type": "string",
+                    "description": "Title of the task",
+                    "maxLength": TITLE_MAX_LEN,
+                },
                 "task_description": {
                     "type": "string",
                     "description": "Detailed description of the task",
@@ -5184,11 +5204,12 @@ def register_task_tools():
                 "depends_on_tasks": {
                     "type": "array",
                     "description": "List of task IDs this task depends on (optional)",
-                    "items": {"type": "string"},
+                    "items": {"type": "string", "maxLength": IDENTIFIER_MAX_LEN},
                 },
                 "parent_task_id": {
                     "type": "string",
                     "description": "ID of the parent task (defaults to agent's current task if not specified, but MUST have a parent)",
+                    "maxLength": IDENTIFIER_MAX_LEN,
                 },
                 "accept_suggestions": {
                     "type": "boolean",
@@ -5226,11 +5247,12 @@ def register_task_tools():
                 "task_id": {
                     "type": "string",
                     "description": "ID of the task to update (for single task operations)",
+                    "maxLength": IDENTIFIER_MAX_LEN,
                 },
                 "task_ids": {
                     "type": "array",
                     "description": "List of task IDs for bulk operations (alternative to task_id)",
-                    "items": {"type": "string"},
+                    "items": {"type": "string", "maxLength": IDENTIFIER_MAX_LEN},
                 },
                 "status": {
                     "type": "string",
@@ -5251,6 +5273,7 @@ def register_task_tools():
                 "title": {
                     "type": "string",
                     "description": "(Admin Only) New title for the task",
+                    "maxLength": TITLE_MAX_LEN,
                 },
                 "description": {
                     "type": "string",
@@ -5264,11 +5287,12 @@ def register_task_tools():
                 "assigned_to": {
                     "type": "string",
                     "description": "(Admin Only) New agent ID to assign the task to",
+                    "maxLength": IDENTIFIER_MAX_LEN,
                 },
                 "depends_on_tasks": {
                     "type": "array",
                     "description": "(Admin Only) New list of task IDs this task depends on",
-                    "items": {"type": "string"},
+                    "items": {"type": "string", "maxLength": IDENTIFIER_MAX_LEN},
                 },
                 # Smart Features
                 "auto_update_dependencies": {
@@ -5312,6 +5336,7 @@ def register_task_tools():
                 "task_id": {
                     "type": "string",
                     "description": "ID of the task to update.",
+                    "maxLength": IDENTIFIER_MAX_LEN,
                 },
                 "status": {
                     "type": "string",
@@ -5327,6 +5352,7 @@ def register_task_tools():
                 "title": {
                     "type": "string",
                     "description": "New title for the task.",
+                    "maxLength": TITLE_MAX_LEN,
                 },
                 "description": {
                     "type": "string",
@@ -5344,6 +5370,7 @@ def register_task_tools():
                         "'unassigned' (or an empty string) to clear the "
                         "assignment."
                     ),
+                    "maxLength": IDENTIFIER_MAX_LEN,
                 },
                 "notes": {
                     "type": "string",
@@ -5608,6 +5635,7 @@ def register_task_tools():
                 "task_id": {
                     "type": "string",
                     "description": "ID of the task for which assistance is needed (parent task).",
+                    "maxLength": IDENTIFIER_MAX_LEN,
                 },
                 "description": {
                     "type": "string",
@@ -5645,6 +5673,7 @@ def register_task_tools():
                             "task_id": {
                                 "type": "string",
                                 "description": "Task ID to operate on",
+                                "maxLength": IDENTIFIER_MAX_LEN,
                             },
                             "status": {
                                 "type": "string",
@@ -5673,6 +5702,7 @@ def register_task_tools():
                             "assigned_to": {
                                 "type": "string",
                                 "description": "New assignee for reassign operation (admin only)",
+                                "maxLength": IDENTIFIER_MAX_LEN,
                             },
                         },
                         "required": ["type", "task_id"],
@@ -5702,6 +5732,7 @@ def register_task_tools():
                 "task_id": {
                     "type": "string",
                     "description": "ID of the task to delete",
+                    "maxLength": IDENTIFIER_MAX_LEN,
                 },
                 "force_delete": {
                     "type": "boolean",
@@ -5735,6 +5766,7 @@ def register_task_tools():
                 "task_title": {
                     "type": "string",
                     "description": "Title of the task to create (required).",
+                    "maxLength": TITLE_MAX_LEN,
                 },
                 "task_description": {
                     "type": "string",
@@ -5752,6 +5784,7 @@ def register_task_tools():
                         "Agent id to assign the task to. Must be a live "
                         "agent. Omit for an unassigned task."
                     ),
+                    "maxLength": IDENTIFIER_MAX_LEN,
                 },
                 "parent_task": {
                     "type": "string",
@@ -5759,6 +5792,7 @@ def register_task_tools():
                         "Existing task id to parent this task under. Must "
                         "exist. Omit for a top-level task."
                     ),
+                    "maxLength": IDENTIFIER_MAX_LEN,
                 },
             },
             "required": ["task_title"],

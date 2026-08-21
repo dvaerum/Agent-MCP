@@ -7,6 +7,10 @@ import mcp.types as mcp_types # Assuming this is the correct import for your mcp
 from ..utils.json_utils import sanitize_json_input, get_sanitized_json_body
 # Import the central logger
 from ..core.config import logger
+# R8-F1: shared string-length ceiling applied to any schema string
+# leaf that doesn't declare its own ``maxLength`` (see
+# ``_first_oversized_string_path`` below).
+from ..core.schema_limits import DEFAULT_STRING_MAX_LEN as _DEFAULT_STRING_MAX_LEN
 # Typed auth-failure exception from the decorator surface; the
 # dispatcher catches it explicitly so the audit log line is uniform.
 from ..core.authorize import AuthRejected
@@ -146,6 +150,116 @@ def _clean_arguments_for_schema(
                 pass
         cleaned[key] = value
     return cleaned
+
+
+def _value_matches_schema_type(value: Any, schema: Dict[str, Any]) -> bool:
+    """True if `value`'s runtime JSON type matches `schema`'s declared
+    ``type`` (or the schema declares no ``type`` at all, i.e. matches
+    anything). Used only to pick the right branch of an ``anyOf`` /
+    ``oneOf`` alternative in :func:`_first_oversized_string_path` —
+    not a general-purpose type validator (jsonschema.validate already
+    does that job for real schema compliance).
+    """
+    if not isinstance(schema, dict):
+        return False
+    declared = schema.get("type")
+    if declared is None:
+        return True
+    types = declared if isinstance(declared, list) else [declared]
+    checks = {
+        "string": lambda v: isinstance(v, str),
+        "number": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
+        "integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
+        "boolean": lambda v: isinstance(v, bool),
+        "null": lambda v: v is None,
+        "object": lambda v: isinstance(v, dict),
+        "array": lambda v: isinstance(v, list),
+    }
+    return any(checks.get(t, lambda v: False)(value) for t in types)
+
+
+def _first_oversized_string_path(
+    value: Any, schema: Optional[Dict[str, Any]], path: str = ""
+) -> Optional[str]:
+    """R8-F1 safety net: recursively walk caller-supplied `value`
+    alongside its `schema`, returning a dotted/bracketed path
+    (``"tasks[0].title"``) to the first string leaf that (a) has no
+    schema-declared ``maxLength`` of its own and (b) exceeds
+    :data:`agent_mcp.core.schema_limits.DEFAULT_STRING_MAX_LEN`.
+    Returns ``None`` if every undeclared string leaf is within bounds.
+
+    String leaves that DO declare their own ``maxLength`` are skipped
+    here — ``jsonschema.validate`` (run by the caller on the same
+    schema) already enforces those, tighter than this default. This
+    function exists purely to give every OTHER string property —
+    including ones no author remembered to bound, in any tool present
+    or future — the same finite ceiling, without requiring every
+    ``register_tool(...)`` call site to declare one by hand.
+
+    Walks ``properties`` (objects), ``items`` (arrays), and
+    ``anyOf``/``oneOf`` (picks the first alternative whose declared
+    ``type`` matches the value's runtime type; a value not covered by
+    the given schema shape is simply not checked here — jsonschema's
+    own validation is the source of truth for shape correctness, this
+    is only a length backstop).
+    """
+    if not isinstance(schema, dict):
+        return None
+
+    for alt_key in ("anyOf", "oneOf"):
+        alternatives = schema.get(alt_key)
+        if isinstance(alternatives, list):
+            for alt in alternatives:
+                if _value_matches_schema_type(value, alt):
+                    return _first_oversized_string_path(value, alt, path)
+            return None
+
+    if isinstance(value, str):
+        if "maxLength" in schema:
+            return None
+        declared_type = schema.get("type")
+        # `type` may be a bare string ("string") or a list of
+        # alternatives (["string", "null"], common in this codebase
+        # for optional fields) — a value only clears this check if
+        # "string" is (or is among) the declared type(s), or no type
+        # is declared at all (matches anything).
+        allowed_types = (
+            declared_type
+            if isinstance(declared_type, list)
+            else [declared_type]
+            if declared_type is not None
+            else None
+        )
+        if allowed_types is not None and "string" not in allowed_types:
+            return None
+        if len(value) > _DEFAULT_STRING_MAX_LEN:
+            return path or "<value>"
+        return None
+
+    if isinstance(value, dict):
+        props = schema.get("properties") or {}
+        for key, sub_value in value.items():
+            sub_schema = props.get(key)
+            if not isinstance(sub_schema, dict):
+                continue
+            hit = _first_oversized_string_path(
+                sub_value, sub_schema, f"{path}.{key}" if path else key
+            )
+            if hit:
+                return hit
+        return None
+
+    if isinstance(value, list):
+        item_schema = schema.get("items")
+        if not isinstance(item_schema, dict):
+            return None
+        for idx, item in enumerate(value):
+            hit = _first_oversized_string_path(item, item_schema, f"{path}[{idx}]")
+            if hit:
+                return hit
+        return None
+
+    return None
 
 
 def _find_schema_for(tool_name: str) -> Optional[Dict[str, Any]]:
@@ -565,6 +679,26 @@ async def dispatch_tool_call(
                 except _jsonschema.ValidationError as e:
                     raise ToolInputValidationError(
                         f"Input validation error: {e.message}"
+                    )
+
+            # R8-F1: length backstop. `maxLength` on individual schema
+            # properties (added for the identifier/title/path-shaped
+            # fields the round-8 fuzz lane hit) is already enforced by
+            # `jsonschema.validate` above. This second pass catches
+            # every OTHER string leaf — anything this sweep didn't
+            # hand-touch, and anything a future tool adds without a
+            # declared bound — against the shared
+            # `DEFAULT_STRING_MAX_LEN` ceiling. See
+            # `_first_oversized_string_path` for the walk semantics.
+            if input_schema:
+                oversized_path = _first_oversized_string_path(
+                    sanitized_arguments, input_schema
+                )
+                if oversized_path:
+                    raise ToolInputValidationError(
+                        f"Input validation error: '{oversized_path}' "
+                        f"exceeds the maximum allowed length of "
+                        f"{_DEFAULT_STRING_MAX_LEN} characters"
                     )
 
             # Direct-call fallback (tests / in-process scripts that

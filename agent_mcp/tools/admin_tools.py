@@ -7,6 +7,12 @@ from typing import Dict, Any, Optional
 
 from .registry import register_tool
 from ..core.config import logger, AGENT_COLORS  # AGENT_COLORS for register_agent
+# R8-F1: explicit maxLength bounds for identifier/path-shaped schema
+# properties (agent_id, name, color, working_directory, ...). See
+# core/schema_limits.py for the full rationale; free-text fields with
+# no explicit bound here inherit DEFAULT_STRING_MAX_LEN from the
+# dispatcher's generic backstop instead.
+from ..core.schema_limits import IDENTIFIER_MAX_LEN, PATH_MAX_LEN
 from ..core import globals as g
 from ..core.auth import generate_token  # For register_agent, terminate_agent
 # Wave 6 PR 5 — migrated to Principal + ToolResult. The
@@ -2135,6 +2141,7 @@ def register_admin_tools():
                 "name": {
                     "type": "string",
                     "description": "agent_id for the new row.",
+                    "maxLength": IDENTIFIER_MAX_LEN,
                 },
                 "agent_id": {
                     "type": "string",
@@ -2142,6 +2149,7 @@ def register_admin_tools():
                         "Back-compat alias for `name`. Either field works; "
                         "if both are present, `name` wins."
                     ),
+                    "maxLength": IDENTIFIER_MAX_LEN,
                 },
                 "role": {
                     "type": "string",
@@ -2160,6 +2168,7 @@ def register_admin_tools():
                         "Project the .mcp.json snippet should point at. "
                         "Optional; falls back to principal.project_name."
                     ),
+                    "maxLength": IDENTIFIER_MAX_LEN,
                 },
                 "host": {
                     "type": "string",
@@ -2168,6 +2177,7 @@ def register_admin_tools():
                         "deployment at (e.g. https://host.tailnet.ts.net). "
                         "Optional; falls back to $AGENT_MCP_EXTERNAL_URL."
                     ),
+                    "maxLength": IDENTIFIER_MAX_LEN,
                 },
             },
             # `name` OR `agent_id` is required — the impl rejects with
@@ -2204,6 +2214,7 @@ def register_admin_tools():
                 "agent_id": {
                     "type": "string",
                     "description": "Unique identifier for the agent to terminate",
+                    "maxLength": IDENTIFIER_MAX_LEN,
                 },
             },
             "required": ["agent_id"],
@@ -2231,6 +2242,7 @@ def register_admin_tools():
                 "agent_id": {
                     "type": "string",
                     "description": "Unique identifier for the terminated agent to restore.",
+                    "maxLength": IDENTIFIER_MAX_LEN,
                 },
             },
             "required": ["agent_id"],
@@ -2253,18 +2265,22 @@ def register_admin_tools():
                 "agent_id": {
                     "type": "string",
                     "description": "Unique identifier for the agent to edit.",
+                    "maxLength": IDENTIFIER_MAX_LEN,
                 },
                 "color": {
                     "type": "string",
                     "description": "Display color for the agent in the dashboard.",
+                    "maxLength": IDENTIFIER_MAX_LEN,
                 },
                 "working_directory": {
                     "type": "string",
                     "description": "Agent working directory (informational metadata).",
+                    "maxLength": PATH_MAX_LEN,
                 },
                 "aoe_session_id": {
                     "type": "string",
                     "description": "AoE session binding (16 lowercase hex chars, or empty to clear).",
+                    "maxLength": IDENTIFIER_MAX_LEN,
                 },
                 "auto_event_loop": {
                     "type": "boolean",
@@ -2296,6 +2312,7 @@ def register_admin_tools():
                 "agent_id": {
                     "type": "string",
                     "description": "Unique identifier for the agent to purge.",
+                    "maxLength": IDENTIFIER_MAX_LEN,
                 },
             },
             "required": ["agent_id"],

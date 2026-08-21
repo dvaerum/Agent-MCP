@@ -50,6 +50,11 @@ from ..core.tool_result import (
 from ..db.actions import task_notes_db
 from ..repositories.task_repository import get_task_by_id
 from .registry import register_tool
+# R8-F1: explicit maxLength bound for the identifier-shaped task_id
+# field. See core/schema_limits.py; `text` is free-form note content
+# and inherits DEFAULT_STRING_MAX_LEN from the dispatcher's generic
+# backstop.
+from ..core.schema_limits import IDENTIFIER_MAX_LEN
 
 
 # Static author-only policy clause appended to the fused NotFound (see
@@ -334,6 +339,7 @@ def register_task_notes_tools() -> None:
                 "task_id": {
                     "type": "string",
                     "description": "Task to attach the note to.",
+                    "maxLength": IDENTIFIER_MAX_LEN,
                 },
                 "text": {
                     "type": "string",
