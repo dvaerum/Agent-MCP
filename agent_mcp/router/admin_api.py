@@ -335,12 +335,20 @@ async def rename_project_handler(req: web.Request) -> web.Response:
     # yield point a slow-drip caller can hold open while a concurrent
     # request revokes their capability. Re-check against a LIVE DB read
     # (and refresh ``req['principal']``/``req['is_sysadmin']``) before
-    # trusting the caller for anything below. (The cross-tenant
-    # membership check above only needs the path param, so it correctly
-    # runs BEFORE the body read and is unaffected by this fix.)
-    from .perm_gates import revalidate_capability_or_403
-
-    denied = await revalidate_capability_or_403(req, "system.projects.manage")
+    # trusting the caller for anything below.
+    # R8-F3 [class-sweep gap IN R7-F1's OWN fix, HIGH, live-exploited]:
+    # R7-F1's capability re-check above left the MEMBERSHIP half of the
+    # entry gate (``_deny_cross_tenant_project_read`` above, which only
+    # needs the path param and correctly runs BEFORE the body read)
+    # stale across this SAME yield point — a member at entry whose
+    # membership on ``old_name`` is revoked mid-flight (e.g. a
+    # concurrent membership DELETE) still completed the rename off the
+    # stale snapshot, on the residual coarse capability alone. Re-check
+    # BOTH halves together post-yield; see
+    # ``_revalidate_capability_and_membership_or_403``.
+    denied = await _revalidate_capability_and_membership_or_403(
+        req, "system.projects.manage", old_name,
+    )
     if denied is not None:
         return denied
     raw_new_name = body.get("name")
@@ -848,10 +856,17 @@ async def delete_project_handler(req: web.Request) -> web.Response:
         # this request's destructive unregister/rmtree/DB-purge runs.
         # Re-validate against a LIVE DB read right alongside the
         # ``active_conns`` re-check above, before the destructive step.
-        from .perm_gates import revalidate_capability_or_403
-
-        denied = await revalidate_capability_or_403(
-            req, "system.projects.manage",
+        # R8-F3 [class-sweep gap IN R7-F1's OWN fix, HIGH, live-exploited]:
+        # the capability-only re-check R7-F1 added here left the
+        # MEMBERSHIP half of the entry gate (``_deny_cross_tenant_project_
+        # read`` above) stale across this SAME lock-contention yield
+        # point — a member at entry whose membership on ``name`` is
+        # revoked mid-flight still completed the delete off the stale
+        # snapshot, on the residual coarse capability alone. Re-check
+        # BOTH halves together; see
+        # ``_revalidate_capability_and_membership_or_403``.
+        denied = await _revalidate_capability_and_membership_or_403(
+            req, "system.projects.manage", name,
         )
         if denied is not None:
             return denied
@@ -1034,10 +1049,17 @@ async def stop_project_handler(req: web.Request) -> web.Response:
         # this request's destructive stop runs. Re-validate against a
         # LIVE DB read right alongside the ``active_conns`` re-check
         # above, before the destructive step.
-        from .perm_gates import revalidate_capability_or_403
-
-        denied = await revalidate_capability_or_403(
-            req, "system.projects.manage",
+        # R8-F3 [class-sweep gap IN R7-F1's OWN fix, HIGH, live-exploited]:
+        # the capability-only re-check R7-F1 added here left the
+        # MEMBERSHIP half of the entry gate (``_deny_cross_tenant_project_
+        # read`` above) stale across this SAME lock-contention yield
+        # point — a member at entry whose membership on ``name`` is
+        # revoked mid-flight still completed the stop off the stale
+        # snapshot, on the residual coarse capability alone. Re-check
+        # BOTH halves together; see
+        # ``_revalidate_capability_and_membership_or_403``.
+        denied = await _revalidate_capability_and_membership_or_403(
+            req, "system.projects.manage", name,
         )
         if denied is not None:
             return denied
@@ -1255,6 +1277,46 @@ def _deny_cross_tenant_project_read(
     ):
         return not_found
     return None
+
+
+async def _revalidate_capability_and_membership_or_403(
+    req: web.Request, cap: str, project_name: str,
+) -> web.Response | None:
+    """Re-check BOTH the capability AND membership invariants post-yield.
+
+    R8-F3 (HIGH, class-sweep gap IN R7-F1's own fix, #674): R7-F1 added
+    ``perm_gates.revalidate_capability_or_403`` after each of
+    ``rename_project_handler`` / ``delete_project_handler`` /
+    ``stop_project_handler``'s genuine yield point (a body-read for
+    rename, lock contention for delete/stop) — but that call re-checks
+    ONLY the capability half of the entry gate. The membership half,
+    ``_deny_cross_tenant_project_read`` — R6-F2's fix, run once at
+    entry, BEFORE the yield point — was never re-invoked alongside it.
+    A caller who is a project member at request start but has that
+    membership revoked mid-flight (e.g. a concurrent
+    ``DELETE .../memberships/<id>``) still completed the mutation off
+    the stale entry-time membership snapshot, using only the residual
+    coarse ``system.projects.manage`` capability — precisely what
+    ``_deny_cross_tenant_project_read``'s own docstring says must not
+    happen.
+
+    Composing both checks in ONE call, instead of two call sites a
+    handler author has to remember to keep in lockstep, makes it
+    structurally impossible to revalidate one half and forget the
+    other at a future yield point — exactly the shape of this miss.
+    ``revalidate_capability_or_403`` runs first and, on success,
+    refreshes ``req['principal']`` / ``req['is_sysadmin']`` in place;
+    the membership re-check then reads those SAME freshly-resolved
+    keys via ``_deny_cross_tenant_project_read``, so both halves are
+    validated against one live snapshot, not two different points in
+    time.
+    """
+    from .perm_gates import revalidate_capability_or_403
+
+    denied = await revalidate_capability_or_403(req, cap)
+    if denied is not None:
+        return denied
+    return _deny_cross_tenant_project_read(req, project_name)
 
 
 async def alias_usage_handler(req: web.Request) -> web.Response:
