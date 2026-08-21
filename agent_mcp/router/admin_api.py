@@ -150,6 +150,17 @@ async def create_project_handler(req: web.Request) -> web.Response:
     if disables_write_endpoint():
         return _app._single_tenant_disabled_response()
     body = await _app._parse_json_body(req)
+    # R7-F1 [class-sweep miss of R6-F2, HIGH, live-exploited]:
+    # ``_parse_json_body`` just awaited on ``req.read()`` — a genuine
+    # yield point a slow-drip caller can hold open while a concurrent
+    # request revokes their capability. Re-check against a LIVE DB read
+    # (and refresh ``req['principal']``/``req['is_sysadmin']``) before
+    # trusting the caller for anything below.
+    from .perm_gates import revalidate_capability_or_403
+
+    denied = await revalidate_capability_or_403(req, "system.projects.manage")
+    if denied is not None:
+        return denied
     raw_name = body.get("name")
     bad = _reject_non_str_name(raw_name)
     if bad is not None:
@@ -319,6 +330,19 @@ async def rename_project_handler(req: web.Request) -> web.Response:
     if denied is not None:
         return denied
     body = await _app._parse_json_body(req)
+    # R7-F1 [class-sweep miss of R6-F2, HIGH, live-exploited]:
+    # ``_parse_json_body`` just awaited on ``req.read()`` — a genuine
+    # yield point a slow-drip caller can hold open while a concurrent
+    # request revokes their capability. Re-check against a LIVE DB read
+    # (and refresh ``req['principal']``/``req['is_sysadmin']``) before
+    # trusting the caller for anything below. (The cross-tenant
+    # membership check above only needs the path param, so it correctly
+    # runs BEFORE the body read and is unaffected by this fix.)
+    from .perm_gates import revalidate_capability_or_403
+
+    denied = await revalidate_capability_or_403(req, "system.projects.manage")
+    if denied is not None:
+        return denied
     raw_new_name = body.get("name")
     bad = _reject_non_str_name(raw_new_name)
     if bad is not None:
@@ -815,6 +839,22 @@ async def delete_project_handler(req: web.Request) -> web.Response:
                 status=409,
                 extra={"active_connections": conns, "agents": []},
             )
+        # R7-F1 [class-sweep, HIGH, live-exploited]: this handler has no
+        # body-read yield point, but the ``async with _ensure_lock`` +
+        # ``await asyncio.to_thread(_systemctl, "stop", ...)`` sequence
+        # below IS a genuine yield point of exactly the same TOCTOU shape
+        # — a slow/contended lock acquisition or the awaited stop itself
+        # gives a concurrent capability revocation time to commit before
+        # this request's destructive unregister/rmtree/DB-purge runs.
+        # Re-validate against a LIVE DB read right alongside the
+        # ``active_conns`` re-check above, before the destructive step.
+        from .perm_gates import revalidate_capability_or_403
+
+        denied = await revalidate_capability_or_403(
+            req, "system.projects.manage",
+        )
+        if denied is not None:
+            return denied
         # BL-R7-3: run the blocking ``systemctl stop`` OFF the event
         # loop (mirrors the round-6 BL-R6-2b fix in ``_ensure``).
         # ``_systemctl`` is a synchronous ``subprocess.run`` (~15-150 ms,
@@ -985,6 +1025,22 @@ async def stop_project_handler(req: web.Request) -> web.Response:
                 status=409,
                 extra={"active_connections": conns, "agents": []},
             )
+        # R7-F1 [class-sweep, HIGH, live-exploited]: this handler has no
+        # body-read yield point, but the ``async with _ensure_lock`` +
+        # the awaited ``_is_active``/``_systemctl`` calls below ARE a
+        # genuine yield point of exactly the same TOCTOU shape — a
+        # slow/contended lock acquisition or the awaited stop itself
+        # gives a concurrent capability revocation time to commit before
+        # this request's destructive stop runs. Re-validate against a
+        # LIVE DB read right alongside the ``active_conns`` re-check
+        # above, before the destructive step.
+        from .perm_gates import revalidate_capability_or_403
+
+        denied = await revalidate_capability_or_403(
+            req, "system.projects.manage",
+        )
+        if denied is not None:
+            return denied
         # OBS-R34-RENAME-ONLOOP class-sweep: ``_is_active`` and
         # ``_systemctl`` both shell out (blocking ``subprocess.run``), so
         # calling them directly stalls the single aiohttp event loop —
