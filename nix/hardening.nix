@@ -29,6 +29,27 @@
 #     /proc entries and non-pid /proc files from the unit.
 #   - PrivateTmp: private /tmp + /var/tmp (no $HOME impact; CPython
 #     tempfiles and sqlite temp files land in the private tmpfs).
+#   - PrivateDevices: no /dev access beyond a minimal null/zero/random
+#     set; the unit never touches a physical or block device.
+#   - ProtectKernelLogs: blocks /dev/kmsg + the kernel log syscall
+#     (dmesg-alike); the unit only ever needs its own stdout/journal.
+#   - RemoveIPC: SysV IPC objects (shm/sem/msg) owned by the unit's
+#     user are removed when the unit stops; nothing here uses SysV IPC.
+#   - CapabilityBoundingSet="" (empty): drops every Linux capability
+#     from the bounding set. Already runs as a static non-root user
+#     under NoNewPrivileges; this additionally narrows what that user
+#     could do even with a setuid/setgid binary in the mix.
+#   - UMask=0077: files created by the unit default to owner-only
+#     (0600/0700) instead of the system-default world-readable mode.
+#
+# Round-8 pentest (R8-F2) verified all five live against vm-dev
+# (agent-mcp-router.service + agent-mcp@.service, the sqlite-vec
+# native-extension backend) as a transient drop-in: `systemd-analyze
+# security` exposure improved 5.4 MEDIUM -> 2.8 OK, and a full
+# login + project-query functional round-trip through the sqlite-vec-
+# loaded backend still passed. Unlike the two directives below, none
+# of these five touch W+X memory mappings or the backend's syscall
+# surface, so sqlite-vec's ctypes dlopen path is unaffected.
 #
 # DELIBERATELY OMITTED everywhere (do NOT "helpfully" add these — they
 # crash the units, hence the signpost):
@@ -57,4 +78,17 @@
   ProtectProc = "invisible";
   ProcSubset = "pid";
   PrivateTmp = true;
+  PrivateDevices = true;
+  ProtectKernelLogs = true;
+  RemoveIPC = true;
+  # NixOS's systemd-lib `attrsToSection` maps a list-valued option to
+  # one ini line per element — an EMPTY list produces zero lines, so
+  # the directive is omitted from the unit file entirely and systemd
+  # falls back to its own default (unrestricted). systemd.exec(5)
+  # treats a PRESENT key with a literally empty value as "reset the
+  # bounding set to empty", which is what we actually want — a
+  # single-element list holding the empty string is the standard
+  # nixpkgs workaround to force that empty-valued line to be emitted.
+  CapabilityBoundingSet = [ "" ];
+  UMask = "0077";
 }
