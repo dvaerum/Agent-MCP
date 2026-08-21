@@ -25,6 +25,7 @@ step in that progression).
 from __future__ import annotations
 
 import functools
+import sqlite3
 from typing import Awaitable, Callable
 
 from aiohttp import web
@@ -32,7 +33,117 @@ from aiohttp import web
 from .single_tenant import bypasses_operator_gate
 
 
-__all__ = ["require_capability"]
+__all__ = ["require_capability", "revalidate_capability_or_403"]
+
+
+def _forbidden_response(req: web.Request, cap: str) -> web.Response:
+    """Shared 403 envelope for both the entry gate and the revalidation
+    re-check below — same shape, same discriminator, one definition."""
+    user = req.get("user") or {}
+    username = user.get("username", "<unknown>")
+    return web.json_response(
+        {
+            "success": False,
+            "error": "forbidden",
+            "message": (
+                f"operator {username!r} lacks capability "
+                f"{cap!r}; this action requires it"
+            ),
+        },
+        status=403,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+async def revalidate_capability_or_403(
+    req: web.Request, cap: str,
+) -> web.Response | None:
+    """Re-check ``cap`` against a FRESH DB read; refresh the cached Principal.
+
+    R6-F2 (HIGH, live-exploited): ``require_operator_session_middleware``
+    resolves the caller's Principal (sysadmin flag + capability set) ONCE
+    at request entry, before any body-bearing admin handler's genuine
+    yield point — ``await req.read()`` inside ``admin_users_api._json_body``.
+    An attacker who controls body-delivery pacing (a slow-drip POST/PATCH)
+    can hold that read open while a concurrent request revokes their
+    privilege in the DB; the paused handler then resumes and completes its
+    write against the PRE-revocation snapshot cached at entry —
+    ``require_capability`` below and every ``_caller_is_sysadmin`` /
+    ``_caps_caller_lacks`` / ``_membership_grant_denied`` read in
+    ``admin_users_api`` all consult that same stale snapshot.
+
+    Mirrors R5-F1's fix for the sibling bug class (one-shot-authenticated
+    long-lived operation must re-validate before it matters — there, the
+    ``/api/events`` SSE stream re-running its open-time gate before every
+    dispatch; here, a body-bearing handler re-running its entry-time gate
+    before its write). Call this immediately AFTER the handler's
+    ``_json_body`` (or any other body-read await) returns and BEFORE
+    anything else that trusts the caller's privilege.
+
+    On success this OVERWRITES ``req['principal']`` and
+    ``req['is_sysadmin']`` in place with the freshly-resolved values, so
+    every downstream self-escalation guard in the same handler — which
+    reads those exact request-scoped keys — sees the live post-
+    revalidation state too, not the snapshot taken at entry.
+
+    Single-tenant mode (ADR-0008) bypasses, mirroring
+    :func:`require_capability`. Fail-closed: a missing session user, or
+    any resolution error along the way, denies with the same 403 shape
+    the entry gate uses.
+    """
+    if bypasses_operator_gate():
+        return None
+
+    user = req.get("user")
+    user_id = user.get("user_id") if user else None
+    if not user_id:
+        # Reaching a body-bearing admin handler at all implies the
+        # middleware already resolved a user; a missing id here means
+        # something upstream is broken. Fail closed rather than let a
+        # capability check run against no identity.
+        return _forbidden_response(req, cap)
+
+    from . import group_resolver
+    from ..core.principal_builder import build_operator_principal
+
+    try:
+        groups: set[str] | None = set(
+            group_resolver.resolve_user_groups(user_id)
+        )
+    except sqlite3.OperationalError:
+        groups = None
+    except Exception:  # pragma: no cover - defensive
+        groups = None
+
+    try:
+        sysadmin = group_resolver.resolve_user_is_sysadmin(
+            user_id, groups=groups,
+        )
+    except sqlite3.OperationalError:
+        sysadmin = False
+    except Exception:  # pragma: no cover - defensive
+        sysadmin = False
+
+    # These 8 handlers all live under ``/agent-mcp/api/router/...``,
+    # which ``auth_middleware._project_from_path`` treats as the
+    # non-project ``router`` admin segment (never project-scoped) — the
+    # ENTRY-time Principal built for this route family always carries
+    # ``project_role=None`` too, so re-deriving it here with the same
+    # ``None`` keeps this revalidation exactly equivalent to a fresh
+    # run of the entry-time construction, just later in the request.
+    principal = build_operator_principal(
+        user_id=str(user_id),
+        kind="operator_session",
+        project_role=None,
+        sysadmin=sysadmin,
+        groups=groups,
+    )
+    req["principal"] = principal
+    req["is_sysadmin"] = sysadmin
+
+    if not principal.has_capability(cap):
+        return _forbidden_response(req, cap)
+    return None
 
 
 def require_capability(
@@ -90,20 +201,7 @@ def require_capability(
 
             principal = request.get("principal")
             if principal is None or not principal.has_capability(cap):
-                user = request.get("user") or {}
-                username = user.get("username", "<unknown>")
-                return web.json_response(
-                    {
-                        "success": False,
-                        "error": "forbidden",
-                        "message": (
-                            f"operator {username!r} lacks capability "
-                            f"{cap!r}; this action requires it"
-                        ),
-                    },
-                    status=403,
-                    headers={"Cache-Control": "no-store"},
-                )
+                return _forbidden_response(request, cap)
             return await handler(request)
 
         return wrapper
