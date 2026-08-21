@@ -431,6 +431,32 @@ async def test_cookie_secure_flag_honours_xfp_from_trusted_proxy() -> None:
     assert login.cookie_secure_flag(req) is True
 
 
+async def test_sso_cookie_secure_flag_ignores_forged_xfp_from_untrusted() -> None:
+    """R6-F3 (pentest-all round 6, class-sweep miss of R6-F1/OBS7): the
+    sso.py flow-cookie's own local copy of the cookie-secure heuristic
+    must not honour X-Forwarded-Proto from an untrusted peer either —
+    same rule as login.cookie_secure_flag, the docstring already claims
+    this but the code never actually gated it before this fix."""
+    from agent_mcp.router import sso
+
+    req = _mocked_request(
+        "203.0.113.7",
+        {"Host": "real.host", "X-Forwarded-Proto": "https"},
+    )
+    assert sso._cookie_secure_flag(req) is False
+
+
+async def test_sso_cookie_secure_flag_honours_xfp_from_trusted_proxy() -> None:
+    """XFP from a trusted proxy still drives Secure (tailnet TLS)."""
+    from agent_mcp.router import sso
+
+    req = _mocked_request(
+        "127.0.0.1",
+        {"Host": "loopback", "X-Forwarded-Proto": "https"},
+    )
+    assert sso._cookie_secure_flag(req) is True
+
+
 async def test_sso_default_redirect_url_ignores_forged_xfh_from_untrusted() -> None:
     """The sibling XFH-trust site: sso._default_redirect_url honours XFH
     only from a trusted proxy (IdP exact-match already backstops it, but
