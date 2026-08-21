@@ -180,14 +180,17 @@ async def test_apply_headers_preserves_explicit_cache_control() -> None:
 
 class _FakeHttpRequest:
     """Minimal stand-in exposing what ``_apply_headers`` reads: a
-    ``headers`` mapping and a ``.url.scheme``. Kept plain-HTTP so no
-    HSTS is added."""
+    ``headers`` mapping, a ``.url.scheme``, and (since R6-F1 gated
+    ``_request_is_https`` on ``rate_limit.request_from_trusted_proxy``)
+    a ``.remote`` peer IP. Kept plain-HTTP with no forwarding header so
+    no HSTS is added regardless of trust."""
 
     class _URL:
         scheme = "http"
 
     headers: ClassVar[dict] = {}
     url = _URL()
+    remote = "203.0.113.7"
 
 
 @pytest.mark.no_auth_seed_session
@@ -223,6 +226,105 @@ async def test_server_banner_stripped_on_401(
     server = resp.headers.get("Server", "")
     assert "aiohttp" not in server.lower()
     assert server == "agent-mcp"
+
+
+# ── OBS7 class-sweep: HSTS gate must trust XFP only from a trusted
+# proxy (R6-F1) ──────────────────────────────────────────────────────
+#
+# ``_request_is_https`` is the last of 5 XFH/XFP trust-boundary
+# consumers (alongside ``login.cookie_secure_flag``,
+# ``login._external_origin``, ``mount.external_origin``,
+# ``sso._default_redirect_url``) to receive the ``request_from_trusted_
+# proxy`` gate. Before the fix it read ``X-Forwarded-Proto`` directly
+# from ANY peer, so an untrusted client could spoof ``https`` to force
+# HSTS onto a plain-HTTP response — or spoof ``http`` to strip HSTS
+# from a genuinely-secure deployment, opening a downgrade window on a
+# later connection. Mirrors ``test_login_flow.py``'s
+# ``_mocked_request`` helper for the untrusted-vs-trusted-peer shape.
+
+
+def _mocked_request(remote: str | None, headers: dict[str, str]):
+    """A GET request with a chosen peer IP and headers.
+
+    ``remote=None`` models a UDS / in-process peer (empty
+    ``request.remote``) which the trusted-proxy check treats as
+    trusted loopback. A dotted-quad models a direct (untrusted) client
+    hit. The mocked request's own scheme is plain HTTP (no TLS
+    metadata attached), matching the underlying connection whose
+    apparent scheme an untrusted peer must not be able to override.
+    """
+    from unittest import mock
+
+    from aiohttp.test_utils import make_mocked_request
+
+    transport = mock.Mock()
+    peername = (remote, 40000) if remote else None
+    transport.get_extra_info = lambda key, default=None: (
+        peername if key == "peername" else default
+    )
+    return make_mocked_request(
+        "GET", "/agent-mcp/login", headers=headers, transport=transport,
+    )
+
+
+async def test_request_is_https_ignores_spoofed_xfp_from_untrusted_peer() -> None:
+    """RED (pre-fix): an untrusted direct peer spoofing
+    ``X-Forwarded-Proto: https`` over a plain-HTTP connection must NOT
+    flip ``_request_is_https`` to True — the underlying transport
+    scheme wins."""
+    from agent_mcp.router.security_headers import _request_is_https
+
+    req = _mocked_request(
+        "203.0.113.7", {"X-Forwarded-Proto": "https"},
+    )
+    assert _request_is_https(req) is False
+
+
+async def test_apply_headers_no_hsts_on_spoofed_xfp_from_untrusted_peer() -> None:
+    """Same bug, exercised through the real consumer: HSTS must stay
+    absent when a spoofed XFP arrives from an untrusted peer over
+    plain HTTP."""
+    from aiohttp import web
+
+    from agent_mcp.router.security_headers import _apply_headers
+
+    req = _mocked_request(
+        "203.0.113.7", {"X-Forwarded-Proto": "https"},
+    )
+    resp = web.Response()
+    _apply_headers(resp, req)
+    assert resp.headers.get("Strict-Transport-Security") is None
+
+
+async def test_request_is_https_honours_xfp_from_trusted_proxy() -> None:
+    """Happy path preserved: a trusted proxy peer (loopback / UDS by
+    default) forwarding ``X-Forwarded-Proto: https`` still flips
+    ``_request_is_https`` to True."""
+    from agent_mcp.router.security_headers import _request_is_https
+
+    req = _mocked_request(
+        "127.0.0.1", {"X-Forwarded-Proto": "https"},
+    )
+    assert _request_is_https(req) is True
+
+
+async def test_request_is_https_honours_xfp_from_uds_peer() -> None:
+    """A UDS / in-process peer (empty ``request.remote``) is trusted
+    loopback by construction, same as the other 4 OBS7-gated
+    consumers."""
+    from agent_mcp.router.security_headers import _request_is_https
+
+    req = _mocked_request(None, {"X-Forwarded-Proto": "https"})
+    assert _request_is_https(req) is True
+
+
+async def test_request_is_https_falls_back_to_transport_scheme_untrusted() -> None:
+    """An untrusted peer with NO forwarding header at all still falls
+    back correctly to the real (plain-HTTP) transport scheme."""
+    from agent_mcp.router.security_headers import _request_is_https
+
+    req = _mocked_request("203.0.113.7", {})
+    assert _request_is_https(req) is False
 
 
 @pytest.mark.no_auth_seed_session
