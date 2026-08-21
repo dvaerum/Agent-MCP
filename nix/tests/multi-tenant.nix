@@ -69,12 +69,22 @@ pkgs.testers.nixosTest {
           "OPENAI_API_KEY=fake"
           "AGENT_MCP_EMBEDDING_MODEL=fake-zero-vector"
           "AGENT_MCP_EMBEDDING_DIMENSION=1024"
+          # R8-F2 class-sweep: same fix as single-tenant.nix — see its
+          # comment. Nothing here exercises the backend today either
+          # (see the module docstring above), so this was equally
+          # dormant; fixed to match module.nix rather than leave a
+          # known-wrong default for the next test that does.
+          "AGENT_MCP_SOCK_DIR=/run/agent-mcp"
         ];
         RuntimeDirectory = "agent-mcp/%i";
         RuntimeDirectoryMode = "0700";
-        # Idempotent stale-socket cleanup; backend's own bind() can't
-        # bind over an existing sock file.
-        ExecStartPre = "${pkgs.coreutils}/bin/rm -f /run/agent-mcp/%i/backend.sock";
+        # R8-F2 class-sweep: same forwarding-HMAC fix as single-tenant.nix
+        # — see its comment. Idempotent stale-socket cleanup (bind() can't
+        # bind over an existing sock file) kept as the second step.
+        ExecStartPre = [
+          "${pkgs.runtimeShell} -c 'test -f \"$RUNTIME_DIRECTORY/forwarding_hmac\" || { ${pkgs.coreutils}/bin/head -c 32 /dev/urandom > \"$RUNTIME_DIRECTORY/forwarding_hmac\" && ${pkgs.coreutils}/bin/chmod 600 \"$RUNTIME_DIRECTORY/forwarding_hmac\"; }'"
+          "${pkgs.coreutils}/bin/rm -f /run/agent-mcp/%i/backend.sock"
+        ];
         ExecStart = ''
           ${packagedPkgs.agentMcpLauncher}/bin/agent-mcp-launcher %i
         '';
@@ -111,6 +121,16 @@ pkgs.testers.nixosTest {
         AGENT_MCP_IDLE_SEC = "14400";
         AGENT_MCP_README_HTML = "${packagedPkgs.readmeHtml}";
         AGENT_MCP_INSTALLER_TEMPLATE = "${packagedPkgs.installerTemplate}";
+        # R8-F2 class-sweep: same dormant mismatch fixed in
+        # single-tenant.nix — the router defaults to `systemctl
+        # --user`, but this VM's agent-mcp@%i template is a
+        # system-level unit. This test's own docstring notes it never
+        # actually exercises the backend (no `_ensure`/systemctl-start
+        # call happens), so the wrong default has been silently inert
+        # here too; fixing it now to match module.nix / the other VM
+        # tests rather than leave a known-wrong default for whoever
+        # extends this test to touch the backend next.
+        AGENT_MCP_SYSTEMCTL_MODE = "system";
       };
       serviceConfig = {
         Type = "simple";

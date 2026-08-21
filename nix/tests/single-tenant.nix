@@ -24,6 +24,35 @@ let
   };
   singleName = "only-project";
   singleWorkspace = "/home/testuser/projects/${singleName}";
+  # R8-F2 discovery: the old ExecStartPre seeded this file with a
+  # hand-escaped `echo "{\"...\":\"...\"}"` one-liner. systemd's OWN
+  # ExecStartPre= command-line tokenizer (systemd.syntax(7)) processes
+  # backslash escapes even INSIDE single quotes (unlike POSIX sh), so
+  # by the time that string reached `sh -c` its `\"` sequences had
+  # already been stripped down to bare `"`, and bash's own quote
+  # parsing then silently swallowed every quote mark. The file that
+  # landed on disk was `{only-project:/home/.../only-project}` — no
+  # quotes at all — which the router's ProjectRegistry logged as
+  # unparseable and silently discarded (see project_registry.py),
+  # starting fresh with an EMPTY registry. Every existing assertion in
+  # this test passed anyway because none of them resolve the project
+  # through ProjectRegistry (the dashboard 200 check doesn't need it).
+  # R8-F2's new backend-liveness check below DOES need a resolvable
+  # project, which is what surfaced this. Fixed the idiomatic way — a
+  # real ``pkgs.writeText`` derivation built from ``builtins.toJSON``
+  # sidesteps shell/systemd escaping entirely; nothing about this file
+  # is one-off imperative munging anymore.
+  projectsSeedFile = pkgs.writeText "projects.local.json"
+    (builtins.toJSON { ${singleName} = singleWorkspace; });
+  # R8-F2 regression guard: merge the real shared hardening subset
+  # (single source of truth for all 6 production call sites — see
+  # nix/hardening.nix) into these two hand-rolled test units, exactly
+  # as nix/module.nix and nix/home-manager-module.nix do. A future
+  # edit to hardening.nix (e.g. dropping one of the 5 directives added
+  # in R8-F2) changes what's merged here too, so the systemctl-show
+  # assertions in testScript below actually exercise it — not just a
+  # copy hand-typed into this test file.
+  hardening = import ../hardening.nix;
 in
 pkgs.testers.nixosTest {
   name = "agent-mcp-single-tenant";
@@ -59,16 +88,64 @@ pkgs.testers.nixosTest {
           "OPENAI_API_KEY=fake"
           "AGENT_MCP_EMBEDDING_MODEL=fake-zero-vector"
           "AGENT_MCP_EMBEDDING_DIMENSION=1024"
+          # R8-F2 discovery: the "sqlite-vec (VSS) extension confirmed
+          # loadable" line the VSS-liveness assertion below greps for is
+          # logged at INFO, and agent_mcp/core/config.py's stderr
+          # handler defaults to a WARNING floor
+          # (AGENT_MCP_STDERR_LOG_LEVEL, "WARNING" unless overridden) —
+          # so without this override that line (and the rest of the
+          # startup sequence's INFO logging) never reaches the journal
+          # at all, regardless of the 5 hardening directives. Verified
+          # live on vm-dev: the full startup sequence, including the
+          # VSS confirmation, completes in ~70-110ms once this is set —
+          # the earlier "hang" was this log-level gap, not a real stall
+          # or a hardening-vs-sqlite-vec conflict.
+          "AGENT_MCP_STDERR_LOG_LEVEL=INFO"
+          # R8-F2 discovery: the backend resolves a forwarded operator-
+          # session cookie against router.identity.get_session(), which
+          # reads the SAME on-disk router.db the router process uses —
+          # both processes must point at one file (see
+          # home-manager-module.nix's AGENT_MCP_ROUTER_DB wiring on ITS
+          # backend units, which this test's template was missing).
+          # Without this, the backend can't see any session the router
+          # minted, logs "operator-session resolution failed...
+          # treating as anonymous", and 401s. No prior assertion in
+          # this test suite drove a cookie-authenticated call through
+          # to the backend, so this gap was dormant too.
+          "AGENT_MCP_ROUTER_DB=/home/testuser/.config/agent-mcp/router.db"
+          # XDG_RUNTIME_DIR above points at a login-
+          # session dir nothing in this VM ever creates (testuser never
+          # logs in, so pam_systemd never provisions /run/user/1500).
+          # The launcher falls back to ``${XDG_RUNTIME_DIR}/agent-mcp``
+          # for its socket dir ONLY when AGENT_MCP_SOCK_DIR is unset
+          # (nix/packages.nix) — so without this override the launcher's
+          # own `mkdir -p` 500'd on the root-owned /run, permission
+          # denied. Same fix already proven in event-driven-coord.nix /
+          # no-auto-cleanup.nix (the two existing VM tests that DO start
+          # a real backend); this test never did until R8-F2's new
+          # liveness assertion, so the gap was dormant.
+          "AGENT_MCP_SOCK_DIR=/run/agent-mcp"
         ];
         RuntimeDirectory = "agent-mcp/%i";
         RuntimeDirectoryMode = "0700";
-        ExecStartPre = "${pkgs.coreutils}/bin/rm -f /run/agent-mcp/%i/backend.sock";
+        # R8-F2 discovery: F015 v4 (see nix/module.nix) generates the
+        # per-project forwarding-HMAC key via ExecStartPre; the
+        # launcher's ``--forwarding-hmac-in`` is click-validated with
+        # ``exists=True`` and exits 2/INVALIDARGUMENT on every launch
+        # without it. Same fix already proven in event-driven-coord.nix
+        # / no-auto-cleanup.nix; this template previously did only the
+        # socket cleanup below, so the backend never came up — dormant
+        # for the same reason as the other 2 fixes above.
+        ExecStartPre = [
+          "${pkgs.runtimeShell} -c 'test -f \"$RUNTIME_DIRECTORY/forwarding_hmac\" || { ${pkgs.coreutils}/bin/head -c 32 /dev/urandom > \"$RUNTIME_DIRECTORY/forwarding_hmac\" && ${pkgs.coreutils}/bin/chmod 600 \"$RUNTIME_DIRECTORY/forwarding_hmac\"; }'"
+          "${pkgs.coreutils}/bin/rm -f /run/agent-mcp/%i/backend.sock"
+        ];
         ExecStart = ''
           ${packagedPkgs.agentMcpLauncher}/bin/agent-mcp-launcher %i
         '';
         Restart = "on-failure";
         RestartSec = 5;
-      };
+      } // hardening;
     };
 
     systemd.services.agent-mcp-router = {
@@ -100,6 +177,17 @@ pkgs.testers.nixosTest {
         AGENT_MCP_IDLE_SEC = "14400";
         AGENT_MCP_README_HTML = "${packagedPkgs.readmeHtml}";
         AGENT_MCP_INSTALLER_TEMPLATE = "${packagedPkgs.installerTemplate}";
+        # R8-F2 discovery: the router defaults to `systemctl --user`,
+        # which matches the nixos-developer-system home-manager
+        # deployment. In this VM test the agent-mcp@%i template is
+        # system-level, so flip the mode (mirrors nix/module.nix's
+        # setting, and event-driven-coord.nix / no-auto-cleanup.nix's
+        # matching fix for the same test-fixture shape). This test
+        # never actually exercised a real `_ensure`/backend-start
+        # before R8-F2's new liveness assertion, so the wrong default
+        # ("user", requiring a $DBUS_SESSION_BUS_ADDRESS this VM never
+        # sets up) was dormant until now.
+        AGENT_MCP_SYSTEMCTL_MODE = "system";
       };
       serviceConfig = {
         Type = "simple";
@@ -111,10 +199,13 @@ pkgs.testers.nixosTest {
           "${pkgs.coreutils}/bin/mkdir -p /home/testuser/.config/agent-mcp /home/testuser/projects ${singleWorkspace}"
           # Seed projects.local.json with the single-tenant entry —
           # mirrors what the home-manager module's
-          # singleProjectSeedScript does on production hosts.
-          ''
-            ${pkgs.bash}/bin/sh -c 'echo "{\"${singleName}\":\"${singleWorkspace}\"}" > /home/testuser/.config/agent-mcp/projects.local.json'
-          ''
+          # singleProjectSeedScript does on production hosts. Copied
+          # (not symlinked) from the nix-store-built ``projectsSeedFile``
+          # so the runtime path stays a regular, independently-writable
+          # file exactly like the home-manager module's version — see
+          # the R8-F2 comment on ``projectsSeedFile`` above for why this
+          # isn't an inline ``echo`` one-liner.
+          "${pkgs.coreutils}/bin/install -m 0644 ${projectsSeedFile} /home/testuser/.config/agent-mcp/projects.local.json"
         ];
         ExecStart = ''
           ${packagedPkgs.agentMcpRouterWrapper}/bin/agent-mcp-router \
@@ -123,7 +214,7 @@ pkgs.testers.nixosTest {
         '';
         Restart = "on-failure";
         RestartSec = 5;
-      };
+      } // hardening;
     };
 
     security.polkit.enable = true;
@@ -298,6 +389,83 @@ pkgs.testers.nixosTest {
         "client-side route transitions construct broken CSS URLs "
         "and the browser strict-MIME check fails. Offending URLs: "
         f"{offenders!r}"
+    )
+
+    # 7. R8-F2 regression guard: the 5 hardening directives added to
+    # nix/hardening.nix (PrivateDevices, ProtectKernelLogs, RemoveIPC,
+    # CapabilityBoundingSet=, UMask=0077) must be in effect on BOTH
+    # units — a future edit to that file that drops one silently
+    # weakens every one of the 6 production call sites, so pin it here.
+    #
+    # First, force a *blocking* backend start (unlike the dashboard's
+    # best-effort background warm-start, the proxied /api/<name>/...
+    # path awaits `_ensure()` before responding — see
+    # agent_mcp/router/project_orchestrator.py) so the assertions below
+    # observe the backend once it's actually up, not mid-spawn.
+    #
+    # R8-F2 discovery: single-tenant mode only bypasses the ROUTER's
+    # own operator-session gate (auth_middleware.py, via
+    # single_tenant.bypasses_operator_gate()) — the /api/<name>/...
+    # REST proxy forwards the request three hops to the BACKEND's own
+    # FastAPI process, whose `require_operator_session` dependency
+    # (agent_mcp/app/deps.py) has no single-tenant awareness at all and
+    # 401s a bare unauthenticated request in EITHER mode. Log in first,
+    # same as every other test in this suite that reaches an
+    # operator-gated route — the bootstrap credentials are already
+    # wired into this unit's environment above, just never used by any
+    # assertion before this one.
+    machine.succeed(
+        "curl -fsS -c /tmp/agent-mcp-cookies.txt "
+        "-F username=ci-sentinel -F password=ci-sentinel-pw "
+        "http://127.0.0.1:${toString ports.routerPort}/agent-mcp/login"
+    )
+    machine.succeed(
+        "curl -fsS -b /tmp/agent-mcp-cookies.txt "
+        "-H 'Accept: application/vnd.agent-mcp.v1+json' "
+        "http://127.0.0.1:${toString ports.routerPort}"
+        "/agent-mcp/api/${singleName}/status"
+    )
+    machine.wait_for_unit("agent-mcp@${singleName}.service")
+
+    expected_props = {
+        "PrivateDevices": "yes",
+        "ProtectKernelLogs": "yes",
+        "RemoveIPC": "yes",
+        "CapabilityBoundingSet": "",
+        "UMask": "0077",
+    }
+    for unit in ("agent-mcp-router.service", "agent-mcp@${singleName}.service"):
+        for prop, expected in expected_props.items():
+            actual = machine.succeed(
+                f"systemctl show --value -p {prop} {unit}"
+            ).strip()
+            assert actual == expected, (
+                f"R8-F2 regression: {unit} {prop}={actual!r}, "
+                f"expected {expected!r} (see nix/hardening.nix)"
+            )
+
+    # Sqlite-vec's ctypes extension is the fragile path the two
+    # deliberately-omitted directives (MemoryDenyWriteExecute,
+    # SystemCallFilter) exist to protect — prove it still loads
+    # cleanly under all 5 new directives together by checking for the
+    # startup confirmation log line (server_lifecycle.py).
+    #
+    # R8-F2 discovery: a single point-in-time `journalctl | grep -c`
+    # right after `wait_for_unit` raced journald's own flush/index
+    # latency — `wait_for_unit` only observes systemd's activation
+    # state (Type=simple activates at fork(), long before the app logs
+    # anything), and the earlier blocking `/api/.../status` curl
+    # succeeding proves the process was fully up, not that journald had
+    # already indexed every line it wrote. Poll instead of a single
+    # snapshot; a real hardening-induced crash still fails this via
+    # `wait_until_succeeds`'s own timeout, and unlike the old `|| true`
+    # form (which silently turned a genuine 0-count into a "succeeded"
+    # shell exit and masked the real signal), that timeout IS the
+    # failure signal now.
+    machine.wait_until_succeeds(
+        "journalctl -u agent-mcp@${singleName}.service --no-pager "
+        "| grep -q 'sqlite-vec (VSS) extension confirmed loadable'",
+        timeout=30,
     )
   '';
 }
