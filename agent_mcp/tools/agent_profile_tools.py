@@ -26,6 +26,11 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 from .registry import register_tool
+# R8-F1: explicit maxLength bound for the identifier-shaped agent_id
+# field. See core/schema_limits.py; `profile` is free-form prose and
+# inherits DEFAULT_STRING_MAX_LEN from the dispatcher's generic
+# backstop.
+from ..core.schema_limits import IDENTIFIER_MAX_LEN
 from ..core.authorize import requires_capability
 from ..core.config import logger
 from ..core.principal import Principal
@@ -241,6 +246,7 @@ def register_agent_profile_tools() -> None:
                         "a manager may target another agent, and only a "
                         "worker in the project."
                     ),
+                    "maxLength": IDENTIFIER_MAX_LEN,
                 },
             },
             "required": [],

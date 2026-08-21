@@ -34,6 +34,9 @@ import sqlite3
 from typing import Any, Dict, List, Optional
 
 from .registry import register_tool
+# R8-F1: explicit maxLength bound for the identifier-shaped
+# context_key field. See core/schema_limits.py for the rationale.
+from ..core.schema_limits import IDENTIFIER_MAX_LEN
 from .project_context_tools import emit_context_write_wakes
 from ..core.config import logger
 from ..core.operator_tier import (
@@ -376,6 +379,7 @@ def register_project_settings_tools() -> None:
                         "The config_* key to set (e.g. "
                         "'config_allow_worker_to_worker')."
                     ),
+                    "maxLength": IDENTIFIER_MAX_LEN,
                 },
                 "context_value": {
                     "description": (
@@ -409,6 +413,7 @@ def register_project_settings_tools() -> None:
                 "context_key": {
                     "type": "string",
                     "description": "The config_* key to delete.",
+                    "maxLength": IDENTIFIER_MAX_LEN,
                 },
             },
             "required": ["context_key"],

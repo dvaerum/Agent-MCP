@@ -38,6 +38,11 @@ import secrets
 from typing import Any, Dict, Optional
 
 from .registry import register_tool
+# R8-F1: explicit maxLength bound for identifier-shaped fields
+# (agent_id, directive_id). See core/schema_limits.py for the
+# rationale; `prompt` is free text and inherits DEFAULT_STRING_MAX_LEN
+# from the dispatcher's generic backstop.
+from ..core.schema_limits import IDENTIFIER_MAX_LEN
 from . import access as _access
 from ..core.authorize import requires_capability, requires_policy
 from ..core.config import logger
@@ -671,6 +676,7 @@ def register_scheduled_directive_tools() -> None:
                 "Target agent. Omit to schedule for yourself. A manager may "
                 "target one of its workers; an operator may target anyone."
             ),
+            "maxLength": IDENTIFIER_MAX_LEN,
         },
         "until": {
             "type": ["string", "null"],
@@ -736,6 +742,7 @@ def register_scheduled_directive_tools() -> None:
                         "Target agent whose schedules to list. Omit for "
                         "your own."
                     ),
+                    "maxLength": IDENTIFIER_MAX_LEN,
                 },
             },
             "required": [],
@@ -758,6 +765,7 @@ def register_scheduled_directive_tools() -> None:
                 "directive_id": {
                     "type": "string",
                     "description": "The id of the schedule to update.",
+                    "maxLength": IDENTIFIER_MAX_LEN,
                 },
                 "prompt": {
                     "type": ["string", "null"],
@@ -806,6 +814,7 @@ def register_scheduled_directive_tools() -> None:
                 "directive_id": {
                     "type": "string",
                     "description": "The id of the schedule to delete.",
+                    "maxLength": IDENTIFIER_MAX_LEN,
                 },
             },
             "required": ["directive_id"],

@@ -11,6 +11,9 @@ import os
 from .registry import register_tool, request_auth_token
 from . import access as _access  # Canonical home for _get_config_bool
 from ..core.config import logger
+# R8-F1: explicit maxLength bounds for identifier/message-shaped
+# schema properties. See core/schema_limits.py for the rationale.
+from ..core.schema_limits import IDENTIFIER_MAX_LEN, MESSAGE_MAX_LEN
 from ..core import globals as g
 from ..core.principal import Principal
 from ..core.principal_builder import (
@@ -2639,11 +2642,22 @@ def register_agent_communication_tools():
             "properties": {
                 "recipient_id": {
                     "type": "string",
-                    "description": "ID of the agent to send message to"
+                    "description": "ID of the agent to send message to",
+                    "maxLength": IDENTIFIER_MAX_LEN,
                 },
                 "message": {
                     "type": "string",
-                    "description": "Message content (max 4000 characters)"
+                    "description": "Message content (max 4000 characters)",
+                    # NOT schema-capped: send_agent_message_tool_impl
+                    # already enforces this exact 4000-char bound
+                    # (`if len(message_content) > 4000`) with its own
+                    # "Message too long (max 4000 characters)" message.
+                    # A schema-level maxLength would fire first in the
+                    # dispatcher and pre-empt that message (same class
+                    # of duplication as project_context's context_key
+                    # -- see FLAG-R17-2). broadcast_admin_message's
+                    # `message` below has no such precedent, so it
+                    # gets the explicit bound.
                 },
                 "message_type": {
                     "type": "string",
@@ -2757,7 +2771,8 @@ def register_agent_communication_tools():
             "properties": {
                 "message": {
                     "type": "string",
-                    "description": "Message content to broadcast"
+                    "description": "Message content to broadcast",
+                    "maxLength": MESSAGE_MAX_LEN,
                 },
                 "message_type": {
                     "type": "string",
