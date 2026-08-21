@@ -25,9 +25,9 @@ CSP notes (the one header that can break the app):
 The whole CSP is overridable via ``AGENT_MCP_CSP`` for operators who
 front the router differently or want to tighten it further.
 
-HSTS is emitted ONLY on HTTPS requests (same ``X-Forwarded-Proto`` /
-scheme heuristic as ``login.cookie_secure_flag``) so the plain-HTTP
-dev / VM smoke doesn't get pinned to HTTPS.
+HSTS is emitted ONLY on HTTPS requests (same trusted-proxy-gated
+``X-Forwarded-Proto`` / scheme heuristic as ``login.cookie_secure_flag``)
+so the plain-HTTP dev / VM smoke doesn't get pinned to HTTPS.
 
 Cache-Control (SC-1): sensitive router surfaces — the login page, authed
 API JSON, and 401/error bodies — carried no cache directive, so they
@@ -94,15 +94,33 @@ def _request_is_https(request: web.Request) -> bool:
     """Same heuristic as ``login.cookie_secure_flag``.
 
     Honours ``X-Forwarded-Proto`` first (TLS terminates upstream and
-    forwards plain HTTP), then the direct request scheme. Kept inline
-    rather than importing ``login`` so this leaf middleware carries no
-    dependency on the login view module.
+    forwards plain HTTP), but ONLY when the direct peer is a trusted
+    proxy (``rate_limit.request_from_trusted_proxy``) — the header is
+    client-settable, so an untrusted peer must not drive the HSTS
+    decision (OBS7 class-sweep; this was the last of 5 XFH/XFP
+    trust-boundary consumers to get the gate — see
+    ``login.cookie_secure_flag`` / ``login._external_origin`` /
+    ``mount.external_origin`` / ``sso._default_redirect_url``).
+    Falls back to the direct request scheme otherwise. ``rate_limit``
+    is imported lazily so this leaf middleware carries no hard import
+    on it at module load time.
+
+    Security: the exploitable direction of an ungated header here is
+    HSTS-suppression — spoofing ``http`` strips HSTS from an
+    otherwise-secure response, opening a downgrade window on a LATER
+    connection. (Spoofing ``https`` to force HSTS onto genuine
+    plain-HTTP has no client impact: RFC 6797 requires an
+    already-validated TLS connection for a browser to honour the
+    header at all.)
     """
-    forwarded = request.headers.get("X-Forwarded-Proto", "").lower()
-    if forwarded == "https":
-        return True
-    if forwarded == "http":
-        return False
+    from . import rate_limit
+
+    if rate_limit.request_from_trusted_proxy(request):
+        forwarded = request.headers.get("X-Forwarded-Proto", "").lower()
+        if forwarded == "https":
+            return True
+        if forwarded == "http":
+            return False
     return request.url.scheme == "https"
 
 
