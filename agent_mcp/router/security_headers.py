@@ -44,6 +44,22 @@ CVE-matching on a direct bind (nginx masks it in prod, but this is the
 defence-in-depth gap). We assign a neutral, version-free banner
 UNCONDITIONALLY (not ``setdefault``) so it's present before aiohttp's
 own default fires and wins over it.
+
+R7-F2: the middleware-level overwrite above only runs for responses
+that reach ``web.Application`` — a request malformed enough to trip
+aiohttp's own HTTP/1.1 parser (bad ``Content-Length``, a bad chunk
+size, ...) never gets that far, so it still leaked the raw banner.
+Closed at the root by reassigning aiohttp's own ``SERVER_SOFTWARE``
+constant(s) at THIS module's import time — see the comment beside
+that reassignment below for why two separate bindings need patching.
+Residual gap accepted: the other hardened headers (CSP, X-Frame-
+Options, ...) still cannot land on that parser-rejected path — there
+is no ``Request``/``Application`` context at that point without
+patching aiohttp's internal ``RequestHandler.handle_error``, out of
+proportion for a defense-in-depth header on an already-4xx'd
+malformed request. Mitigated in production by fronting the router
+behind nginx/Tailscale, which doesn't forward raw malformed requests
+to begin with.
 """
 
 from __future__ import annotations
@@ -88,6 +104,43 @@ _HSTS_VALUE = "max-age=63072000; includeSubDomains"
 # Python/… aiohttp/…`` banner (SC-2 / SD-3). Names the product but
 # discloses nothing a CVE scanner can pivot on.
 _SERVER_BANNER = "agent-mcp"
+
+# R7-F2: `_apply_headers`'s unconditional `hdrs["Server"] = ...`
+# above only fires for responses that flow through
+# `web.Application.__call__` — i.e. this middleware. A genuinely
+# malformed HTTP/1.1 request (bad/duplicate Content-Length, a bad
+# chunk size, a garbage request line, ...) never gets that far:
+# aiohttp's own `RequestHandler.handle_error` (web_protocol.py)
+# builds and writes a bare `Response(...)` directly from within the
+# protocol's `data_received`, bypassing `Application` — and every
+# middleware, including this one — entirely. That response fills
+# `Server` via `headers.setdefault(hdrs.SERVER, SERVER_SOFTWARE)`,
+# so the only way to neutralise it there is to make aiohttp's OWN
+# default neutral, by reassigning the constant it reads.
+#
+# `aiohttp.web_response` does `from .http import SERVER_SOFTWARE` at
+# import time — that's a SEPARATE name binding in its own module
+# namespace, not an attribute lookup through `aiohttp.http` — so
+# patching only `aiohttp.http.SERVER_SOFTWARE` leaves
+# `aiohttp.web_response.SERVER_SOFTWARE` (the one `Response.
+# write_headers` actually reads) holding the real version string.
+# Both must be reassigned.
+#
+# Doing this at THIS module's import time (rather than, say, inside
+# `make_app()`) makes it a guaranteed side effect of the single
+# statement both live entrypoints already have —
+# `router/app.py::make_app` and `cli.py`'s `router` subcommand both
+# `from .security_headers import security_headers_middleware` before
+# constructing the `web.Application`, and in both cases that
+# construction completes (as a function-call argument or otherwise)
+# before `web.run_app` is invoked. One import, both entrypoints
+# covered, no risk of a future call site forgetting a separate
+# startup hook.
+import aiohttp.http as _aiohttp_http
+import aiohttp.web_response as _aiohttp_web_response
+
+_aiohttp_http.SERVER_SOFTWARE = _SERVER_BANNER
+_aiohttp_web_response.SERVER_SOFTWARE = _SERVER_BANNER
 
 
 def _request_is_https(request: web.Request) -> bool:
