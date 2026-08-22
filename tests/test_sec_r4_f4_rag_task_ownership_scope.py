@@ -66,6 +66,13 @@ class _StubEmbedder:
     def embed(self, texts):
         return [[0.0] * 8 for _ in texts]
 
+    async def aembed(self, texts):
+        # R12-F2: query_rag_system now calls the async aembed() (never
+        # the sync, event-loop-freezing embed()) — this stub must
+        # answer both so it stays a faithful stand-in for the real
+        # embedding seam.
+        return [[0.0] * 8 for _ in texts]
+
 
 def _user_content(cap: _CapturingClient) -> str:
     assert cap.messages is not None, (

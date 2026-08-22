@@ -62,6 +62,21 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         monkeypatch.setenv(
             "AGENT_MCP_ROUTER_DB", str(tmp_path / "router-floor.db")
         )
+    # R12-F3: embedding_client() now caches one client per resolved
+    # (provider, model, dimension, base_url, api_key) tuple for the
+    # life of the process (fixing an unbounded connection leak — see
+    # embedding_service.py). That's correct for a real server process,
+    # but a cache hit could hand a later test an already-constructed
+    # openai/httpx client built BEFORE that test's own `mock_ollama` /
+    # `mcp_session` transport patch was installed — httpx.Client.__init__
+    # is only patched for NEWLY constructed instances, so an
+    # already-built client would silently keep talking through a stale
+    # prior test's mock transport instead of the current test's. Reset
+    # the cache every test so each test's first embedding_client() call
+    # builds (and binds) its SDK client while ITS OWN mocks are active.
+    from agent_mcp.external.embedding_service import reset_embedding_client_cache
+
+    reset_embedding_client_cache()
 
 
 def reset_and_snapshot_globals() -> Callable[[], None]:

@@ -96,9 +96,14 @@ async def _get_embeddings_batch(
 ) -> bool:
     """
     Processes a single batch of embeddings asynchronously through the
-    embedding seam (:func:`embedding_client`). A fresh client per batch
-    preserves the original "separate async client per batch for true
-    concurrency" behaviour.
+    embedding seam (:func:`embedding_client`). Each call resolves the
+    SAME cached client for a given (provider, model, dimension) — see
+    R12-F3 in embedding_service.py — so concurrent batches share one
+    connection pool rather than each opening (and leaking) its own; the
+    original "true concurrency" this docstring used to credit to a
+    fresh-client-per-batch actually comes from ``await``ing the async
+    client, which lets many batches' requests be in flight on the same
+    pool at once.
     This is a helper for run_rag_indexing_periodically.
     Based on original main.py: lines 656-675.
     """
@@ -125,10 +130,12 @@ async def _get_embeddings_batch(
                     " "
                 )  # Use single space as fallback to maintain batch size
 
-        # A fresh embedding client per batch preserves the original
-        # "separate async client for true concurrency" behaviour; the
-        # seam owns model/dimension/base_url/api_key so the endpoint is
-        # resolved the same way as every other embedding call site.
+        # R12-F3: embedding_client() now hands back the SAME cached
+        # client (and connection pool) for this (provider, model,
+        # dimension) — concurrent batches share it rather than each
+        # leaking an independent one. The seam owns
+        # model/dimension/base_url/api_key so the endpoint is resolved
+        # the same way as every other embedding call site.
         vectors = await embedding_client().aembed(validated_chunks)
         # Store results directly in the provided results list
         for j, vector in enumerate(vectors):
@@ -1155,7 +1162,15 @@ async def index_task_data(task_id: str, task_data: Dict[str, Any]) -> None:
         # Generate embeddings for each chunk + insert via repo.
         for chunk_text in chunks:
             try:
-                embedding_vector = emb_client.embed([chunk_text])[0]
+                # R12-F2 (HIGH, live-exploited): async aembed(), not the
+                # sync embed() — index_task_data runs on
+                # asyncio.create_task() from EVERY ordinary create_task/
+                # update_task call (task_tools.py), so a sync, blocking
+                # embed() call here froze the whole backend's event loop
+                # during routine, non-adversarial use, not just
+                # deliberate abuse. See features/rag/query.py's call
+                # sites for the identical bug and full explanation.
+                embedding_vector = (await emb_client.aembed([chunk_text]))[0]
                 rag_repo.bulk_index_chunks(
                     source_type="task",
                     source_ref=task_id,

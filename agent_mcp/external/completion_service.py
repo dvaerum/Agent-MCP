@@ -80,6 +80,19 @@ _OLLAMA_DEFAULT_BASE_URL = "http://localhost:11434/v1"
 # via OLLAMA_MODEL.
 _OLLAMA_DEFAULT_MODEL = "qwen3:1.7b"
 
+# R12-F2 (HIGH, live-exploited) defense-in-depth: the openai SDK's own
+# default is 600s x automatic retries. This client is already always
+# awaited correctly (chat() is async end-to-end, unlike the embedding
+# seam's pre-fix sync .embed() call sites), but an unreachable/hung
+# provider should still degrade in a bounded number of seconds rather
+# than minutes. Mirrors the identically-named constant in
+# embedding_service.py by design — the two seams are kept in lockstep
+# (see that module's docstring) but not merged into one, so each stays
+# self-contained and cheap to read in isolation.
+_SDK_CLIENT_TIMEOUT_SECONDS = float(
+    os.environ.get("AGENT_MCP_LLM_CLIENT_TIMEOUT_SECONDS", "30")
+)
+
 
 class CompletionConfigError(RuntimeError):
     """Raised when env-var configuration is internally inconsistent.
@@ -115,7 +128,10 @@ class _BaseChatClient:
             raise CompletionConfigError(
                 "openai package not installed; cannot construct chat client"
             ) from e
-        kwargs: dict = {"api_key": self._api_key}
+        kwargs: dict = {
+            "api_key": self._api_key,
+            "timeout": _SDK_CLIENT_TIMEOUT_SECONDS,
+        }
         if self.base_url:
             kwargs["base_url"] = self.base_url
         self._client = openai.AsyncOpenAI(**kwargs)

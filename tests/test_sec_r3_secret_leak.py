@@ -71,6 +71,11 @@ class _StubEmbedder:
     def embed(self, texts):
         return [[0.0] * 8 for _ in texts]
 
+    async def aembed(self, texts):
+        # R12-F2: query_rag_system calls the async aembed(), never the
+        # sync embed() — this stub must answer both.
+        return [[0.0] * 8 for _ in texts]
+
 
 def _wire_capture(monkeypatch, *, vss: bool = False) -> _CapturingClient:
     cap = _CapturingClient()

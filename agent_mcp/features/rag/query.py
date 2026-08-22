@@ -448,7 +448,15 @@ async def query_rag_system(
         # the vector in.
         if is_vss_loadable():
             try:
-                query_embedding = embedding_client().embed([query_text])[0]
+                # R12-F2 (HIGH, live-exploited): MUST be the async
+                # aembed(), never the sync embed(). This coroutine has
+                # no earlier `await`, so a sync, blocking embed() call
+                # here holds the whole event loop hostage for the call's
+                # duration — freezing every other agent's stream and
+                # every other REST endpoint on this backend, not just
+                # this request. Live-repro'd: a single ask_project_rag
+                # call froze the target backend for 15+ minutes.
+                query_embedding = (await embedding_client().aembed([query_text]))[0]
                 # k=13 is the legacy knn-results constant the previous
                 # raw SQL used; preserved exactly so retrieval quality
                 # is unchanged across the migration. ADR-0017: no
@@ -703,7 +711,10 @@ async def query_rag_system_with_model(
         # k=13 retrieval window as the main RAG path.
         if is_vss_loadable():
             try:
-                query_embedding = embedding_client().embed([query_text])[0]
+                # R12-F2 (HIGH, live-exploited): async aembed(), not the
+                # sync embed() — see query_rag_system's identical
+                # call-site comment above for the full explanation.
+                query_embedding = (await embedding_client().aembed([query_text]))[0]
                 # ADR-0017: no content-based secret drop on chunks.
                 vector_search_results = rag_repo.search_similar(
                     query_embedding=query_embedding,

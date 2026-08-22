@@ -46,6 +46,7 @@ ambiguous-config trap to guard against.
 from __future__ import annotations
 
 import os
+import threading
 from typing import Any, List, Optional
 
 from ..core import config as _config
@@ -53,6 +54,18 @@ from ..core.config import logger
 
 
 _OLLAMA_DEFAULT_BASE_URL = "http://localhost:11434/v1"
+
+# R12-F2 (HIGH, live-exploited) defense-in-depth: the openai SDK's own
+# default is 600s x automatic retries. Even after fixing every call
+# site to await the async client (the actual fix for the event-loop
+# freeze — see query.py / indexing.py), an unreachable/hung provider
+# should still degrade in a bounded number of seconds, not minutes.
+# Mirrors the identically-named constant in completion_service.py by
+# design (see that module's docstring on why the two seams are kept in
+# lockstep but not merged).
+_SDK_CLIENT_TIMEOUT_SECONDS = float(
+    os.environ.get("AGENT_MCP_LLM_CLIENT_TIMEOUT_SECONDS", "30")
+)
 
 
 class EmbeddingConfigError(RuntimeError):
@@ -98,7 +111,10 @@ class _BaseEmbeddingClient:
         return openai
 
     def _client_kwargs(self) -> dict:
-        kwargs: dict = {"api_key": self._api_key}
+        kwargs: dict = {
+            "api_key": self._api_key,
+            "timeout": _SDK_CLIENT_TIMEOUT_SECONDS,
+        }
         if self.base_url:
             kwargs["base_url"] = self.base_url
         return kwargs
@@ -126,7 +142,20 @@ class _BaseEmbeddingClient:
 
     def embed(self, texts: List[str]) -> List[List[float]]:
         """Synchronously embed ``texts``; returns one vector per input,
-        in order."""
+        in order.
+
+        R12-F2 (HIGH, live-exploited): NEVER call this from inside a
+        coroutine running on the shared server event loop. It's a
+        genuinely blocking network round-trip (bounded by
+        ``_SDK_CLIENT_TIMEOUT_SECONDS`` but still seconds-long) with no
+        ``await`` point for the loop to yield on, so it freezes every
+        other coroutine on that loop — all REST endpoints, every other
+        agent's stream, task/message ops — for the call's whole
+        duration. Every async call site MUST use :meth:`aembed`
+        instead (``await embedding_client().aembed(...)``); this
+        method exists for genuinely synchronous callers only (e.g. a
+        plain script, or code already off-loaded to a worker thread).
+        """
         client = self._get_sync_client()
         response = client.embeddings.create(
             input=texts,
@@ -185,6 +214,51 @@ class OllamaEmbeddingClient(_BaseEmbeddingClient):
 EmbeddingClient = _BaseEmbeddingClient  # Public type alias for callers
 
 
+# R12-F3 (MEDIUM, CONFIRMED): every embedding_client() call used to
+# construct a BRAND NEW client — and, the first time embed()/aembed()
+# is actually invoked on it, a brand new openai SDK client with its own
+# independent httpx connection pool — with nothing anywhere in the
+# codebase ever calling .close()/.aclose(). Live SSH showed 21
+# simultaneous ESTABLISHED connections to the embedding endpoint after
+# ~1hr uptime, monotonically accumulating with every embedding
+# operation: unbounded per-process FD/connection growth that also
+# compounds R12-F2 (new calls queue behind an ever-growing set of stale
+# connections to the same provider).
+#
+# Fix: cache one client per resolved (class, model, dimension, base_url,
+# api_key) tuple at module scope, so a long-running server process
+# reuses the SAME client — and therefore the SAME underlying connection
+# pool — across every call with that configuration, instead of leaking
+# a fresh one each time. A cache (vs. threading .close() calls through
+# every call site) is the simpler fix here: it needs no lifecycle
+# management at any call site, and the underlying _BaseEmbeddingClient
+# already lazily builds its SDK client exactly once (see
+# _get_sync_client / _get_async_client) — this just extends that same
+# "build once, reuse" discipline one level up, to the client object
+# itself. Distinct tuples (e.g. an operator's live --advanced
+# reconfigure, or an explicit model/dimension override) still get their
+# own cached entry, so a runtime reconfigure is honoured exactly as
+# before — nothing is pinned to the FIRST resolution.
+#
+# Constructing a candidate instance is cheap and side-effect-free
+# (attribute assignment only; __init__ never touches the network or
+# builds an SDK client — see _get_sync_client/_get_async_client's own
+# lazy construction), so building one to read back its OWN resolved
+# base_url/api_key for the cache key is simpler and less error-prone
+# than re-deriving that resolution logic (which each subclass's
+# __init__ already owns) a second time here.
+_client_cache: dict[tuple, _BaseEmbeddingClient] = {}
+_client_cache_lock = threading.Lock()
+
+
+def reset_embedding_client_cache() -> None:
+    """Drop every cached client. Test-isolation seam (mirrors
+    ``db.engine.reset_engine_cache()``'s per-test reset) — a real
+    server process never needs to call this."""
+    with _client_cache_lock:
+        _client_cache.clear()
+
+
 def embedding_client(
     *,
     model: Optional[str] = None,
@@ -197,6 +271,11 @@ def embedding_client(
     never disagree about which provider is live. ``model`` / ``dimension``
     default to the ``core.config`` values (read at call time so a runtime
     reconfigure is honoured) but may be overridden by callers.
+
+    R12-F3: returns a CACHED client (and therefore a shared connection
+    pool) for a given (provider, model, dimension, base_url, api_key)
+    tuple rather than a fresh one on every call — see the module-level
+    comment above ``_client_cache`` for why.
     """
     settings = _config.embedding_settings()
     resolved_model = model or settings.model
@@ -209,11 +288,27 @@ def embedding_client(
             resolved_model,
             resolved_dimension,
         )
-        return OpenAIEmbeddingClient(resolved_model, resolved_dimension)
+        candidate: _BaseEmbeddingClient = OpenAIEmbeddingClient(
+            resolved_model, resolved_dimension
+        )
+    else:
+        logger.debug(
+            "embedding_service: using Ollama provider model=%s dim=%s",
+            resolved_model,
+            resolved_dimension,
+        )
+        candidate = OllamaEmbeddingClient(resolved_model, resolved_dimension)
 
-    logger.debug(
-        "embedding_service: using Ollama provider model=%s dim=%s",
-        resolved_model,
-        resolved_dimension,
+    cache_key = (
+        type(candidate),
+        candidate.model,
+        candidate.dimension,
+        candidate.base_url,
+        candidate._api_key,
     )
-    return OllamaEmbeddingClient(resolved_model, resolved_dimension)
+    with _client_cache_lock:
+        cached = _client_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        _client_cache[cache_key] = candidate
+        return candidate
