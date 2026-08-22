@@ -1270,19 +1270,32 @@ async def handle_oidc_callback(request: web.Request) -> web.StreamResponse:
     if not isinstance(groups_claim, list):
         groups_claim = []
 
-    user = find_or_create_sso_user(
-        email=email,
-        preferred_username=preferred_username,
-        subject=subject,
-        email_verified=email_verified,
-        # Bootstrap gate (round-9 AC-R9-2): the empty-table first-user
-        # sysadmin promotion only fires when the operator opted in. The
-        # empty-users redirect middleware already bounces empty-table
-        # HTTP logins to /setup, so this is the code-level backstop that
-        # keeps a fresh OIDC deploy from silently minting a sysadmin if
-        # the callback is ever reached against an empty table.
-        bootstrap_sysadmin=cfg.default_is_sysadmin,
-    )
+    from . import identity
+
+    try:
+        user = find_or_create_sso_user(
+            email=email,
+            preferred_username=preferred_username,
+            subject=subject,
+            email_verified=email_verified,
+            # Bootstrap gate (round-9 AC-R9-2): the empty-table first-user
+            # sysadmin promotion only fires when the operator opted in. The
+            # empty-users redirect middleware already bounces empty-table
+            # HTTP logins to /setup, so this is the code-level backstop that
+            # keeps a fresh OIDC deploy from silently minting a sysadmin if
+            # the callback is ever reached against an empty table.
+            bootstrap_sysadmin=cfg.default_is_sysadmin,
+        )
+    except identity.InvalidEmailError:
+        # R15-F2 sibling: an IdP ``email`` claim carrying an unpaired
+        # UTF-16 surrogate would otherwise crash ``create_user``'s INSERT
+        # with a raw ``UnicodeEncodeError``, surfacing as a bare 500 —
+        # same posture as the discovery/token/decode failures above:
+        # IdP-side data problem, log server-side, clean 502 to the client.
+        logger.exception("OIDC claims produced an invalid email")
+        return web.Response(
+            status=502, text="OIDC claims contained invalid email content",
+        )
     if cfg.group_mapping:
         apply_group_mapping(
             user["user_id"], groups_claim, cfg.group_mapping,
