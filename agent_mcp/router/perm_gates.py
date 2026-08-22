@@ -24,16 +24,22 @@ step in that progression).
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import sqlite3
-from typing import Awaitable, Callable
+from typing import AsyncIterator, Awaitable, Callable
 
 from aiohttp import web
 
 from .single_tenant import bypasses_operator_gate
 
 
-__all__ = ["require_capability", "revalidate_capability_or_403"]
+__all__ = [
+    "require_capability",
+    "revalidate_capability_or_403",
+    "read_body_and_revalidate",
+    "revalidated_lock",
+]
 
 
 def _forbidden_response(req: web.Request, cap: str) -> web.Response:
@@ -181,6 +187,125 @@ async def revalidate_capability_or_403(
     if not principal.has_capability(cap):
         return _forbidden_response(req, cap)
     return None
+
+
+async def read_body_and_revalidate(
+    req: web.Request,
+    parse_body: Callable[[web.Request], Awaitable[dict]],
+    cap: str,
+    project_name: str | None = None,
+    *,
+    min_role: str | None = None,
+) -> tuple[dict, web.Response | None]:
+    """Read the JSON body AND revalidate — ONE call, not two.
+
+    OBS-R11-1 (architectural): every one of R6-F2 / R7-F1 / R7-F3 / R8-F3 /
+    R9-F2 / R9-F3 / R9-F4 was the SAME shape — a handler snapshots the
+    caller's Principal at entry, does a genuine ``await`` (a body-read
+    here; a lock-acquire for ``revalidated_lock`` below), and trusts the
+    stale pre-await snapshot for the write that follows. The revalidation
+    helpers (this module's ``revalidate_capability_or_403`` and
+    ``admin_api._revalidate_capability_and_membership_or_403``) already
+    re-derive every axis correctly — capability, membership, role-tier,
+    session-liveness — but calling them was OPT-IN: a handler author had
+    to remember to (1) call the body-read, (2) separately call the
+    revalidator, immediately after, with the right project/min_role
+    arguments, and NOT do anything privileged in between. Six rounds
+    across two files rediscovered that "remember to" gap seven times.
+
+    Fusing the read and the revalidation into one coroutine removes the
+    opt-in step entirely: there is no way to obtain ``body`` without the
+    revalidation ALSO having run, because they're the same call. A future
+    handler that awaits ``parse_body`` directly and skips this wrapper is
+    exactly the shape the static-analysis test in
+    ``tests/router/test_arch_enforced_revalidation.py`` flags — the
+    structural guarantee is enforced by that test, not by hoping the next
+    author reads this docstring.
+
+    ``parse_body`` is the caller's own body-parser (``admin_api``'s
+    ``_parse_json_body`` / ``admin_users_api``'s ``_json_body`` — kept as
+    a parameter rather than duplicated or unified here, since the two
+    emit slightly different malformed-JSON error discriminators and
+    unifying that is out of this refactor's scope). It still raises
+    ``web.HTTPBadRequest`` the same way it always did on a malformed
+    body; only the shape of what happens on a WELL-FORMED body changes.
+
+    ``project_name=None`` (the create/user/group-CRUD shape, no resource
+    to scope to yet) revalidates capability alone via
+    ``revalidate_capability_or_403``. A given ``project_name`` (the
+    rename/membership shape) revalidates capability AND membership
+    together via ``admin_api._revalidate_capability_and_membership_or_403``
+    — imported lazily here (mirroring this module's existing lazy-import
+    convention for ``.login`` / ``.group_resolver`` above) to avoid a
+    module-load-time cycle with ``admin_api``, which itself lazily
+    imports ``revalidate_capability_or_403`` from this module.
+    ``min_role`` threads straight through to that combined check.
+
+    Returns ``(body, denied)`` — ``denied`` is ``None`` on success (caller
+    proceeds using ``body``) or the 403 envelope to return immediately.
+    """
+    body = await parse_body(req)
+    if project_name is not None:
+        from .admin_api import _revalidate_capability_and_membership_or_403
+
+        denied = await _revalidate_capability_and_membership_or_403(
+            req, cap, project_name, min_role=min_role,
+        )
+    else:
+        denied = await revalidate_capability_or_403(req, cap)
+    return body, denied
+
+
+@contextlib.asynccontextmanager
+async def revalidated_lock(
+    req: web.Request,
+    cap: str,
+    project_name: str,
+    *,
+    min_role: str | None = None,
+    role: str = "backend",
+) -> AsyncIterator[web.Response | None]:
+    """Acquire the per-project ``_ensure_lock`` AND revalidate — as ONE
+    atomic unit, before control ever reaches the ``async with`` body.
+
+    OBS-R11-1: the lock-based sibling of ``read_body_and_revalidate``
+    above, for handlers whose genuine yield point is lock CONTENTION
+    (``delete_project_handler`` / ``stop_project_handler``) rather than a
+    body-read. ``rename_project_handler`` also holds an ``_ensure_lock``
+    (for the destructive stop/move/registry-rename sequence), but its
+    revalidation was only ever wired to the earlier body-read yield
+    point (see ``read_body_and_revalidate``) — that pre-existing scope is
+    preserved as-is here, not widened, since this refactor's job is to
+    consolidate the two-call pattern into one call per already-guarded
+    yield-shape, not to add new revalidation points that weren't there
+    before. Lock acquisition and revalidation used to be two separate statements
+    inside a handler (``async with _app._ensure_lock(...): ...
+    await _revalidate_capability_and_membership_or_403(...)``) — nothing
+    stopped a future handler from acquiring the lock and forgetting the
+    second line, or reordering them so privileged work ran before the
+    re-check. Folding both into one ``@asynccontextmanager`` makes that
+    reordering impossible: the revalidation runs INSIDE the lock,
+    immediately after acquisition, before this generator's ``yield``
+    ever hands control back to the caller's ``async with`` body — so
+    there is no statement position left where "acquire, then act, then
+    (maybe) revalidate" could be written.
+
+    Yields the ``denied`` value (``None`` on success, else the 403/404
+    envelope) — the caller checks it exactly like every other gate in
+    this codebase (``if denied is not None: return denied``) before
+    doing the destructive work, still inside the ``async with`` block so
+    the lock is held for the whole privileged section and released on
+    exit either way (mirrors ``_app._ensure_lock``'s own release
+    semantics — this wraps it, not replaces it).
+    """
+    from . import app as _app
+    from .admin_api import _revalidate_capability_and_membership_or_403
+
+    async with _app._ensure_lock(project_name, role):
+        denied = await _revalidate_capability_and_membership_or_403(
+            req, cap, project_name, min_role=min_role,
+        )
+        yield denied
 
 
 def require_capability(
