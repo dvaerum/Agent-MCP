@@ -272,13 +272,19 @@ async def revalidated_lock(
     above, for handlers whose genuine yield point is lock CONTENTION
     (``delete_project_handler`` / ``stop_project_handler``) rather than a
     body-read. ``rename_project_handler`` also holds an ``_ensure_lock``
-    (for the destructive stop/move/registry-rename sequence), but its
-    revalidation was only ever wired to the earlier body-read yield
-    point (see ``read_body_and_revalidate``) — that pre-existing scope is
-    preserved as-is here, not widened, since this refactor's job is to
-    consolidate the two-call pattern into one call per already-guarded
-    yield-shape, not to add new revalidation points that weren't there
-    before. Lock acquisition and revalidation used to be two separate statements
+    (for the destructive stop/move/registry-rename sequence); OBS-R11-1's
+    initial consolidation left its revalidation wired ONLY to the earlier
+    body-read yield point (see ``read_body_and_revalidate``), deliberately
+    not widening scope during that refactor. R13-F1 (HIGH, live-exploited)
+    found that this left rename's OWN ``_ensure_lock`` contention — a real,
+    independently-exploitable yield point, up to a full backend cold-boot
+    (~9s) — completely unrevalidated: a caller's capability/membership
+    revoked while blocked on this lock could still complete the rename.
+    ``rename_project_handler`` now routes this lock acquisition through
+    ``revalidated_lock`` too, exactly like delete/stop, IN ADDITION to
+    (not instead of) its existing body-read revalidation — both of
+    rename's genuine yield points are revalidated now. Lock acquisition
+    and revalidation used to be two separate statements
     inside a handler (``async with _app._ensure_lock(...): ...
     await _revalidate_capability_and_membership_or_403(...)``) — nothing
     stopped a future handler from acquiring the lock and forgetting the

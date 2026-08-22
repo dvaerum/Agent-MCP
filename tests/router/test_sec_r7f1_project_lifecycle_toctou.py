@@ -408,8 +408,15 @@ async def test_revalidate_helper_invoked_at_all_four_sites(
     """Coverage + non-regression: ``create_project_handler``,
     ``rename_project_handler``, ``delete_project_handler`` and
     ``stop_project_handler`` all call ``revalidate_capability_or_403``
-    exactly once, with the SAME capability string their
-    ``require_capability`` route gate uses."""
+    (directly, or transitively via
+    ``_revalidate_capability_and_membership_or_403``, which calls it
+    first), with the SAME capability string their ``require_capability``
+    route gate uses.
+
+    R13-F1: ``rename_project_handler`` now revalidates at BOTH of its
+    genuine yield points (body-read + ``_ensure_lock`` acquisition), so
+    it contributes TWO entries here, not one; the other three handlers
+    are unaffected."""
     from agent_mcp.router import perm_gates
 
     calls: list[str] = []
@@ -455,7 +462,8 @@ async def test_revalidate_helper_invoked_at_all_four_sites(
 
     assert calls == [
         "system.projects.manage",  # create_project_handler
-        "system.projects.manage",  # rename_project_handler
+        "system.projects.manage",  # rename_project_handler (body-read)
+        "system.projects.manage",  # rename_project_handler (lock, R13-F1)
         "system.projects.manage",  # stop_project_handler
         "system.projects.manage",  # delete_project_handler
     ], calls

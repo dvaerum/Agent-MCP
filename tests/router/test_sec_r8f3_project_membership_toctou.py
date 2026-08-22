@@ -460,9 +460,15 @@ async def test_combined_revalidation_helper_invoked_at_all_three_sites(
 ) -> None:
     """Coverage + non-regression: ``rename_project_handler``,
     ``delete_project_handler`` and ``stop_project_handler`` all call
-    ``_revalidate_capability_and_membership_or_403`` exactly once, with
-    the SAME capability string their ``require_capability`` route gate
-    uses, and the correct in-flight project name.
+    ``_revalidate_capability_and_membership_or_403``, with the SAME
+    capability string their ``require_capability`` route gate uses, and
+    the correct in-flight project name.
+
+    R13-F1: ``rename_project_handler`` now revalidates at BOTH of its
+    genuine yield points — the body-read (``read_body_and_revalidate``)
+    AND the ``_ensure_lock`` acquisition (``revalidated_lock``) — so it
+    calls this helper TWICE, not once; ``delete``/``stop`` are
+    unaffected and still call it exactly once each.
 
     R9-F2: also pins that all three now thread ``min_role="operator"``
     through the post-yield re-check, mirroring the entry-time check —
@@ -508,6 +514,7 @@ async def test_combined_revalidation_helper_invoked_at_all_three_sites(
     assert delete_resp.status == 200, await delete_resp.text()
 
     assert calls == [
+        ("system.projects.manage", "spy-rename-membership", "operator"),
         ("system.projects.manage", "spy-rename-membership", "operator"),
         ("system.projects.manage", "spy-stop-membership", "operator"),
         ("system.projects.manage", "spy-delete-membership", "operator"),
