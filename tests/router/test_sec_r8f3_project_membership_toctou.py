@@ -462,15 +462,19 @@ async def test_combined_revalidation_helper_invoked_at_all_three_sites(
     ``delete_project_handler`` and ``stop_project_handler`` all call
     ``_revalidate_capability_and_membership_or_403`` exactly once, with
     the SAME capability string their ``require_capability`` route gate
-    uses, and the correct in-flight project name."""
+    uses, and the correct in-flight project name.
+
+    R9-F2: also pins that all three now thread ``min_role="operator"``
+    through the post-yield re-check, mirroring the entry-time check —
+    the rank bar must not silently drop across the yield point."""
     from agent_mcp.router import admin_api
 
-    calls: list[tuple[str, str]] = []
+    calls: list[tuple[str, str, str | None]] = []
     original = admin_api._revalidate_capability_and_membership_or_403
 
-    async def spy(req, cap, project_name):
-        calls.append((cap, project_name))
-        return await original(req, cap, project_name)
+    async def spy(req, cap, project_name, *, min_role=None):
+        calls.append((cap, project_name, min_role))
+        return await original(req, cap, project_name, min_role=min_role)
 
     monkeypatch.setattr(
         admin_api, "_revalidate_capability_and_membership_or_403", spy,
@@ -504,7 +508,7 @@ async def test_combined_revalidation_helper_invoked_at_all_three_sites(
     assert delete_resp.status == 200, await delete_resp.text()
 
     assert calls == [
-        ("system.projects.manage", "spy-rename-membership"),
-        ("system.projects.manage", "spy-stop-membership"),
-        ("system.projects.manage", "spy-delete-membership"),
+        ("system.projects.manage", "spy-rename-membership", "operator"),
+        ("system.projects.manage", "spy-stop-membership", "operator"),
+        ("system.projects.manage", "spy-delete-membership", "operator"),
     ], calls

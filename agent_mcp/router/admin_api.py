@@ -326,7 +326,13 @@ async def rename_project_handler(req: web.Request) -> web.Response:
     # holding only the deployment-wide ``system.projects.manage`` cap with NO
     # membership on ``old_name`` must not rename another tenant's project, and
     # must get the SAME 404 as a nonexistent slug (no 200-vs-404 oracle).
-    denied = _deny_cross_tenant_project_read(req, old_name)
+    # R9-F2: a mere ``viewer``-tier member is a resolved member (passes the
+    # check above unmodified) but must NOT be authorised to rename — that
+    # requires at least ``operator``-tier membership (sysadmin still admits
+    # unconditionally via the check inside `_deny_cross_tenant_project_read`).
+    denied = _deny_cross_tenant_project_read(
+        req, old_name, min_role="operator",
+    )
     if denied is not None:
         return denied
     body = await _app._parse_json_body(req)
@@ -345,9 +351,10 @@ async def rename_project_handler(req: web.Request) -> web.Response:
     # concurrent membership DELETE) still completed the rename off the
     # stale snapshot, on the residual coarse capability alone. Re-check
     # BOTH halves together post-yield; see
-    # ``_revalidate_capability_and_membership_or_403``.
+    # ``_revalidate_capability_and_membership_or_403``. R9-F2: carry the
+    # same ``operator``-tier rank bar through the post-yield re-check too.
     denied = await _revalidate_capability_and_membership_or_403(
-        req, "system.projects.manage", old_name,
+        req, "system.projects.manage", old_name, min_role="operator",
     )
     if denied is not None:
         return denied
@@ -747,7 +754,9 @@ async def delete_project_handler(req: web.Request) -> web.Response:
     # holding only the deployment-wide ``system.projects.manage`` cap with NO
     # membership on this project must not destroy another tenant's project,
     # and must get the SAME 404 as a nonexistent slug (no 200-vs-404 oracle).
-    denied = _deny_cross_tenant_project_read(req, name)
+    # R9-F2: a mere ``viewer``-tier member must NOT be authorised to delete —
+    # requires at least ``operator``-tier membership (sysadmin bypass intact).
+    denied = _deny_cross_tenant_project_read(req, name, min_role="operator")
     if denied is not None:
         return denied
     projects = _app._projects_dict()
@@ -864,9 +873,10 @@ async def delete_project_handler(req: web.Request) -> web.Response:
         # revoked mid-flight still completed the delete off the stale
         # snapshot, on the residual coarse capability alone. Re-check
         # BOTH halves together; see
-        # ``_revalidate_capability_and_membership_or_403``.
+        # ``_revalidate_capability_and_membership_or_403``. R9-F2: carry the
+        # same ``operator``-tier rank bar through the post-yield re-check.
         denied = await _revalidate_capability_and_membership_or_403(
-            req, "system.projects.manage", name,
+            req, "system.projects.manage", name, min_role="operator",
         )
         if denied is not None:
             return denied
@@ -978,7 +988,9 @@ async def stop_project_handler(req: web.Request) -> web.Response:
     # holding only the deployment-wide ``system.projects.manage`` cap with NO
     # membership on this project must not DoS another tenant's backend, and
     # must get the SAME 404 as a nonexistent slug (no 200-vs-404 oracle).
-    denied = _deny_cross_tenant_project_read(req, name)
+    # R9-F2: a mere ``viewer``-tier member must NOT be authorised to stop —
+    # requires at least ``operator``-tier membership (sysadmin bypass intact).
+    denied = _deny_cross_tenant_project_read(req, name, min_role="operator")
     if denied is not None:
         return denied
     if name not in _app._projects_dict():
@@ -1057,9 +1069,10 @@ async def stop_project_handler(req: web.Request) -> web.Response:
         # revoked mid-flight still completed the stop off the stale
         # snapshot, on the residual coarse capability alone. Re-check
         # BOTH halves together; see
-        # ``_revalidate_capability_and_membership_or_403``.
+        # ``_revalidate_capability_and_membership_or_403``. R9-F2: carry the
+        # same ``operator``-tier rank bar through the post-yield re-check.
         denied = await _revalidate_capability_and_membership_or_403(
-            req, "system.projects.manage", name,
+            req, "system.projects.manage", name, min_role="operator",
         )
         if denied is not None:
             return denied
@@ -1207,7 +1220,7 @@ async def installer_handler(req: web.Request) -> web.Response:
 
 
 def _deny_cross_tenant_project_read(
-    req: web.Request, project_name: str,
+    req: web.Request, project_name: str, *, min_role: str | None = None,
 ) -> web.Response | None:
     """R4-F3/R6-F2: scope a per-project op to members + close the oracle.
 
@@ -1255,6 +1268,35 @@ def _deny_cross_tenant_project_read(
     hidden project instead returns this function's uniform 404, so a
     genuinely free name and a hidden-but-taken one both look like
     "unknown" to them rather than confirming the taken name's existence.
+
+    R9-F2 (HIGH, live-exploited, NO RACE NEEDED — single ordinary request):
+    this function only ever asked "does the caller resolve ANY role on
+    ``project_name``?" — it never compared the resolved role's RANK against
+    the destructive weight of the action being gated. A non-sysadmin
+    holding the coarse ``system.projects.manage`` cap via a group grant,
+    PLUS a mere ``viewer``-tier membership on the project, could fully
+    rename / stop / delete it: membership existence was necessary AND (pre-
+    fix) SUFFICIENT, when for the three lifecycle mutations + alias removal
+    it should only have been necessary. This is inconsistent with the
+    codebase's own adjacent invariant — ``_membership_grant_denied``
+    (``admin_users_api.py``) already requires the caller's live role rank
+    to be at or above the role being granted/revoked for membership-CRUD
+    writes; the lifecycle mutations had no equivalent rank guard.
+
+    ``min_role`` (keyword-only, default ``None``) opts a call site into
+    that same rank comparison: when set, a resolved member whose
+    ``store.role_rank(role)`` is BELOW ``store.role_rank(min_role)`` is
+    denied with a 403 ``forbidden`` — deliberately NOT the 404
+    non-member/nonexistent oracle-closer above, because this caller IS a
+    genuine, already-disclosed member of a project they can see in their
+    own ``/projects`` view; only their AUTHORITY for this specific
+    destructive action is insufficient, so there is no oracle to close.
+    Leaving ``min_role`` unset preserves the exact pre-R9-F2 behaviour
+    (any resolved membership admits) for read-only call sites like
+    ``alias_usage_handler``, where "is a member at all" is the correct
+    bar. ``rename_project_handler`` / ``delete_project_handler`` /
+    ``stop_project_handler`` / ``remove_alias_handler`` now pass
+    ``min_role="operator"``.
     """
     from . import app as _app
     from .admin_users_api import _ERROR_NOT_FOUND, _caller_is_sysadmin, _error
@@ -1271,16 +1313,33 @@ def _deny_cross_tenant_project_read(
         return not_found
     principal = req.get("principal")
     caller_id = getattr(principal, "user_id", None) if principal else None
-    if (
-        caller_id is None
-        or store.resolve_user_project_role(caller_id, project_name) is None
-    ):
+    role = (
+        store.resolve_user_project_role(caller_id, project_name)
+        if caller_id is not None
+        else None
+    )
+    if role is None:
         return not_found
+    if min_role is not None and store.role_rank(role) < store.role_rank(
+        min_role,
+    ):
+        user = req.get("user") or {}
+        username = user.get("username", "<unknown>")
+        return _error(
+            error="forbidden",
+            message=(
+                f"operator {username!r} holds only {role!r} membership on "
+                f"project {project_name!r}; this action requires at least "
+                f"{min_role!r}-tier membership"
+            ),
+            status=403,
+        )
     return None
 
 
 async def _revalidate_capability_and_membership_or_403(
-    req: web.Request, cap: str, project_name: str,
+    req: web.Request, cap: str, project_name: str, *,
+    min_role: str | None = None,
 ) -> web.Response | None:
     """Re-check BOTH the capability AND membership invariants post-yield.
 
@@ -1310,13 +1369,21 @@ async def _revalidate_capability_and_membership_or_403(
     keys via ``_deny_cross_tenant_project_read``, so both halves are
     validated against one live snapshot, not two different points in
     time.
+
+    R9-F2: ``min_role`` is threaded straight through to
+    ``_deny_cross_tenant_project_read`` so the post-yield re-check
+    enforces the SAME rank bar as the entry-time check — a member whose
+    role is downgraded (not just revoked) mid-flight must not slip
+    through on the residual capability either.
     """
     from .perm_gates import revalidate_capability_or_403
 
     denied = await revalidate_capability_or_403(req, cap)
     if denied is not None:
         return denied
-    return _deny_cross_tenant_project_read(req, project_name)
+    return _deny_cross_tenant_project_read(
+        req, project_name, min_role=min_role,
+    )
 
 
 async def alias_usage_handler(req: web.Request) -> web.Response:
@@ -1409,7 +1476,11 @@ async def remove_alias_handler(req: web.Request) -> web.Response:
     # expire an alias on a project hidden from their own views AND read the
     # 200-vs-404 existence oracle. Scope it to members exactly like
     # ``alias_usage_handler`` above.
-    denied = _deny_cross_tenant_project_read(req, name)
+    # R9-F2: unlike the read-only ``alias_usage_handler``, this DELETE is a
+    # mutation (expires the alias immediately) — a mere ``viewer``-tier
+    # member must NOT be authorised; require ``operator``-tier, mirroring
+    # rename/delete/stop (sysadmin bypass intact).
+    denied = _deny_cross_tenant_project_read(req, name, min_role="operator")
     if denied is not None:
         return denied
     row = _app._REGISTRY.get(name)
