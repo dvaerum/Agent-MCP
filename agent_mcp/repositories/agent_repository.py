@@ -87,6 +87,7 @@ from ..core.config import logger
 # costs nothing at this call frequency.
 from ..db.engine import get_session
 from ..db.models import Agent
+from ..utils.pagination_cache import StableOrderCache
 
 # ---------------------------------------------------------------------------
 # Canonical "is this a live agent?" predicate (arch-deepening F).
@@ -539,6 +540,15 @@ class AgentRepository:
 
     _cache_disabled: bool = False
 
+    # R17-F2: class-level (shared across the process, like
+    # ``_cache_disabled``) so it anchors ``query()``'s offset pagination
+    # across separate ``list_agents`` calls -- see
+    # ``agent_mcp/utils/pagination_cache.py`` for the full rationale.
+    # Tests: registered with ``tests.conftest.reset_and_snapshot_globals``
+    # so a cache entry from one test's tmp DB never leaks agent_ids into
+    # another test's identical-shaped filter.
+    _pagination_cache: StableOrderCache = StableOrderCache()
+
     @contextlib.contextmanager
     def disable_cache(self) -> Iterator[None]:
         """Suspend cache reads/writes inside the ``with`` block.
@@ -716,9 +726,22 @@ class AgentRepository:
         Returns ``(rows, total)`` where ``rows`` is the page and
         ``total`` is the unfiltered row count for the filter set.
         On DB error returns ``([], 0)``.
-        """
-        from sqlalchemy import func
 
+        R17-F2: offset/limit windowing goes through
+        ``self._pagination_cache`` — a fresh ``offset == 0`` call
+        re-filters/re-sorts and anchors the resulting ``agent_id``
+        ordering for this exact filter+sort shape; a following
+        ``offset > 0`` call replays that anchored ordering (re-fetching
+        CURRENT row data for exactly those ids) instead of re-running
+        the live filter from scratch. Without this, an agent
+        terminating (or otherwise leaving an ``include_terminated``/
+        ``status`` filter) between two paginated calls can shift a
+        still-matching agent out of every page — see
+        ``agent_mcp/utils/pagination_cache.py`` for the full rationale
+        and disclosed trade-off. ``total`` reflects the anchored
+        ordering's length (consistent with the window it describes),
+        not a fresh unconditional COUNT.
+        """
         filters = filters or {}
         allowed_sort = {
             "agent_id", "status", "created_at", "terminated_at",
@@ -741,48 +764,82 @@ class AgentRepository:
         filter_after = filters.get("created_after")
         filter_before = filters.get("created_before")
 
+        cache_key = (
+            filter_status, filter_pattern, bool(include_terminated),
+            filter_after, filter_before, sort_by, sort_order,
+        )
+
         try:
             with get_session() as session:
-                q = session.query(Agent)
-                # BL-R31-3: tombstone rows (purge-cascade FK artefacts,
-                # created by insert_tombstone) are NEVER listable agents.
-                # Exclude them unconditionally — before the count — so
-                # MCP view_agents matches the REST agent-list surfaces
-                # (routers/agents.py applies `WHERE status != 'tombstone'`
-                # regardless of any status filter, and refuses
-                # `status=tombstone`). Combined with an explicit
-                # `status='tombstone'` filter this yields the empty set,
-                # mirroring `GET /api/agents?status=tombstone` → [].
-                q = q.filter(Agent.status != "tombstone")
-                if filter_status:
-                    q = q.filter(Agent.status == filter_status)
-                if filter_pattern:
-                    q = q.filter(Agent.agent_id.like(filter_pattern))
-                if not include_terminated:
-                    q = q.filter(Agent.status != "terminated")
-                if filter_after:
-                    q = q.filter(Agent.created_at >= filter_after)
-                if filter_before:
-                    q = q.filter(Agent.created_at <= filter_before)
+                def build_filtered_query():
+                    q = session.query(Agent)
+                    # BL-R31-3: tombstone rows (purge-cascade FK
+                    # artefacts, created by insert_tombstone) are
+                    # NEVER listable agents. Exclude them
+                    # unconditionally — before the count — so MCP
+                    # view_agents matches the REST agent-list surfaces
+                    # (routers/agents.py applies
+                    # `WHERE status != 'tombstone'` regardless of any
+                    # status filter, and refuses `status=tombstone`).
+                    # Combined with an explicit `status='tombstone'`
+                    # filter this yields the empty set, mirroring
+                    # `GET /api/agents?status=tombstone` → [].
+                    q = q.filter(Agent.status != "tombstone")
+                    if filter_status:
+                        q = q.filter(Agent.status == filter_status)
+                    if filter_pattern:
+                        q = q.filter(Agent.agent_id.like(filter_pattern))
+                    if not include_terminated:
+                        q = q.filter(Agent.status != "terminated")
+                    if filter_after:
+                        q = q.filter(Agent.created_at >= filter_after)
+                    if filter_before:
+                        q = q.filter(Agent.created_at <= filter_before)
+                    return q
 
-                total = q.with_entities(func.count(Agent.agent_id)).scalar() or 0
+                def compute_ordered_ids() -> List[str]:
+                    sort_col = getattr(Agent, sort_by)
+                    order_cols = (
+                        [sort_col.asc(), Agent.agent_id.asc()]
+                        if sort_order == "ASC"
+                        else [sort_col.desc(), Agent.agent_id.asc()]
+                    )
+                    id_q = (
+                        build_filtered_query()
+                        .with_entities(Agent.agent_id)
+                        .order_by(*order_cols)
+                    )
+                    return [row[0] for row in id_q.all()]
 
-                sort_col = getattr(Agent, sort_by)
-                if sort_order == "ASC":
-                    q = q.order_by(sort_col.asc())
-                else:
-                    q = q.order_by(sort_col.desc())
+                ordered_ids = self._pagination_cache.get_or_anchor(
+                    cache_key, offset=offset, compute=compute_ordered_ids,
+                )
+                total = len(ordered_ids)
+                window_ids = ordered_ids[offset:] if offset else ordered_ids
+                window_ids = window_ids[:limit]
 
-                rows = q.limit(limit).offset(offset).all()
+                if not window_ids:
+                    return [], total
+
+                # Fetch full row data for exactly the windowed ids —
+                # current values, not whatever was true when the
+                # ordering was anchored.
+                rows_by_id = {
+                    r.agent_id: r
+                    for r in session.query(Agent)
+                    .filter(Agent.agent_id.in_(window_ids))
+                    .all()
+                }
                 return [
                     {
-                        "token": r.token,
-                        "agent_id": r.agent_id,
-                        "status": r.status,
-                        "created_at": r.created_at,
+                        "token": rows_by_id[aid].token,
+                        "agent_id": rows_by_id[aid].agent_id,
+                        "status": rows_by_id[aid].status,
+                        "created_at": rows_by_id[aid].created_at,
                     }
-                    for r in rows
-                ], int(total)
+                    for aid in window_ids
+                    if aid in rows_by_id
+                ], total
         except SQLAlchemyError as e:
             logger.error(
                 f"Database error querying agents: {e}", exc_info=True,

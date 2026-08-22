@@ -37,6 +37,8 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
+from ..utils.pagination_cache import StableOrderCache
+
 
 # --- Public dataclasses -----------------------------------------------
 
@@ -221,6 +223,18 @@ class TaskQueryEngine:
         Optional callable returning a ``datetime`` — injected so the
         stale-task rule is deterministic in tests. Defaults to
         ``datetime.datetime.now``.
+    pagination_cache:
+        Optional :class:`~agent_mcp.utils.pagination_cache.StableOrderCache`
+        used to make ``offset``-based pagination survive concurrent
+        mutation of the task set (R17-F2 — see that module's
+        docstring for the full rationale). Defaults to a private
+        instance owned by this engine, so tests get isolation for
+        free. Production (``view_tasks_tool_impl``) passes a
+        MODULE-LEVEL shared instance explicitly — a fresh
+        ``TaskQueryEngine`` is constructed on every tool call, so
+        without an explicitly shared cache the anchor would never
+        outlive a single call and pagination would be exactly as
+        unsafe as before this fix.
     """
 
     def __init__(
@@ -228,9 +242,13 @@ class TaskQueryEngine:
         task_source: Callable[[], Dict[str, Dict[str, Any]]],
         *,
         now: Optional[Callable[[], _dt.datetime]] = None,
+        pagination_cache: Optional[StableOrderCache] = None,
     ) -> None:
         self._task_source = task_source
         self._now = now or _dt.datetime.now
+        self._pagination_cache: StableOrderCache = (
+            pagination_cache if pagination_cache is not None else StableOrderCache()
+        )
 
     # -- snapshot / dependency helpers ---------------------------------
 
@@ -380,6 +398,17 @@ class TaskQueryEngine:
 
         Returns the windowed slice plus ``total_count`` (matching count
         BEFORE the window) so the caller can render pagination hints.
+
+        ``offset``/``limit`` windowing goes through ``pagination_cache``
+        (R17-F2): an ``offset == 0`` call always re-filters/re-sorts
+        fresh and anchors the resulting id ordering; a following
+        ``offset > 0`` call for the SAME ``(filters, sort)`` shape
+        replays that anchored ordering (looking up each id's CURRENT
+        row data) instead of re-filtering from scratch — so a task
+        that leaves the matched set between the two calls can no
+        longer shift a still-matching task out of both pages. See
+        ``agent_mcp/utils/pagination_cache.py`` for the full rationale
+        and the disclosed trade-off of this fix.
         """
         filters = filters or TaskFilterSpec()
         sort = sort or TaskSortSpec()
@@ -390,24 +419,34 @@ class TaskQueryEngine:
             h = self.health_of(task, snapshot)
             return h.is_blocked or not h.can_start
 
-        matched: List[Dict[str, Any]] = [
-            row
-            for row in snapshot.values()
-            if self._matches(row, filters, snapshot, is_blocked)
-        ]
+        def compute_ordered_ids() -> List[str]:
+            matched = [
+                row
+                for row in snapshot.values()
+                if self._matches(row, filters, snapshot, is_blocked)
+            ]
+            matched.sort(
+                key=lambda t: self._sort_key(t, sort),
+                reverse=sort.by in _REVERSE_SORT_KEYS,
+            )
+            return [row["task_id"] for row in matched]
 
-        matched.sort(
-            key=lambda t: self._sort_key(t, sort),
-            reverse=sort.by in _REVERSE_SORT_KEYS,
+        ordered_ids = self._pagination_cache.get_or_anchor(
+            (filters, sort), offset=offset, compute=compute_ordered_ids
         )
 
-        total_count = len(matched)
-        if offset:
-            matched = matched[offset:]
+        total_count = len(ordered_ids)
+        window_ids = ordered_ids[offset:] if offset else ordered_ids
         if limit is not None:
-            matched = matched[:limit]
+            window_ids = window_ids[:limit]
 
-        return QueryResult(tasks=matched, total_count=total_count)
+        # Rows anchored earlier may since have been deleted outright
+        # (as opposed to merely no longer matching ``filters``) — omit
+        # them from the window rather than shifting a neighbour into
+        # their place (that would just reintroduce the original bug).
+        tasks = [snapshot[tid] for tid in window_ids if tid in snapshot]
+
+        return QueryResult(tasks=tasks, total_count=total_count)
 
     # -- aggregate metrics --------------------------------------------
 

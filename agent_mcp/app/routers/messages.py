@@ -98,7 +98,15 @@ async def list_messages_api_route(
       since/until    ISO timestamp window
       q              substring (LIKE %q%) across content, subject,
                      sender_id, and recipient_id
-      limit/offset   pagination (default 50 / 0)
+      limit/offset   pagination (default 50 / 0). Sequential paging
+                     (offset=0, then offset=limit, 2*limit, ...) with
+                     the same filters is anchored to the ordering seen
+                     at offset=0 for a short window (R17-F2 — see
+                     agent_mcp/utils/pagination_cache.py), so a message
+                     changing e.g. its `read` flag between calls can't
+                     shift another message out of every page. Jumping
+                     straight to an arbitrary offset does not get this
+                     guarantee.
     """
     try:
         data = await get_sanitized_json_body(request)

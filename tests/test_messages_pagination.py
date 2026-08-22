@@ -149,6 +149,60 @@ async def test_query_offset_at_total_returns_zero_rows(tmp_path) -> None:
         assert body["total"] == 150, body
 
 
+async def test_query_offset_pagination_survives_concurrent_read_change(
+    tmp_path,
+) -> None:
+    """R17-F2 end-to-end: paginating ``POST /api/messages/query`` with
+    ``read=false`` across two calls must not silently skip a message
+    that stayed unread the whole time, even if an earlier-ranked
+    message gets marked read in between (ordinary concurrent activity
+    — someone opens the dashboard and reads it).
+    """
+    async with mcp_session(tmp_path) as admin:
+        await admin.create_worker("A")
+        await admin.create_worker("B")
+        _seed_many_messages("A", "B", 5)
+
+        base_filters = {
+            "from": "A", "to": "B", "read": False, "limit": 2,
+        }
+
+        page1 = admin.post(
+            "/api/messages/query", json={**base_filters, "offset": 0},
+        ).json()
+        assert len(page1["messages"]) == 2, page1
+        newest_id = page1["messages"][0]["message_id"]
+
+        # Ordinary concurrent activity between the two page requests:
+        # the newest message gets read and drops out of read=false.
+        from agent_mcp.db.connection import get_db_connection
+
+        conn = get_db_connection()
+        try:
+            conn.execute(
+                "UPDATE agent_messages SET read = 1 WHERE message_id = ?",
+                (newest_id,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        page2 = admin.post(
+            "/api/messages/query", json={**base_filters, "offset": 2},
+        ).json()
+
+        seen_ids = {m["message_id"] for m in page1["messages"]} | {
+            m["message_id"] for m in page2["messages"]
+        }
+        # 5 seeded messages, newest dropped out of the filter: the
+        # remaining 4 unread messages must all surface across the two
+        # pages -- none silently skipped.
+        assert len(seen_ids) == 4, (
+            f"expected all 4 still-unread messages across both pages, "
+            f"got {seen_ids}; page1={page1} page2={page2}"
+        )
+
+
 async def test_query_offset_overshoot_is_graceful(tmp_path) -> None:
     """offset=999 is well past total; endpoint must respond 200 with
     an empty page (not 400, not 500). Guards against the dashboard

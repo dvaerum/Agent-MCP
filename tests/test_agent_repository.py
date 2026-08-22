@@ -242,6 +242,82 @@ def test_query_excludes_tombstone_rows_and_count(project_dir, reset_globals):
         )
 
 
+def _seed_agent_at(agent_id: str, *, token: str, status: str, created_at: str):
+    """Like ``_seed_agent`` but with an explicit ``created_at`` so
+    sort order across several seeded rows is deterministic."""
+    from agent_mcp.db.engine import get_session
+    from agent_mcp.db.models import Agent
+
+    with get_session() as session:
+        session.add(
+            Agent(
+                token=token,
+                agent_id=agent_id,
+                created_at=created_at,
+                status=status,
+                current_task=None,
+                working_directory="/tmp/seed",
+                color="#abcdef",
+                terminated_at=None,
+                updated_at=created_at,
+                aoe_session_id=None,
+            )
+        )
+        session.commit()
+
+
+def test_query_offset_pagination_survives_concurrent_status_change(
+    project_dir, reset_globals,
+):
+    """R17-F2 class-sweep sibling: ``AgentRepository.query`` (backs the
+    MCP ``get_agent_tokens`` / dashboard agent-list surfaces) re-filters
+    a live table on every call, exactly like the ``view_tasks`` case.
+    5 agents, paginate ``limit=2``; between page 1 and page 2 the
+    top-ranked agent (pg-a5) terminates and drops out of the
+    ``include_terminated=False`` filter — an agent that was in-filter
+    the ENTIRE time (pg-a3) must not be silently skipped.
+    """
+    with _make_client(project_dir):
+        from agent_mcp.repositories import agent_repo
+        from agent_mcp.db.engine import get_session
+        from agent_mcp.db.models import Agent
+
+        base = datetime.datetime(2025, 6, 1)
+        for i in range(1, 6):
+            _seed_agent_at(
+                f"pg-a{i}",
+                token=f"tok-pg-a{i}",
+                status="active",
+                created_at=(base + datetime.timedelta(minutes=i)).isoformat(),
+            )
+
+        filters = {
+            "agent_id_pattern": "pg-a%",
+            "include_terminated": False,
+            "limit": 2,
+        }
+        page1, _ = agent_repo.query({**filters, "offset": 0})
+        assert [r["agent_id"] for r in page1] == ["pg-a5", "pg-a4"]
+
+        # Ordinary concurrent activity between the two page requests.
+        with get_session() as session:
+            session.query(Agent).filter(
+                Agent.agent_id == "pg-a5"
+            ).update({"status": "terminated"})
+            session.commit()
+
+        page2, _ = agent_repo.query({**filters, "offset": 2})
+
+        seen_ids = {r["agent_id"] for r in page1} | {
+            r["agent_id"] for r in page2
+        }
+        assert "pg-a3" in seen_ids, (
+            "pg-a3 was active for the entire window and must not be "
+            f"silently skipped; page1={page1!r} page2={page2!r}"
+        )
+        assert [r["agent_id"] for r in page2] == ["pg-a3", "pg-a2"]
+
+
 def test_query_status_tombstone_filter_returns_empty(project_dir, reset_globals):
     """An explicit ``status='tombstone'`` filter must return nothing —
     tombstone is a DB-internal FK artefact, never an operator-queryable

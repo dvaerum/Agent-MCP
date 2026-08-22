@@ -372,3 +372,115 @@ def test_snapshot_consistency_during_concurrent_write(
     snapshot["t1"]["status"] = "completed"
     post_ids = {t["task_id"] for t in result.tasks}
     assert pre_ids == post_ids
+
+
+# --- 6. R17-F2: offset pagination under concurrent mutation -----------
+
+
+def _five_pending_tasks() -> dict[str, dict[str, Any]]:
+    """5 pending tasks, newest-first by created_at — the exact shape of
+    the R17-F2 live reproduction: T5..T1 in descending creation order.
+    """
+    base = _dt.datetime(2025, 6, 1)
+    return {
+        f"t{n}": _task(
+            f"t{n}",
+            status="pending",
+            created_at=(base + _dt.timedelta(minutes=n)).isoformat(),
+        )
+        for n in range(1, 6)
+    }
+
+
+def test_offset_pagination_skips_row_under_concurrent_status_change() -> None:
+    """R17-F2 live reproduction: 5 pending tasks, paginate limit=2 across
+    two calls. Between the calls, the top-ranked task (T5) leaves the
+    ``status="pending"`` filter (claimed / advanced by someone else —
+    ordinary concurrent activity, not an attack). T3 was pending for
+    the entire window and must appear on SOME page — it must never be
+    silently skipped.
+
+    Fixed via ``StableOrderCache``: page 1 (offset=0) anchors the
+    ordering [T5,T4,T3,T2,T1]; page 2 (offset=2) replays that anchored
+    ordering instead of recomputing against the live (now 4-row)
+    matching set, so T3 lands in the window exactly where it should.
+    """
+    tasks = _five_pending_tasks()
+    engine = TaskQueryEngine(task_source=lambda: tasks)
+    filters = TaskFilterSpec(status="pending")
+    sort = TaskSortSpec(by="created_at")
+
+    page1 = engine.query(filters=filters, sort=sort, offset=0, limit=2)
+    assert [t["task_id"] for t in page1.tasks] == ["t5", "t4"]
+
+    # Ordinary concurrent activity between the two page requests: T5
+    # gets claimed/advanced and drops out of the pending filter.
+    tasks["t5"]["status"] = "in_progress"
+
+    page2 = engine.query(filters=filters, sort=sort, offset=2, limit=2)
+
+    seen_ids = {t["task_id"] for t in page1.tasks} | {
+        t["task_id"] for t in page2.tasks
+    }
+    assert "t3" in seen_ids, (
+        "T3 was pending for the entire window and must not be "
+        f"silently skipped; page1={page1.tasks!r} page2={page2.tasks!r}"
+    )
+    assert [t["task_id"] for t in page2.tasks] == ["t3", "t2"]
+
+
+def test_offset_pagination_cache_miss_falls_back_to_fresh_compute() -> None:
+    """A caller that jumps straight to ``offset>0`` without ever asking
+    for ``offset=0`` first has no anchored ordering to replay — the
+    engine must fall back to a fresh (best-effort, unanchored) compute
+    rather than raising or returning nothing. Documents the disclosed
+    residual: no anchor exists yet, so this call gets no consistency
+    guarantee (same as pre-fix behaviour).
+    """
+    tasks = _five_pending_tasks()
+    engine = TaskQueryEngine(task_source=lambda: tasks)
+    filters = TaskFilterSpec(status="pending")
+    sort = TaskSortSpec(by="created_at")
+
+    page = engine.query(filters=filters, sort=sort, offset=2, limit=2)
+    assert [t["task_id"] for t in page.tasks] == ["t3", "t2"]
+
+
+def test_offset_pagination_new_sweep_resets_anchor() -> None:
+    """A fresh ``offset=0`` call always recomputes and re-anchors —
+    a caller starting a brand-new sweep sees current data, not a stale
+    anchor from an earlier, unrelated sweep over the same filter shape.
+    """
+    tasks = _five_pending_tasks()
+    engine = TaskQueryEngine(task_source=lambda: tasks)
+    filters = TaskFilterSpec(status="pending")
+    sort = TaskSortSpec(by="created_at")
+
+    engine.query(filters=filters, sort=sort, offset=0, limit=2)
+
+    # A task is removed entirely (not just reassigned) before the next
+    # sweep starts.
+    del tasks["t5"]
+
+    fresh = engine.query(filters=filters, sort=sort, offset=0, limit=2)
+    assert [t["task_id"] for t in fresh.tasks] == ["t4", "t3"]
+
+
+def test_offset_pagination_omits_row_deleted_from_anchored_window() -> None:
+    """If a row inside the anchored window is deleted (not merely
+    filtered out) before the next page is fetched, it is simply
+    omitted from the replayed window rather than crashing or shifting
+    a neighbour into its place.
+    """
+    tasks = _five_pending_tasks()
+    engine = TaskQueryEngine(task_source=lambda: tasks)
+    filters = TaskFilterSpec(status="pending")
+    sort = TaskSortSpec(by="created_at")
+
+    engine.query(filters=filters, sort=sort, offset=0, limit=2)
+    del tasks["t3"]
+
+    page2 = engine.query(filters=filters, sort=sort, offset=2, limit=2)
+    # t3 (anchored at this position) was deleted outright -- omitted,
+    # not backfilled from t1. No crash, no reintroducing the shift bug.
+    assert [t["task_id"] for t in page2.tasks] == ["t2"]
