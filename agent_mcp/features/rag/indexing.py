@@ -148,6 +148,62 @@ async def _get_embeddings_batch(
         return False
 
 
+def _delete_stale_chunks_and_commit(
+    cursor: sqlite3.Cursor,
+    conn: sqlite3.Connection,
+    sources_to_process_for_embedding: List[Tuple[str, str, str, str]],
+) -> int:
+    """Purge every stale chunk for ``sources_to_process_for_embedding``
+    and commit, UNCONDITIONALLY, before returning.
+
+    Returns the total ``rag_chunks`` row count deleted (for logging
+    only — callers must not use it to decide whether to commit; see
+    R10-F2 below).
+
+    R10-F2: the caller (:func:`run_rag_indexing_periodically`) shares
+    one long-lived ``conn`` across an entire indexing cycle, including
+    the embedding phase that follows this delete pass — a sequence of
+    ``await`` points on a (possibly slow, network-bound) embedding
+    endpoint that can run for seconds to minutes under load. This used
+    to gate the interim commit on ``delete_count > 0``:
+
+        if delete_count > 0:
+            conn.commit()
+
+    but a DELETE statement opens sqlite's write transaction (and holds
+    its WAL write lock) the moment it EXECUTES, regardless of how many
+    rows it actually matched. A cycle indexing only brand-new sources
+    (nothing to delete yet, so every ``rag_repo.delete_chunks_for``
+    call returns 0) satisfied that DELETE-executed-but-nothing-matched
+    case on EVERY source, so ``delete_count`` stayed 0, the commit was
+    skipped, and the connection sat in an open, uncommitted transaction
+    for the entire embedding-await phase that followed — starving
+    every OTHER writer in the process (e.g. a concurrent
+    ``delete_project_context`` / ``create_task`` request via
+    ``unit_of_work()``) well past their 5s ``busy_timeout`` with
+    ``sqlite3.OperationalError: database is locked``, for as long as
+    the embedding phase ran. Committing unconditionally here — whether
+    or not any row actually matched — releases the lock immediately,
+    before the awaits begin.
+    """
+    from ...repositories import rag_repo
+
+    delete_count = 0
+    for source_type, source_ref, _content, _hash in sources_to_process_for_embedding:
+        n_deleted = rag_repo.delete_chunks_for(
+            source_type, source_ref, connection=cursor,
+        )
+        delete_count += n_deleted
+    if delete_count > 0:
+        logger.info(
+            f"Deleted {delete_count} old chunks and their embeddings."
+        )
+    # Unconditional: see the docstring above — a 0-row DELETE still
+    # opened the transaction and still holds the write lock.
+    conn.commit()
+    return delete_count
+
+
 def _watermark_after_failures(
     old_watermark: Any,
     uncapped_max: Any,
@@ -559,20 +615,20 @@ async def run_rag_indexing_periodically(
                 # rag_embeddings-existence guard. We pass the
                 # cycle's shared ``cursor`` so the deletes join the
                 # same transaction as the inserts further down.
+                #
+                # R10-F2: the commit below is UNCONDITIONAL — see
+                # ``_delete_stale_chunks_and_commit``'s docstring for
+                # why gating it on "did anything actually get deleted"
+                # left a write transaction open (and the WAL write
+                # lock held) across the entire embedding-await phase
+                # that follows, starving every other writer in the
+                # process past its busy_timeout.
                 logger.info(
                     "Deleting existing chunks and embeddings for sources needing update..."
                 )
-                delete_count = 0
-                for source_type, source_ref, _, _ in sources_to_process_for_embedding:
-                    n_deleted = rag_repo.delete_chunks_for(
-                        source_type, source_ref, connection=cursor,
-                    )
-                    delete_count += n_deleted
-                if delete_count > 0:
-                    logger.info(
-                        f"Deleted {delete_count} old chunks and their embeddings."
-                    )
-                    conn.commit()  # Commit deletions
+                delete_count = _delete_stale_chunks_and_commit(
+                    cursor, conn, sources_to_process_for_embedding,
+                )
 
                 # Generate chunks and prepare for embedding (Original main.py:631-647)
                 all_chunks_texts_to_embed: List[str] = []
@@ -1078,9 +1134,19 @@ async def index_task_data(task_id: str, task_data: Dict[str, Any]) -> None:
         chunks = simple_chunker(content, chunk_size=2000)
 
         # Delete existing chunks for this task. Shares the owner
-        # cursor so the delete + the openai-call + the subsequent
-        # inserts all stage atomically.
+        # cursor so the delete stages on this connection, but MUST
+        # commit right away (R10-F2, same class as
+        # ``_delete_stale_chunks_and_commit`` in
+        # ``run_rag_indexing_periodically``): the DELETE opens sqlite's
+        # write transaction — and holds its WAL write lock — the
+        # instant it executes, whether or not it matched any rows (a
+        # never-before-indexed task matches 0). Without this commit
+        # the lock stayed held across the embedding call(s) below,
+        # which is exactly the multi-second-under-load network hop the
+        # comment above says we're trying not to pin a transaction
+        # across — starving every other writer past its busy_timeout.
         rag_repo.delete_chunks_for("task", task_id, connection=cursor)
+        conn.commit()
 
         # Embedding seam: one endpoint-resolution rule shared with the
         # periodic indexer + the query path.
