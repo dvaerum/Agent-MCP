@@ -413,12 +413,55 @@ def test_rename_keeps_old_name_as_alias(reg) -> None:
 
     assert reg.get("old") is None
     row = reg.get("new")
-    # Workspace path is NOT touched by the data-model layer — the
-    # caller (router endpoint) is responsible for the dir rename.
+    # ``rename()`` never physically moves anything on disk — that's
+    # still the caller's (router endpoint's) job. But R9-F5: the field
+    # DOES follow the naming convention `<parent>/<name>` when the
+    # CURRENT value already matches it (see
+    # test_rename_updates_workspace_field_when_it_follows_naming_convention
+    # below). Here it deliberately does NOT: "/tmp/work"'s basename is
+    # "work", not "old", so this is the "custom, non-conventional
+    # workspace" case, and the field is left untouched — exactly
+    # mirroring the router endpoint's own decision not to move such a
+    # directory.
     assert row["workspace"] == "/tmp/work"
     assert len(row["aliases"]) == 1
     assert row["aliases"][0]["name"] == "old"
     assert reg.resolve_alias("old") == "new"
+
+
+def test_rename_updates_workspace_field_when_it_follows_naming_convention(
+    reg,
+) -> None:
+    """R9-F5: when the registered workspace basename matches the
+    project's CURRENT name (the invariant every project created via
+    the create-project endpoint satisfies — workspace is always
+    ``DEFAULT_WORKSPACE_PARENT / <name>``), ``rename()`` must keep the
+    ``"workspace"`` field's basename in sync too, not freeze it at
+    creation time.
+
+    Without this, a SECOND rename desyncs the registry from the
+    filesystem forever: the router endpoint's directory-move guard
+    trusts this field to know whether ``old_name`` still names the
+    directory on disk, and a stale field makes that guard silently
+    skip the move on every rename after the first while still
+    reporting success (R9-F5, HIGH, live-reproduced against vm-dev).
+    """
+    reg.register("alpha", "/srv/projects/alpha")
+
+    # grace_days=0 so each parked alias expires immediately — renaming
+    # back to a still-active alias's name is a separate, intentional
+    # 409 (AliasCollision) unrelated to the workspace-tracking bug
+    # under test here.
+    reg.rename("alpha", "beta", grace_days=0)
+    assert reg.get("beta")["workspace"] == "/srv/projects/beta"
+
+    # The natural generalization: a SECOND (and third) rename must
+    # keep composing correctly, not just the first.
+    reg.rename("beta", "gamma", grace_days=0)
+    assert reg.get("gamma")["workspace"] == "/srv/projects/gamma"
+
+    reg.rename("gamma", "alpha", grace_days=0)
+    assert reg.get("alpha")["workspace"] == "/srv/projects/alpha"
 
 
 def test_rename_rejects_when_new_name_exists(reg) -> None:

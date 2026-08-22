@@ -242,7 +242,13 @@ async def test_alias_reaper_removes_expired_entries(
     reg.add_alias("alpha", "expired-one", expires_at=past)
     reg.add_alias("alpha", "alive-one", expires_at=future)
 
-    caplog.set_level(logging.INFO, logger="agent_mcp.router.app")
+    # ``_alias_reaper_tick`` lives in (and logs via) ``project_orchestrator``
+    # — ``router_module._alias_reaper_tick`` is just an app.py re-export
+    # (`_alias_reaper_tick = _po._alias_reaper_tick`). caplog has to target
+    # the logger the code actually uses, not the module it's imported
+    # into, or every record is silently dropped and the assertion below
+    # sees an empty list no matter what the reaper logged.
+    caplog.set_level(logging.INFO, logger="agent_mcp.router.project_orchestrator")
     await router_module._alias_reaper_tick(reg)
 
     row = reg.get("alpha")
