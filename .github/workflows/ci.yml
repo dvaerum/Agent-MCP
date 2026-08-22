@@ -72,6 +72,20 @@ jobs:
         # exception" ERROR + traceback in production. F821 is already at
         # zero here, so this gate costs nothing and cannot be tripped by
         # the pre-existing style debt above.
+        #
+        # `if: success() || failure()` — a step failure otherwise skips
+        # every step after it, which silently skipped `Run pytest` for 3
+        # merges (R13-F1 -> R13-F3) when a single ruff violation landed
+        # in tests/: the job still went red, but nobody noticed the
+        # *real* test suite (including this loop's own TOCTOU/capability
+        # regression tests) hadn't executed at all, not just failed.
+        # This condition (not bare `always()`, which would also fire on
+        # a cancelled run) forces this and the pytest step to run
+        # regardless of the earlier lint step's own pass/fail, keeping
+        # each gate independent — the job's overall conclusion still
+        # fails if EITHER step fails, but a lint nit can no longer mask
+        # whether the tests themselves are green.
+        if: success() || failure()
         run: uv run ruff check --select F821 agent_mcp/
 
       - name: Run pytest
@@ -79,6 +93,10 @@ jobs:
         # under [tool.pytest.ini_options] addopts; pytest-xdist comes
         # in via `.[dev]` above. GitHub ubuntu-latest runners give us
         # ~4 cores, which is the sweet spot for this suite.
+        #
+        # `if: always()` — see the note on the F821 step above; pytest
+        # must run independently of either lint gate's outcome.
+        if: success() || failure()
         run: uv run pytest -v
 
   aoe-bridge:
