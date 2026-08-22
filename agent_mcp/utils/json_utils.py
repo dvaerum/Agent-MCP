@@ -90,6 +90,27 @@ _CONTROL_BYTE_RE = re.compile(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]')
 # pure-strip treatment as `Cf`, not the cap-not-strip treatment used
 # for combining marks, since a lone surrogate has zero legitimate use
 # in JSON string content.
+#
+# R16-F3 CROSS-PR-INTERACTION WARNING for whoever edits this set next:
+# this module is a SHARED chokepoint every downstream validation guard
+# implicitly depends on. Adding `Cs` here (R15-F1, PR #700) silently
+# made a DIFFERENT, already-merged-in-the-same-round PR's own explicit
+# validation guard (R15-F2, PR #702's `admin_users_api._reject_unencodable_str`
+# and `identity.create_user`'s UTF-8-round-trip check) permanently
+# unreachable dead code for the surrogate case -- both PRs were
+# developed in isolated worktrees off the same earlier base, each
+# passed its own local suite, and the interaction only showed up once
+# both had merged into `main` in sequence (caught by R16-F3). Every
+# character in Unicode general category `Cs` is the ONLY class of
+# character that fails `str.encode("utf-8", "strict")` (exhaustively
+# verified over 0x0-0x10FFFF) -- so ANY future widening of this set
+# that covers a category some downstream code explicitly checks for
+# can have the exact same effect: silently satisfying that check
+# upstream and turning it into dead code. Before adding a category
+# here, grep the codebase for guards checking the SAME failure mode
+# (search for `UnicodeEncodeError`, `.encode("utf-8"`, and
+# `InvalidEmailError`) and update or remove them in the SAME change --
+# don't let a future round rediscover this the hard way.
 _HIDDEN_FORMAT_CATEGORIES = frozenset({"Cf", "Zl", "Zp", "Cs"})
 
 # Variation Selectors 1-16 (BMP) and 17-256 (supplementary plane): carry

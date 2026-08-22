@@ -405,7 +405,16 @@ def _sanitise_username(raw: str) -> str:
     dash, leading / trailing dashes stripped. We accept whatever
     comes out — usernames in the router store are TEXT UNIQUE, not
     constrained by a regex.
+
+    R16-F1 belt-and-suspenders: ``handle_oidc_callback`` now coerces a
+    non-``str`` ``preferred_username``/``sub`` claim to ``None`` before
+    it ever reaches here, so this guard should be unreachable via that
+    caller — kept anyway since this is a module-level helper any future
+    caller could reach directly with un-vetted input, and ``raw.lower()``
+    on a dict/int is the exact crash this whole finding is about.
     """
+    if not isinstance(raw, str):
+        return "user"
     s = _USERNAME_SANITISE.sub("-", raw.lower())
     s = s.strip("-")
     return s or "user"
@@ -1257,15 +1266,33 @@ async def handle_oidc_callback(request: web.Request) -> web.StreamResponse:
             status=502, text="OIDC id_token validation failed",
         )
 
-    email = claims.get("email")
+    # R16-F1: OIDC claims are untyped/optional per spec -- a
+    # misconfigured IdP (a multi-valued LDAP/SCIM attribute serialised
+    # as a JSON array/object, or a numeric ``sub``) can send a
+    # non-``str`` value for any of these. Coerce a badly-typed claim to
+    # None (same "degrade to absent" posture the ``groups_claim`` guard
+    # just below already uses for a non-list ``groups``) so it falls
+    # through to JIT-create with a generated username / the existing
+    # ``InvalidEmailError``->502 path, instead of propagating an
+    # unhandled ``AttributeError``/``sqlite3.ProgrammingError`` out of
+    # ``identity.create_user``, ``_sanitise_username``, or
+    # ``find_linkable_user_by_email`` -- all of which assume ``str``.
+    raw_email = claims.get("email")
+    email = raw_email if isinstance(raw_email, str) else None
     # Strict boolean check: an IdP that omits the claim, or sends a
     # string / falsy value, is treated as UNVERIFIED so its email can't
     # be used to link to (take over) a pre-existing local account.
     email_verified = claims.get("email_verified") is True
-    preferred_username = claims.get("preferred_username") or claims.get("sub")
+    raw_preferred_username = claims.get("preferred_username")
+    preferred_username_claim = (
+        raw_preferred_username if isinstance(raw_preferred_username, str) else None
+    )
+    raw_sub = claims.get("sub")
+    sub_claim = raw_sub if isinstance(raw_sub, str) else None
+    preferred_username = preferred_username_claim or sub_claim
     # Stable reconciliation key: (iss, sub). ``iss`` is the validated
     # issuer from the id_token; fall back to the configured issuer.
-    subject = _oidc_subject(claims.get("iss") or cfg.issuer, claims.get("sub"))
+    subject = _oidc_subject(claims.get("iss") or cfg.issuer, sub_claim)
     groups_claim = claims.get("groups") or []
     if not isinstance(groups_claim, list):
         groups_claim = []
