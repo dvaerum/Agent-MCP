@@ -86,10 +86,20 @@ async def revalidate_capability_or_403(
     reads those exact request-scoped keys — sees the live post-
     revalidation state too, not the snapshot taken at entry.
 
+    R9-F4 (HIGH, live-exploited): the checks above re-derive capability
+    and group/sysadmin state fresh, but until this fix the caller's
+    IDENTITY was still trusted from the entry-time ``req['user']``
+    snapshot — a session logged out DURING the yield point was
+    invisible to the revalidation, so a privileged write could
+    complete using an already-logged-out session. This function now
+    also re-runs ``login.resolve_current_user`` against the request's
+    own session cookie (when one is present) and denies if the session
+    no longer resolves, before ever re-deriving capability/group state.
+
     Single-tenant mode (ADR-0008) bypasses, mirroring
-    :func:`require_capability`. Fail-closed: a missing session user, or
-    any resolution error along the way, denies with the same 403 shape
-    the entry gate uses.
+    :func:`require_capability`. Fail-closed: a missing session user, an
+    invalidated session, or any resolution error along the way, denies
+    with the same 403 shape the entry gate uses.
     """
     if bypasses_operator_gate():
         return None
@@ -102,6 +112,33 @@ async def revalidate_capability_or_403(
         # something upstream is broken. Fail closed rather than let a
         # capability check run against no identity.
         return _forbidden_response(req, cap)
+
+    # R9-F4 (HIGH, live-exploited): everything above and below this
+    # block re-derives capability/group/sysadmin state from a FRESH DB
+    # read, but the caller's IDENTITY itself — ``user`` / ``user_id`` —
+    # still comes from ``req.get("user")``, the value the middleware
+    # cached ONCE at request entry, before this handler's own yield
+    # point. A session invalidated (logged out) DURING that yield point
+    # is invisible to every check below: they all faithfully re-confirm
+    # that the (now-stale) ``user_id`` still has the capability, never
+    # that the SESSION which authenticated it is still live. Re-run the
+    # exact same live lookup the entry-time middleware gate uses
+    # (``login.resolve_current_user``, backed by ``identity.get_session``)
+    # against the request's OWN session cookie, and deny if it no longer
+    # resolves. Scoped to requests that actually carry a session cookie —
+    # proxy-header SSO identities (Phase 3 Wave 3) have no session row to
+    # invalidate and are re-verified fresh on every request already, so
+    # they're left untouched here.
+    from .login import SESSION_COOKIE_NAME, resolve_current_user
+
+    session_id = req.cookies.get(SESSION_COOKIE_NAME, "")
+    if session_id:
+        try:
+            live_user = resolve_current_user(req)
+        except Exception:  # pragma: no cover - defensive
+            live_user = None
+        if live_user is None:
+            return _forbidden_response(req, cap)
 
     from . import group_resolver
     from ..core.principal_builder import build_operator_principal
