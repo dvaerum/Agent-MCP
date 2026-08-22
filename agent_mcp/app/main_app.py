@@ -1253,11 +1253,30 @@ def _top_level_id_kind(body: bytes) -> Optional[str]:
     """Classify the JSON type of the root object's top-level ``"id"``
     key's value in a JSON-RPC `body`, without fully parsing it.
 
-    Returns ``"object"``, ``"array"``, or ``"bool"`` for the three
-    spec-invalid shapes; ``None`` if the key is absent, the value is a
-    spec-valid string/number/``null``, or the body doesn't parse as an
-    object at all (any of those are either fine or the SDK's own
-    parse/validation problem, not ours).
+    Returns ``"object"``, ``"array"``, ``"bool"``, or ``"float"`` for
+    the four spec-invalid shapes; ``None`` if the key is absent, the
+    value is a spec-valid string/int/``null``, or the body doesn't
+    parse as an object at all (any of those are either fine or the
+    SDK's own parse/validation problem, not ours).
+
+    ``"float"`` covers any numeric token containing ``.``, ``e``, or
+    ``E`` (`1.5`, `1e10`, `-1.5`, `1e30`, ...) — pentest R16-F2. The
+    vendored SDK's `RequestId = Annotated[int, Field(strict=True)] |
+    str` (`mcp/types.py`) misclassifies these exactly like an
+    object/array/bool id (see the guard's module comment above): they
+    fall through to `JSONRPCNotification` and the caller gets a silent
+    202 instead of a signal their request was malformed. This is a
+    *lexical* check (token shape, not value) rather than a `float()`
+    parse-and-compare, because that's what pydantic-core's strict-int
+    check itself does in JSON mode — confirmed empirically that even a
+    whole-valued exponent literal like `1e30` (or `1e10`) still fails
+    strict-int and is misclassified the same as `1.5`, while a bare
+    integer of arbitrary magnitude (no `.`/`e`/`E` in the token, e.g.
+    a 30-digit literal) passes, since Python/pydantic ints are
+    bignums. So the token's *shape* — not its numeric value or
+    magnitude — is exactly what pydantic strict-int keys off of; a
+    lexical scan for `.`/`e`/`E` reproduces that decision without
+    needing to parse the number at all.
 
     Byte-scan, string-literal-aware the same way `_body_nesting_exceeds`
     and `_body_has_nonfinite_number` are — no recursive JSON parse, so
@@ -1306,6 +1325,22 @@ def _top_level_id_kind(body: bytes) -> Optional[str]:
                                 found_kind = "array"
                             elif vch in (0x74, 0x66):  # 't' / 'f'
                                 found_kind = "bool"
+                            elif vch == 0x2D or 0x30 <= vch <= 0x39:
+                                # '-' or a digit: a JSON number token.
+                                # Scan forward through it (numbers can't
+                                # contain braces/brackets/quotes, so no
+                                # depth/string tracking needed here) and
+                                # flag "float" iff it contains '.', 'e',
+                                # or 'E' — see the docstring above for
+                                # why a lexical check matches pydantic's
+                                # strict-int behavior exactly.
+                                k = j
+                                is_float = False
+                                while k < n and body[k] in _JSON_NUMBER_BYTES:
+                                    if body[k] in (0x2E, 0x65, 0x45):
+                                        is_float = True
+                                    k += 1
+                                found_kind = "float" if is_float else None
                             else:
                                 found_kind = None
             continue
@@ -1321,9 +1356,10 @@ def _top_level_id_kind(body: bytes) -> Optional[str]:
 
 
 def _body_has_invalid_id(body: bytes) -> bool:
-    """True if `body`'s top-level ``"id"`` is a dict, list, or bool —
-    the three shapes the MCP SDK silently misclassifies as a
-    Notification instead of rejecting (see the guard comment above).
+    """True if `body`'s top-level ``"id"`` is a dict, list, bool, or
+    float/exponent-shaped number — the four shapes the MCP SDK
+    silently misclassifies as a Notification instead of rejecting
+    (see the guard comment above).
     """
     return _top_level_id_kind(body) is not None
 

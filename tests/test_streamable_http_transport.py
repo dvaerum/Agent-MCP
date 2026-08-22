@@ -429,6 +429,65 @@ async def test_post_mcp_string_and_int_id_unaffected_by_id_guard(
         assert payload.get("id") == "abc", payload
 
 
+# R16-F2: `_top_level_id_kind`'s byte-scanner above only inspected the
+# id value's *first* byte, so a `.`/`e`/`E`-shaped numeric id token
+# (`1.5`, `1e10`, `-1.5`, ...) started with a digit/`-` and fell
+# through to the same `None` ("valid") bucket as a plain int — same
+# silent-Notification bug R15-F3 closed for object/array/bool, just
+# for a numeric-but-non-strict-int token shape. Confirmed by directly
+# exercising `mcp.types.JSONRPCMessage.model_validate_json` with this
+# repo's pinned `mcp==1.28.1`/`pydantic==2.13.4`: *any* token containing
+# `.`/`e`/`E` fails strict-int and is misclassified — including a
+# whole-valued exponent literal like `1e30` or `1e10`, not just a
+# genuinely-fractional one like `1.5`. A bare integer of arbitrary
+# magnitude (no `.`/`e`/`E` in the token) passes fine, since
+# Python/pydantic ints are bignums — see
+# `test_post_mcp_huge_bare_integer_id_unaffected_by_id_guard` below.
+async def test_post_mcp_float_id_returns_400_invalid_request(tmp_path) -> None:
+    """A float/exponent-shaped numeric `id` must be rejected with a
+    clean 400, not silently misclassified as a Notification."""
+    async with mcp_session(tmp_path) as admin:
+        for id_literal in ("1.5", "-1.5", "0.0", "1e10", "-1e10", "1e30", "2e-3"):
+            body = (
+                '{"jsonrpc":"2.0","id":%s,"method":"tools/list","params":{}}'
+                % id_literal
+            ).encode()
+            r = _post_mcp_raw(
+                admin.client,
+                body,
+                headers={"Authorization": f"Bearer {admin.admin_token}"},
+            )
+            assert r.status_code == 400, (id_literal, r.status_code, r.text)
+            payload = r.json()
+            assert payload["error"]["code"] == -32600, (id_literal, payload)
+            assert payload["error"]["message"] == "Invalid Request", (
+                id_literal,
+                payload,
+            )
+
+
+async def test_post_mcp_huge_bare_integer_id_unaffected_by_id_guard(
+    tmp_path,
+) -> None:
+    """No-regression check: a huge but *bare* integer id (no `.`/`e`/`E`
+    in the token) is genuinely strict-int-valid per pydantic — Python
+    ints are bignums — and must sail through unaffected, same as any
+    ordinary int id."""
+    async with mcp_session(tmp_path) as admin:
+        huge_int = 10**30
+        r = _post_mcp_raw(
+            admin.client,
+            (
+                '{"jsonrpc":"2.0","id":%d,"method":"tools/list","params":{}}'
+                % huge_int
+            ).encode(),
+            headers={"Authorization": f"Bearer {admin.admin_token}"},
+        )
+        assert r.status_code == 200, r.text
+        payload = _extract_jsonrpc_result(r)
+        assert payload.get("id") == huge_int, payload
+
+
 # ---------- GET /mcp -------------------------------------------------
 
 
