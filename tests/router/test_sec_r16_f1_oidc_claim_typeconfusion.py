@@ -254,3 +254,94 @@ async def test_oidc_callback_survives_dict_preferred_username_claim(
     # fallback slug rather than the (rejected) dict claim.
     row = identity.get_user_by_username("user-dict-username")
     assert row is not None, "expected JIT-created user under sub-fallback slug"
+
+
+# ── R17-F1: non-str ``sub`` must still reconcile identity ──────────
+#
+# R16-F1 (above) applied its str-only ``sub`` coercion to BOTH of
+# ``sub``'s uses: the (genuinely str-only) preferred_username fallback,
+# AND ``_oidc_subject``'s stable reconciliation key -- which only
+# f-string-interpolates ``sub`` and never needed a str guard. That
+# regressed a numeric (or bool/float) ``sub`` to a permanently-None
+# subject, defeating subject-based reconciliation: every login from
+# such an IdP re-minted a brand-new orphaned user instead of matching
+# the existing one.
+
+
+async def test_oidc_callback_reconciles_int_sub_across_logins(
+    aiohttp_client, router_app, sso_oidc_env, monkeypatch,
+) -> None:
+    """RED (pre-fix): two logins with the same (iss, sub=424242) and no
+    email claim must reconcile to the SAME user row via a stable,
+    non-None ``sso_subject`` -- not mint two distinct users."""
+    from agent_mcp.router import identity
+
+    client = await aiohttp_client(router_app)
+    claims = {
+        "sub": 424242,
+        "preferred_username": "numericsubuser",
+        "groups": [],
+    }
+
+    cb1 = await _drive_callback(client, monkeypatch, claims=dict(claims))
+    assert cb1.status in (302, 303), await cb1.text()
+    cb2 = await _drive_callback(client, monkeypatch, claims=dict(claims))
+    assert cb2.status in (302, 303), await cb2.text()
+
+    row1 = identity.get_user_by_username("numericsubuser")
+    assert row1 is not None
+    assert row1["sso_subject"] is not None, (
+        "a numeric sub must still produce a stable, non-None "
+        "sso_subject -- degrading it to None defeats reconciliation"
+    )
+
+    # The second login must NOT have minted a "numericsubuser-2"
+    # collision row -- it must have matched row1 via sso_subject.
+    assert identity.get_user_by_username("numericsubuser-2") is None
+    row2 = identity.find_user_by_sso_subject(row1["sso_subject"])
+    assert row2 is not None
+    assert row2["user_id"] == row1["user_id"]
+
+
+async def test_oidc_callback_int_sub_username_fallback_still_safe(
+    aiohttp_client, router_app, sso_oidc_env, monkeypatch,
+) -> None:
+    """The ORIGINAL R16-F1 fix must still hold: a non-str ``sub`` used
+    as the preferred_username FALLBACK (no preferred_username claim at
+    all) must not crash ``_sanitise_username`` -- it degrades cleanly
+    to the generated "user" slug, independent of the (now-fixed, still
+    non-None) subject reconciliation key."""
+    from agent_mcp.router import identity
+
+    client = await aiohttp_client(router_app)
+    cb = await _drive_callback(client, monkeypatch, claims={
+        "sub": 999999,
+        "groups": [],
+    })
+    assert cb.status in (302, 303), await cb.text()
+
+    # No preferred_username and a non-str sub -> _sanitise_username
+    # never received a usable str, so the JIT username falls back to
+    # the generated "user" slug (or its collision-suffixed sibling).
+    row = identity.get_user_by_username("user")
+    assert row is not None, "expected JIT-created user under fallback slug"
+    assert row["sso_subject"] is not None
+
+
+async def test_oidc_subject_missing_sub_unaffected(monkeypatch) -> None:
+    """A genuinely absent ``sub`` (no sub at all) must still degrade
+    ``_oidc_subject`` to None -- no regression to the pre-existing
+    "no sub" path."""
+    from agent_mcp.router import sso
+
+    assert sso._oidc_subject("https://idp.example.test", None) is None
+
+
+async def test_oidc_subject_str_sub_unaffected(monkeypatch) -> None:
+    """A normal str ``sub`` must be unaffected by the R17-F1 fix."""
+    from agent_mcp.router import sso
+
+    assert (
+        sso._oidc_subject("https://idp.example.test", "abc-123")
+        == "oidc:https://idp.example.test:abc-123"
+    )

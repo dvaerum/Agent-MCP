@@ -384,7 +384,16 @@ _OIDC_SUBJECT_PREFIX = "oidc:"
 _PROXY_SUBJECT_PREFIX = "proxy:"
 
 
-def _oidc_subject(iss: str | None, sub: str | None) -> str | None:
+# JSON-scalar shapes ``sub`` may legally arrive as (str is the spec
+# shape; int/float/bool cover the real-world misconfigured-IdP cases
+# R17-F1 was filed over, e.g. a numeric employee/subject id). A dict
+# or list ``sub`` is not a sane identity key on its own -- degrade
+# those to None the same as a missing claim, rather than keying
+# reconciliation on a stringified blob.
+_OIDC_SUBJECT_SCALAR_TYPES = (str, int, float, bool)
+
+
+def _oidc_subject(iss: str | None, sub: object | None) -> str | None:
     """Build the stable OIDC subject key from ``(iss, sub)``.
 
     Per the OIDC spec ``sub`` is unique+stable only WITHIN an issuer,
@@ -392,8 +401,22 @@ def _oidc_subject(iss: str | None, sub: str | None) -> str | None:
     spec-noncompliant id_token) — the caller then falls back to the
     verified-email / JIT-create path rather than keying on a partial
     identifier.
+
+    ``sub`` deliberately accepts more than ``str``: this function only
+    f-string-interpolates it, so any JSON scalar (str/int/float/bool)
+    is safe input and produces a stable key. R17-F1: an earlier fix
+    (R16-F1) mistakenly fed this the SAME str-only-coerced value used
+    for the (genuinely ``str``-only) ``preferred_username`` fallback,
+    which silently degraded a non-str ``sub`` (e.g. a numeric IdP
+    subject id) to None on EVERY login -- defeating subject-based
+    reconciliation and re-minting a fresh orphaned user each time
+    instead of crashing. Only a missing ``sub`` or a non-scalar shape
+    (dict/list, e.g. a misserialised multi-valued attribute) degrades
+    to None here.
     """
-    if not iss or not sub:
+    if not iss or sub is None:
+        return None
+    if not isinstance(sub, _OIDC_SUBJECT_SCALAR_TYPES):
         return None
     return f"{_OIDC_SUBJECT_PREFIX}{iss}:{sub}"
 
@@ -1268,8 +1291,8 @@ async def handle_oidc_callback(request: web.Request) -> web.StreamResponse:
 
     # R16-F1: OIDC claims are untyped/optional per spec -- a
     # misconfigured IdP (a multi-valued LDAP/SCIM attribute serialised
-    # as a JSON array/object, or a numeric ``sub``) can send a
-    # non-``str`` value for any of these. Coerce a badly-typed claim to
+    # as a JSON array/object) can send a non-``str`` value for
+    # ``email``/``preferred_username``. Coerce a badly-typed claim to
     # None (same "degrade to absent" posture the ``groups_claim`` guard
     # just below already uses for a non-list ``groups``) so it falls
     # through to JIT-create with a generated username / the existing
@@ -1277,6 +1300,11 @@ async def handle_oidc_callback(request: web.Request) -> web.StreamResponse:
     # unhandled ``AttributeError``/``sqlite3.ProgrammingError`` out of
     # ``identity.create_user``, ``_sanitise_username``, or
     # ``find_linkable_user_by_email`` -- all of which assume ``str``.
+    # R17-F1: ``sub`` is deliberately NOT included in that "degrade
+    # non-str to None" posture below -- see ``_oidc_subject``'s
+    # docstring for why the stable-identity-key use of ``sub`` needs a
+    # wider (JSON-scalar) type acceptance than the username-fallback
+    # use does.
     raw_email = claims.get("email")
     email = raw_email if isinstance(raw_email, str) else None
     # Strict boolean check: an IdP that omits the claim, or sends a
@@ -1288,11 +1316,18 @@ async def handle_oidc_callback(request: web.Request) -> web.StreamResponse:
         raw_preferred_username if isinstance(raw_preferred_username, str) else None
     )
     raw_sub = claims.get("sub")
+    # ``sub_claim`` is the str-only coercion, used ONLY for the
+    # preferred_username fallback below (``_sanitise_username`` needs a
+    # ``str`` for ``.lower()``). ``_oidc_subject`` gets the RAW claim
+    # instead (R17-F1) -- it accepts any JSON scalar and is the ONLY
+    # input to the stable reconciliation key, so degrading a non-str
+    # (but still scalar, e.g. numeric) sub to None here would silently
+    # defeat subject-based account reconciliation on every login.
     sub_claim = raw_sub if isinstance(raw_sub, str) else None
     preferred_username = preferred_username_claim or sub_claim
     # Stable reconciliation key: (iss, sub). ``iss`` is the validated
     # issuer from the id_token; fall back to the configured issuer.
-    subject = _oidc_subject(claims.get("iss") or cfg.issuer, sub_claim)
+    subject = _oidc_subject(claims.get("iss") or cfg.issuer, raw_sub)
     groups_claim = claims.get("groups") or []
     if not isinstance(groups_claim, list):
         groups_claim = []
