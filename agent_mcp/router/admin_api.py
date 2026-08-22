@@ -495,7 +495,7 @@ async def rename_project_handler(req: web.Request) -> web.Response:
     # destructive stop/move/registry-rename runs. This is IN ADDITION to
     # the body-read revalidation above, not a replacement — rename now has
     # BOTH yield points revalidated.
-    from .perm_gates import revalidated_lock
+    from .perm_gates import revalidate_after, revalidated_lock
 
     async with revalidated_lock(
         req, "system.projects.manage", old_name, min_role="operator",
@@ -567,9 +567,28 @@ async def rename_project_handler(req: web.Request) -> web.Response:
         # up to the SC-R7-2 timeout on a D-Bus stall); calling it directly
         # while holding ``_ensure_lock`` stalls the single aiohttp event
         # loop — every other concurrent router request — for the duration.
-        await asyncio.to_thread(
-            _app._po._systemctl, "stop", _app._unit_name(old_name, "backend"),
+        #
+        # R14-F2 (HIGH, live-exploited): this await is a genuine yield
+        # point INSIDE the lock, downstream of ``revalidated_lock``'s
+        # one-shot entry revalidation above — holding the lock does not
+        # stop an unrelated capability/membership revocation from
+        # committing to the DB while this coroutine is suspended here.
+        # Confirmed live: a rename racing a concurrent membership
+        # revocation timed to land during this exact await still
+        # completed the rename on already-revoked authority.
+        # ``revalidate_after`` fuses the await with a FRESH re-check the
+        # instant it resolves — see its docstring in ``perm_gates.py`` —
+        # so nothing after this point runs on stale authority.
+        _, denied = await revalidate_after(
+            asyncio.to_thread(
+                _app._po._systemctl,
+                "stop",
+                _app._unit_name(old_name, "backend"),
+            ),
+            req, "system.projects.manage", old_name, min_role="operator",
         )
+        if denied is not None:
+            return denied
         # BL-R35-1 (mirrors delete's BL-R7-2): purge the per-OLD-name
         # orchestrator lifecycle state via the single ``forget`` clear
         # path, inside the lock (atomic with stop+registry rename) so a
@@ -868,7 +887,7 @@ async def delete_project_handler(req: web.Request) -> web.Response:
     # ``async with`` body ever runs) is what makes it structural rather
     # than opt-in. R9-F2's ``operator``-tier rank bar carries through
     # via ``min_role``.
-    from .perm_gates import revalidated_lock
+    from .perm_gates import revalidate_after, revalidated_lock
 
     async with revalidated_lock(
         req, "system.projects.manage", name, min_role="operator",
@@ -908,9 +927,21 @@ async def delete_project_handler(req: web.Request) -> web.Response:
         # or up to the SC-R7-2 timeout on a D-Bus stall); calling it
         # directly while holding ``_ensure_lock`` stalls every other
         # tenant's request on this single event loop for the duration.
-        await asyncio.to_thread(
-            _app._po._systemctl, "stop", _app._unit_name(name, "backend"),
+        #
+        # R14-F2 (HIGH, live-exploited): genuine in-lock yield point,
+        # downstream of ``revalidated_lock``'s one-shot entry
+        # revalidation — see the identical comment in
+        # ``rename_project_handler`` above. ``revalidate_after`` fuses
+        # this await with a fresh re-check right before the destructive
+        # unregister below.
+        _, denied = await revalidate_after(
+            asyncio.to_thread(
+                _app._po._systemctl, "stop", _app._unit_name(name, "backend"),
+            ),
+            req, "system.projects.manage", name, min_role="operator",
         )
+        if denied is not None:
+            return denied
         try:
             _app._REGISTRY.unregister(name)
         except KeyError:
@@ -1055,7 +1086,7 @@ async def stop_project_handler(req: web.Request) -> web.Response:
     # re-check (R8-F3's own class-sweep gap) into one call is what makes
     # this structural rather than opt-in. R9-F2's ``operator``-tier rank
     # bar carries through via ``min_role``.
-    from .perm_gates import revalidated_lock
+    from .perm_gates import revalidate_after, revalidated_lock
 
     async with revalidated_lock(
         req, "system.projects.manage", name, min_role="operator",
@@ -1094,8 +1125,29 @@ async def stop_project_handler(req: web.Request) -> web.Response:
         # every other concurrent router request — for the duration. Run
         # both off-loop via ``asyncio.to_thread`` (mirrors the
         # orchestrator's BL-R6-2b and delete's BL-R7-3).
-        if await asyncio.to_thread(_app._po._is_active, unit):
-            r = await asyncio.to_thread(_app._po._systemctl, "stop", unit)
+        #
+        # R14-F2 (HIGH, live-exploited): BOTH of these are genuine
+        # in-lock yield points, downstream of ``revalidated_lock``'s
+        # one-shot entry revalidation — see the identical comment in
+        # ``rename_project_handler`` above. Route EACH through
+        # ``revalidate_after`` so whichever one actually runs LAST on a
+        # given code path (``_is_active`` alone when the unit is already
+        # inactive; ``_is_active`` then ``_systemctl stop`` otherwise) is
+        # always immediately followed by a fresh re-check before the
+        # orchestrator-state clear below.
+        is_active, denied = await revalidate_after(
+            asyncio.to_thread(_app._po._is_active, unit),
+            req, "system.projects.manage", name, min_role="operator",
+        )
+        if denied is not None:
+            return denied
+        if is_active:
+            r, denied = await revalidate_after(
+                asyncio.to_thread(_app._po._systemctl, "stop", unit),
+                req, "system.projects.manage", name, min_role="operator",
+            )
+            if denied is not None:
+                return denied
             if r.returncode != 0:
                 # SD-R15-1: sibling of SC-R8-2 (project_orchestrator._ensure).
                 # Reachable via the delegatable ``system.projects.manage``

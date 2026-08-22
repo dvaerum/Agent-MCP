@@ -39,6 +39,7 @@ __all__ = [
     "revalidate_capability_or_403",
     "read_body_and_revalidate",
     "revalidated_lock",
+    "revalidate_after",
 ]
 
 
@@ -303,6 +304,15 @@ async def revalidated_lock(
     the lock is held for the whole privileged section and released on
     exit either way (mirrors ``_app._ensure_lock``'s own release
     semantics — this wraps it, not replaces it).
+
+    R14-F2 (HIGH, live-exploited): this ``yield`` only ever revalidates
+    ONCE, at entry. Holding the lock does NOT protect anything a caller
+    does after this point from a concurrent, unrelated revocation — see
+    ``revalidate_after`` below, which every ``await``/``asyncio.to_thread``
+    call INSIDE this block must now be routed through instead of being
+    awaited bare, so the destructive write that follows always sits
+    right after a fresh re-check, not this generator's one-shot entry
+    snapshot.
     """
     from . import app as _app
     from .admin_api import _revalidate_capability_and_membership_or_403
@@ -312,6 +322,66 @@ async def revalidated_lock(
             req, cap, project_name, min_role=min_role,
         )
         yield denied
+
+
+async def revalidate_after(
+    awaitable: Awaitable[object],
+    req: web.Request,
+    cap: str,
+    project_name: str,
+    *,
+    min_role: str | None = None,
+) -> tuple[object, web.Response | None]:
+    """Await ``awaitable`` AND revalidate immediately after it resolves —
+    ONE call, not two.
+
+    R14-F2 (HIGH, live-exploited): ``revalidated_lock`` above revalidates
+    capability+membership exactly ONCE, immediately after lock
+    acquisition, then ``yield``s control to the caller's protected
+    ``async with`` body. Everything the caller does AFTER that —
+    while STILL lexically inside the block, still holding the lock —
+    ran completely un-rechecked. A held ``asyncio.Lock`` only blocks
+    OTHER coroutines racing for the SAME lock; it does nothing to stop
+    an unrelated capability/membership DELETE (a different request
+    entirely) from committing to the DB while THIS coroutine is
+    suspended mid-``await`` inside the "protected" block.
+    ``rename_project_handler`` / ``delete_project_handler`` /
+    ``stop_project_handler`` each held a bare ``asyncio.to_thread``
+    systemctl-stop (and, for stop, an ``_is_active`` probe too) await
+    immediately inside their ``revalidated_lock`` block, with the
+    destructive registry/orchestrator write straight after — a caller
+    whose authority was revoked mid-``systemctl stop`` still completed
+    the write on the lock's one-shot ENTRY snapshot. Confirmed live: a
+    rename request racing a concurrent membership revocation timed to
+    land during the ``systemctl stop`` await still renamed the project
+    on already-revoked authority.
+
+    Wrap that inner await in this helper instead of calling it bare:
+    the revalidation runs the INSTANT the awaitable resolves, so there
+    is no statement position left between "the last genuine yield
+    point inside the lock" and "the next revalidation" for a
+    concurrent revocation to land in undetected. Mirrors
+    ``read_body_and_revalidate``'s fusion idiom one level in — that one
+    fuses a body-read with the ENTRY revalidation; this one fuses an
+    in-lock await with a FRESH re-check right before the destructive
+    write that follows it. A handler with more than one await inside
+    the lock (``stop_project_handler``'s ``_is_active`` then
+    ``systemctl stop``) wraps EACH one, so no matter which is the last
+    one actually executed on a given code path, a fresh revalidation
+    always sits between it and the write.
+
+    Returns ``(result, denied)`` — ``result`` is whatever ``awaitable``
+    resolved to, ``denied`` is ``None`` on success (caller proceeds) or
+    the 403/404 envelope to return immediately, exactly like
+    ``read_body_and_revalidate``.
+    """
+    result = await awaitable
+    from .admin_api import _revalidate_capability_and_membership_or_403
+
+    denied = await _revalidate_capability_and_membership_or_403(
+        req, cap, project_name, min_role=min_role,
+    )
+    return result, denied
 
 
 def require_capability(

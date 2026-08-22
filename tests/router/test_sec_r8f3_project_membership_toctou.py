@@ -467,10 +467,17 @@ async def test_combined_revalidation_helper_invoked_at_all_three_sites(
     R13-F1: ``rename_project_handler`` now revalidates at BOTH of its
     genuine yield points — the body-read (``read_body_and_revalidate``)
     AND the ``_ensure_lock`` acquisition (``revalidated_lock``) — so it
-    calls this helper TWICE, not once; ``delete``/``stop`` are
-    unaffected and still call it exactly once each.
+    calls this helper TWICE, not once.
 
-    R9-F2: also pins that all three now thread ``min_role="operator"``
+    R14-F2: the in-lock ``asyncio.to_thread`` systemctl-stop (and, for
+    stop, ``_is_active`` too) awaits now each route through
+    ``perm_gates.revalidate_after``, which calls THIS SAME helper again
+    — a THIRD call for rename, a second for delete, and a second for
+    stop (the ``_is_active`` re-check; the project isn't actually
+    running in this test, so the further ``systemctl stop``-guarded
+    re-check never fires).
+
+    R9-F2: also pins that all now thread ``min_role="operator"``
     through the post-yield re-check, mirroring the entry-time check —
     the rank bar must not silently drop across the yield point."""
     from agent_mcp.router import admin_api
@@ -516,6 +523,9 @@ async def test_combined_revalidation_helper_invoked_at_all_three_sites(
     assert calls == [
         ("system.projects.manage", "spy-rename-membership", "operator"),
         ("system.projects.manage", "spy-rename-membership", "operator"),
+        ("system.projects.manage", "spy-rename-membership", "operator"),
         ("system.projects.manage", "spy-stop-membership", "operator"),
+        ("system.projects.manage", "spy-stop-membership", "operator"),
+        ("system.projects.manage", "spy-delete-membership", "operator"),
         ("system.projects.manage", "spy-delete-membership", "operator"),
     ], calls

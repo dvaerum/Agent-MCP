@@ -60,15 +60,29 @@ correctly wired to ``read_body_and_revalidate`` — the bare
 invisible to a check that only ever looked at index 0.
 ``test_no_bare_yield_point_after_last_revalidation`` below closes that:
 for every discovered handler, it walks the AST for any bare (non-
-marker) ``await``/``async with`` occurring, in source order, AFTER the
-handler's LAST combined-helper call — excluding yield points lexically
-nested INSIDE that last marker's own protected ``async with`` body
-(those run under the still-held lock the marker just freshly
-revalidated inside, e.g. ``delete``/``stop``'s ``asyncio.to_thread``
-systemctl-stop call; that's the region the marker exists to guard, not
-a gap). A non-empty result is exactly the R13-F1 shape: a yield point
-downstream of every revalidation call in the function, that a
-concurrent revocation can land in.
+marker) ``await``/``async with`` occurring, in source order, with no
+combined-helper marker call anywhere AFTER it.
+
+R14-F2 (HIGH, live-exploited): the FIRST version of this check
+(shipped for R13-F1) excluded yield points lexically nested INSIDE the
+last marker's own ``async with`` body outright, reasoning that they ran
+"under the still-held lock the marker just freshly revalidated inside
+... that's the protected region the marker exists to guard, not a
+gap." That reasoning was unsound: a held ``asyncio.Lock`` only blocks
+OTHER coroutines racing for the SAME lock; it does nothing to stop an
+unrelated capability/membership DELETE from committing to the DB while
+THIS coroutine is suspended mid-``await`` inside the "protected" block.
+``rename_project_handler`` / ``delete_project_handler`` /
+``stop_project_handler`` each held a bare ``asyncio.to_thread``
+systemctl-stop (or, for stop, ``_is_active`` too) await immediately
+inside their ``revalidated_lock`` block, with the destructive write
+straight after — completely unrevalidated. The check below no longer
+carves out an exemption for anything nested inside a marker's body: a
+bare yield point is "covered" only when *some* marker call — including
+``perm_gates.revalidate_after``, the new helper this fix introduced —
+occurs anywhere LATER in the function, at any nesting depth. A handler
+with a bare yield point and no marker after it anywhere is exactly the
+R14-F2 shape.
 """
 
 from __future__ import annotations
@@ -84,7 +98,9 @@ import pytest
 # walk and must NOT inherit an asyncio mark.
 
 _MUTATION_METHODS = {"post", "put", "patch", "delete"}
-_COMBINED_HELPERS = {"read_body_and_revalidate", "revalidated_lock"}
+_COMBINED_HELPERS = {
+    "read_body_and_revalidate", "revalidated_lock", "revalidate_after",
+}
 
 # (module dotted path, route-registration function name) pairs to scan.
 # Both are the two files OBS-R11-1 names explicitly as the recurring
@@ -213,83 +229,144 @@ def _yield_points_and_markers(
     return yield_points, markers
 
 
-def _marker_nodes(func: ast.AsyncFunctionDef) -> list[ast.AST]:
-    """Every yield-point AST node (``Await`` or ``AsyncWith``) in
-    ``func`` that IS a combined-helper marker call, in source order.
-
-    Unlike ``_yield_points_and_markers`` above (which only needs
-    POSITIONS), this returns the actual nodes — the R13-F1 check needs
-    the last marker's own subtree to exclude its lexically-nested body
-    from the "bare yield point after the last marker" scan below.
-    """
-    nodes: list[ast.AST] = []
-    for node in ast.walk(func):
-        if isinstance(node, ast.Await) and isinstance(
-            node.value, ast.Call,
-        ) and _is_combined_helper_call(node.value):
-            nodes.append(node)
-        elif isinstance(node, ast.AsyncWith):
-            for item in node.items:
-                ctx = item.context_expr
-                if isinstance(ctx, ast.Call) and _is_combined_helper_call(ctx):
-                    nodes.append(node)
-                    break
-    nodes.sort(key=lambda n: (n.lineno, n.col_offset))
-    return nodes
-
-
 def _unprotected_yield_points_after_last_marker(
     func: ast.AsyncFunctionDef,
 ) -> list[tuple[int, int]]:
-    """R13-F1: positions of every bare (non-marker) ``await``/``async
-    with`` occurring, in source order, AFTER the LAST combined-helper
-    marker call in ``func`` — excluding yield points lexically nested
-    INSIDE that last marker's own ``async with`` body.
+    """R13-F1 / R14-F2: positions of every bare (non-marker)
+    ``await``/``async with`` in ``func`` that has NO combined-helper
+    marker call anywhere AFTER it in source order — at ANY nesting
+    depth, including yield points lexically NESTED inside another
+    marker's own ``async with`` body.
 
-    Those nested yield points (e.g. ``delete``/``stop``'s
-    ``asyncio.to_thread`` systemctl-stop call inside their
-    ``revalidated_lock`` block) run under the lock the marker just
-    freshly revalidated inside — that's the protected region the
-    marker exists to guard, not a gap. Anything else after the last
-    marker, at the same or an outer scope, is exactly the R13-F1 shape:
-    a yield point downstream of every revalidation call that a
-    concurrent revocation can land in.
+    R14-F2 (HIGH, live-exploited) found that the ORIGINAL version of
+    this check (written for R13-F1) exempted everything nested inside
+    the LAST marker's own body outright, reasoning it ran "under the
+    still-held lock the marker just freshly revalidated inside" —
+    unsound: a held ``asyncio.Lock`` blocks only OTHER coroutines
+    racing for the SAME lock, not a concurrent, unrelated capability/
+    membership DELETE committing to the DB while THIS coroutine is
+    suspended mid-await still inside that block.
+    ``rename_project_handler`` / ``delete_project_handler`` /
+    ``stop_project_handler`` all held a bare ``asyncio.to_thread``
+    systemctl-stop (or ``_is_active``) await INSIDE their
+    ``revalidated_lock`` block, straight after its one-shot entry
+    revalidation, with the destructive write immediately after — the
+    exact shape this now catches. The fix routes that inner await
+    through ``perm_gates.revalidate_after`` (a NEW combined-helper
+    marker fusing the await with a fresh re-check the instant it
+    resolves — mirrors ``read_body_and_revalidate``'s existing fusion
+    idiom, see its docstring in ``perm_gates.py``).
+
+    A bare yield point is "covered" whenever *some* marker call occurs
+    anywhere LATER in the function, at any nesting depth — not "the
+    yield point must itself be a marker". This is intentionally a
+    little more permissive than requiring every single yield point to
+    be a marker: an earlier read-only probe (e.g. ``stop``'s
+    ``_is_active`` check, ALSO wrapped in ``revalidate_after`` by this
+    fix, but hypothetically even if it weren't) can stay bare as long
+    as a later marker fires before the actual write, since that later
+    revalidation is what protects the write regardless of whether the
+    earlier probe's own result was already stale.
 
     Returns an empty list for a handler with no markers at all — that
     shape is covered by ``test_no_bare_yield_point_before_revalidation``
     above instead (either immune-by-construction, or already flagged
     there for having a yield point with NO revalidation whatsoever).
     """
-    markers = _marker_nodes(func)
+    yield_points, markers = _yield_points_and_markers(func)
     if not markers:
         return []
-    last_marker = markers[-1]
-    protected_ids = {id(n) for n in ast.walk(last_marker)}
-    last_pos = (last_marker.lineno, last_marker.col_offset)
-
-    hits: list[tuple[int, int]] = []
-    for node in ast.walk(func):
-        if id(node) in protected_ids:
-            continue
-        if isinstance(node, ast.Await):
-            pos = (node.lineno, node.col_offset)
-            if pos > last_pos and not (
-                isinstance(node.value, ast.Call)
-                and _is_combined_helper_call(node.value)
-            ):
-                hits.append(pos)
-        elif isinstance(node, ast.AsyncWith):
-            pos = (node.lineno, node.col_offset)
-            if pos > last_pos:
-                is_marker = any(
-                    isinstance(item.context_expr, ast.Call)
-                    and _is_combined_helper_call(item.context_expr)
-                    for item in node.items
-                )
-                if not is_marker:
-                    hits.append(pos)
+    marker_set = set(markers)
+    hits = [
+        pos for pos in yield_points
+        if pos not in marker_set and not any(m > pos for m in markers)
+    ]
     hits.sort()
     return hits
+
+
+def _parse_async_func(src: str) -> ast.AsyncFunctionDef:
+    """Parse a standalone async-function source snippet for the
+    synthetic-shape unit tests below — these exercise the AST checker
+    directly, independent of any real handler in the codebase."""
+    tree = ast.parse(src)
+    fn = tree.body[0]
+    assert isinstance(fn, ast.AsyncFunctionDef)
+    return fn
+
+
+def test_unprotected_yield_points_catches_bare_await_nested_in_revalidated_lock() -> None:
+    """R14-F2 synthetic case: a bare ``await`` INSIDE a
+    ``revalidated_lock`` block, with the destructive write immediately
+    after and NOTHING revalidating in between, must be flagged — this
+    is exactly the shape ``rename``/``delete``/``stop`` had pre-fix,
+    and exactly what the ORIGINAL (R13-F1-only) version of this checker
+    blanket-exempted as "protected by the still-held lock"."""
+    src = (
+        "async def handler(req):\n"
+        "    async with revalidated_lock(req, 'cap', name) as denied:\n"
+        "        if denied is not None:\n"
+        "            return denied\n"
+        "        await asyncio.to_thread(systemctl, 'stop', unit)\n"
+        "        registry.destroy(name)\n"
+    )
+    hits = _unprotected_yield_points_after_last_marker(_parse_async_func(src))
+    assert hits, "expected the bare in-lock await to be flagged"
+
+
+def test_unprotected_yield_points_clears_when_wrapped_in_revalidate_after() -> None:
+    """Same synthetic shape, fixed: the in-lock await is routed through
+    ``revalidate_after`` — no violation, proving the checker doesn't
+    just blanket-flag everything inside a ``revalidated_lock`` block
+    either."""
+    src = (
+        "async def handler(req):\n"
+        "    async with revalidated_lock(req, 'cap', name) as denied:\n"
+        "        if denied is not None:\n"
+        "            return denied\n"
+        "        _, denied = await revalidate_after(\n"
+        "            asyncio.to_thread(systemctl, 'stop', unit),\n"
+        "            req, 'cap', name,\n"
+        "        )\n"
+        "        if denied is not None:\n"
+        "            return denied\n"
+        "        registry.destroy(name)\n"
+    )
+    hits = _unprotected_yield_points_after_last_marker(_parse_async_func(src))
+    assert not hits, f"unexpected hits: {hits}"
+
+
+def test_unprotected_yield_points_no_false_positive_on_single_marker_handler() -> None:
+    """Legitimate protected code, no regression: a handler whose ONLY
+    yield point is the combined-helper marker itself (no further
+    awaits at all — the ``create_project_handler`` shape) must not be
+    flagged."""
+    src = (
+        "async def handler(req):\n"
+        "    body, denied = await read_body_and_revalidate(req, parse, 'cap')\n"
+        "    if denied is not None:\n"
+        "        return denied\n"
+        "    do_write(body)\n"
+    )
+    hits = _unprotected_yield_points_after_last_marker(_parse_async_func(src))
+    assert not hits, f"unexpected hits: {hits}"
+
+
+def test_unprotected_yield_points_still_catches_r13f1_second_lock_shape() -> None:
+    """Non-regression on the ORIGINAL R13-F1 shape: a whole SECOND,
+    independent bare ``async with`` lock acquisition after the first
+    marker, with no revalidation ever following it, must still be
+    flagged exactly as before this file's R14-F2 rewrite."""
+    src = (
+        "async def handler(req):\n"
+        "    body, denied = await read_body_and_revalidate(req, parse, 'cap')\n"
+        "    if denied is not None:\n"
+        "        return denied\n"
+        "    async with _app._ensure_lock(name, 'backend'):\n"
+        "        registry.destroy(name)\n"
+    )
+    hits = _unprotected_yield_points_after_last_marker(_parse_async_func(src))
+    assert hits, "expected the bare second-lock async-with to be flagged"
 
 
 def _collect_gated_mutation_handlers() -> list[tuple[str, str, ast.AsyncFunctionDef]]:
@@ -412,26 +489,32 @@ def test_no_bare_yield_point_before_revalidation(
 def test_no_bare_yield_point_after_last_revalidation(
     module_name: str, handler_name: str, func: ast.AsyncFunctionDef,
 ) -> None:
-    """R13-F1: nothing may await/hold bare AFTER the handler's LAST
-    combined-helper call either — the END of the yield-point chain,
+    """R13-F1 / R14-F2: nothing may await/hold bare with no combined-
+    helper marker call anywhere AFTER it, at ANY nesting depth —
     complementing ``test_no_bare_yield_point_before_revalidation``'s
-    check of the START. A handler with no marker at all is already
-    flagged (or exempted) by that other test; this one only fires for a
-    handler that revalidates SOMEWHERE but still leaves a later,
-    unrevalidated yield point downstream of its last check."""
+    check of the START of the yield-point chain. A handler with no
+    marker at all is already flagged (or exempted) by that other test;
+    this one only fires for a handler that revalidates SOMEWHERE but
+    still leaves a bare yield point with nothing revalidating after it
+    — whether that's a whole SECOND yield point outside the first
+    marker's block (R13-F1: a separate ``_ensure_lock`` acquisition) or
+    an in-lock await lexically NESTED inside a ``revalidated_lock``
+    block with no ``revalidate_after`` following it (R14-F2)."""
     hits = _unprotected_yield_points_after_last_marker(func)
     assert not hits, (
         f"{module_name}.{handler_name} has a bare async yield point at "
-        f"line(s) {[h[0] for h in hits]} AFTER its LAST call to a "
-        f"combined revalidation helper (read_body_and_revalidate / "
-        f"revalidated_lock) — the R13-F1 shape: a SECOND, later, "
-        f"independent yield point (e.g. a separate ``_ensure_lock`` "
-        f"acquisition, or lock CONTENTION worth a full backend "
-        f"cold-boot) that the fusion refactor's revalidation was never "
-        f"wired to. A concurrent capability/membership revocation can "
+        f"line(s) {[h[0] for h in hits]} with no combined revalidation "
+        f"helper call (read_body_and_revalidate / revalidated_lock / "
+        f"revalidate_after) anywhere AFTER it — the R13-F1/R14-F2 "
+        f"shape: a yield point (a separate ``_ensure_lock`` acquisition, "
+        f"lock CONTENTION worth a full backend cold-boot, or a bare "
+        f"``asyncio.to_thread`` call INSIDE an already-held "
+        f"``revalidated_lock`` block) that no revalidation call ever "
+        f"runs after. A concurrent capability/membership revocation can "
         f"land in that window and the destructive write downstream "
-        f"would still run on stale authority. Wrap this handler's "
-        f"remaining yield point in perm_gates.revalidated_lock too (or "
-        f"fold it into the existing marker's own protected block) so "
-        f"nothing after the last revalidation can run un-rechecked."
+        f"would still run on stale authority. Wrap this yield point in "
+        f"perm_gates.revalidated_lock (for a fresh lock acquisition) or "
+        f"perm_gates.revalidate_after (for an await already inside a "
+        f"held revalidated_lock block) so a fresh revalidation always "
+        f"follows it before anything downstream runs un-rechecked."
     )
