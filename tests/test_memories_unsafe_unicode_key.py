@@ -55,12 +55,20 @@ pytestmark = pytest.mark.asyncio
 # range (\x80-\x9F) alongside C0, so DEL (and C1 bytes like CSI
 # \x9B) are silently sanitized upstream too, same as
 # null_byte/control_soh.
+#
+# R13-F2: zero_width_space / bom / line_separator moved out of this
+# list to _HIDDEN_UNICODE_KEYS below for the same reason -- the
+# JSON-input sanitizer's hidden-Unicode strip (_HIDDEN_UNICODE_RE,
+# \u200B-\u200F/\uFEFF/\u2028/\u2029) now runs unconditionally on
+# every string leaf too, so these three no longer reach the unsafe-key
+# validator intact. rtl_override/lri_isolate/word_joiner/
+# deprecated_bidi stay here: U+202E, U+2066, U+2060, U+206F are
+# outside that character class (deliberately -- it mirrors the exact
+# scope of the old fallback-only "Step 4" regex, not every bidi/format
+# character) so they are still rejected, not silently sanitized.
 _DISALLOWED_KEYS = [
     ("rtl_override",      "config‮drowssap"),   # the spoofing case
-    ("zero_width_space",  "a\u200bb"),
-    ("bom",               "a﻿b"),
     ("lri_isolate",       "a⁦b"),
-    ("line_separator",    "a b"),
     ("word_joiner",       "a⁠b"),
     ("deprecated_bidi",   "a⁯b"),
 ]
@@ -75,6 +83,20 @@ _CONTROL_BYTE_KEYS = [
     ("null_byte",   "a\x00b"),
     ("control_soh", "a\x01b"),
     ("del",         "a\x7fb"),
+]
+
+# R13-F2: hidden/spoofing Unicode (zero-width space, BOM, line
+# separator) is stripped by the JSON-input sanitizer's
+# _HIDDEN_UNICODE_RE before the unsafe-key validator runs, so a
+# request carrying one no longer 400s -- see
+# test_create_memory_hidden_unicode_key_is_silently_sanitized below.
+# Kept as its own list for the same reason as _CONTROL_BYTE_KEYS: the
+# direct-validator unit test bypasses the JSON chokepoint entirely and
+# still needs to exercise these.
+_HIDDEN_UNICODE_KEYS = [
+    ("zero_width_space",  "a\u200bb"),
+    ("bom",               "a\ufeffb"),
+    ("line_separator",    "a\u2028b"),
 ]
 
 
@@ -169,6 +191,62 @@ async def test_create_memory_control_byte_key_is_silently_sanitized(
             )
             assert "\x00" not in row.context_key
             assert "\x01" not in row.context_key
+        finally:
+            sess.close()
+
+
+@pytest.mark.parametrize(
+    "label,bad_key", _HIDDEN_UNICODE_KEYS, ids=[t[0] for t in _HIDDEN_UNICODE_KEYS]
+)
+async def test_create_memory_hidden_unicode_key_is_silently_sanitized(
+    tmp_path, label: str, bad_key: str,
+) -> None:
+    """R13-F2: hidden/spoofing Unicode (zero-width space, BOM, line
+    separator) embedded in ``context_key`` is stripped by the shared
+    JSON-input sanitizer BEFORE this route ever sees it -- the request
+    now succeeds with the SANITIZED key, rather than being rejected by
+    the unsafe-key validator (which never observes the raw character).
+    The invariant this file exists to pin still holds: no raw hidden
+    Unicode ever reaches ``project_context.context_key`` -- it's just
+    enforced by upstream normalization instead of rejection, exactly
+    like ``test_create_memory_control_byte_key_is_silently_sanitized``
+    above for control bytes.
+
+    Reuses the production ``_HIDDEN_UNICODE_RE`` rather than a second
+    copy of the character class, so this test can't silently drift out
+    of sync with what the sanitizer actually strips.
+    """
+    from agent_mcp.utils.json_utils import _HIDDEN_UNICODE_RE
+
+    sanitized_key = _HIDDEN_UNICODE_RE.sub("", bad_key)
+
+    async with mcp_session(tmp_path) as admin:
+        r = admin.client.post(
+            "/api/memories",
+            json={"context_key": bad_key, "context_value": "val"},
+            headers={"Authorization": f"Bearer {admin.admin_token}"},
+        )
+        assert r.status_code == 200, (
+            f"{label}: expected 200 (sanitized upstream), "
+            f"got {r.status_code} body={r.text!r}"
+        )
+        from agent_mcp.db.engine import SessionLocal
+        from agent_mcp.db.models import ProjectContext
+
+        sess = SessionLocal()
+        try:
+            row = (
+                sess.query(ProjectContext)
+                .filter(ProjectContext.context_key == sanitized_key)
+                .one_or_none()
+            )
+            assert row is not None, (
+                f"{label}: 200 returned but sanitized key "
+                f"{sanitized_key!r} was not found"
+            )
+            assert "\u200b" not in row.context_key
+            assert "﻿" not in row.context_key
+            assert " " not in row.context_key
         finally:
             sess.close()
 
@@ -306,8 +384,9 @@ async def test_has_unsafe_unicode_for_identifier_unit() -> None:
     contract so refactors that hide the regex behind a different
     surface still satisfy the same shape.
 
-    Includes ``_CONTROL_BYTE_KEYS`` (R4-F3): called directly here, the
-    validator still correctly flags C0 control bytes — it's only the
+    Includes ``_CONTROL_BYTE_KEYS`` (R4-F3) and ``_HIDDEN_UNICODE_KEYS``
+    (R13-F2): called directly here, the validator still correctly
+    flags C0 control bytes and hidden/spoofing Unicode — it's only the
     HTTP round-trip that no longer observes them, because the shared
     JSON-input sanitizer strips them one layer earlier now."""
     from agent_mcp.utils.string_utils import (
@@ -315,7 +394,9 @@ async def test_has_unsafe_unicode_for_identifier_unit() -> None:
     )
 
     # All disallowed cases reject.
-    for _label, bad_key in _DISALLOWED_KEYS + _CONTROL_BYTE_KEYS:
+    for _label, bad_key in (
+        _DISALLOWED_KEYS + _CONTROL_BYTE_KEYS + _HIDDEN_UNICODE_KEYS
+    ):
         assert has_unsafe_unicode_for_identifier(bad_key), (
             f"helper must reject {bad_key!r}"
         )
