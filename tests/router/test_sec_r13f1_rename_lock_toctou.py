@@ -217,7 +217,7 @@ async def test_slow_drip_rename_lock_contention_rejects_stale_capability(
 
     root_id = _seed_user("root-r13f1a", is_sysadmin=True)
     assert root_id
-    client, alice_cookie, alice_id, group_id = await _delegated_member_client(
+    client, alice_cookie, _alice_id, group_id = await _delegated_member_client(
         aiohttp_client, router_app, target_project, "system.projects.manage",
     )
     admin_client = await aiohttp_client(router_app)
@@ -354,7 +354,7 @@ async def test_non_racing_delegate_rename_still_succeeds(
     still succeed exactly as before the fix."""
     target_project = "stable-rename-lock-project"
     register_project(target_project)
-    client, cookie, alice_id, _group_id = await _delegated_member_client(
+    client, cookie, _alice_id, _group_id = await _delegated_member_client(
         aiohttp_client, router_app, target_project, "system.projects.manage",
     )
 
