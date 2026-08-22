@@ -760,3 +760,168 @@ def test_update_fields_via_cursor_and_standalone_agree(
         cursor_row = task_repo.get_by_id("task-cursor-san")
         standalone_row = task_repo.get_by_id("task-standalone-san")
         assert cursor_row["notes"] == standalone_row["notes"] == ["n1", "n2"]
+
+
+# --- OBS-R12-2: DB-level terminal-state guard (migration 0025) ----------
+#
+# These call ``task_repo.update_fields`` DIRECTLY — no ``task_tools.py``
+# Python-level ``_TERMINAL_TASK_STATUSES`` / ``_is_status_transition_
+# allowed`` check runs anywhere in this path. This is exactly "a future
+# write path that forgot the check": the DB-level trigger must refuse
+# the mutation on its own, and the repo must translate the trigger's
+# raw ``sqlite3.IntegrityError`` into a clean, typed
+# ``TerminalTaskWriteBlocked`` — never a silent swallow-to-``None``
+# (which would look like success to a caller that doesn't check) and
+# never a raw leaked SQL error.
+
+
+def test_update_fields_cursor_path_raises_on_reassign_of_terminal_task(
+    project_dir, reset_globals,
+):
+    from agent_mcp.repositories.task_repository import TerminalTaskWriteBlocked
+
+    with _make_client(project_dir):
+        from agent_mcp.db.connection import get_db_connection
+        from agent_mcp.repositories import agent_repo, task_repo
+
+        agent_repo.create(
+            token="tok-ttwb-1", agent_id="ttwb-agent-1", status="active",
+            working_directory="/tmp/a", color="#111111",
+        )
+        _seed_task("task-ttwb-1", status="completed")
+
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN")
+            with pytest.raises(TerminalTaskWriteBlocked):
+                task_repo.update_fields(
+                    "task-ttwb-1", {"assigned_to": "ttwb-agent-1"},
+                    connection=cursor,
+                )
+            conn.rollback()
+        finally:
+            conn.close()
+
+        row = task_repo.get_by_id("task-ttwb-1")
+        assert row["assigned_to"] is None, (
+            "the DB itself must refuse the reassign — the row must be "
+            "UNCHANGED, not just the Python call returning an error"
+        )
+
+
+def test_update_fields_standalone_path_raises_on_notes_edit_of_terminal_task(
+    project_dir, reset_globals,
+):
+    """Same guard, the non-``connection=`` (SQLAlchemy session) writer —
+    the path a caller takes when it doesn't hold an open cursor."""
+    from agent_mcp.repositories.task_repository import TerminalTaskWriteBlocked
+
+    with _make_client(project_dir):
+        from agent_mcp.repositories import task_repo
+
+        _seed_task("task-ttwb-2", status="cancelled")
+
+        with pytest.raises(TerminalTaskWriteBlocked):
+            task_repo.update_fields(
+                "task-ttwb-2", {"notes": ["sneaky"]},
+            )
+
+        row = task_repo.get_by_id("task-ttwb-2")
+        assert row["notes"] == []
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"status": "in_progress"},
+        {"priority": "high"},
+        {"title": "renamed"},
+        {"description": "changed"},
+    ],
+)
+def test_update_fields_cursor_path_raises_for_every_protected_field(
+    project_dir, reset_globals, fields,
+):
+    from agent_mcp.repositories.task_repository import TerminalTaskWriteBlocked
+
+    with _make_client(project_dir):
+        from agent_mcp.db.connection import get_db_connection
+        from agent_mcp.repositories import task_repo
+
+        task_id = f"task-ttwb-field-{next(iter(fields))}"
+        _seed_task(task_id, status="failed")
+
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN")
+            with pytest.raises(TerminalTaskWriteBlocked):
+                task_repo.update_fields(task_id, fields, connection=cursor)
+            conn.rollback()
+        finally:
+            conn.close()
+
+
+def test_update_fields_cursor_path_allows_clearing_assigned_to_on_terminal_task(
+    project_dir, reset_globals,
+):
+    """BL-R17-2 legitimate carve-out (agent-purge FK cleanup): clearing
+    ``assigned_to`` to NULL on a terminal task must NOT raise — only
+    reassigning it to a live, non-NULL agent is refused."""
+    with _make_client(project_dir):
+        from agent_mcp.db.connection import get_db_connection
+        from agent_mcp.repositories import agent_repo, task_repo
+
+        agent_repo.create(
+            token="tok-ttwb-3", agent_id="ttwb-agent-3", status="active",
+            working_directory="/tmp/c", color="#333333",
+        )
+        _seed_task(
+            "task-ttwb-3", status="completed", assigned_to="ttwb-agent-3",
+        )
+
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN")
+            result = task_repo.update_fields(
+                "task-ttwb-3", {"assigned_to": None}, connection=cursor,
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        assert result is not None
+
+        row = task_repo.get_by_id("task-ttwb-3")
+        assert row["assigned_to"] is None
+        assert row["status"] == "completed"
+
+
+def test_update_fields_cursor_path_allows_child_tasks_write_on_terminal_task(
+    project_dir, reset_globals,
+):
+    """Delete-cascade / link-child-to-parent style writes to
+    ``child_tasks`` on an already-terminal row must keep working — this
+    field is NOT protected by the guard."""
+    with _make_client(project_dir):
+        from agent_mcp.db.connection import get_db_connection
+        from agent_mcp.repositories import task_repo
+
+        _seed_task("task-ttwb-4", status="completed")
+
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN")
+            result = task_repo.update_fields(
+                "task-ttwb-4", {"child_tasks": ["child-a"]},
+                connection=cursor,
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        assert result is not None
+
+        row = task_repo.get_by_id("task-ttwb-4")
+        assert row["child_tasks"] == ["child-a"]

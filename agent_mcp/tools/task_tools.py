@@ -34,6 +34,7 @@ from ..utils.audit_utils import log_audit
 from ..db.connection import get_db_connection
 from ..db.unit_of_work import unit_of_work
 from ..db.actions.agent_actions_db import log_agent_action_to_db
+from ..db.terminal_task_guard import TerminalTaskWriteBlocked
 from ..features.task_placement.validator import validate_task_placement
 from ..features.task_placement.suggestions import (
     format_suggestions_for_agent,
@@ -628,7 +629,26 @@ async def _update_single_task(
         if new_depends_on_tasks is not None:
             fields_to_update["depends_on_tasks"] = new_depends_on_tasks
 
-    task_repo.update_fields(task_id, fields_to_update, connection=cursor)
+    try:
+        task_repo.update_fields(task_id, fields_to_update, connection=cursor)
+    except TerminalTaskWriteBlocked:
+        # OBS-R12-2 defense-in-depth: the DB-level guard trigger caught
+        # something the check above (``_is_status_transition_allowed``)
+        # should have already refused. Translate into the SAME
+        # "invalid status transition" error shape that check produces —
+        # both existing consumers of this dict already know how to turn
+        # that into a clean typed result (``update_task_tool_impl``'s
+        # substring match -> ``Conflict``; ``update_task_status_tool_impl``'s
+        # aggregate text response) — never an uncaught 500.
+        return {
+            "success": False,
+            "error": (
+                f"Invalid status transition for task '{task_id}': "
+                f"write refused — task is in a terminal state "
+                f"(completed/cancelled/failed) and is frozen "
+                f"(DB-level guard)."
+            ),
+        }
 
     # Update in-memory cache — the repo defers cache write on the
     # connection= path because the caller's transaction is still open;
@@ -691,8 +711,24 @@ async def _update_single_task(
         "parent_task"
     ):
         parent_task_id = task_current_data["parent_task"]
-        cursor.execute("SELECT notes FROM tasks WHERE task_id = ?", (parent_task_id,))
+        cursor.execute(
+            "SELECT notes, status FROM tasks WHERE task_id = ?", (parent_task_id,)
+        )
         parent_row = cursor.fetchone()
+        # OBS-R12-2: a PARENT that is itself already terminal has its
+        # ``notes`` frozen by the DB-level guard trigger (migration
+        # 0025) — this system "FYI" append is best-effort bookkeeping,
+        # not something the child's own (legitimate) completion should
+        # be blocked on. Skip it rather than let an uncaught
+        # ``TerminalTaskWriteBlocked`` turn a valid child-completion
+        # into a failed whole-request error. No Python-level guard
+        # existed here before the trigger either, so this write
+        # silently succeeded pre-fix even on a terminal parent — the
+        # skip below is the FIRST place this invariant is enforced for
+        # this call site, matching the "terminal is a frozen sink"
+        # rule every other notes-write in this module already follows.
+        if parent_row and parent_row["status"] in _TERMINAL_TASK_STATUSES:
+            parent_row = None
         if parent_row:
             parent_notes_list = json.loads(parent_row["notes"] or "[]")
             parent_notes_list.append(
@@ -1394,6 +1430,16 @@ async def _assign_to_existing_tasks(
 
             return Ok(message="\n".join(response_parts))
 
+    except TerminalTaskWriteBlocked as e_ttb:
+        # OBS-R12-2 defense-in-depth: the terminal-sink filter above
+        # should already have refused every task in ``task_ids``. Never
+        # reachable in normal operation; translated to the same
+        # ``Conflict`` shape the filter's own refusal uses.
+        logger.error(
+            "TerminalTaskWriteBlocked reached _assign_to_existing_tasks "
+            "despite the terminal-sink filter: %s", e_ttb,
+        )
+        return Conflict(reason=str(e_ttb))
     except Exception as e:
         # The unit-of-work already rolled back + closed the connection.
         logger.error(f"Error assigning existing tasks: {e}", exc_info=True)
@@ -3261,7 +3307,22 @@ async def update_task_tool_impl(
                     clearing_fanout_needed = True
                     if not explicit_status:
                         clear_fields["status"] = "unassigned"
-                _task_repo.update_fields(task_id, clear_fields, connection=cursor)
+                try:
+                    _task_repo.update_fields(
+                        task_id, clear_fields, connection=cursor,
+                    )
+                except TerminalTaskWriteBlocked:
+                    # OBS-R12-2 defense-in-depth: the prior_status check
+                    # above should already have refused this. Translate
+                    # into the same Conflict shape that check produces.
+                    return Conflict(
+                        reason=(
+                            f"Cannot clear assignment for task "
+                            f"'{task_id}': status '{prior_status}' is "
+                            f"terminal (completed/cancelled/failed) and "
+                            f"its assignment is frozen."
+                        )
+                    )
                 if task_id in g.tasks:
                     g.tasks[task_id]["assigned_to"] = None
                     if "status" in clear_fields:

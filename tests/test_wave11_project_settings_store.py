@@ -54,8 +54,9 @@ from tests.harness import (
 
 _REDACTED = "[redacted]"
 # The alembic head advances as migrations are added; keep this in lockstep
-# with the newest revision (0024 = purge retired AoE settings).
-_MIGRATION_HEAD = "0024_drop_config_aoe_settings"
+# with the newest revision (0025 = OBS-R12-2 terminal-task DB guard
+# triggers).
+_MIGRATION_HEAD = "0025_terminal_task_guard_trigger"
 
 
 # ---------------------------------------------------------------------------
