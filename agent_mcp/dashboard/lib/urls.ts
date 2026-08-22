@@ -77,6 +77,15 @@ export function loginUrl(next?: string): string {
   return `${ROOT}/login?next=${encodeURIComponent(next)}`
 }
 
+/** Operator logout endpoint (R12-F1). ``POST``-only server route that
+ *  drops the session row and clears the cookie — see
+ *  ``agent_mcp/router/login.py`` ``logout_handler``. Mount-derived like
+ *  ``loginUrl()`` (ADR-0020: root vs tailnet front doors both alias
+ *  this route to the same handler via ``_add_root_aliases``). */
+export function logoutUrl(): string {
+  return `${ROOT}/logout`
+}
+
 /** React overview entry (cross-project cards). */
 export function overviewAppUrl(): string {
   return `${APP}/`
