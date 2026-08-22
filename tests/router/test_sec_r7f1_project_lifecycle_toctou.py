@@ -415,8 +415,18 @@ async def test_revalidate_helper_invoked_at_all_four_sites(
 
     R13-F1: ``rename_project_handler`` now revalidates at BOTH of its
     genuine yield points (body-read + ``_ensure_lock`` acquisition), so
-    it contributes TWO entries here, not one; the other three handlers
-    are unaffected."""
+    it contributes TWO entries here, not one.
+
+    R14-F2: ``revalidated_lock``'s protected ``async with`` body itself
+    is no longer a single yield point — the in-lock ``asyncio.to_thread``
+    systemctl-stop (and, for stop, ``_is_active`` too) awaits now each
+    route through ``perm_gates.revalidate_after``, which ALSO calls
+    through to ``revalidate_capability_or_403``. That adds a THIRD entry
+    for rename (the in-lock systemctl-stop re-check), a second entry for
+    delete (ditto), and a second entry for stop (the ``_is_active``
+    re-check — the project isn't actually running in this test, so
+    ``_is_active`` is False and the further ``systemctl stop``-guarded
+    re-check never fires)."""
     from agent_mcp.router import perm_gates
 
     calls: list[str] = []
@@ -464,8 +474,11 @@ async def test_revalidate_helper_invoked_at_all_four_sites(
         "system.projects.manage",  # create_project_handler
         "system.projects.manage",  # rename_project_handler (body-read)
         "system.projects.manage",  # rename_project_handler (lock, R13-F1)
-        "system.projects.manage",  # stop_project_handler
-        "system.projects.manage",  # delete_project_handler
+        "system.projects.manage",  # rename_project_handler (systemctl stop, R14-F2)
+        "system.projects.manage",  # stop_project_handler (lock)
+        "system.projects.manage",  # stop_project_handler (_is_active, R14-F2)
+        "system.projects.manage",  # delete_project_handler (lock)
+        "system.projects.manage",  # delete_project_handler (systemctl stop, R14-F2)
     ], calls
 
 
