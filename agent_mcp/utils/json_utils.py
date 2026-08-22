@@ -1,6 +1,7 @@
 # Agent-MCP/mcp_template/mcp_server_src/utils/json_utils.py
 import json
 import re
+import unicodedata
 from typing import Any, Union, Dict, List
 
 # Import the centrally configured logger
@@ -27,26 +28,121 @@ from ..core.config import logger
 # rather than duplicating it, so they cannot drift apart again).
 _CONTROL_BYTE_RE = re.compile(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]')
 
-# Hidden/spoofing Unicode worth stripping from a *parsed* string value:
-# zero-width spaces (U+200B-U+200F), the BOM / zero-width no-break space
-# (U+FEFF), and the line/paragraph separators (U+2028/U+2029). R13-F2:
-# this is the exact character class the old "Step 4" fallback-only regex
-# matched — hoisted to module scope for the same reason R5-F8 hoisted
-# _CONTROL_BYTE_RE: so both the post-parse-success path and the
-# already-a-dict/list path can share one definition instead of drifting
-# apart. Visually near-indistinguishable strings (e.g. a task title with
-# a trailing zero-width space) are a duplicate-identifier / spoofing risk
-# even though they parse as perfectly legal JSON string content.
-_HIDDEN_UNICODE_RE = re.compile(r'[\u200B-\u200F\uFEFF\u2028\u2029]')
+# Hidden/spoofing Unicode worth stripping from a *parsed* string value.
+# R13-F2 originally hand-enumerated zero-width spaces (U+200B-U+200F),
+# the BOM (U+FEFF), and the line/paragraph separators (U+2028/U+2029) as
+# a single regex hoisted to module scope for the same reason R5-F8
+# hoisted _CONTROL_BYTE_RE. R14-F3 widened this: that hand-picked set
+# missed the bidi override/embedding/isolate controls (U+202A-U+202E
+# LRE/RLE/PDF/LRO/RLO -- RLO is the classic filename/display-spoofing
+# primitive that flips the visual order of trailing characters -- and
+# U+2066-U+2069 LRI/RLI/FSI/PDI) and the word joiner (U+2060), all of
+# which round-tripped byte-for-byte through a live task-title exploit.
+#
+# Rather than hand-enumerating yet another range and risking the same
+# gap again, this now mirrors aoe-bridge/src/render.rs's
+# sanitize_for_pane (R4-F4/R5-F9): every character in Unicode general
+# category `Cf` (Format) is stripped by *category*, not by range table.
+# `Cf` covers all of the above in one check -- LRE/RLE/PDF/LRO/RLO,
+# LRI/RLI/FSI/PDI, ZWSP/ZWNJ/ZWJ/LRM/RLM, the word joiner, the Arabic
+# Letter Mark, and the BOM -- without needing to know the exact
+# codepoints; Python's stdlib `unicodedata` module classifies these
+# identically to the Rust `unicode_general_category` crate render.rs
+# uses. U+2028/U+2029 (line/paragraph separator) are categories
+# `Zl`/`Zp`, not `Cf`, so they're kept as an explicit addition to match
+# the original R13-F2 scope (each category has exactly one member, so
+# this can't silently grow to catch more than intended).
+#
+# Variation selectors (U+FE00-U+FE0F, U+E0100-U+E01EF) are category
+# `Mn` (Mark, nonspacing), not `Cf` -- render.rs excludes them from its
+# `Cf` check for the same reason and lists them explicitly (R5-F9);
+# this does the same via _VARIATION_SELECTOR_RANGES below. Like
+# render.rs, general combining marks (the rest of `Mn`/`Mc`/`Me`) are
+# deliberately NOT stripped outright: legitimate non-Latin text
+# (Vietnamese tone marks, Arabic tashkeel, Devanagari vowel signs, ...)
+# is built from combining marks in the same Unicode blocks a naive
+# strip would hit, and over-stripping would corrupt real content the
+# way under-stripping under-protects it. Unlike render.rs -- which
+# only ever renders a single ephemeral terminal-nudge line -- this
+# sanitizer's output is PERSISTED and rendered indefinitely in the
+# dashboard, so an unbounded run of combining marks stacked onto one
+# base character ("zalgo text") is a real display-integrity issue here
+# that render.rs's scope doesn't have to address. _cap_combining_marks
+# below caps (does not remove) runs of Mn/Me marks per base character
+# instead of stripping the category outright -- see its docstring for
+# the chosen limit and why.
+#
+# Visually near-indistinguishable strings (e.g. a task title with a
+# trailing zero-width space, or one carrying an RTL override) are a
+# duplicate-identifier / spoofing risk even though they parse as
+# perfectly legal JSON string content.
+_HIDDEN_FORMAT_CATEGORIES = frozenset({"Cf", "Zl", "Zp"})
+
+# Variation Selectors 1-16 (BMP) and 17-256 (supplementary plane): carry
+# no glyph of their own, only ever modifying/annotating the preceding
+# character (or rendering as nothing when unpaired) -- same reasoning
+# and same ranges as render.rs's R5-F9 fix.
+_VARIATION_SELECTOR_RANGES = ((0xFE00, 0xFE0F), (0xE0100, 0xE01EF))
+
+# R14-F3: cap on consecutive Unicode combining marks (general category
+# `Mn`/`Me`) allowed after a single base character. Chosen to
+# comfortably clear legitimate stacking depth (Vietnamese needs at most
+# 2: a vowel modifier + a tone mark; Arabic tashkeel commonly stacks
+# 2-3, e.g. shadda + a vowel; Devanagari vowel-sign combinations rarely
+# exceed 2) while still capping "zalgo" text, which stacks tens to
+# hundreds of combining marks onto one character specifically to break
+# layout/readability. This limits rather than removes the category,
+# unlike the Cf/variation-selector strip above, because -- per the
+# comment above -- Mn/Me marks carry real, load-bearing glyph content
+# for those scripts; only pathological run *lengths* are the actual
+# spoofing/layout-DoS primitive, not the category itself.
+_MAX_COMBINING_MARKS_PER_BASE = 4
+
+
+def _is_variation_selector(codepoint: int) -> bool:
+    return any(lo <= codepoint <= hi for lo, hi in _VARIATION_SELECTOR_RANGES)
+
+
+def _strip_hidden_unicode(value: str) -> str:
+    """Strip hidden/format Unicode and variation selectors from ``value``
+    by general category (R14-F3), replacing the old hand-enumerated
+    ``_HIDDEN_UNICODE_RE`` regex. See the module-level comment above
+    for the category rationale.
+    """
+    return ''.join(
+        ch for ch in value
+        if unicodedata.category(ch) not in _HIDDEN_FORMAT_CATEGORIES
+        and not _is_variation_selector(ord(ch))
+    )
+
+
+def _cap_combining_marks(value: str) -> str:
+    """Cap (not remove) runs of consecutive combining marks (categories
+    ``Mn``/``Me``) to ``_MAX_COMBINING_MARKS_PER_BASE`` per base
+    character. See ``_MAX_COMBINING_MARKS_PER_BASE`` above for why this
+    is a cap rather than an outright strip.
+    """
+    out = []
+    run_length = 0
+    for ch in value:
+        if unicodedata.category(ch) in ("Mn", "Me"):
+            run_length += 1
+            if run_length > _MAX_COMBINING_MARKS_PER_BASE:
+                continue
+        else:
+            run_length = 0
+        out.append(ch)
+    return ''.join(out)
 
 
 def _strip_control_bytes(value: Any) -> Any:
     """Recursively walk a parsed JSON value and strip C0/C1/DEL control
-    bytes (``_CONTROL_BYTE_RE``) and hidden/spoofing Unicode
-    (``_HIDDEN_UNICODE_RE``) from every string leaf.
+    bytes (``_CONTROL_BYTE_RE``), hidden/format Unicode and variation
+    selectors (``_strip_hidden_unicode``), and cap runs of combining
+    marks (``_cap_combining_marks``) on every string leaf.
 
-    R4-F3/R5-F8/R13-F2: this is the ONLY place sanitization needs to
-    happen now — called unconditionally on every input to
+    R4-F3/R5-F8/R13-F2/R14-F3: this is the ONLY place sanitization needs
+    to happen now — called unconditionally on every input to
     ``sanitize_json_input``, whether it arrived as an already-decoded
     dict/list (the MCP ``tools/call`` path) or as a string/bytes payload
     that parsed cleanly on the first ``json.loads()`` attempt (the
@@ -59,7 +155,9 @@ def _strip_control_bytes(value: Any) -> Any:
     None) pass through unchanged.
     """
     if isinstance(value, str):
-        return _HIDDEN_UNICODE_RE.sub('', _CONTROL_BYTE_RE.sub('', value))
+        return _cap_combining_marks(
+            _strip_hidden_unicode(_CONTROL_BYTE_RE.sub('', value))
+        )
     if isinstance(value, dict):
         return {k: _strip_control_bytes(v) for k, v in value.items()}
     if isinstance(value, list):
@@ -146,18 +244,21 @@ def sanitize_json_input(input_data: Union[str, bytes, Dict, List, Any]) -> Union
     # impossible to reintroduce.
     cleaned = _CONTROL_BYTE_RE.sub('', cleaned)
 
-    # Step 4: Remove problematic Unicode (Zero-width spaces, BOM, line/paragraph separators)
-    # R13-F2: for string LEAF VALUES this is now redundant — _strip_control_bytes
+    # Step 4: Remove problematic Unicode (format/bidi controls, variation
+    # selectors, BOM, line/paragraph separators — see _strip_hidden_unicode)
+    # R13-F2/R14-F3: for string LEAF VALUES this is now redundant — _strip_control_bytes
     # (called unconditionally below, and on every other return path) already
-    # strips _HIDDEN_UNICODE_RE from every string leaf post-parse. This raw-TEXT
+    # strips this same class from every string leaf post-parse. This raw-TEXT
     # pass still earns its keep, though: these hidden-Unicode characters are not
     # valid JSON structural whitespace, so one sitting between tokens (e.g. right
     # after a '{' or a ',') would otherwise make Step 5's json.loads() fail (and
     # Step 6's regex fallback fail the same way, since '\s' doesn't match them
     # either) even after Step 3's control-byte strip succeeds. Removing this line
     # would reintroduce that "chars in structural position" fallback failure —
-    # kept, not dead code.
-    cleaned = _HIDDEN_UNICODE_RE.sub('', cleaned)
+    # kept, not dead code. (No combining-mark cap here — combining marks are
+    # valid JSON whitespace-adjacent content and don't break structural
+    # parsing; the leaf-level cap below is sufficient.)
+    cleaned = _strip_hidden_unicode(cleaned)
 
     # Step 5: Try parsing the aggressively cleaned string
     try:

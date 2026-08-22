@@ -40,6 +40,8 @@ paths.
 
 from __future__ import annotations
 
+import unicodedata
+
 import pytest
 
 from agent_mcp.utils.json_utils import sanitize_json_input
@@ -239,3 +241,210 @@ async def test_live_task_title_hidden_unicode_stripped_not_persisted(
         title = matches[0]["title"]
         assert _ZWSP not in title, f"raw ZWSP persisted verbatim: {title!r}"
         assert title == "pentest-fuzz-target-r13b", title
+
+
+# ---------------------------------------------------------------------
+# R14-F3 — R13-F2's fix hoisted the hidden-Unicode strip onto every fast
+# path, but never widened the CHARACTER CLASS it strips. Confirmed live:
+# a task title carrying U+202E (RIGHT-TO-LEFT OVERRIDE -- the classic
+# filename/display-spoofing primitive), repeated U+0301 combining
+# marks, U+2060 (WORD JOINER), and U+FE0F (VARIATION SELECTOR-16) round-
+# tripped byte-for-byte identical on read-back -- none of these were
+# stripped by the old hand-enumerated regex.
+#
+# Fix: the hidden-Unicode strip is now driven by Unicode general
+# category (mirroring aoe-bridge/src/render.rs's sanitize_for_pane,
+# R4-F4/R5-F9) rather than a hand-picked range table: every `Cf`
+# (Format) character is stripped -- this covers the bidi override/
+# embedding/isolate controls (U+202A-U+202E, U+2066-U+2069) and the
+# word joiner (U+2060) in one check, alongside the R13-F2 zero-width/
+# BOM/line-separator set. Variation selectors (U+FE00-U+FE0F,
+# U+E0100-U+E01EF) are category `Mn`, not `Cf`, so they're stripped via
+# an explicit range check, matching render.rs's R5-F9 fix. General
+# combining marks (the rest of `Mn`/`Me`) are NOT stripped outright --
+# legitimate non-Latin text depends on them -- but consecutive runs are
+# CAPPED per base character to block zalgo-style stacking without
+# corrupting normal single/double-diacritic use.
+# ---------------------------------------------------------------------
+
+_RLO = "‮"  # RIGHT-TO-LEFT OVERRIDE
+_LRI = "⁦"  # LEFT-TO-RIGHT ISOLATE
+_RLI = "⁧"  # RIGHT-TO-LEFT ISOLATE
+_FSI = "⁨"  # FIRST STRONG ISOLATE
+_PDI = "⁩"  # POP DIRECTIONAL ISOLATE
+_WORD_JOINER = "⁠"
+_VS16 = "️"  # VARIATION SELECTOR-16 (BMP block)
+_VS_SUPPLEMENT = "\U000e0100"  # VARIATION SELECTOR-17 (supplementary block)
+_COMBINING_ACUTE = "́"  # zalgo-stacking building block
+
+
+def test_rtl_override_stripped_from_dict_input() -> None:
+    """U+202E RLO -- the filename/display-spoofing primitive -- must be
+    stripped, not just the R13-F2 zero-width/BOM/line-separator set."""
+    given = {"task_title": f"safe{_RLO}gnp.exe"}
+    result = sanitize_json_input(given)
+    assert _RLO not in result["task_title"]
+    assert result["task_title"] == "safegnp.exe"
+
+
+def test_bidi_embedding_and_override_controls_stripped() -> None:
+    """The full LRE/RLE/PDF/LRO/RLO block (U+202A-U+202E), not just RLO."""
+    for cp in range(0x202A, 0x202F):
+        ch = chr(cp)
+        given = {"task_title": f"a{ch}b"}
+        result = sanitize_json_input(given)
+        assert ch not in result["task_title"], f"U+{cp:04X} survived"
+        assert result["task_title"] == "ab"
+
+
+def test_bidi_isolate_controls_stripped() -> None:
+    """LRI/RLI/FSI/PDI (U+2066-U+2069) -- the newer bidi-isolate
+    controls, functionally equivalent spoofing primitives to LRE/RLO."""
+    for ch in (_LRI, _RLI, _FSI, _PDI):
+        given = {"task_title": f"a{ch}b"}
+        result = sanitize_json_input(given)
+        assert ch not in result["task_title"]
+        assert result["task_title"] == "ab"
+
+
+def test_word_joiner_stripped() -> None:
+    """U+2060 WORD JOINER -- an invisible-formatting `Cf` character
+    adjacent in intent to the R13-F2 zero-width-space set, but outside
+    its old U+200B-U+200F range."""
+    given = {"task_title": f"a{_WORD_JOINER}b"}
+    result = sanitize_json_input(given)
+    assert _WORD_JOINER not in result["task_title"]
+    assert result["task_title"] == "ab"
+
+
+def test_variation_selectors_stripped_bmp_and_supplement() -> None:
+    """Variation Selectors 1-16 (BMP, U+FE00-U+FE0F) and 17-256
+    (supplementary plane, U+E0100-U+E01EF) carry no glyph of their own
+    (R5-F9's exact reasoning in render.rs) and must be stripped."""
+    given = {"task_title": f"safe{_VS16}mid{_VS_SUPPLEMENT}end"}
+    result = sanitize_json_input(given)
+    assert _VS16 not in result["task_title"]
+    assert _VS_SUPPLEMENT not in result["task_title"]
+    assert result["task_title"] == "safemidend"
+
+
+def test_confirmed_live_repro_fully_sanitized() -> None:
+    """The exact confirmed-live-exploited payload: RLO + repeated
+    combining marks + word joiner + a variation selector, on the REST
+    task-creation path. Must not round-trip byte-for-byte identical."""
+    evil = f"safe{_RLO}gnp.exe{_COMBINING_ACUTE * 10}{_WORD_JOINER}{_VS16}end"
+    given = {"task_title": evil}
+    result = sanitize_json_input(given)
+    assert result["task_title"] != evil
+    assert _RLO not in result["task_title"]
+    assert _WORD_JOINER not in result["task_title"]
+    assert _VS16 not in result["task_title"]
+    # The combining-mark run must be capped, not left at its original
+    # length of 10.
+    combining_run = sum(
+        1 for ch in result["task_title"] if unicodedata.category(ch) in ("Mn", "Me")
+    )
+    assert combining_run < 10, f"combining-mark run not capped: {combining_run}"
+
+
+def test_zalgo_combining_marks_capped_not_left_unbounded() -> None:
+    """A base character with an excessive run of combining marks
+    (zalgo-style stacking) must be capped to a small number per base
+    character, not stripped-to-zero (legitimate accented text needs
+    combining marks to survive) and not left completely unbounded
+    (unbounded stacking is a display-integrity / layout-DoS primitive
+    once persisted and rendered indefinitely in the dashboard)."""
+    zalgo = "z" + _COMBINING_ACUTE * 50 + "algo"
+    given = {"task_title": zalgo}
+    result = sanitize_json_input(given)
+
+    marks_after_z = 0
+    for ch in result["task_title"][1:]:
+        if unicodedata.category(ch) in ("Mn", "Me"):
+            marks_after_z += 1
+        else:
+            break
+    assert 0 < marks_after_z <= 4, (
+        f"expected a small capped run of combining marks, got {marks_after_z}"
+    )
+    # The base character and the trailing plain text must still be present.
+    assert result["task_title"].startswith("z")
+    assert result["task_title"].endswith("algo")
+
+
+@pytest.mark.asyncio
+async def test_live_task_title_rtlo_spoofing_stripped_not_persisted(
+    tmp_path,
+) -> None:
+    """Live REST repro: POST a task title carrying the confirmed
+    exploit payload, read it back over REST, and confirm none of the
+    spoofing/hidden characters survived to storage."""
+    async with mcp_session(tmp_path) as admin:
+        evil = f"pentest-fuzz-r14f3-safe{_RLO}gnp.exe{_WORD_JOINER}{_VS16}"
+        r = admin.post(
+            "/api/tasks",
+            json={
+                "task_title": evil,
+                "task_description": "repro R14-F3",
+            },
+        )
+        assert r.status_code == 200, r.text
+        payload = r.json()
+        task_id = payload["task_id"]
+
+        listing = admin.client.get("/api/tasks").json()
+        matches = [t for t in listing if t.get("task_id") == task_id]
+        assert matches, f"task {task_id} not found in listing"
+        title = matches[0]["title"]
+        assert title != evil, "spoofing payload round-tripped byte-for-byte identical"
+        assert _RLO not in title
+        assert _WORD_JOINER not in title
+        assert _VS16 not in title
+
+
+# ---------------------------------------------------------------------
+# Non-regression: legitimate international text using combining marks
+# in the ordinary (non-excessive) way it was designed for must survive
+# untouched. This is the "getting it wrong = breaks legitimate Unicode
+# text" side of the R14-F3 fix.
+# ---------------------------------------------------------------------
+
+
+def test_legitimate_vietnamese_combining_marks_unchanged() -> None:
+    """Vietnamese written with decomposed combining marks (base letter +
+    a vowel-modifier mark + a tone mark -- at most 2 combining marks per
+    base character) must survive unchanged. e.g. decomposed "Việt Nam":
+    i + COMBINING DOT BELOW (U+0323), except this uses the fully
+    decomposed 'ệ' as e + COMBINING CIRCUMFLEX ACCENT (U+0302) +
+    COMBINING DOT BELOW (U+0323)."""
+    text = "Tiếng Vị̂t Nam"  # decomposed-ish sample
+    # Use NFD-decomposed real Vietnamese words directly for clarity:
+    text = unicodedata.normalize("NFD", "Tiếng Việt")
+    given = {"task_title": text}
+    result = sanitize_json_input(given)
+    assert result["task_title"] == text, (
+        f"legitimate Vietnamese text was mangled: {result['task_title']!r} != {text!r}"
+    )
+
+
+def test_legitimate_arabic_diacritics_unchanged() -> None:
+    """Arabic tashkeel (vowel diacritics, combining marks) -- commonly
+    2-3 stacked per letter (e.g. shadda + a vowel) -- must survive."""
+    # "بِسْمِ اللَّهِ" (bismillah) with full diacritics -- several letters
+    # here carry 2 combining marks (e.g. shadda + fatha on the lam-lam).
+    text = "بِسْمِ اللَّهِ"
+    given = {"task_title": text}
+    result = sanitize_json_input(given)
+    assert result["task_title"] == text, (
+        f"legitimate Arabic diacritics were mangled: {result['task_title']!r} != {text!r}"
+    )
+
+
+def test_legitimate_single_diacritic_accented_text_unchanged() -> None:
+    """A single combining accent per base character (the common case
+    for NFD-normalized European text) must never be touched by the
+    combining-mark cap."""
+    text = unicodedata.normalize("NFD", "café résumé naïve")
+    given = {"task_title": text}
+    result = sanitize_json_input(given)
+    assert result["task_title"] == text

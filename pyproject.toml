@@ -234,3 +234,8 @@ known-first-party = ["agent-mcp"]
 # is not an option: two of the five hits are inside the module
 # docstring, where a trailing comment is just more string content.
 "tests/test_memories_unsafe_unicode_key.py" = ["PLE2502"]
+# R14-F3: same reasoning as the ignore above, for the same reason —
+# this file's RTLO/LRI/RLI/FSI/PDI/word-joiner/variation-selector
+# literals are the exact spoofing payload sanitize_json_input must now
+# strip (agent_mcp/utils/json_utils.py), not incidental content.
+"tests/test_sec_r13_f2_hidden_unicode_fast_paths.py" = ["PLE2502"]
