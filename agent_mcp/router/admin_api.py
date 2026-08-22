@@ -477,7 +477,31 @@ async def rename_project_handler(req: web.Request) -> web.Response:
     # per-(name,role) ``asyncio.Lock`` (non-reentrant); nothing we call under
     # it re-acquires the same key, so holding it across the awaited
     # ``to_thread`` stop cannot deadlock (delete does exactly this).
-    async with _app._ensure_lock(old_name, "backend"):
+    #
+    # R13-F1 (HIGH, live-exploited): this lock acquisition is a SECOND,
+    # independent genuine yield point — ``_ensure_lock`` contention alone
+    # (a concurrent warm-start cold-booting the SAME backend) can block for
+    # the full ~9s cold-boot sequence, attacker-triggerable for free via a
+    # plain ``GET /agent-mcp/app/<old_name>/``. OBS-R11-1's revalidation
+    # fusion was only ever wired to the EARLIER body-read yield point
+    # (``read_body_and_revalidate`` above) — see the ``revalidated_lock``
+    # docstring in ``perm_gates.py`` for the (now corrected) history of that
+    # scope decision. A caller whose capability/membership is revoked AFTER
+    # the body-read revalidation but WHILE blocked here could previously
+    # still complete the rename on now-revoked authority. Route this lock
+    # acquisition through ``revalidated_lock`` exactly like
+    # ``delete_project_handler`` / ``stop_project_handler`` already do —
+    # revalidating freshly INSIDE the lock, immediately before the
+    # destructive stop/move/registry-rename runs. This is IN ADDITION to
+    # the body-read revalidation above, not a replacement — rename now has
+    # BOTH yield points revalidated.
+    from .perm_gates import revalidated_lock
+
+    async with revalidated_lock(
+        req, "system.projects.manage", old_name, min_role="operator",
+    ) as denied:
+        if denied is not None:
+            return denied
         # PF-R36-1 [500-hygiene/TOCTOU]: the existence + alias-collision
         # probes above ran OUTSIDE this lock. Two concurrent renames of the
         # SAME project serialise here (BL-R35-1), so the LOSING racer would,
