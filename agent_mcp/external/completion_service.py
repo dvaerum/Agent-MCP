@@ -68,6 +68,7 @@ ever appear; none do today.
 from __future__ import annotations
 
 import os
+import threading
 from typing import Any, List, Optional
 
 from ..core.config import logger
@@ -219,12 +220,44 @@ class OllamaChatClient(_BaseChatClient):
 CompletionClient = _BaseChatClient  # Public type alias for callers
 
 
+# R13-F3 (MEDIUM, CONFIRMED, live-exploited): every completion_client()
+# call used to construct a BRAND NEW client — and, the first time
+# chat() is actually invoked on it, a brand new openai.AsyncOpenAI SDK
+# client with its own independent httpx connection pool — with nothing
+# anywhere in the codebase ever calling .aclose() on it. Live ``ss
+# -tnp`` showed 11-25 stable ESTABLISHED sockets to the LLM endpoint,
+# not draining: unbounded per-process FD/connection growth, one leaked
+# connection pool per ``ask_project_rag`` call (``features/rag/query.py``).
+# This is the exact same bug class R12-F3 already fixed on the sibling
+# embedding seam (embedding_service.embedding_client()); this mirrors
+# that fix precisely. See that module's ``_client_cache`` comment for
+# the full rationale on why a cache (vs. threading .aclose() calls
+# through call sites) is the right shape here too. Completion clients
+# have no "dimension" concept (unlike embeddings), so the cache key is
+# one tuple element shorter: (class, model, base_url, api_key).
+_client_cache: dict[tuple, _BaseChatClient] = {}
+_client_cache_lock = threading.Lock()
+
+
+def reset_completion_client_cache() -> None:
+    """Drop every cached client. Test-isolation seam (mirrors
+    ``embedding_service.reset_embedding_client_cache()``) — a real
+    server process never needs to call this."""
+    with _client_cache_lock:
+        _client_cache.clear()
+
+
 def completion_client() -> _BaseChatClient:
     """Pick a chat-completion client based on env vars.
 
     See module docstring for the full decision table. Raises
     :class:`CompletionConfigError` when ``OPENAI_API_KEY`` is set
     without ``OPENAI_MODEL``.
+
+    R13-F3: returns a CACHED client (and therefore a shared connection
+    pool) for a given (provider, model, base_url, api_key) tuple rather
+    than a fresh one on every call — see the module-level comment above
+    ``_client_cache`` for why.
     """
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if api_key:
@@ -237,13 +270,26 @@ def completion_client() -> _BaseChatClient:
                 "model explicitly via the OPENAI_MODEL env var."
             )
         logger.info("completion_service: using OpenAI provider with model=%s", model)
-        return OpenAIChatClient(model=model)
+        candidate: _BaseChatClient = OpenAIChatClient(model=model)
+    else:
+        model = (
+            os.environ.get("OLLAMA_MODEL", "").strip() or _OLLAMA_DEFAULT_MODEL
+        )
+        logger.info("completion_service: using Ollama provider with model=%s", model)
+        candidate = OllamaChatClient(model=model)
 
-    model = (
-        os.environ.get("OLLAMA_MODEL", "").strip() or _OLLAMA_DEFAULT_MODEL
+    cache_key = (
+        type(candidate),
+        candidate.model,
+        candidate.base_url,
+        candidate._api_key,
     )
-    logger.info("completion_service: using Ollama provider with model=%s", model)
-    return OllamaChatClient(model=model)
+    with _client_cache_lock:
+        cached = _client_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        _client_cache[cache_key] = candidate
+        return candidate
 
 
 def resolve_chat_base_url() -> Optional[str]:

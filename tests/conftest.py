@@ -78,6 +78,14 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
 
     reset_embedding_client_cache()
 
+    # R13-F3: completion_client() now caches one client per resolved
+    # (provider, model, base_url, api_key) tuple, mirroring R12-F3's
+    # embedding_client() cache above — same stale-mock-binding hazard,
+    # same per-test reset.
+    from agent_mcp.external.completion_service import reset_completion_client_cache
+
+    reset_completion_client_cache()
+
 
 def reset_and_snapshot_globals() -> Callable[[], None]:
     """Reset `agent_mcp.core.globals` state; return a restore closure.
