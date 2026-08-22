@@ -25,7 +25,7 @@
 import React, { useEffect, useState } from "react"
 import {
   RefreshCw, Folder, Loader2, AlertCircle, ChevronDown, ChevronUp,
-  Plus, Pencil, Trash2, MoreHorizontal,
+  Plus, Pencil, Trash2, MoreHorizontal, LogOut,
 } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -45,7 +45,7 @@ import {
   type ProjectOverviewRow,
   type ProjectStatus,
 } from "@/lib/stores/projects-store"
-import { appUrl } from "@/lib/urls"
+import { appUrl, loginUrl, logoutUrl } from "@/lib/urls"
 import { formatRelative } from "@/lib/utils"
 import { AddProjectModal } from "./add-project-modal"
 import { RemoveProjectModal } from "./remove-project-modal"
@@ -59,6 +59,21 @@ import { UsersDashboard } from "./users-dashboard"
 import { GroupsDashboard } from "./groups-dashboard"
 import { SsoDashboard } from "./sso-dashboard"
 import { ProjectMembershipsModal } from "./project-memberships-modal"
+
+// R12-F1 class-sweep sibling: this page renders its own header (the
+// title bar below) instead of going through <MainLayout>/<Header> —
+// see the `isOverview` branch in app/page.tsx — so it needs its own
+// logout affordance rather than inheriting Header's. Same POST-then-
+// redirect behaviour as Header's `handleLogout`, same `logoutUrl()`/
+// `loginUrl()` helpers (lib/urls.ts) — do not fork a second
+// implementation.
+async function handleLogout() {
+  try {
+    await fetch(logoutUrl(), { method: "POST", credentials: "include" })
+  } finally {
+    window.location.assign(loginUrl())
+  }
+}
 
 const STATUS_VARIANT: Record<ProjectStatus, "default" | "secondary" | "destructive" | "outline"> = {
   active: "default",
@@ -315,6 +330,17 @@ export function ProjectsOverviewDashboard(): React.ReactElement {
                 <RefreshCw className="h-4 w-4 mr-2" />
               )}
               Refresh
+            </Button>
+            {/* Logout (R12-F1 class-sweep sibling). This page skips
+                <Header>, so it needs its own control — see
+                handleLogout above. */}
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleLogout}
+            >
+              <LogOut className="h-4 w-4 mr-2" />
+              Log out
             </Button>
           </div>
         </div>
