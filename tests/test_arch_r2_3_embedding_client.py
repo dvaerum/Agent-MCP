@@ -137,7 +137,9 @@ def test_both_clients_expose_embed_and_aembed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Callers don't branch on provider: sync ``embed`` + async ``aembed``
-    exist on both adapters (batch path uses aembed; query path uses embed)."""
+    exist on both adapters. Every async call site (the batch indexer AND
+    both query paths — R12-F2) uses ``aembed``; ``embed`` remains for
+    genuinely synchronous callers only."""
     from agent_mcp.external.embedding_service import (
         OllamaEmbeddingClient,
         OpenAIEmbeddingClient,
@@ -214,6 +216,14 @@ async def test_query_embedding_flows_through_the_seam(
         base_url = "http://recorded/v1"
 
         def embed(self, texts):
+            calls["n"] += 1
+            return [[0.0] * 8 for _ in texts]
+
+        async def aembed(self, texts):
+            # R12-F2: query_rag_system's vector-search embedding call
+            # goes through the async aembed() (never the sync,
+            # event-loop-freezing embed()) — the seam this test is
+            # actually proving is used.
             calls["n"] += 1
             return [[0.0] * 8 for _ in texts]
 

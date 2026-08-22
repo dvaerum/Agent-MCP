@@ -97,7 +97,10 @@ async def test_index_task_data_commits_delete_before_embedding(
         observed_in_transaction: list[bool] = []
 
         class _FakeEmbClient:
-            def embed(self, texts):
+            # R12-F2: index_task_data now calls the async aembed()
+            # (never the sync, event-loop-freezing embed()) — this
+            # fake must expose that same method.
+            async def aembed(self, texts):
                 # Probe the module's own shared connection state from
                 # a SEPARATE connection while the (fake, instant, but
                 # representative of a slow real one) embedding call is
