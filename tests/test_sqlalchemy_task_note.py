@@ -22,7 +22,11 @@ pytestmark = pytest.mark.asyncio
 
 
 def _insert_task(
-    task_id: str, *, title: str = "T", assigned_to: str | None = None,
+    task_id: str,
+    *,
+    title: str = "T",
+    assigned_to: str | None = None,
+    status: str = "pending",
 ) -> None:
     """Insert a task row via raw SQL (mirrors the helper in
     test_sqlalchemy_task.py).
@@ -30,6 +34,12 @@ def _insert_task(
     SEC Wave-B: ``add_task_note`` gates note authorship on task
     ownership; tests that have a worker author a note pass
     ``assigned_to=<worker_agent_id>`` so the worker owns the task.
+
+    ``status`` (OBS-R12-2): defaults to ``"pending"``; pass a terminal
+    value for the terminal-state-guard tests below. Inserted directly
+    (never via an UPDATE), so the DB-level guard trigger — which only
+    fires on an UPDATE whose OLD row is already terminal — never
+    interferes with seeding.
     """
     import json as _json
 
@@ -44,7 +54,7 @@ def _insert_task(
             "parent_task, child_tasks, depends_on_tasks, notes) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)",
             (
-                task_id, title, "", assigned_to, "admin", "pending",
+                task_id, title, "", assigned_to, "admin", status,
                 "medium", now, now,
                 _json.dumps([]),
                 _json.dumps([]),
@@ -438,3 +448,195 @@ async def test_edit_task_note_tool_max_int64_id_not_found(tmp_path) -> None:
         assert "not found" in text or str(_MAX_NOTE_ID) in text
         assert "tool execution failed" not in text
         assert "overflow" not in text
+
+
+# ---- OBS-R12-2 (round-13 class-sweep): terminal-state carve-out miss --------
+#
+# The round-13 pentest sweep found this side table was a THIRD sibling of
+# the "terminal-state carve-out miss" bug class BL-R25-1 / R12-F4 / R12-F5
+# already fixed on the legacy ``tasks.notes`` JSON-column paths — none of
+# ``add_note``/``edit_note``/``delete_note`` (or their tool wrappers)
+# checked the parent task's terminal status at all. These tests pin the
+# fix: a Python-level check (ordered AFTER the ownership gate, so the
+# PF-1 note-existence oracle isn't reopened) PLUS the DB-level guard
+# triggers (migration 0025) as a backstop.
+
+
+async def test_add_note_raises_terminal_task_write_blocked(tmp_path) -> None:
+    """Direct DB-layer call, bypassing every Python-level check — the
+    DB trigger itself refuses the INSERT and the repo translates it
+    into a clean, typed exception (never a silent no-op or raw SQL
+    leak)."""
+    from agent_mcp.db.actions import task_notes_db
+    from agent_mcp.db.terminal_task_guard import TerminalTaskWriteBlocked
+
+    async with mcp_session(tmp_path):
+        _insert_task("tn-terminal-1", status="completed")
+
+        with pytest.raises(TerminalTaskWriteBlocked):
+            task_notes_db.add_note("tn-terminal-1", "alice", "sneaky")
+
+        assert task_notes_db.list_notes_for_task("tn-terminal-1") == []
+
+
+async def test_edit_note_returns_clean_error_on_terminal_task(tmp_path) -> None:
+    from agent_mcp.db.actions import task_notes_db
+
+    async with mcp_session(tmp_path):
+        _insert_task("tn-terminal-2", status="pending")
+        nid = task_notes_db.add_note("tn-terminal-2", "alice", "original")
+        # Drive the task terminal AFTER the note exists — mirrors a
+        # worker completing a task that already carries notes.
+        from agent_mcp.db.connection import get_db_connection
+
+        conn = get_db_connection()
+        try:
+            conn.execute(
+                "UPDATE tasks SET status='completed' WHERE task_id=?",
+                ("tn-terminal-2",),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        ok, err = task_notes_db.edit_note(
+            note_id=nid, requester="alice", new_text="edited",
+            is_admin=False,
+        )
+        assert ok is False
+        assert "terminal" in err.lower()
+        assert task_notes_db.get_note(nid)["text"] == "original"
+
+
+async def test_delete_note_returns_clean_error_on_terminal_task(tmp_path) -> None:
+    from agent_mcp.db.actions import task_notes_db
+    from agent_mcp.db.connection import get_db_connection
+
+    async with mcp_session(tmp_path):
+        _insert_task("tn-terminal-3", status="pending")
+        nid = task_notes_db.add_note("tn-terminal-3", "alice", "original")
+        conn = get_db_connection()
+        try:
+            conn.execute(
+                "UPDATE tasks SET status='cancelled' WHERE task_id=?",
+                ("tn-terminal-3",),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        ok, err = task_notes_db.delete_note(
+            note_id=nid, requester="alice", is_admin=False,
+        )
+        assert ok is False
+        assert "terminal" in err.lower()
+        assert task_notes_db.get_note(nid) is not None
+
+
+async def test_edit_note_non_author_still_gets_ownership_error_on_terminal_task(
+    tmp_path,
+) -> None:
+    """PF-1 ordering: a non-owner probing a note on a TERMINAL task must
+    get the SAME "owned by" refusal as on a live task — the terminal
+    check must never run (or leak) before the ownership gate, or a
+    non-owner could distinguish task status from the error shape."""
+    from agent_mcp.db.actions import task_notes_db
+    from agent_mcp.db.connection import get_db_connection
+
+    async with mcp_session(tmp_path):
+        _insert_task("tn-terminal-4", status="pending")
+        nid = task_notes_db.add_note("tn-terminal-4", "alice", "original")
+        conn = get_db_connection()
+        try:
+            conn.execute(
+                "UPDATE tasks SET status='failed' WHERE task_id=?",
+                ("tn-terminal-4",),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        ok, err = task_notes_db.edit_note(
+            note_id=nid, requester="bob", new_text="hijacked",
+            is_admin=False,
+        )
+        assert ok is False
+        assert "alice" in err
+        assert "terminal" not in err.lower()
+        assert task_notes_db.get_note(nid)["text"] == "original"
+
+
+async def test_add_task_note_tool_blocked_on_terminal_task(tmp_path) -> None:
+    from agent_mcp.db.actions import task_notes_db
+
+    async with mcp_session(tmp_path) as admin:
+        _insert_task("tn-tool-terminal-1", status="completed")
+
+        result = await admin.call(
+            "add_task_note",
+            {"task_id": "tn-tool-terminal-1", "text": "sneaky"},
+        )
+        assert admin._last_is_error is True
+        text = _first_text(result).lower()
+        assert "terminal" in text
+        assert task_notes_db.list_notes_for_task("tn-tool-terminal-1") == []
+
+
+async def test_edit_task_note_tool_blocked_on_terminal_task(tmp_path) -> None:
+    from agent_mcp.db.actions import task_notes_db
+    from agent_mcp.db.connection import get_db_connection
+
+    async with mcp_session(tmp_path) as admin:
+        _insert_task("tn-tool-terminal-2", status="pending")
+        await admin.assert_tool_succeeds(
+            "add_task_note",
+            {"task_id": "tn-tool-terminal-2", "text": "original"},
+        )
+        nid = task_notes_db.list_notes_for_task("tn-tool-terminal-2")[0]["note_id"]
+        conn = get_db_connection()
+        try:
+            conn.execute(
+                "UPDATE tasks SET status='completed' WHERE task_id=?",
+                ("tn-tool-terminal-2",),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        result = await admin.call(
+            "edit_task_note", {"note_id": nid, "text": "edited"},
+        )
+        assert admin._last_is_error is True
+        text = _first_text(result).lower()
+        assert "terminal" in text
+        assert task_notes_db.get_note(nid)["text"] == "original"
+
+
+async def test_delete_task_note_tool_blocked_on_terminal_task(tmp_path) -> None:
+    from agent_mcp.db.actions import task_notes_db
+    from agent_mcp.db.connection import get_db_connection
+
+    async with mcp_session(tmp_path) as admin:
+        _insert_task("tn-tool-terminal-3", status="pending")
+        await admin.assert_tool_succeeds(
+            "add_task_note",
+            {"task_id": "tn-tool-terminal-3", "text": "original"},
+        )
+        nid = task_notes_db.list_notes_for_task("tn-tool-terminal-3")[0]["note_id"]
+        conn = get_db_connection()
+        try:
+            conn.execute(
+                "UPDATE tasks SET status='cancelled' WHERE task_id=?",
+                ("tn-tool-terminal-3",),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        result = await admin.call(
+            "delete_task_note", {"note_id": nid},
+        )
+        assert admin._last_is_error is True
+        text = _first_text(result).lower()
+        assert "terminal" in text
+        assert task_notes_db.get_note(nid) is not None

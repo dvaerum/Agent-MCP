@@ -38,8 +38,10 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
+from ..core.config import logger
 from ..core.principal import Principal
 from ..core.tool_result import (
+    Conflict,
     Failed,
     Invalid,
     NotFound,
@@ -48,6 +50,8 @@ from ..core.tool_result import (
     ToolResult,
 )
 from ..db.actions import task_notes_db
+from ..db.terminal_task_guard import TerminalTaskWriteBlocked
+from ..features.task_queries import TERMINAL_TASK_STATUSES
 from ..repositories.task_repository import get_task_by_id
 from .registry import register_tool
 # R8-F1: explicit maxLength bound for the identifier-shaped task_id
@@ -110,6 +114,13 @@ def _classify_db_error(err: str, note_id: int) -> ToolResult:
             identifier=str(note_id),
             hint=_AUTHOR_ONLY_HINT,
         )
+    # OBS-R12-2: ``edit_note``/``delete_note`` return this after the
+    # ownership gate already passed (see their docstrings) — so unlike
+    # the fused NotFound above, surfacing it doesn't leak anything a
+    # non-owner couldn't already infer; it is a state-invariant refusal,
+    # not an authorization one.
+    if "terminal state" in low:
+        return Conflict(reason=err)
     return Failed(message=err)
 
 
@@ -189,6 +200,25 @@ async def add_task_note_tool_impl(
                 action="add a note to it",
             )
 
+    # SECURITY (OBS-R12-2, round-13 class-sweep): the terminal-sink
+    # invariant every ``tasks.notes`` JSON-column write path already
+    # enforces (``task_tools._TERMINAL_TASK_STATUSES`` /
+    # ``_is_status_transition_allowed``) never reached this side-table
+    # tool — a completed/cancelled/failed task's notes were mutable
+    # here even though the legacy column is frozen. Checked AFTER the
+    # ownership gate above (never before) so a non-owner probing a
+    # foreign task's notes still gets the SAME fused not-found/denied
+    # result regardless of that task's status — this Conflict is only
+    # ever visible to a caller who already passed ownership.
+    if task.get("status") in TERMINAL_TASK_STATUSES:
+        return Conflict(
+            reason=(
+                f"Cannot add a note to task '{task_id}': status "
+                f"'{task.get('status')}' is terminal (completed/"
+                f"cancelled/failed) and its notes are frozen."
+            )
+        )
+
     # Author attribution: agent_bearer → agent_id; operator path →
     # user_id (the operator's username from the session row). The
     # task_notes_db.add_note column is a free-form string already, so
@@ -196,9 +226,18 @@ async def add_task_note_tool_impl(
     # without a schema change.
     author = principal.agent_id or principal.user_id
 
-    note_id = task_notes_db.add_note(
-        task_id=task_id, author=author, text=text,
-    )
+    try:
+        note_id = task_notes_db.add_note(
+            task_id=task_id, author=author, text=text,
+        )
+    except TerminalTaskWriteBlocked as e_ttb:
+        # Defense-in-depth: the check above should already have
+        # refused this. Never reachable in normal operation.
+        logger.error(
+            "TerminalTaskWriteBlocked reached add_task_note_tool_impl "
+            "despite the terminal-status check: %s", e_ttb,
+        )
+        return Conflict(reason=str(e_ttb))
     if note_id is None:
         return Failed(message=f"Failed to add note to task '{task_id}'.")
     return Ok(
@@ -256,12 +295,22 @@ async def edit_task_note_tool_impl(
     # (operator + sysadmin + manager-role agent) in the cap model.
     is_admin = principal.has_capability("tasks.assign")
 
-    ok, err = task_notes_db.edit_note(
-        note_id=note_id,
-        requester=requester,
-        new_text=new_text,
-        is_admin=is_admin,
-    )
+    try:
+        ok, err = task_notes_db.edit_note(
+            note_id=note_id,
+            requester=requester,
+            new_text=new_text,
+            is_admin=is_admin,
+        )
+    except TerminalTaskWriteBlocked as e_ttb:
+        # Defense-in-depth: the terminal check inside edit_note should
+        # already have refused this. Never reachable in normal
+        # operation.
+        logger.error(
+            "TerminalTaskWriteBlocked reached edit_task_note_tool_impl "
+            "despite edit_note's terminal-status check: %s", e_ttb,
+        )
+        return Conflict(reason=str(e_ttb))
     if not ok:
         return _classify_db_error(err, note_id)
     return Ok(

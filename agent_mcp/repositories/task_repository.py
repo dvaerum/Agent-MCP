@@ -81,6 +81,10 @@ from ..core.config import logger
 # costs nothing at this call frequency.
 from ..db.engine import get_session
 from ..db.models import Task
+from ..db.terminal_task_guard import (
+    GUARD_MARKER as _TERMINAL_GUARD_MARKER,
+    TerminalTaskWriteBlocked,
+)
 
 
 def _publish(addressee: str, event: str, payload: Dict[str, Any]) -> None:
@@ -410,6 +414,18 @@ def update_task_fields_in_db(
             )
             return True
     except SQLAlchemyError as e:
+        # OBS-R12-2: the DB-level terminal-state guard trigger
+        # (migration 0025) raises via ``RAISE(ABORT, ...)``, which
+        # SQLAlchemy wraps as an ``IntegrityError`` (a ``SQLAlchemyError``
+        # subclass) — must be checked BEFORE the generic swallow-to-False
+        # below, or a future write path that forgot the Python-level
+        # check would see a silent no-op "failure" instead of a clean,
+        # typed refusal. Matched by the marker substring (present in
+        # both ``str(e)`` and the wrapped ``e.orig``) since SQLite's
+        # trigger grammar only allows a static string literal for the
+        # RAISE message, not an interpolated task_id.
+        if _TERMINAL_GUARD_MARKER in str(e):
+            raise TerminalTaskWriteBlocked(task_id) from e
         logger.error(
             f"Database error updating task '{task_id}': {e}", exc_info=True,
         )
@@ -809,6 +825,25 @@ class TaskRepository:
         try:
             cursor.execute(sql, params)
             return cursor.rowcount > 0
+        except sqlite3.IntegrityError as e:
+            # OBS-R12-2: distinguish the DB-level terminal-state guard
+            # trigger's ``RAISE(ABORT, ...)`` (migration 0025) from an
+            # ordinary integrity failure BEFORE the generic swallow-to-
+            # False below — a future write path that forgot the
+            # Python-level ``_TERMINAL_TASK_STATUSES`` check must see a
+            # clean, typed refusal, not a silently-ignored "0 rows
+            # affected". The marker is a static string literal (SQLite's
+            # trigger grammar can't interpolate the task_id into the
+            # RAISE message), so it's matched by substring here and the
+            # real task_id is threaded in from the caller instead.
+            if _TERMINAL_GUARD_MARKER in str(e):
+                raise TerminalTaskWriteBlocked(task_id) from e
+            logger.error(
+                f"Database error updating task '{task_id}' via shared "
+                f"cursor: {e}",
+                exc_info=True,
+            )
+            return False
         except Exception as e:
             logger.error(
                 f"Database error updating task '{task_id}' via shared "
