@@ -49,6 +49,7 @@ from ..features.task_queries import (
     TaskSortSpec,
     status_filter_matches,
 )
+from ..utils.pagination_cache import StableOrderCache
 
 # For request_assistance, generate_id was used. Let's use secrets.token_hex for consistency.
 # from main.py:1191 (generate_id - not present, assuming secrets.token_hex was intended)
@@ -3421,6 +3422,14 @@ async def update_task_tool_impl(
         return Failed(message=f"Unexpected error updating task: {e}")
 
 
+# R17-F2: module-level (process-lifetime) cache, shared across every
+# ``view_tasks_tool_impl`` call. A fresh ``TaskQueryEngine`` is built
+# per call below, so a per-instance cache would never outlive a single
+# call -- this MUST be shared explicitly for the offset-pagination fix
+# (see agent_mcp/utils/pagination_cache.py) to do anything at all.
+_VIEW_TASKS_PAGINATION_CACHE = StableOrderCache()
+
+
 # --- view_tasks tool ---
 # Original logic from main.py: lines 1586-1655 (view_tasks_tool function)
 # Wave 9 PR 2: @requires("any") → @requires_capability("tasks.view").
@@ -3520,30 +3529,33 @@ async def view_tasks_tool_impl(
     # Delegate filter/sort/dependency-analysis to the engine — the
     # handler stays an adapter (parse args -> query -> presentation).
     # See agent_mcp/features/task_queries.py for the rules.
-    engine = TaskQueryEngine(task_source=lambda: g.tasks)
-
-    query_result = engine.query(
-        filters=TaskFilterSpec(
-            status=filter_status,
-            priority=filter_priority,
-            agent_id=target_agent_id_for_filter,
-            parent_task_id=filter_parent_task,
-            blocked_only=bool(show_blocked_tasks),
-            # A non-admin worker sees its own tasks PLUS the unassigned
-            # (claimable) pool — so the documented self-claim loop can
-            # actually discover a task_id. Pool visibility is
-            # unconditional for workers (NOT gated on
-            # config_allow_worker_self_assign, which only gates the
-            # write-side claim). Foreign-owned rows stay hidden.
-            # An admin filtering by a specific agent_id wants exactly
-            # that agent's tasks, so this stays off for admins.
-            include_unassigned=not is_admin_request,
-            created_by=filter_created_by,
-            unassigned=filter_unassigned,
-            assigned=filter_assigned,
-        ),
-        sort=TaskSortSpec(by=sort_by),
+    engine = TaskQueryEngine(
+        task_source=lambda: g.tasks,
+        pagination_cache=_VIEW_TASKS_PAGINATION_CACHE,
     )
+
+    filters_spec = TaskFilterSpec(
+        status=filter_status,
+        priority=filter_priority,
+        agent_id=target_agent_id_for_filter,
+        parent_task_id=filter_parent_task,
+        blocked_only=bool(show_blocked_tasks),
+        # A non-admin worker sees its own tasks PLUS the unassigned
+        # (claimable) pool — so the documented self-claim loop can
+        # actually discover a task_id. Pool visibility is
+        # unconditional for workers (NOT gated on
+        # config_allow_worker_self_assign, which only gates the
+        # write-side claim). Foreign-owned rows stay hidden.
+        # An admin filtering by a specific agent_id wants exactly
+        # that agent's tasks, so this stays off for admins.
+        include_unassigned=not is_admin_request,
+        created_by=filter_created_by,
+        unassigned=filter_unassigned,
+        assigned=filter_assigned,
+    )
+    sort_spec = TaskSortSpec(by=sort_by)
+
+    query_result = engine.query(filters=filters_spec, sort=sort_spec)
     tasks_to_display: List[Dict[str, Any]] = query_result.tasks
     # Dependency analysis is attached for the formatter as the legacy
     # dict shape (`_dependency_analysis`) — done after the engine query
@@ -3564,8 +3576,22 @@ async def view_tasks_tool_impl(
 
     # Legacy token-style pagination: `start_after=<task_id>` skips to
     # the first task AFTER the named one. Kept here (vs. inside the
-    # engine) because it's a presentation-window concern — the engine
-    # already supports offset/limit which is the structural API.
+    # engine) because it's a presentation-window concern layered
+    # AFTER the engine's filter/sort/dependency-analysis output —
+    # start_after itself is immune to R17-F2 (it anchors on a task
+    # identity, not a live recount).
+    #
+    # Known residual (documented, not fixed here — see R17-F2 PR
+    # description): if the anchor task is deleted OUTRIGHT between two
+    # calls (not merely re-filtered — genuinely gone), the loop below
+    # never finds it, `start_index` stays 0, and pagination silently
+    # restarts from the top instead of continuing where it left off.
+    # This re-serves already-seen tasks (redundant re-processing) — a
+    # lower-severity sibling of the skip bug (degrades to "duplicate",
+    # not "missed"). A correct fix needs the cursor to carry the
+    # anchor's sort-key value (not just its id) so position can be
+    # recovered without the row still existing — an API shape change,
+    # judged out of scope for this fix.
     if start_after:
         start_index = 0
         for i, task in enumerate(tasks_to_display):
@@ -3574,17 +3600,45 @@ async def view_tasks_tool_impl(
                 break
         tasks_to_display = tasks_to_display[start_index:]
 
-    # Page-based pagination: capture the total matching count BEFORE
-    # offset/limit slicing so we can report "Total: N" to the caller.
-    # Only emit the Total line when `limit` is explicitly set — older
-    # callers that don't pass `limit` must see the exact same response
-    # shape. Mirrors the legacy: total reflects the list AFTER
-    # start_after but BEFORE offset+limit.
-    total_matching = len(tasks_to_display)
-    if offset:
-        tasks_to_display = tasks_to_display[offset:]
+    # Page-based pagination (offset/limit).
+    #
+    # R17-F2: raw ``tasks_to_display[offset:offset+limit]`` slicing
+    # re-filters/re-sorts a live, mutating task set on every call with
+    # no cross-call isolation. If any task ranked ahead of the offset
+    # boundary leaves the matched set between two calls (claimed,
+    # completed, reprioritized -- ordinary concurrent activity), a
+    # still-matching task can shift into the gap and never be returned
+    # on ANY page. Fixed via the same ``StableOrderCache`` mechanism as
+    # ``TaskQueryEngine.query`` (see agent_mcp/utils/pagination_cache.py
+    # for the full rationale + disclosed trade-off): an ``offset == 0``
+    # call anchors the current ordering for this exact
+    # (filters, sort, start_after) shape; a following ``offset > 0``
+    # call replays that anchored ordering (with CURRENT row data)
+    # instead of re-slicing a freshly recomputed list.
+    tasks_by_id = {t["task_id"]: t for t in tasks_to_display}
+    pagination_key = (filters_spec, sort_spec, start_after)
+    ordered_ids = _VIEW_TASKS_PAGINATION_CACHE.get_or_anchor(
+        pagination_key,
+        offset=offset,
+        compute=lambda: [t["task_id"] for t in tasks_to_display],
+    )
+    # Capture the total matching count BEFORE offset/limit slicing so
+    # we can report "Total: N" to the caller. Only emit the Total line
+    # when `limit` is explicitly set — older callers that don't pass
+    # `limit` must see the exact same response shape. Mirrors the
+    # legacy: total reflects the list AFTER start_after but BEFORE
+    # offset+limit (now the anchored count on an offset>0 cache hit,
+    # consistent with the anchored window it describes).
+    total_matching = len(ordered_ids)
+    window_ids = ordered_ids[offset:] if offset else ordered_ids
     if limit is not None:
-        tasks_to_display = tasks_to_display[:limit]
+        window_ids = window_ids[:limit]
+    # Anchored ids whose row was deleted outright (not merely filtered
+    # out) between calls are omitted rather than backfilled from a
+    # neighbour -- that would just reintroduce the original shift bug.
+    tasks_to_display = [
+        tasks_by_id[tid] for tid in window_ids if tid in tasks_by_id
+    ]
 
     if not tasks_to_display:
         response_text = "No tasks found matching the criteria."
@@ -5632,7 +5686,17 @@ def register_task_tools():
                     "description": (
                         "Pagination offset — skip the first N tasks "
                         "(applied after filters + sort). Pairs with "
-                        "limit. Default: 0."
+                        "limit. Default: 0. Sequential paging "
+                        "(offset=0, then offset=limit, 2*limit, ...) "
+                        "with the same filters/sort is anchored to the "
+                        "ordering seen at offset=0 for a short window, "
+                        "so a task changing status between calls can't "
+                        "shift another task out of every page. Jumping "
+                        "straight to an arbitrary offset (no prior "
+                        "offset=0 call), or two callers paging the "
+                        "identical filters concurrently, do not get "
+                        "this guarantee — use start_after for a fully "
+                        "concurrency-safe cursor."
                     ),
                     "minimum": 0,
                     "default": 0,

@@ -405,6 +405,92 @@ def test_query_pagination_and_total(project_dir, reset_globals):
         assert rows[0]["message_id"] == "m4"
 
 
+def test_query_offset_pagination_survives_concurrent_read_flag_change(
+    project_dir, reset_globals,
+):
+    """R17-F2 class-sweep sibling: ``MessageRepository.query`` (backs
+    ``POST /api/messages/query``) re-filters the live ``agent_messages``
+    table on every call, exactly like the ``view_tasks`` case. 5 unread
+    messages, paginate ``limit=2``; between page 1 and page 2 the
+    newest message (m4) gets marked read and drops out of the
+    ``read=False`` filter — a message that was unread the ENTIRE time
+    (m2) must not be silently skipped.
+    """
+    with _make_client(project_dir):
+        from agent_mcp.repositories import message_repo
+        from agent_mcp.db.engine import get_session
+        from agent_mcp.db.models import AgentMessage
+
+        _seed_agent("alice")
+        _seed_agent("bob")
+        for i in range(5):
+            _seed_message(
+                f"pgm{i}", sender_id="alice", recipient_id="bob",
+                timestamp=f"2026-07-0{i + 1}T00:00:00", read=False,
+            )
+
+        filters = {"to": "bob", "read": False, "limit": 2}
+        page1 = message_repo.query({**filters, "offset": 0})
+        assert [m["message_id"] for m in page1] == ["pgm4", "pgm3"]
+
+        # Ordinary concurrent activity between the two page requests.
+        with get_session() as session:
+            session.query(AgentMessage).filter(
+                AgentMessage.message_id == "pgm4"
+            ).update({"read": True})
+            session.commit()
+
+        page2 = message_repo.query({**filters, "offset": 2})
+
+        seen_ids = {m["message_id"] for m in page1} | {
+            m["message_id"] for m in page2
+        }
+        assert "pgm2" in seen_ids, (
+            "pgm2 was unread for the entire window and must not be "
+            f"silently skipped; page1={page1!r} page2={page2!r}"
+        )
+        assert [m["message_id"] for m in page2] == ["pgm2", "pgm1"]
+
+
+def test_count_query_offset_pagination_survives_concurrent_read_flag_change(
+    project_dir, reset_globals,
+):
+    """Sibling of the ``query`` test above for ``count_query``: the
+    "Total: N" figure a paginated caller sees must stay consistent with
+    the anchored window ``query`` returned, not drift mid-sweep from a
+    fresh unconditional COUNT.
+    """
+    with _make_client(project_dir):
+        from agent_mcp.repositories import message_repo
+        from agent_mcp.db.engine import get_session
+        from agent_mcp.db.models import AgentMessage
+
+        _seed_agent("carol")
+        _seed_agent("dave")
+        for i in range(5):
+            _seed_message(
+                f"cqm{i}", sender_id="carol", recipient_id="dave",
+                timestamp=f"2026-07-1{i + 1}T00:00:00", read=False,
+            )
+
+        filters = {"to": "dave", "read": False, "limit": 2}
+        message_repo.query({**filters, "offset": 0})
+        first_total = message_repo.count_query({**filters, "offset": 0})
+        assert first_total == 5
+
+        with get_session() as session:
+            session.query(AgentMessage).filter(
+                AgentMessage.message_id == "cqm4"
+            ).update({"read": True})
+            session.commit()
+
+        second_total = message_repo.count_query({**filters, "offset": 2})
+        assert second_total == 5, (
+            "total must stay anchored to the sweep started at offset=0, "
+            f"not drift to a fresh live count mid-sweep: {second_total}"
+        )
+
+
 # --- Write interface: send ----------------------------------------------
 
 

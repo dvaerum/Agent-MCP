@@ -2392,7 +2392,17 @@ def register_admin_tools():
                 },
                 "offset": {
                     "type": "integer",
-                    "description": "Number of agents to skip for pagination (default: 0)",
+                    "description": (
+                        "Number of agents to skip for pagination "
+                        "(default: 0). Sequential paging (offset=0, "
+                        "then offset=limit, 2*limit, ...) with the "
+                        "same filters is anchored to the ordering "
+                        "seen at offset=0 for a short window, so an "
+                        "agent changing status between calls can't "
+                        "shift another agent out of every page. "
+                        "Jumping straight to an arbitrary offset does "
+                        "not get this guarantee."
+                    ),
                     "default": 0,
                     "minimum": 0,
                 },

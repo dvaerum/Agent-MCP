@@ -100,6 +100,7 @@ from ..core.config import logger
 # at this call frequency.
 from ..db.engine import get_session
 from ..db.models import Agent, AgentMessage
+from ..utils.pagination_cache import StableOrderCache
 
 
 class ParentMessageNotFound(LookupError):
@@ -590,6 +591,14 @@ class MessageRepository:
 
     _cache_disabled: bool = False
 
+    # R17-F2: class-level (shared across the process) so it anchors
+    # ``query()``/``count_query()`` offset pagination across separate
+    # calls -- see ``agent_mcp/utils/pagination_cache.py`` for the full
+    # rationale. Tests: registered with ``tests.conftest.
+    # reset_and_snapshot_globals`` so an entry from one test's tmp DB
+    # never leaks message_ids into another test's identical filter.
+    _pagination_cache: StableOrderCache = StableOrderCache()
+
     @contextlib.contextmanager
     def disable_cache(self) -> Iterator[None]:
         """No-op cache toggle — keeps the repo interface uniform across
@@ -896,6 +905,19 @@ class MessageRepository:
         :meth:`count_query`.
 
         On DB error returns ``[]`` and logs at error level.
+
+        R17-F2: offset/limit windowing goes through
+        ``self._pagination_cache`` — a fresh ``offset == 0`` call
+        re-filters and anchors the resulting ``message_id`` ordering
+        for this exact filter+direction shape; a following
+        ``offset > 0`` call replays that anchored ordering (re-fetching
+        CURRENT row data for exactly those ids) instead of re-running
+        the live filter from scratch. Without this, a message getting
+        marked read (or otherwise leaving a ``read``/``type``/etc.
+        filter) between two paginated calls can shift a still-matching
+        message out of every page — see
+        ``agent_mcp/utils/pagination_cache.py`` for the full rationale
+        and disclosed trade-off.
         """
         filters = filters or {}
         limit = int(filters.get("limit", 50))
@@ -907,29 +929,47 @@ class MessageRepository:
         if offset < 0:
             offset = 0
 
+        cache_key = self._pagination_key(filters, oldest_first=oldest_first)
+
         try:
             with get_session() as session:
-                stmt = select(AgentMessage)
-                _unused = select(AgentMessage)
-                stmt, _unused = self._apply_query_filters(
-                    stmt, _unused, filters,
-                )
-
-                order_col = (
-                    AgentMessage.timestamp.asc()
-                    if oldest_first
-                    else AgentMessage.timestamp.desc()
-                )
-                rows = (
-                    session.execute(
-                        stmt.order_by(order_col)
-                        .limit(limit)
-                        .offset(offset)
+                def compute_ordered_ids() -> List[str]:
+                    id_stmt = select(AgentMessage.message_id)
+                    _unused = select(AgentMessage.message_id)
+                    id_stmt, _unused = self._apply_query_filters(
+                        id_stmt, _unused, filters,
                     )
-                    .scalars()
-                    .all()
+                    order_col = (
+                        AgentMessage.timestamp.asc()
+                        if oldest_first
+                        else AgentMessage.timestamp.desc()
+                    )
+                    id_stmt = id_stmt.order_by(
+                        order_col, AgentMessage.message_id.asc(),
+                    )
+                    return [row[0] for row in session.execute(id_stmt).all()]
+
+                ordered_ids = self._pagination_cache.get_or_anchor(
+                    cache_key, offset=offset, compute=compute_ordered_ids,
                 )
-                return [_message_to_dict(r) for r in rows]
+                window_ids = ordered_ids[offset:] if offset else ordered_ids
+                window_ids = window_ids[:limit]
+                if not window_ids:
+                    return []
+
+                rows_by_id = {
+                    r.message_id: r
+                    for r in session.execute(
+                        select(AgentMessage).where(
+                            AgentMessage.message_id.in_(window_ids)
+                        )
+                    ).scalars().all()
+                }
+                return [
+                    _message_to_dict(rows_by_id[mid])
+                    for mid in window_ids
+                    if mid in rows_by_id
+                ]
         except SQLAlchemyError as e:
             logger.error(
                 f"Database error querying messages: {e}", exc_info=True,
@@ -951,16 +991,37 @@ class MessageRepository:
         need both to know whether more pages exist.
 
         On DB error returns ``0`` and logs at error level.
+
+        R17-F2: reuses the same ``self._pagination_cache`` anchor as
+        :meth:`query` (identical cache key when called with the SAME
+        filters dict and the default ``oldest_first=False`` — exactly
+        how ``list_messages_api_route`` calls both back-to-back), so
+        the reported total stays consistent with the anchored window
+        ``query`` returned rather than drifting from a fresh,
+        unconditional COUNT mid-sweep. When ``filters`` carries no
+        ``offset`` (the ``admin_tools`` stat-counter call sites), this
+        always recomputes fresh — safe, since those callers never
+        paginate.
         """
         filters = filters or {}
+        offset = int(filters.get("offset", 0) or 0)
+        if offset < 0:
+            offset = 0
+        cache_key = self._pagination_key(filters, oldest_first=False)
         try:
             with get_session() as session:
-                stmt = select(AgentMessage)
-                _unused = select(AgentMessage)
-                stmt, _unused = self._apply_query_filters(
-                    stmt, _unused, filters,
+                def compute_ordered_ids() -> List[str]:
+                    id_stmt = select(AgentMessage.message_id)
+                    _unused = select(AgentMessage.message_id)
+                    id_stmt, _unused = self._apply_query_filters(
+                        id_stmt, _unused, filters,
+                    )
+                    return [row[0] for row in session.execute(id_stmt).all()]
+
+                ordered_ids = self._pagination_cache.get_or_anchor(
+                    cache_key, offset=offset, compute=compute_ordered_ids,
                 )
-                return len(session.execute(stmt).all())
+                return len(ordered_ids)
         except SQLAlchemyError as e:
             logger.error(
                 f"Database error counting message query: {e}",
@@ -973,6 +1034,28 @@ class MessageRepository:
                 exc_info=True,
             )
             return 0
+
+    @staticmethod
+    def _pagination_key(filters: Dict[str, Any], *, oldest_first: bool) -> Any:
+        """Hashable cache key for ``self._pagination_cache`` — every
+        filter dimension EXCEPT ``limit``/``offset`` (those vary within
+        a single pagination sweep and must not fragment the anchor).
+        ``between`` is a list (unhashable) in the raw filters dict —
+        tupled here."""
+        between = filters.get("between")
+        between_key = tuple(between) if isinstance(between, list) else between
+        return (
+            filters.get("from"),
+            filters.get("to"),
+            between_key,
+            filters.get("type"),
+            filters.get("priority"),
+            filters.get("read"),
+            filters.get("since"),
+            filters.get("until"),
+            filters.get("q"),
+            oldest_first,
+        )
 
     @staticmethod
     def _apply_query_filters(

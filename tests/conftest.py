@@ -129,6 +129,23 @@ def reset_and_snapshot_globals() -> Callable[[], None]:
     from agent_mcp.core import session_registry as _sr
     _sr._profile_greeted_agents.clear()
 
+    # R17-F2: offset-pagination anchor caches are process-lifetime
+    # singletons (module-level in task_tools.py; class-level on
+    # AgentRepository/MessageRepository) by design — that's what lets
+    # them survive across the fresh per-call objects that hold a
+    # reference to them. That same persistence means a cache entry
+    # anchored by one test's fixture data (task/agent/message ids tied
+    # to a tmp DB that's about to be torn down) would otherwise leak
+    # into the next test that happens to build an identical filter/sort
+    # cache key. Clear all three on both sides of a test.
+    from agent_mcp.tools.task_tools import _VIEW_TASKS_PAGINATION_CACHE
+    from agent_mcp.repositories.agent_repository import AgentRepository
+    from agent_mcp.repositories.message_repository import MessageRepository
+
+    _VIEW_TASKS_PAGINATION_CACHE.clear()
+    AgentRepository._pagination_cache.clear()
+    MessageRepository._pagination_cache.clear()
+
     snapshot = {
         "connections": dict(g.connections),
         "active_agents": dict(g.active_agents),
@@ -176,6 +193,9 @@ def reset_and_snapshot_globals() -> Callable[[], None]:
         g.agent_event_queues.clear()
         g.agent_event_waiters.clear()
         g.reset_startup_complete_event()
+        _VIEW_TASKS_PAGINATION_CACHE.clear()
+        AgentRepository._pagination_cache.clear()
+        MessageRepository._pagination_cache.clear()
 
     return _restore
 

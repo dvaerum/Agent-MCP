@@ -189,6 +189,56 @@ async def test_summary_with_limit_combined(tmp_path) -> None:
         )
 
 
+# --- 6. R17-F2: offset pagination under concurrent mutation -----------
+
+
+async def test_offset_pagination_survives_concurrent_status_change(
+    tmp_path,
+) -> None:
+    """End-to-end R17-F2 exploit against the real ``view_tasks`` tool
+    (not just the engine unit test): 5 pending tasks, paginate
+    ``limit=2`` across two calls; the top-ranked task claims/advances
+    between calls and drops out of the ``status=pending`` filter. A
+    task that was pending the entire window must not be silently
+    skipped across both pages.
+    """
+    from agent_mcp.core import globals as g
+
+    async with mcp_session(tmp_path) as admin:
+        ids = _seed_tasks("admin", count=5)
+        # _seed_tasks creates ids in ascending created_at order; sorted
+        # DESC (the default), the newest (last id) ranks first.
+        newest_id = ids[-1]
+
+        page1 = await _view(
+            admin, {"status": "pending", "limit": 2, "offset": 0},
+        )
+        assert _count_task_blocks(page1) == 2, page1
+
+        # Ordinary concurrent activity between the two page requests.
+        g.tasks[newest_id]["status"] = "in_progress"
+
+        page2 = await _view(
+            admin, {"status": "pending", "limit": 2, "offset": 2},
+        )
+
+        def _ids(text: str) -> set[str]:
+            return {
+                line.removeprefix("ID: ").strip()
+                for line in text.splitlines()
+                if line.startswith("ID: task_")
+            }
+
+        seen_ids = _ids(page1) | _ids(page2)
+        # 5 seeded tasks, one dropped out of the filter mid-sweep: the
+        # remaining 4 pending tasks must all surface across the two
+        # pages -- none silently skipped.
+        assert len(seen_ids) == 4, (
+            f"expected all 4 still-pending tasks across both pages, got "
+            f"{seen_ids}\n--- page1 ---\n{page1}\n--- page2 ---\n{page2}"
+        )
+
+
 # --- 5. Backward-compat regression: no new params -> existing shape ---
 
 
