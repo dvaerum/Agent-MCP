@@ -491,6 +491,30 @@ class ProjectRegistry:
         (`agent_mcp.router.app.rename_handler`). This method only
         rewrites the registry file.
 
+        R9-F5: it DOES, however, keep the record's `"workspace"` field
+        tracking the rename whenever that field still follows the
+        `<parent>/<name>` naming convention every project created via
+        `register()` satisfies (i.e. `Path(workspace).name == old_name`)
+        — the same check the calling endpoint uses to decide whether to
+        physically move the directory. Without this, `"workspace"`
+        froze at whatever value was set at CREATE time and never
+        tracked ANY rename, so a project's second rename would silently
+        desync the registry from the filesystem forever: the endpoint's
+        move-guard trusts this field to know whether `old_name` still
+        names the directory on disk, and a stale field makes that guard
+        false on every rename after the first, silently skipping the
+        `os.rename()` while still reporting success. Updating the field
+        here — using the exact same naming-convention test — keeps it
+        correct across an arbitrary number of renames, which matters
+        beyond this module: the `agent-mcp-launcher` shell script
+        (`nix/packages.nix`) resolves a running project's workspace
+        directory straight out of this same registry file's
+        `"workspace"` field, not from any Python-side cache. When the
+        field doesn't follow the naming convention (a workspace
+        registered at a custom, non-conventional path), it's left
+        untouched, exactly mirroring the endpoint's own decision not to
+        move such a directory.
+
         Raises (all subclass the built-in they replace, so existing
         ``except KeyError`` / ``except ValueError`` catch them unchanged):
             UnknownProject (KeyError): `old_name` isn't registered → 404.
@@ -536,6 +560,17 @@ class ProjectRegistry:
                         )
 
             record = self._coerce_to_record(data[old_name])
+            # R9-F5: re-derive the workspace path from the CURRENT
+            # value using the same naming-convention test the calling
+            # endpoint applies before physically moving the directory
+            # (`Path(workspace).name == old_name`). This is what keeps
+            # the field from freezing at creation time — every rename
+            # re-applies the same transformation the previous rename
+            # (if any) already applied, so it composes correctly across
+            # an arbitrary number of renames instead of only the first.
+            old_workspace = record.get("workspace", "")
+            if old_workspace and Path(old_workspace).name == old_name:
+                record["workspace"] = str(Path(old_workspace).with_name(new_name))
             record["aliases"].append(
                 {"name": old_name, "expires_at": expires_at}
             )
