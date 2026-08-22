@@ -50,6 +50,7 @@ file's ``workspace`` field (not from any Python-side cache).
 
 from __future__ import annotations
 
+import itertools
 import json
 
 import pytest
@@ -141,7 +142,7 @@ async def test_triple_rename_keeps_workspace_dir_in_sync(
     client = await aiohttp_client(router_app)
 
     names = ["stage-one", "stage-two", "stage-three", "stage-four"]
-    for old_name, new_name in zip(names, names[1:]):
+    for old_name, new_name in itertools.pairwise(names):
         resp = await _rename(client, old_name, new_name)
         assert resp.status == 200, (
             f"rename {old_name!r} -> {new_name!r} failed: "
