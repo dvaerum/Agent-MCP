@@ -76,7 +76,21 @@ _CONTROL_BYTE_RE = re.compile(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]')
 # trailing zero-width space, or one carrying an RTL override) are a
 # duplicate-identifier / spoofing risk even though they parse as
 # perfectly legal JSON string content.
-_HIDDEN_FORMAT_CATEGORIES = frozenset({"Cf", "Zl", "Zp"})
+#
+# R15-F1: category `Cs` (Surrogate) is stripped the same way -- a lone/
+# unpaired UTF-16 surrogate code point (e.g. from a JSON `\udXXX` escape
+# not followed by a valid low-surrogate partner) parses fine under
+# `json.loads()` as a real Python string character, but is not valid
+# UTF-8 (`'\ud800'.encode('utf-8')` raises `UnicodeEncodeError:
+# surrogates not allowed`) and crashes SQLite's TEXT binding with an
+# unhandled exception instead of a clean 4xx. A genuine surrogate PAIR
+# (e.g. an emoji) is not affected: Python combines a valid pair into a
+# single non-`Cs` astral-plane code point before this code ever runs,
+# so only the pathological lone/unpaired case is in scope here -- same
+# pure-strip treatment as `Cf`, not the cap-not-strip treatment used
+# for combining marks, since a lone surrogate has zero legitimate use
+# in JSON string content.
+_HIDDEN_FORMAT_CATEGORIES = frozenset({"Cf", "Zl", "Zp", "Cs"})
 
 # Variation Selectors 1-16 (BMP) and 17-256 (supplementary plane): carry
 # no glyph of their own, only ever modifying/annotating the preceding
