@@ -3048,11 +3048,22 @@ async def update_task_status_tool_impl(
 # non-None), so the BL-R16-1 / BL-R17-1 clear-assignment choreography
 # (flip to ``status='unassigned'`` + fan out
 # ``notify_unassigned_task_appeared`` on a NON-terminal task; keep the
-# terminal status + fire NO fanout on a terminal one — clearing a
-# terminal task's assignee stays allowed, unlike reassigning it to a
-# live agent) stays a dedicated code path here, structurally unchanged
-# from the pre-refactor route, just relocated off the REST router so
-# an MCP caller gets the identical guarantee.
+# terminal status + fire NO fanout on a terminal one) stays a dedicated
+# code path here, structurally unchanged from the pre-refactor route,
+# just relocated off the REST router so an MCP caller gets the
+# identical guarantee.
+#
+# R12-F5 (closed the one remaining carve-out miss): clearing used to
+# stay allowed even when the task's PRIOR status was already terminal
+# — the dedicated path never re-validated status at all, so it was the
+# one admin-adjacent field that bypassed the terminal-sink guard
+# ``_update_single_task`` enforces on every other field. A bare
+# ``assigned_to: null`` on an already-terminal task is now refused
+# (``Conflict``) before ``clear_fields`` is even built — see the check
+# at the top of the ``if clearing:`` block below. A combined call that
+# itself DRIVES the task terminal in the same request (``{"status":
+# "completed", "assigned_to": null}``) is unaffected: that guard keys
+# on the PRIOR status, not the post-call effective one.
 @requires_capability("tasks.assign")
 async def update_task_tool_impl(
     arguments: Dict[str, Any],
@@ -3203,6 +3214,35 @@ async def update_task_tool_impl(
             if clearing:
                 from ..repositories import task_repo as _task_repo
                 from ..repositories import agent_repo as _agent_repo
+
+                # SECURITY (R12-F5): terminal-state carve-out miss. Every
+                # OTHER admin field on this tool refuses a terminal task
+                # via ``_update_single_task``'s transition re-validation
+                # (see the module docstring above) — but a bare
+                # ``assigned_to: null`` clear-only call never routes
+                # through that helper (``admin_fields_requested`` is
+                # False), so it skipped the guard entirely and silently
+                # stripped attribution from finished work. Key this on
+                # ``prior_status`` (the task's status BEFORE this call),
+                # not the post-call ``effective_status`` computed below:
+                # if this SAME call is what is driving the task terminal
+                # (a combined ``{"status": "completed", "assigned_to":
+                # null}`` request — see the BL-R16-1/BL-R17-1 choreography
+                # comment below), ``admin_fields_requested`` is True and
+                # ``_update_single_task`` already validated + applied that
+                # transition above; only an ALREADY-terminal prior status
+                # reaches this branch with nothing yet written, so the
+                # refusal here is always a clean no-op rejection, never a
+                # partial-write rollback.
+                if prior_status in _TERMINAL_TASK_STATUSES:
+                    return Conflict(
+                        reason=(
+                            f"Cannot clear assignment for task '{task_id}': "
+                            f"status '{prior_status}' is terminal "
+                            f"(completed/cancelled/failed) and its "
+                            f"assignment is frozen."
+                        )
+                    )
 
                 clear_fields: Dict[str, Any] = {"assigned_to": None}
                 # R16-F2 (ordering gap, now closed): gate the
@@ -4495,6 +4535,23 @@ async def bulk_task_operations_tool_impl(
                             )
                             continue
 
+                        # SECURITY (R12-F4): terminal-state carve-out miss.
+                        # Mirror the reassign sibling (BL-R25-1) — a
+                        # completed/cancelled/failed task is a sink and
+                        # must refuse admin-field mutations too, not just
+                        # status transitions and reassign. Deny this one
+                        # op (append error + continue) rather than
+                        # aborting the whole bulk transaction.
+                        current_status = task_data.get("status")
+                        if current_status in _TERMINAL_TASK_STATUSES:
+                            results.append(
+                                f"Operation {i+1}: cannot update priority "
+                                f"for task '{task_id}' — its status "
+                                f"'{current_status}' is terminal "
+                                f"(completed/cancelled/failed)"
+                            )
+                            continue
+
                         # PR 7 (Task flip): bulk priority update flows
                         # through task_repo.update_fields with the caller's
                         # cursor.
@@ -4519,6 +4576,23 @@ async def bulk_task_operations_tool_impl(
                         if not note_content:
                             results.append(
                                 f"Operation {i+1}: Missing 'content' for add_note operation"
+                            )
+                            continue
+
+                        # SECURITY (R12-F4): terminal-state carve-out miss.
+                        # Mirror the reassign sibling (BL-R25-1) — a
+                        # completed/cancelled/failed task is a sink and
+                        # must refuse admin-field mutations too, not just
+                        # status transitions and reassign. Deny this one
+                        # op (append error + continue) rather than
+                        # aborting the whole bulk transaction.
+                        current_status = task_data.get("status")
+                        if current_status in _TERMINAL_TASK_STATUSES:
+                            results.append(
+                                f"Operation {i+1}: cannot add note to task "
+                                f"'{task_id}' — its status "
+                                f"'{current_status}' is terminal "
+                                f"(completed/cancelled/failed)"
                             )
                             continue
 

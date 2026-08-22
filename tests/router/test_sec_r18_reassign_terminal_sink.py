@@ -16,12 +16,19 @@ ASSIGN axis too.
 The fix rejects a reassign-to-a-real-agent of a terminal task with 409
 Conflict (mirroring composition.py's status-path illegal-transition
 guard, which 409s a terminal-source transition). It does NOT touch the
-CLEAR-assignment branch (``assigned_to`` -> null / '') — that is
-BL-R17-1's carve-out (a terminal task may still be unassigned, keeping
-its terminal status).
+CLEAR-assignment branch (``assigned_to`` -> null / '') — that was
+BL-R17-1's carve-out (a terminal task could still be unassigned,
+keeping its terminal status).
 
 RED on origin/main (reassign succeeds; task now re-pinned on a live
 agent = resurrected). GREEN after the terminal-task check.
+
+R12-F5 SUPERSESSION: the BL-R17-1 clear-assignment carve-out referenced
+above was itself closed — a terminal task's assignment can no longer be
+cleared at all (the whole clearing op is refused, 409), closing the one
+admin-adjacent field that still bypassed the terminal-sink guard. See
+``tests/router/test_sec_r12_clear_assignment_terminal_sink.py`` for the
+full rationale.
 """
 
 from __future__ import annotations
@@ -140,26 +147,33 @@ async def test_reassign_nonterminal_task_still_succeeds(
 
 
 @pytest.mark.parametrize("terminal_status", TERMINAL_STATUSES)
-async def test_clear_terminal_assignment_still_allowed(
+async def test_clear_terminal_assignment_now_refused(
     tmp_path, terminal_status,
 ) -> None:
-    """BL-R17-1 carve-out must be untouched: CLEARING a terminal task's
-    assignment (assigned_to -> '') still succeeds and keeps the terminal
-    status (no error, no resurrection)."""
+    """R12-F5 superseded the BL-R17-1 carve-out this test used to pin:
+    CLEARING a terminal task's assignment (assigned_to -> '') is now
+    REFUSED (409) — the whole clearing op is denied, not just the
+    status-flip/fanout half of it, so ``assigned_to`` stays intact
+    too."""
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("alice")
         task_id = await _create_task(admin, assigned_to="alice")
         _force_status(task_id, terminal_status, "alice")
 
         r = _reassign(admin, task_id, "")
-        assert r.status_code == 200, r.text
+        assert r.status_code != 200, (
+            f"clearing a {terminal_status!r} task's assignee must be "
+            f"refused (R12-F5), got {r.status_code}: {r.text}"
+        )
 
         row = _row("tasks", "task_id = ?", (task_id,))
         assert row["status"] == terminal_status, (
-            f"clearing a {terminal_status!r} task's assignee must keep its "
-            f"terminal status, got {row['status']!r}"
+            f"a refused clear must keep the terminal status, got "
+            f"{row['status']!r}"
         )
-        assert row["assigned_to"] is None, "assignment must be cleared"
+        assert row["assigned_to"] == "alice", (
+            "R12-F5: a refused clear must not strip assigned_to either"
+        )
 
 
 @pytest.mark.parametrize("terminal_status", TERMINAL_STATUSES)
