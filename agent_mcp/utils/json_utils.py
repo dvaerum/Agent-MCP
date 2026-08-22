@@ -27,25 +27,39 @@ from ..core.config import logger
 # rather than duplicating it, so they cannot drift apart again).
 _CONTROL_BYTE_RE = re.compile(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]')
 
+# Hidden/spoofing Unicode worth stripping from a *parsed* string value:
+# zero-width spaces (U+200B-U+200F), the BOM / zero-width no-break space
+# (U+FEFF), and the line/paragraph separators (U+2028/U+2029). R13-F2:
+# this is the exact character class the old "Step 4" fallback-only regex
+# matched — hoisted to module scope for the same reason R5-F8 hoisted
+# _CONTROL_BYTE_RE: so both the post-parse-success path and the
+# already-a-dict/list path can share one definition instead of drifting
+# apart. Visually near-indistinguishable strings (e.g. a task title with
+# a trailing zero-width space) are a duplicate-identifier / spoofing risk
+# even though they parse as perfectly legal JSON string content.
+_HIDDEN_UNICODE_RE = re.compile(r'[\u200B-\u200F\uFEFF\u2028\u2029]')
+
 
 def _strip_control_bytes(value: Any) -> Any:
-    """Recursively walk a parsed JSON value and strip C0 control bytes
-    (``_CONTROL_BYTE_RE``) from every string leaf.
+    """Recursively walk a parsed JSON value and strip C0/C1/DEL control
+    bytes (``_CONTROL_BYTE_RE``) and hidden/spoofing Unicode
+    (``_HIDDEN_UNICODE_RE``) from every string leaf.
 
-    R4-F3: this is the ONLY place sanitization needs to happen now —
-    called unconditionally on every input to ``sanitize_json_input``,
-    whether it arrived as an already-decoded dict/list (the MCP
-    ``tools/call`` path) or as a string/bytes payload that parsed
-    cleanly on the first ``json.loads()`` attempt (the common REST
-    case: standard ``\\u001b``-style escapes are valid JSON and never
-    reach the old malformed-JSON-only fallback cleaning).
+    R4-F3/R5-F8/R13-F2: this is the ONLY place sanitization needs to
+    happen now — called unconditionally on every input to
+    ``sanitize_json_input``, whether it arrived as an already-decoded
+    dict/list (the MCP ``tools/call`` path) or as a string/bytes payload
+    that parsed cleanly on the first ``json.loads()`` attempt (the
+    common REST case: standard ``\\u001b``-style escapes, and hidden
+    Unicode characters, are valid JSON and never reach the old
+    malformed-JSON-only fallback cleaning).
 
     dict keys are left untouched (matches historical behavior — only
     values were ever sanitized); non-string leaves (numbers, bools,
     None) pass through unchanged.
     """
     if isinstance(value, str):
-        return _CONTROL_BYTE_RE.sub('', value)
+        return _HIDDEN_UNICODE_RE.sub('', _CONTROL_BYTE_RE.sub('', value))
     if isinstance(value, dict):
         return {k: _strip_control_bytes(v) for k, v in value.items()}
     if isinstance(value, list):
@@ -133,7 +147,17 @@ def sanitize_json_input(input_data: Union[str, bytes, Dict, List, Any]) -> Union
     cleaned = _CONTROL_BYTE_RE.sub('', cleaned)
 
     # Step 4: Remove problematic Unicode (Zero-width spaces, BOM, line/paragraph separators)
-    cleaned = re.sub(r'[\u200B-\u200F\uFEFF\u2028\u2029]', '', cleaned)
+    # R13-F2: for string LEAF VALUES this is now redundant — _strip_control_bytes
+    # (called unconditionally below, and on every other return path) already
+    # strips _HIDDEN_UNICODE_RE from every string leaf post-parse. This raw-TEXT
+    # pass still earns its keep, though: these hidden-Unicode characters are not
+    # valid JSON structural whitespace, so one sitting between tokens (e.g. right
+    # after a '{' or a ',') would otherwise make Step 5's json.loads() fail (and
+    # Step 6's regex fallback fail the same way, since '\s' doesn't match them
+    # either) even after Step 3's control-byte strip succeeds. Removing this line
+    # would reintroduce that "chars in structural position" fallback failure —
+    # kept, not dead code.
+    cleaned = _HIDDEN_UNICODE_RE.sub('', cleaned)
 
     # Step 5: Try parsing the aggressively cleaned string
     try:
