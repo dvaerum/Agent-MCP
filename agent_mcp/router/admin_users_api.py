@@ -725,16 +725,17 @@ async def create_user_handler(req: web.Request) -> web.Response:
     with Phase 1 bootstrap.
     """
     _ensure_wave1a_schema()
-    body = await _json_body(req)
-    # R6-F2: ``_json_body`` just awaited on ``req.read()`` — a genuine
-    # yield point a slow-drip caller can hold open while a concurrent
-    # request revokes their capability. Re-check against a LIVE DB read
-    # (and refresh ``req['principal']``/``req['is_sysadmin']``) before
-    # trusting the caller for the `_caller_is_sysadmin` check below or the
-    # write itself.
-    from .perm_gates import revalidate_capability_or_403
+    # OBS-R11-1: ``_json_body`` awaits on ``req.read()`` — a genuine yield
+    # point a slow-drip caller can hold open while a concurrent request
+    # revokes their capability (R6-F2). ``read_body_and_revalidate`` fuses
+    # the read and the post-yield re-check into one call — see its
+    # docstring in ``perm_gates.py`` for why that structurally prevents
+    # the "opt-in, remember-to-call-it" gap this class kept reopening.
+    from .perm_gates import read_body_and_revalidate
 
-    denied = await revalidate_capability_or_403(req, "system.users.manage")
+    body, denied = await read_body_and_revalidate(
+        req, _json_body, "system.users.manage",
+    )
     if denied is not None:
         return denied
     # PF-R8-1: reject a non-string ``username`` BEFORE ``.strip()`` — a
@@ -828,13 +829,13 @@ async def edit_user_handler(req: web.Request) -> web.Response:
     """
     _ensure_wave1a_schema()
     user_id = req.match_info["user_id"]
-    body = await _json_body(req)
-    # R6-F2: re-check against a LIVE DB read post-body-read (see
-    # create_user_handler's comment for the full race description) before
-    # trusting the caller for the ``is_sysadmin`` write guard below.
-    from .perm_gates import revalidate_capability_or_403
+    # OBS-R11-1: see ``create_user_handler``'s comment — same fused
+    # read+revalidate call, same reason.
+    from .perm_gates import read_body_and_revalidate
 
-    denied = await revalidate_capability_or_403(req, "system.users.manage")
+    body, denied = await read_body_and_revalidate(
+        req, _json_body, "system.users.manage",
+    )
     if denied is not None:
         return denied
     # Setting OR clearing the sysadmin bit is sysadmin-only.
@@ -1008,13 +1009,13 @@ async def create_group_handler(req: web.Request) -> web.Response:
     sysadmin-tier group in one shot rather than create + PATCH.
     """
     _ensure_wave1a_schema()
-    body = await _json_body(req)
-    # R6-F2: re-check against a LIVE DB read post-body-read (see
-    # create_user_handler's comment for the full race description) before
-    # trusting the caller for the ``is_sysadmin`` write guard below.
-    from .perm_gates import revalidate_capability_or_403
+    # OBS-R11-1: see ``create_user_handler``'s comment — same fused
+    # read+revalidate call, same reason.
+    from .perm_gates import read_body_and_revalidate
 
-    denied = await revalidate_capability_or_403(req, "system.groups.manage")
+    body, denied = await read_body_and_revalidate(
+        req, _json_body, "system.groups.manage",
+    )
     if denied is not None:
         return denied
     # PF-R8-1: reject a non-string ``name`` BEFORE ``.strip()`` (see
@@ -1073,13 +1074,13 @@ async def edit_group_handler(req: web.Request) -> web.Response:
     """
     _ensure_wave1a_schema()
     group_id = req.match_info["group_id"]
-    body = await _json_body(req)
-    # R6-F2: re-check against a LIVE DB read post-body-read (see
-    # create_user_handler's comment for the full race description) before
-    # trusting the caller for the ``is_sysadmin`` write guard below.
-    from .perm_gates import revalidate_capability_or_403
+    # OBS-R11-1: see ``create_user_handler``'s comment — same fused
+    # read+revalidate call, same reason.
+    from .perm_gates import read_body_and_revalidate
 
-    denied = await revalidate_capability_or_403(req, "system.groups.manage")
+    body, denied = await read_body_and_revalidate(
+        req, _json_body, "system.groups.manage",
+    )
     if denied is not None:
         return denied
     # Setting OR clearing the sysadmin bit is sysadmin-only.
@@ -1326,14 +1327,15 @@ async def add_group_member_handler(req: web.Request) -> web.Response:
     """
     _ensure_wave1a_schema()
     parent_group_id = req.match_info["group_id"]
-    body = await _json_body(req)
-    # R6-F2: re-check against a LIVE DB read post-body-read (see
-    # create_user_handler's comment for the full race description) before
-    # trusting the caller for the amplification guards below (all of
-    # which read ``req['principal']``/``_caller_is_sysadmin``).
-    from .perm_gates import revalidate_capability_or_403
+    # OBS-R11-1: see ``create_user_handler``'s comment — same fused
+    # read+revalidate call, same reason (the amplification guards below
+    # all read ``req['principal']``/``_caller_is_sysadmin``, so they must
+    # see post-yield state too).
+    from .perm_gates import read_body_and_revalidate
 
-    denied = await revalidate_capability_or_403(req, "system.groups.manage")
+    body, denied = await read_body_and_revalidate(
+        req, _json_body, "system.groups.manage",
+    )
     if denied is not None:
         return denied
     member_user_id = body.get("user_id")
@@ -1679,24 +1681,25 @@ async def add_project_membership_handler(req: web.Request) -> web.Response:
     denied = _deny_cross_tenant_project_read(req, project_name)
     if denied is not None:
         return denied
-    body = await _json_body(req)
-    # R9-F3 (HIGH, class-sweep gap R8-F3 (#674) missed): re-checking ONLY
-    # the capability half here (``perm_gates.revalidate_capability_or_403``)
-    # left the MEMBERSHIP half — ``_deny_cross_tenant_project_read`` above —
+    # OBS-R11-1 (R9-F3, HIGH, class-sweep gap R8-F3 (#674) missed):
+    # re-checking ONLY the capability half post-body-read left the
+    # MEMBERSHIP half — ``_deny_cross_tenant_project_read`` above —
     # validated ONLY at entry, before this body-read yield point. A
     # delegate whose OWN project membership is revoked mid-flight (their
     # coarse ``system.projects.manage`` capability untouched) resumed and
     # reached the ``_membership_grant_denied`` role-rank guard below with a
     # rich 403 instead of the SAME uniform 404 a genuine non-member gets —
     # reopening exactly the existence/role oracle
-    # ``_deny_cross_tenant_project_read`` exists to close. Route through
-    # the SAME composed re-check R8-F3 built for its three admin_api.py
-    # siblings so both invariants are re-validated against one live
-    # snapshot, not two different points in time.
-    from .admin_api import _revalidate_capability_and_membership_or_403
+    # ``_deny_cross_tenant_project_read`` exists to close.
+    # ``read_body_and_revalidate`` (with ``project_name`` set) fuses the
+    # body-read with the SAME combined capability-AND-membership re-check
+    # R8-F3 built for its admin_api.py siblings, as one call — see
+    # ``perm_gates.py``'s docstring for why that's what makes this
+    # structural rather than opt-in.
+    from .perm_gates import read_body_and_revalidate
 
-    denied = await _revalidate_capability_and_membership_or_403(
-        req, "system.projects.manage", project_name,
+    body, denied = await read_body_and_revalidate(
+        req, _json_body, "system.projects.manage", project_name,
     )
     if denied is not None:
         return denied
@@ -1788,17 +1791,13 @@ async def change_project_membership_role_handler(
             status=400,
         )
     kind, target_id = parsed
-    body = await _json_body(req)
-    # R9-F3 (HIGH, class-sweep gap R8-F3 (#674) missed): see the identical
-    # comment in ``add_project_membership_handler`` above — re-checking
-    # ONLY the capability half here left the MEMBERSHIP half validated
-    # once, pre-yield, reopening the existence/role oracle
-    # ``_deny_cross_tenant_project_read`` closes. Route through the same
-    # composed re-check R8-F3 built for its three admin_api.py siblings.
-    from .admin_api import _revalidate_capability_and_membership_or_403
+    # OBS-R11-1 (R9-F3): see the identical comment in
+    # ``add_project_membership_handler`` above — the fused
+    # read+revalidate call closes the same gap here.
+    from .perm_gates import read_body_and_revalidate
 
-    denied = await _revalidate_capability_and_membership_or_403(
-        req, "system.projects.manage", project_name,
+    body, denied = await read_body_and_revalidate(
+        req, _json_body, "system.projects.manage", project_name,
     )
     if denied is not None:
         return denied
@@ -1948,15 +1947,13 @@ async def replace_group_capabilities_handler(
     finally:
         conn.close()
 
-    body = await _json_body(req)
-    # R6-F2: re-check against a LIVE DB read post-body-read (see
-    # create_user_handler's comment for the full race description) before
-    # trusting the caller for the ``_caps_caller_lacks`` amplification
-    # guard below (which reads ``req['principal']``).
-    from .perm_gates import revalidate_capability_or_403
+    # OBS-R11-1: see ``create_user_handler``'s comment — same fused
+    # read+revalidate call, same reason (the ``_caps_caller_lacks``
+    # amplification guard below reads ``req['principal']``).
+    from .perm_gates import read_body_and_revalidate
 
-    denied = await revalidate_capability_or_403(
-        req, "system.groups.capabilities.manage",
+    body, denied = await read_body_and_revalidate(
+        req, _json_body, "system.groups.capabilities.manage",
     )
     if denied is not None:
         return denied

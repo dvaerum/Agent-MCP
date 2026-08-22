@@ -149,16 +149,20 @@ async def create_project_handler(req: web.Request) -> web.Response:
 
     if disables_write_endpoint():
         return _app._single_tenant_disabled_response()
-    body = await _app._parse_json_body(req)
-    # R7-F1 [class-sweep miss of R6-F2, HIGH, live-exploited]:
-    # ``_parse_json_body`` just awaited on ``req.read()`` — a genuine
+    # OBS-R11-1: ``_parse_json_body`` awaits on ``req.read()`` — a genuine
     # yield point a slow-drip caller can hold open while a concurrent
-    # request revokes their capability. Re-check against a LIVE DB read
-    # (and refresh ``req['principal']``/``req['is_sysadmin']``) before
-    # trusting the caller for anything below.
-    from .perm_gates import revalidate_capability_or_403
+    # request revokes their capability (R7-F1, class-sweep miss of
+    # R6-F2, HIGH, live-exploited). ``read_body_and_revalidate`` fuses the
+    # read and the post-yield re-check into one call so there's no
+    # separate step to forget — see its docstring in ``perm_gates.py``.
+    # No ``project_name`` here: the project doesn't exist yet, so this is
+    # a capability-only re-check (mirrors the old bare
+    # ``revalidate_capability_or_403`` call this replaces).
+    from .perm_gates import read_body_and_revalidate
 
-    denied = await revalidate_capability_or_403(req, "system.projects.manage")
+    body, denied = await read_body_and_revalidate(
+        req, _app._parse_json_body, "system.projects.manage",
+    )
     if denied is not None:
         return denied
     raw_name = body.get("name")
@@ -335,26 +339,23 @@ async def rename_project_handler(req: web.Request) -> web.Response:
     )
     if denied is not None:
         return denied
-    body = await _app._parse_json_body(req)
-    # R7-F1 [class-sweep miss of R6-F2, HIGH, live-exploited]:
-    # ``_parse_json_body`` just awaited on ``req.read()`` — a genuine
-    # yield point a slow-drip caller can hold open while a concurrent
-    # request revokes their capability. Re-check against a LIVE DB read
-    # (and refresh ``req['principal']``/``req['is_sysadmin']``) before
-    # trusting the caller for anything below.
-    # R8-F3 [class-sweep gap IN R7-F1's OWN fix, HIGH, live-exploited]:
-    # R7-F1's capability re-check above left the MEMBERSHIP half of the
-    # entry gate (``_deny_cross_tenant_project_read`` above, which only
-    # needs the path param and correctly runs BEFORE the body read)
-    # stale across this SAME yield point — a member at entry whose
-    # membership on ``old_name`` is revoked mid-flight (e.g. a
-    # concurrent membership DELETE) still completed the rename off the
-    # stale snapshot, on the residual coarse capability alone. Re-check
-    # BOTH halves together post-yield; see
-    # ``_revalidate_capability_and_membership_or_403``. R9-F2: carry the
-    # same ``operator``-tier rank bar through the post-yield re-check too.
-    denied = await _revalidate_capability_and_membership_or_403(
-        req, "system.projects.manage", old_name, min_role="operator",
+    # OBS-R11-1: ``_parse_json_body`` awaits on ``req.read()`` — a genuine
+    # yield point (R7-F1, class-sweep miss of R6-F2, HIGH, live-
+    # exploited). Its earlier two-call fix (read, THEN separately
+    # re-check capability+membership) is exactly the shape that let
+    # R8-F3's own class-sweep gap happen — a handler author re-checking
+    # ONE half and forgetting the other is only possible when there are
+    # two calls to keep in lockstep. ``read_body_and_revalidate`` fuses
+    # them: passing ``old_name``/``min_role`` routes it through
+    # ``_revalidate_capability_and_membership_or_403`` (both invariants,
+    # one live snapshot) as part of the SAME call that reads the body —
+    # see the docstring in ``perm_gates.py``. R9-F2's ``operator``-tier
+    # rank bar carries straight through via ``min_role``.
+    from .perm_gates import read_body_and_revalidate
+
+    body, denied = await read_body_and_revalidate(
+        req, _app._parse_json_body, "system.projects.manage", old_name,
+        min_role="operator",
     )
     if denied is not None:
         return denied
@@ -828,7 +829,28 @@ async def delete_project_handler(req: web.Request) -> web.Response:
     # the unregister and aborts. Without this pairing, a warm-start that
     # started the backend between our ``stop`` and our ``unregister``
     # would leave an orphan the reaper only clears after ``IDLE_SEC``.
-    async with _app._ensure_lock(name, "backend"):
+    #
+    # OBS-R11-1: R7-F1 (HIGH, live-exploited) found that lock CONTENTION
+    # here is just as genuine a yield point as a body-read — a
+    # slow/contended acquire gives a concurrent capability revocation
+    # time to commit before the destructive unregister/rmtree/DB-purge
+    # below runs. R8-F3 then found its OWN fix's class-sweep gap: a
+    # capability-only re-check left the MEMBERSHIP half stale across
+    # that same yield point. ``revalidated_lock`` fuses lock-acquire +
+    # the combined capability-AND-membership re-check into one call so a
+    # future handler physically cannot acquire this lock without the
+    # re-check also running — see its docstring in ``perm_gates.py`` for
+    # why that ordering (revalidate INSIDE the lock, before the
+    # ``async with`` body ever runs) is what makes it structural rather
+    # than opt-in. R9-F2's ``operator``-tier rank bar carries through
+    # via ``min_role``.
+    from .perm_gates import revalidated_lock
+
+    async with revalidated_lock(
+        req, "system.projects.manage", name, min_role="operator",
+    ) as denied:
+        if denied is not None:
+            return denied
         # R3-F3 [TOCTOU / 500-hygiene, mirrors PF-R36-1's inside-lock
         # existence/alias re-check in ``rename_project_handler`` below]:
         # the ``active_conns`` probe above ran OUTSIDE this lock and is
@@ -856,30 +878,6 @@ async def delete_project_handler(req: web.Request) -> web.Response:
                 status=409,
                 extra={"active_connections": conns, "agents": []},
             )
-        # R7-F1 [class-sweep, HIGH, live-exploited]: this handler has no
-        # body-read yield point, but the ``async with _ensure_lock`` +
-        # ``await asyncio.to_thread(_systemctl, "stop", ...)`` sequence
-        # below IS a genuine yield point of exactly the same TOCTOU shape
-        # — a slow/contended lock acquisition or the awaited stop itself
-        # gives a concurrent capability revocation time to commit before
-        # this request's destructive unregister/rmtree/DB-purge runs.
-        # Re-validate against a LIVE DB read right alongside the
-        # ``active_conns`` re-check above, before the destructive step.
-        # R8-F3 [class-sweep gap IN R7-F1's OWN fix, HIGH, live-exploited]:
-        # the capability-only re-check R7-F1 added here left the
-        # MEMBERSHIP half of the entry gate (``_deny_cross_tenant_project_
-        # read`` above) stale across this SAME lock-contention yield
-        # point — a member at entry whose membership on ``name`` is
-        # revoked mid-flight still completed the delete off the stale
-        # snapshot, on the residual coarse capability alone. Re-check
-        # BOTH halves together; see
-        # ``_revalidate_capability_and_membership_or_403``. R9-F2: carry the
-        # same ``operator``-tier rank bar through the post-yield re-check.
-        denied = await _revalidate_capability_and_membership_or_403(
-            req, "system.projects.manage", name, min_role="operator",
-        )
-        if denied is not None:
-            return denied
         # BL-R7-3: run the blocking ``systemctl stop`` OFF the event
         # loop (mirrors the round-6 BL-R6-2b fix in ``_ensure``).
         # ``_systemctl`` is a synchronous ``subprocess.run`` (~15-150 ms,
@@ -1025,7 +1023,21 @@ async def stop_project_handler(req: web.Request) -> web.Response:
     # non-reentrant per-(name,role) ``asyncio.Lock``; nothing we call under
     # it re-acquires the same key, so holding it across the awaited
     # ``to_thread`` stop cannot deadlock (delete/rename do exactly this).
-    async with _app._ensure_lock(name, "backend"):
+    # OBS-R11-1: R7-F1 (HIGH, live-exploited) found that the lock-
+    # contention window here is a genuine yield point too — see the
+    # identical comment in ``delete_project_handler`` above, and
+    # ``revalidated_lock``'s docstring in ``perm_gates.py`` for why
+    # fusing lock-acquire + the combined capability-AND-membership
+    # re-check (R8-F3's own class-sweep gap) into one call is what makes
+    # this structural rather than opt-in. R9-F2's ``operator``-tier rank
+    # bar carries through via ``min_role``.
+    from .perm_gates import revalidated_lock
+
+    async with revalidated_lock(
+        req, "system.projects.manage", name, min_role="operator",
+    ) as denied:
+        if denied is not None:
+            return denied
         # R3-F3 [TOCTOU / 500-hygiene, mirrors the delete/rename inside-
         # lock ``active_conns`` re-checks (same idiom as PF-R36-1's
         # existence/alias-collision backstop in ``rename_project_handler``
@@ -1052,30 +1064,6 @@ async def stop_project_handler(req: web.Request) -> web.Response:
                 status=409,
                 extra={"active_connections": conns, "agents": []},
             )
-        # R7-F1 [class-sweep, HIGH, live-exploited]: this handler has no
-        # body-read yield point, but the ``async with _ensure_lock`` +
-        # the awaited ``_is_active``/``_systemctl`` calls below ARE a
-        # genuine yield point of exactly the same TOCTOU shape — a
-        # slow/contended lock acquisition or the awaited stop itself
-        # gives a concurrent capability revocation time to commit before
-        # this request's destructive stop runs. Re-validate against a
-        # LIVE DB read right alongside the ``active_conns`` re-check
-        # above, before the destructive step.
-        # R8-F3 [class-sweep gap IN R7-F1's OWN fix, HIGH, live-exploited]:
-        # the capability-only re-check R7-F1 added here left the
-        # MEMBERSHIP half of the entry gate (``_deny_cross_tenant_project_
-        # read`` above) stale across this SAME lock-contention yield
-        # point — a member at entry whose membership on ``name`` is
-        # revoked mid-flight still completed the stop off the stale
-        # snapshot, on the residual coarse capability alone. Re-check
-        # BOTH halves together; see
-        # ``_revalidate_capability_and_membership_or_403``. R9-F2: carry the
-        # same ``operator``-tier rank bar through the post-yield re-check.
-        denied = await _revalidate_capability_and_membership_or_403(
-            req, "system.projects.manage", name, min_role="operator",
-        )
-        if denied is not None:
-            return denied
         # OBS-R34-RENAME-ONLOOP class-sweep: ``_is_active`` and
         # ``_systemctl`` both shell out (blocking ``subprocess.run``), so
         # calling them directly stalls the single aiohttp event loop —
@@ -1375,6 +1363,18 @@ async def _revalidate_capability_and_membership_or_403(
     enforces the SAME rank bar as the entry-time check — a member whose
     role is downgraded (not just revoked) mid-flight must not slip
     through on the residual capability either.
+
+    OBS-R11-1: this function is the shared building block, but it's no
+    longer a DIRECT call site for handlers — ``perm_gates
+    .read_body_and_revalidate`` / ``.revalidated_lock`` now call it as
+    part of their own fused read-or-lock + revalidate unit, so a handler
+    author calls one of those instead of wiring the awaited yield point
+    and this re-check together by hand. Kept here (not moved into
+    ``perm_gates``) because it composes ``perm_gates
+    .revalidate_capability_or_403`` with ``_deny_cross_tenant_project_read``,
+    which is this module's own function; ``perm_gates`` imports it back
+    lazily, mirroring the lazy-import convention already used throughout
+    both modules to avoid a load-time cycle.
     """
     from .perm_gates import revalidate_capability_or_403
 
