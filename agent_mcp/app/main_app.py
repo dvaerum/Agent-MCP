@@ -1212,6 +1212,122 @@ def _body_has_nonfinite_number(body: bytes) -> bool:
     return False
 
 
+# --- MCP pre-parse malformed-id guard (pentest R15-F3) ---------------
+#
+# Per JSON-RPC 2.0 (and the MCP SDK's own `RequestId = int | str` in
+# `mcp/types.py`), an `id` MUST be a string, a number, or absent —
+# `null` is spec-legal too, it just means the envelope IS a
+# Notification, same as omitting `id` outright. The SDK's own
+# discriminated union (`JSONRPCMessage.model_validate(...)`,
+# `RootModel[JSONRPCRequest | JSONRPCNotification | JSONRPCResponse |
+# JSONRPCError]`) doesn't raise when a request's `id` fails that
+# check — Pydantic's union fallback just reclassifies the whole
+# envelope as a `JSONRPCNotification`, which has no `id` field at all,
+# so the field (and the request) is silently swallowed.
+# `_handle_post_request` special-cases exactly this: "For notifications
+# and responses only, return 202 Accepted" — with no body — and never
+# invokes a handler, since `tools/call` has no notification handler
+# registered. An object/array/bool `id` therefore yields a bare 202
+# with the tool never called: not a wrong-response-code execution bug,
+# but a caller who sent a malformed `id` (client bug, or a deliberate
+# protocol-confusion probe) gets no signal their request was ever
+# rejected.
+#
+# Same fix shape as the two guards above: byte-scan the raw body for
+# the top-level `"id"` value's leading token before the SDK's own
+# parse/validate ever runs, and reject an object/array/bool value with
+# a clean 400 `-32600 Invalid Request` — spec-correct code for "the
+# JSON sent is not a valid Request object". Per spec, when an error
+# response can't determine a caller-supplied id, `id` MUST be `null`.
+_MCP_INVALID_ID_GUARD_BODY = json.dumps({
+    "jsonrpc": "2.0",
+    "id": None,
+    "error": {"code": -32600, "message": _JSONRPC_TERSE_MESSAGES[-32600]},
+}).encode("utf-8")
+
+#: Whitespace bytes per the JSON grammar (RFC 8259 §2).
+_JSON_WHITESPACE = frozenset(b" \t\r\n")
+
+
+def _top_level_id_kind(body: bytes) -> Optional[str]:
+    """Classify the JSON type of the root object's top-level ``"id"``
+    key's value in a JSON-RPC `body`, without fully parsing it.
+
+    Returns ``"object"``, ``"array"``, or ``"bool"`` for the three
+    spec-invalid shapes; ``None`` if the key is absent, the value is a
+    spec-valid string/number/``null``, or the body doesn't parse as an
+    object at all (any of those are either fine or the SDK's own
+    parse/validation problem, not ours).
+
+    Byte-scan, string-literal-aware the same way `_body_nesting_exceeds`
+    and `_body_has_nonfinite_number` are — no recursive JSON parse, so
+    this stays safe even on a body nested right up to
+    `_MCP_MAX_BODY_NESTING_DEPTH`. A JSON string closing at bracket-
+    depth 1 (i.e. directly inside the root object, not nested inside a
+    key's own object/array value) is a *key* iff the next non-
+    whitespace byte after it is ``:`` — a value string never has a
+    colon immediately after it — so no separate key/value state
+    machine is needed: this single-pass depth+string tracker already
+    distinguishes the two positions.
+
+    If ``"id"`` appears more than once (a malformed-but-parseable
+    duplicate-key body), the LAST occurrence wins — matching
+    `json.loads`'s own last-write-wins dict semantics — so a benign
+    leading `id` can't be used to mask a malformed one later in the
+    same body.
+    """
+    depth = 0
+    in_string = False
+    escaped = False
+    string_start = -1
+    found_kind: Optional[str] = None
+    n = len(body)
+    for i, ch in enumerate(body):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == 0x5C:  # backslash
+                escaped = True
+            elif ch == 0x22:  # closing quote
+                in_string = False
+                if depth == 1 and body[string_start:i] == b"id":
+                    j = i + 1
+                    while j < n and body[j] in _JSON_WHITESPACE:
+                        j += 1
+                    if j < n and body[j] == 0x3A:  # ':'
+                        j += 1
+                        while j < n and body[j] in _JSON_WHITESPACE:
+                            j += 1
+                        if j < n:
+                            vch = body[j]
+                            if vch == 0x7B:  # '{'
+                                found_kind = "object"
+                            elif vch == 0x5B:  # '['
+                                found_kind = "array"
+                            elif vch in (0x74, 0x66):  # 't' / 'f'
+                                found_kind = "bool"
+                            else:
+                                found_kind = None
+            continue
+        if ch == 0x22:  # opening quote
+            in_string = True
+            string_start = i + 1
+        elif ch == 0x7B or ch == 0x5B:  # { or [
+            depth += 1
+        elif ch == 0x7D or ch == 0x5D:  # } or ]
+            if depth > 0:
+                depth -= 1
+    return found_kind
+
+
+def _body_has_invalid_id(body: bytes) -> bool:
+    """True if `body`'s top-level ``"id"`` is a dict, list, or bool —
+    the three shapes the MCP SDK silently misclassifies as a
+    Notification instead of rejecting (see the guard comment above).
+    """
+    return _top_level_id_kind(body) is not None
+
+
 def _replay_receive(raw_receive, body: bytes, disconnected: bool):
     """Build an ASGI `receive` callable that replays an already-drained
     body exactly once, then delegates to the real channel.
@@ -1316,6 +1432,12 @@ class _McpAsgiApp:
                 # model_dump(mode="json") round-trip silently coerces it to
                 # null and (for a top-level argument) drops it outright.
                 await _send_simple_response(send, 400, _MCP_NONFINITE_GUARD_BODY)
+                return
+            if not disconnected and _body_has_invalid_id(body):
+                # Object/array/bool id → clean 400 before the SDK's
+                # discriminated union silently reclassifies the envelope
+                # as a Notification (pentest R15-F3).
+                await _send_simple_response(send, 400, _MCP_INVALID_ID_GUARD_BODY)
                 return
             # Event-loop long-hold: capture the client's clientInfo from an
             # `initialize` POST so the wait_for_events hold-strategy resolver

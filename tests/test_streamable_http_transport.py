@@ -324,6 +324,111 @@ async def test_post_mcp_finite_numeric_argument_is_accepted(tmp_path) -> None:
         assert payload.get("id") == 1, payload
 
 
+# ---------- pentest R15-F3: malformed JSON-RPC id guard --------------
+#
+# Per JSON-RPC 2.0 (and the MCP SDK's own `RequestId = int | str` in
+# `mcp/types.py`), an `id` MUST be a string, a number, or absent
+# (`null` is spec-legal too — it just makes the envelope a
+# Notification). The SDK's own discriminated union
+# (`JSONRPCMessage.model_validate(...)`,
+# `RootModel[JSONRPCRequest | JSONRPCNotification | ...]`) doesn't
+# raise when a request's `id` fails the `int | str` check — it falls
+# through to `JSONRPCNotification`, which has no `id` field at all, so
+# the field (and the whole request) is silently swallowed:
+# `tools/call` has no notification handler, so an object/array/bool
+# `id` yields a 202 Accepted with an empty body and the tool is never
+# invoked. These tests pin the pre-parse guard (`_body_has_invalid_id`
+# + `_MCP_INVALID_ID_GUARD_BODY` in `agent_mcp/app/main_app.py`) that
+# rejects such a body with a clean 400 `-32600 Invalid Request` before
+# the SDK's own misclassification ever runs.
+
+
+async def test_post_mcp_object_id_returns_400_invalid_request(tmp_path) -> None:
+    """An object-valued `id` must be rejected, not silently
+    misclassified as a Notification (R15-F3 repro)."""
+    async with mcp_session(tmp_path) as admin:
+        r = _post_mcp_raw(
+            admin.client,
+            b'{"jsonrpc":"2.0","id":{"x":1},"method":"tools/call","params":'
+            b'{"name":"create_task","arguments":{"task_title":"pwn"}}}',
+            headers={"Authorization": f"Bearer {admin.admin_token}"},
+        )
+        assert r.status_code == 400, r.text
+        payload = r.json()
+        assert payload.get("jsonrpc") == "2.0", payload
+        assert payload["error"]["code"] == -32600, payload
+        assert payload["error"]["message"] == "Invalid Request", payload
+
+
+async def test_post_mcp_array_id_returns_400_invalid_request(tmp_path) -> None:
+    """An array-valued `id` must also be rejected."""
+    async with mcp_session(tmp_path) as admin:
+        r = _post_mcp_raw(
+            admin.client,
+            b'{"jsonrpc":"2.0","id":[1,2],"method":"tools/call","params":'
+            b'{"name":"create_task","arguments":{"task_title":"pwn"}}}',
+            headers={"Authorization": f"Bearer {admin.admin_token}"},
+        )
+        assert r.status_code == 400, r.text
+        payload = r.json()
+        assert payload["error"]["code"] == -32600, payload
+
+
+async def test_post_mcp_bool_id_returns_400_invalid_request(tmp_path) -> None:
+    """A bool-valued `id` must also be rejected."""
+    async with mcp_session(tmp_path) as admin:
+        r = _post_mcp_raw(
+            admin.client,
+            b'{"jsonrpc":"2.0","id":true,"method":"tools/call","params":'
+            b'{"name":"create_task","arguments":{"task_title":"pwn"}}}',
+            headers={"Authorization": f"Bearer {admin.admin_token}"},
+        )
+        assert r.status_code == 400, r.text
+        payload = r.json()
+        assert payload["error"]["code"] == -32600, payload
+
+
+async def test_post_mcp_null_id_is_still_a_notification(tmp_path) -> None:
+    """No-regression check: `id: null` is a spec-legal Notification, NOT
+    a malformed Request — the new guard must not touch it. A Notification
+    correctly gets a 202 Accepted with no JSON-RPC body (identical shape
+    to a request with `id` omitted entirely)."""
+    async with mcp_session(tmp_path) as admin:
+        r = _post_mcp_raw(
+            admin.client,
+            b'{"jsonrpc":"2.0","id":null,"method":"notifications/initialized",'
+            b'"params":{}}',
+            headers={"Authorization": f"Bearer {admin.admin_token}"},
+        )
+        assert r.status_code == 202, r.text
+        assert r.text == "" or r.text == "null", r.text
+
+
+async def test_post_mcp_string_and_int_id_unaffected_by_id_guard(
+    tmp_path,
+) -> None:
+    """No-regression check: ordinary string/int `id` requests must be
+    completely unaffected by the new guard."""
+    async with mcp_session(tmp_path) as admin:
+        r_int = _post_mcp_raw(
+            admin.client,
+            b'{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
+            headers={"Authorization": f"Bearer {admin.admin_token}"},
+        )
+        assert r_int.status_code == 200, r_int.text
+        payload = _extract_jsonrpc_result(r_int)
+        assert payload.get("id") == 1, payload
+
+        r_str = _post_mcp_raw(
+            admin.client,
+            b'{"jsonrpc":"2.0","id":"abc","method":"tools/list","params":{}}',
+            headers={"Authorization": f"Bearer {admin.admin_token}"},
+        )
+        assert r_str.status_code == 200, r_str.text
+        payload = _extract_jsonrpc_result(r_str)
+        assert payload.get("id") == "abc", payload
+
+
 # ---------- GET /mcp -------------------------------------------------
 
 
