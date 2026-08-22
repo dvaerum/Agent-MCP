@@ -440,22 +440,41 @@ def create_user(
     ``sso.find_or_create_sso_user``'s JIT-create fork — that writes
     ``email`` to the DB, so it's stripped of the same hidden/spoofing
     Unicode ``admin_users_api._json_body`` strips on the REST path
-    (``_strip_control_bytes``) and checked for UTF-8 round-trip-ability
-    here, once, for every caller. The IdP-claim-derived SSO path in
-    particular never goes anywhere near ``admin_users_api``'s sanitizer
-    wiring, so without this an unpaired UTF-16 surrogate in an IdP's
-    ``email`` claim would crash the INSERT below exactly like the
-    REST-layer bug this mirrors.
+    (``_strip_control_bytes``) here, once, for every caller. The
+    IdP-claim-derived SSO path in particular never goes anywhere near
+    ``admin_users_api``'s sanitizer wiring, so without this a hidden-
+    Unicode spoofing character in an IdP's ``email`` claim would survive
+    unstripped into the DB.
+
+    R16-F3: an explicit UTF-8-round-trip check (raising
+    ``InvalidEmailError`` on an unpaired surrogate) used to run
+    immediately after the strip above. R15-F1 widened
+    ``_HIDDEN_FORMAT_CATEGORIES`` (the category set ``_strip_control_bytes``
+    strips) to include ``Cs`` (Surrogate) — exhaustively verified that
+    ``Cs`` is the ONLY category whose members fail
+    ``str.encode("utf-8", "strict")`` — so the strip call directly above
+    now ALREADY removes every character that check could ever have
+    caught, for every caller, unconditionally. That check was therefore
+    provably unreachable dead code and has been removed; the INSERT-level
+    ``except UnicodeEncodeError`` backstop below stays as the regression
+    guard if a future edit ever narrows the category set or this strip
+    call is removed.
     """
     if email is not None:
-        email = _strip_control_bytes(email)
-        try:
-            email.encode("utf-8", "strict")
-        except UnicodeEncodeError as e:
+        # R16-F1: OIDC claims (and, in principle, any caller) can hand
+        # this a non-``str`` value -- ``sso.handle_oidc_callback``
+        # already coerces a badly-typed IdP claim to ``None`` before
+        # calling here, but this is also reachable from the CLI
+        # bootstrap and the setup wizard, and must never crash on a bad
+        # type from ANY caller. A dict/int ``email`` would otherwise
+        # reach ``_strip_control_bytes``'s dict-recursion (which passes
+        # a dict straight back through unhandled by the caller) or the
+        # INSERT bind below with an un-typed value.
+        if not isinstance(email, str):
             raise InvalidEmailError(
-                "email contains a character that cannot be represented "
-                "in UTF-8 (e.g. an unpaired surrogate)"
-            ) from e
+                f"email must be a string; got {type(email).__name__}"
+            )
+        email = _strip_control_bytes(email)
     user_id = secrets.token_hex(8)  # 16 hex chars
     if password_hash is None and password is not None:
         password_hash = hash_password(password)
@@ -511,12 +530,15 @@ def create_user(
                 f"username {username!r} already exists"
             ) from e
         except UnicodeEncodeError as e:
-            # R15-F2 defensive backstop: the pre-check above should
-            # already have caught an unpaired surrogate in ``email``,
+            # R15-F2 defensive backstop, kept post-R16-F3 as a
+            # regression guard: ``_strip_control_bytes`` above should
+            # already have stripped an unpaired surrogate out of
+            # ``email`` (R15-F1 widened it to cover category ``Cs``),
             # but this converts a raw ``UnicodeEncodeError`` at the bind
             # site into the same typed error regardless — a future
-            # refactor that skips the pre-check must not let this
-            # escape as an opaque, undocumented exception type.
+            # refactor that narrows the stripped category set, or skips
+            # the strip, must not let this escape as an opaque,
+            # undocumented exception type.
             raise InvalidEmailError(
                 "email contains a character that cannot be represented "
                 "in UTF-8 (e.g. an unpaired surrogate)"
@@ -616,7 +638,19 @@ def find_linkable_user_by_email(
     or a legacy pre-subject SSO row (``sso_subject IS NULL``) is eligible;
     password users are preferred when both shapes share an email. The
     predicate is unchanged from the inline query it replaces.
+
+    R16-F1 belt-and-suspenders: ``handle_oidc_callback`` now coerces a
+    non-``str`` ``email`` claim to ``None`` before it ever reaches the
+    ``if email and email_verified`` gate that calls into this, so this
+    guard should be unreachable via that caller — kept anyway because a
+    dict/list ``email`` bound straight into the ``sqlite3`` query below
+    raises a raw ``sqlite3.ProgrammingError``/``sqlite3.InterfaceError``
+    instead of a clean "no match", and this is called from a plain
+    module-level function any future caller could reach with un-vetted
+    input.
     """
+    if not isinstance(email, str):
+        return None
     with _conn_ctx(conn) as c:
         row = c.execute(
             """

@@ -282,13 +282,18 @@ async def _json_body(req: web.Request) -> dict:
     JSON decoder on a deeply nested body (PF-R20-1), and from the walk in
     ``_strip_control_bytes`` on a deeply nested already-parsed structure.
 
-    NOTE: this does NOT close the unpaired-UTF-16-surrogate crash
-    (R15-F2 consequence 1) — a lone surrogate is category ``Cs``, not
-    one of the hidden-format categories the sanitizer strips, so it
-    round-trips through unchanged. That is guarded separately and
-    explicitly on ``email`` (see ``_reject_unencodable_str``) plus a
-    widened exception catch at every write site — defense in depth, not
-    either/or.
+    NOTE (R16-F3 update): at the time R15-F2 wrote this, ``Cs``
+    (Surrogate) was NOT one of the hidden-format categories the
+    sanitizer stripped, so an unpaired UTF-16 surrogate round-tripped
+    through unchanged and needed a separate explicit reject-check on
+    ``email`` (formerly ``_reject_unencodable_str``, since removed as
+    dead code). R15-F1 — merged in the same round, into this exact
+    shared sanitizer — widened ``_HIDDEN_FORMAT_CATEGORIES`` to include
+    ``Cs``, so THIS call now DOES close the unpaired-surrogate crash:
+    the surrogate is silently stripped here, same as any other hidden-
+    format character. The widened exception catch at every write site
+    (``except (UnicodeEncodeError, ValueError)``) stays as a regression
+    backstop in case a future edit narrows the category set again.
     """
     raw = await req.read()
     if not raw:
@@ -673,40 +678,30 @@ def _reject_non_str(value: Any, field: str, *, allow_none: bool) -> str | None:
     return None
 
 
-def _reject_unencodable_str(value: str | None, field: str) -> str | None:
-    """Guard a free-text string field against content that cannot
-    round-trip through UTF-8 (R15-F2).
-
-    ``json.loads`` happily decodes a JSON ``\\ud800``-style escape into a
-    lone-surrogate Python ``str`` — valid Python, but not valid Unicode
-    text. ``sanitize_json_input``'s hidden-Unicode strip (R13-F2/R14-F3)
-    does NOT catch this: an unpaired surrogate is Unicode category
-    ``Cs`` (Surrogate), not one of the ``Cf``/``Zl``/``Zp`` hidden-format
-    categories the sanitizer strips, nor a variation selector. Left
-    unchecked it reaches the SQLite TEXT bind and raises a raw
-    ``UnicodeEncodeError`` deep inside the driver — this rejects it here
-    instead, with the same clean 400 ``validation_error`` envelope every
-    other malformed field gets. Explicit content-level guard requested
-    as defense in depth alongside the sanitizer wiring, not instead of
-    it — a future refactor that bypasses ``_json_body`` would still hit
-    this.
-
-    Only ``email`` on this surface is unconstrained free text; every
-    other string field (``username``, group ``name``, ``role``,
-    capability strings) is already regex- or enum-validated to a set
-    that can never contain a surrogate, so this is called selectively
-    rather than folded into ``_reject_non_str`` itself.
-    """
-    if value is None:
-        return None
-    try:
-        value.encode("utf-8", "strict")
-    except UnicodeEncodeError:
-        return (
-            f"{field} contains a character that cannot be represented "
-            "in UTF-8 (e.g. an unpaired surrogate)"
-        )
-    return None
+# R16-F3: ``_reject_unencodable_str()`` (a pre-write guard rejecting a
+# free-text field with a 400 when it couldn't round-trip through UTF-8)
+# used to live here, added by R15-F2 to catch an unpaired UTF-16
+# surrogate in ``email`` before it reached the SQLite TEXT bind and
+# raised a raw ``UnicodeEncodeError``. R15-F1 (merged in the SAME
+# round, into the SAME sanitizer both PRs shared — see the
+# cross-PR-interaction comment on ``_HIDDEN_FORMAT_CATEGORIES`` in
+# ``utils/json_utils.py``) widened that shared sanitizer to strip
+# category ``Cs`` (Surrogate) from every string leaf, unconditionally,
+# for every value that passes through ``sanitize_json_input`` --
+# exhaustively verified (every codepoint 0x0-0x10FFFF) that ``Cs`` is
+# the ONLY category whose members fail ``str.encode("utf-8", "strict")``.
+# Both of this function's call sites (``create_user_handler``,
+# ``edit_user_handler``) read their body via ``_json_body``, which
+# always calls ``sanitize_json_input`` first -- so by the time either
+# handler could call this, ``body["email"]`` can no longer contain an
+# unencodable character; the guard was provably unreachable dead code.
+# Removed rather than left in place per this project's "explain, don't
+# silently delete OR silently leave dead code" convention (see the PR
+# description for the full reasoning). The raw-bind ``except
+# (UnicodeEncodeError, ValueError)`` backstops around the actual
+# INSERT/UPDATE below stay -- they guard a genuinely different failure
+# moment (the DB bind itself) and remain a real regression backstop if
+# a future edit ever breaks the sanitizer wiring upstream.
 
 
 def _parse_bool_field(
@@ -853,9 +848,6 @@ async def create_user_handler(req: web.Request) -> web.Response:
     email_err = _reject_non_str(email, "email", allow_none=True)
     if email_err is not None:
         return _error(error=_ERROR_VALIDATION, message=email_err, status=400)
-    email_err = _reject_unencodable_str(email, "email")
-    if email_err is not None:
-        return _error(error=_ERROR_VALIDATION, message=email_err, status=400)
 
     user_id = secrets.token_hex(8)
     password_hash = identity.hash_password(password)
@@ -880,12 +872,15 @@ async def create_user_handler(req: web.Request) -> web.Response:
                 status=409,
             )
         except (UnicodeEncodeError, ValueError) as e:
-            # R15-F2 defensive backstop: ``_reject_unencodable_str`` above
-            # should already have caught this, but a future refactor that
-            # skips it (or a field that gains free-text content later)
-            # must not let a raw UnicodeEncodeError escape as a bare 500 —
-            # same posture as ``tools/registry.py``'s broad ``except
-            # Exception`` degrading the identical payload on the MCP path.
+            # R15-F2 defensive backstop, kept post-R16-F3 as a
+            # regression guard: ``_json_body``'s sanitizer above should
+            # already have stripped anything unencodable, but a future
+            # refactor that narrows ``_HIDDEN_FORMAT_CATEGORIES`` or
+            # bypasses the sanitizer (or a field that gains free-text
+            # content later) must not let a raw UnicodeEncodeError
+            # escape as a bare 500 — same posture as ``tools/registry.py``'s
+            # broad ``except Exception`` degrading the identical payload
+            # on the MCP path.
             logger.warning("create_user insert failed: %s", e)
             return _error(
                 error=_ERROR_VALIDATION,
@@ -945,15 +940,12 @@ async def edit_user_handler(req: web.Request) -> web.Response:
         params.append(1 if is_sysadmin_val else 0)
     if "email" in body:
         # email is nullable (setting None clears it); reject structured
-        # JSON types before the write lock (PF-R7-1), and reject content
-        # that can't round-trip through UTF-8 (R15-F2) before the write
-        # lock too.
+        # JSON types before the write lock (PF-R7-1). Unencodable
+        # content (an unpaired surrogate) no longer needs a separate
+        # reject-check here -- see the R16-F3 comment where
+        # ``_reject_unencodable_str`` used to be defined, above, for
+        # why that guard was removed as provably dead code post-R15-F1.
         email_err = _reject_non_str(body["email"], "email", allow_none=True)
-        if email_err is not None:
-            return _error(
-                error=_ERROR_VALIDATION, message=email_err, status=400,
-            )
-        email_err = _reject_unencodable_str(body["email"], "email")
         if email_err is not None:
             return _error(
                 error=_ERROR_VALIDATION, message=email_err, status=400,
@@ -1000,11 +992,11 @@ async def edit_user_handler(req: web.Request) -> web.Response:
             )
         except (UnicodeEncodeError, ValueError) as e:
             # R15-F2: this UPDATE had NO exception handling at all
-            # pre-fix — a bare 500. ``_reject_unencodable_str`` above
-            # should already have caught an unpaired surrogate in
-            # ``email``; this is the same defensive backstop
-            # ``create_user_handler`` gets, so a future refactor can't
-            # reopen the crash silently.
+            # pre-fix — a bare 500. Post-R15-F1, ``_json_body``'s
+            # sanitizer above should already have stripped an unpaired
+            # surrogate in ``email``; this is the same defensive
+            # backstop ``create_user_handler`` gets, so a future
+            # refactor can't reopen the crash silently.
             conn.execute("ROLLBACK")
             logger.warning("edit_user update failed: %s", e)
             return _error(
@@ -1602,9 +1594,12 @@ async def add_group_member_handler(req: web.Request) -> web.Response:
             # R15-F2: an unpaired surrogate in ``user_id``/``group_id``
             # fails the UTF-8 bind BEFORE the FK/UNIQUE check ever runs,
             # so it isn't an ``IntegrityError`` — a real gap distinct
-            # from the two callers guarded by ``_reject_unencodable_str``
-            # (this handler only rejects structured JSON types via
-            # ``_reject_non_str``, not unencodable string content).
+            # from ``create_user_handler``/``edit_user_handler``'s
+            # ``email`` field (this handler only rejects structured
+            # JSON types via ``_reject_non_str``, not unencodable string
+            # content). Post-R15-F1 the sanitizer strips this upstream
+            # too, same as ``email``; this stays as a regression
+            # backstop for the same reason the sibling ones do.
             conn.execute("ROLLBACK")
             logger.warning("add_group_member insert failed: %s", e)
             return _error(
