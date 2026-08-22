@@ -202,6 +202,18 @@ def _first_oversized_string_path(
     the given schema shape is simply not checked here — jsonschema's
     own validation is the source of truth for shape correctness, this
     is only a length backstop).
+
+    R9-F1: an object/array schema node with NO ``properties``/``items``
+    key at all — the "any JSON-serializable value" shape used by
+    ``anyOf``/``oneOf`` alternatives like a bare ``{"type": "object"}``
+    — has no per-key schema to walk, but that must not mean the
+    subtree goes unchecked: it falls through to
+    :func:`_first_oversized_string_path_unbound`, which walks the
+    RUNTIME VALUE directly and applies ``DEFAULT_STRING_MAX_LEN`` to
+    every string leaf found, however deeply nested. A schema that DOES
+    declare ``properties`` but simply omits a given key (permissive
+    ``additionalProperties``) keeps the old skip — that shape gap is
+    jsonschema's contract to enforce, not this backstop's.
     """
     if not isinstance(schema, dict):
         return None
@@ -237,24 +249,88 @@ def _first_oversized_string_path(
         return None
 
     if isinstance(value, dict):
-        props = schema.get("properties") or {}
+        raw_props = schema.get("properties")
+        # R9-F1: a schema node with NO `properties` key at all is the
+        # "any JSON-serializable value" shape (e.g. an anyOf/oneOf
+        # alternative of a bare {"type": "object"}) -- there is no
+        # per-key schema to consult, but that does NOT mean the
+        # subtree is unconstrained: every string leaf inside it still
+        # owes DEFAULT_STRING_MAX_LEN. Only a schema that explicitly
+        # declares `properties` (and simply omits this particular key,
+        # i.e. relies on default-permissive `additionalProperties`)
+        # falls back to the old skip -- that's jsonschema's shape
+        # contract to enforce, not this backstop's.
+        has_declared_props = isinstance(raw_props, dict)
+        props = raw_props if has_declared_props else {}
         for key, sub_value in value.items():
             sub_schema = props.get(key)
-            if not isinstance(sub_schema, dict):
+            if isinstance(sub_schema, dict):
+                hit = _first_oversized_string_path(
+                    sub_value, sub_schema, f"{path}.{key}" if path else key
+                )
+            elif has_declared_props:
                 continue
-            hit = _first_oversized_string_path(
-                sub_value, sub_schema, f"{path}.{key}" if path else key
-            )
+            else:
+                hit = _first_oversized_string_path_unbound(
+                    sub_value, f"{path}.{key}" if path else key
+                )
             if hit:
                 return hit
         return None
 
     if isinstance(value, list):
         item_schema = schema.get("items")
-        if not isinstance(item_schema, dict):
+        if isinstance(item_schema, dict):
+            for idx, item in enumerate(value):
+                hit = _first_oversized_string_path(
+                    item, item_schema, f"{path}[{idx}]"
+                )
+                if hit:
+                    return hit
             return None
+        if "items" not in schema:
+            # R9-F1: same free-form shape as above -- a bare
+            # {"type": "array"} with no `items` at all.
+            for idx, item in enumerate(value):
+                hit = _first_oversized_string_path_unbound(item, f"{path}[{idx}]")
+                if hit:
+                    return hit
+            return None
+        return None
+
+    return None
+
+
+def _first_oversized_string_path_unbound(value: Any, path: str = "") -> Optional[str]:
+    """R9-F1 companion to :func:`_first_oversized_string_path`: walks a
+    RUNTIME VALUE with no schema at all to consult (the subtree under a
+    free-form "any JSON-serializable value" field -- a bare
+    ``{"type": "object"}``/``{"type": "array"}`` alternative with no
+    ``properties``/``items`` declared). Every string encountered is an
+    implicit "no declared maxLength" leaf, so it is checked against
+    :data:`agent_mcp.core.schema_limits.DEFAULT_STRING_MAX_LEN`
+    unconditionally; dicts and lists are recursed into unconditionally
+    too, however deeply nested -- there is no further schema shape
+    (oneOf/anyOf or otherwise) to pick a branch by, since the value is,
+    by construction, unconstrained JSON.
+    """
+    if isinstance(value, str):
+        if len(value) > _DEFAULT_STRING_MAX_LEN:
+            return path or "<value>"
+        return None
+
+    if isinstance(value, dict):
+        for key, sub_value in value.items():
+            hit = _first_oversized_string_path_unbound(
+                sub_value, f"{path}.{key}" if path else key
+            )
+            if hit:
+                return hit
+        return None
+
+    if isinstance(value, list):
         for idx, item in enumerate(value):
-            hit = _first_oversized_string_path(item, item_schema, f"{path}[{idx}]")
+            hit = _first_oversized_string_path_unbound(item, f"{path}[{idx}]")
             if hit:
                 return hit
         return None
