@@ -1680,13 +1680,24 @@ async def add_project_membership_handler(req: web.Request) -> web.Response:
     if denied is not None:
         return denied
     body = await _json_body(req)
-    # R6-F2: re-check against a LIVE DB read post-body-read (see
-    # create_user_handler's comment for the full race description) before
-    # trusting the caller for the ``_membership_grant_denied`` role-rank
-    # guard below (which reads ``req['principal']``).
-    from .perm_gates import revalidate_capability_or_403
+    # R9-F3 (HIGH, class-sweep gap R8-F3 (#674) missed): re-checking ONLY
+    # the capability half here (``perm_gates.revalidate_capability_or_403``)
+    # left the MEMBERSHIP half — ``_deny_cross_tenant_project_read`` above —
+    # validated ONLY at entry, before this body-read yield point. A
+    # delegate whose OWN project membership is revoked mid-flight (their
+    # coarse ``system.projects.manage`` capability untouched) resumed and
+    # reached the ``_membership_grant_denied`` role-rank guard below with a
+    # rich 403 instead of the SAME uniform 404 a genuine non-member gets —
+    # reopening exactly the existence/role oracle
+    # ``_deny_cross_tenant_project_read`` exists to close. Route through
+    # the SAME composed re-check R8-F3 built for its three admin_api.py
+    # siblings so both invariants are re-validated against one live
+    # snapshot, not two different points in time.
+    from .admin_api import _revalidate_capability_and_membership_or_403
 
-    denied = await revalidate_capability_or_403(req, "system.projects.manage")
+    denied = await _revalidate_capability_and_membership_or_403(
+        req, "system.projects.manage", project_name,
+    )
     if denied is not None:
         return denied
     user_id = body.get("user_id")
@@ -1778,13 +1789,17 @@ async def change_project_membership_role_handler(
         )
     kind, target_id = parsed
     body = await _json_body(req)
-    # R6-F2: re-check against a LIVE DB read post-body-read (see
-    # create_user_handler's comment for the full race description) before
-    # trusting the caller for the ``_membership_grant_denied`` role-rank
-    # guards below (which read ``req['principal']``).
-    from .perm_gates import revalidate_capability_or_403
+    # R9-F3 (HIGH, class-sweep gap R8-F3 (#674) missed): see the identical
+    # comment in ``add_project_membership_handler`` above — re-checking
+    # ONLY the capability half here left the MEMBERSHIP half validated
+    # once, pre-yield, reopening the existence/role oracle
+    # ``_deny_cross_tenant_project_read`` closes. Route through the same
+    # composed re-check R8-F3 built for its three admin_api.py siblings.
+    from .admin_api import _revalidate_capability_and_membership_or_403
 
-    denied = await revalidate_capability_or_403(req, "system.projects.manage")
+    denied = await _revalidate_capability_and_membership_or_403(
+        req, "system.projects.manage", project_name,
+    )
     if denied is not None:
         return denied
     role = body.get("role")
