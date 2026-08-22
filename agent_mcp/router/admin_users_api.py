@@ -62,6 +62,7 @@ from typing import Any, Iterable
 
 from aiohttp import web
 
+from ..utils.json_utils import sanitize_json_input
 from . import group_resolver, identity
 from .router_store import store
 from .single_tenant import bypasses_operator_gate
@@ -258,11 +259,42 @@ def _error(
 
 
 async def _json_body(req: web.Request) -> dict:
+    """Read + parse the request body — routed through the shared
+    ``sanitize_json_input`` chokepoint (R15-F2).
+
+    Pre-fix this called a bare ``json.loads(raw)``, the ONE JSON-body
+    surface in the codebase that never went through
+    ``utils.json_utils.sanitize_json_input`` — every sibling (MCP
+    ``tools/call`` via ``dispatch_tool_call``, the FastAPI
+    ``app/routers/*`` tier via ``get_sanitized_json_body``) strips C0/C1/
+    DEL control bytes and hidden/spoofing Unicode (R4-F3/R5-F8/R13-F2/
+    R14-F3) on every string leaf. Skipping it here let hidden-Unicode
+    spoofing characters (zero-width space, RTLO, …) survive unstripped
+    into ``email`` and get echoed back verbatim by ``GET /users``.
+
+    ``sanitize_json_input`` decodes bytes itself (UTF-8 with a latin-1
+    fallback) and raises ``ValueError`` on any parse failure — it never
+    raises ``json.JSONDecodeError`` directly, so the ``exc.msg`` special
+    case below is dead for this call site but kept for defensiveness (a
+    future ``sanitize_json_input`` change that raises a JSONDecodeError
+    subclass would still get the more precise message). ``RecursionError``
+    stays an explicit sibling: it can still surface from CPython's C
+    JSON decoder on a deeply nested body (PF-R20-1), and from the walk in
+    ``_strip_control_bytes`` on a deeply nested already-parsed structure.
+
+    NOTE: this does NOT close the unpaired-UTF-16-surrogate crash
+    (R15-F2 consequence 1) — a lone surrogate is category ``Cs``, not
+    one of the hidden-format categories the sanitizer strips, so it
+    round-trips through unchanged. That is guarded separately and
+    explicitly on ``email`` (see ``_reject_unencodable_str``) plus a
+    widened exception catch at every write site — defense in depth, not
+    either/or.
+    """
     raw = await req.read()
     if not raw:
         return {}
     try:
-        parsed = json.loads(raw)
+        parsed = sanitize_json_input(raw)
     except (ValueError, RecursionError) as exc:
         # Broaden to ValueError (was JSONDecodeError): an invalid-UTF8
         # body makes ``json.loads(bytes)`` raise ``UnicodeDecodeError``
@@ -641,6 +673,42 @@ def _reject_non_str(value: Any, field: str, *, allow_none: bool) -> str | None:
     return None
 
 
+def _reject_unencodable_str(value: str | None, field: str) -> str | None:
+    """Guard a free-text string field against content that cannot
+    round-trip through UTF-8 (R15-F2).
+
+    ``json.loads`` happily decodes a JSON ``\\ud800``-style escape into a
+    lone-surrogate Python ``str`` — valid Python, but not valid Unicode
+    text. ``sanitize_json_input``'s hidden-Unicode strip (R13-F2/R14-F3)
+    does NOT catch this: an unpaired surrogate is Unicode category
+    ``Cs`` (Surrogate), not one of the ``Cf``/``Zl``/``Zp`` hidden-format
+    categories the sanitizer strips, nor a variation selector. Left
+    unchecked it reaches the SQLite TEXT bind and raises a raw
+    ``UnicodeEncodeError`` deep inside the driver — this rejects it here
+    instead, with the same clean 400 ``validation_error`` envelope every
+    other malformed field gets. Explicit content-level guard requested
+    as defense in depth alongside the sanitizer wiring, not instead of
+    it — a future refactor that bypasses ``_json_body`` would still hit
+    this.
+
+    Only ``email`` on this surface is unconstrained free text; every
+    other string field (``username``, group ``name``, ``role``,
+    capability strings) is already regex- or enum-validated to a set
+    that can never contain a surrogate, so this is called selectively
+    rather than folded into ``_reject_non_str`` itself.
+    """
+    if value is None:
+        return None
+    try:
+        value.encode("utf-8", "strict")
+    except UnicodeEncodeError:
+        return (
+            f"{field} contains a character that cannot be represented "
+            "in UTF-8 (e.g. an unpaired surrogate)"
+        )
+    return None
+
+
 def _parse_bool_field(
     body: dict, field: str, *, default: bool = False,
 ) -> tuple[bool, str | None]:
@@ -785,6 +853,9 @@ async def create_user_handler(req: web.Request) -> web.Response:
     email_err = _reject_non_str(email, "email", allow_none=True)
     if email_err is not None:
         return _error(error=_ERROR_VALIDATION, message=email_err, status=400)
+    email_err = _reject_unencodable_str(email, "email")
+    if email_err is not None:
+        return _error(error=_ERROR_VALIDATION, message=email_err, status=400)
 
     user_id = secrets.token_hex(8)
     password_hash = identity.hash_password(password)
@@ -807,6 +878,19 @@ async def create_user_handler(req: web.Request) -> web.Response:
                 error=_ERROR_CONFLICT,
                 message=f"username {username!r} already exists",
                 status=409,
+            )
+        except (UnicodeEncodeError, ValueError) as e:
+            # R15-F2 defensive backstop: ``_reject_unencodable_str`` above
+            # should already have caught this, but a future refactor that
+            # skips it (or a field that gains free-text content later)
+            # must not let a raw UnicodeEncodeError escape as a bare 500 —
+            # same posture as ``tools/registry.py``'s broad ``except
+            # Exception`` degrading the identical payload on the MCP path.
+            logger.warning("create_user insert failed: %s", e)
+            return _error(
+                error=_ERROR_VALIDATION,
+                message="could not create user: invalid field content",
+                status=400,
             )
         row = conn.execute(
             "SELECT user_id, username, email, is_sysadmin, "
@@ -861,8 +945,15 @@ async def edit_user_handler(req: web.Request) -> web.Response:
         params.append(1 if is_sysadmin_val else 0)
     if "email" in body:
         # email is nullable (setting None clears it); reject structured
-        # JSON types before the write lock (PF-R7-1).
+        # JSON types before the write lock (PF-R7-1), and reject content
+        # that can't round-trip through UTF-8 (R15-F2) before the write
+        # lock too.
         email_err = _reject_non_str(body["email"], "email", allow_none=True)
+        if email_err is not None:
+            return _error(
+                error=_ERROR_VALIDATION, message=email_err, status=400,
+            )
+        email_err = _reject_unencodable_str(body["email"], "email")
         if email_err is not None:
             return _error(
                 error=_ERROR_VALIDATION, message=email_err, status=400,
@@ -902,10 +993,25 @@ async def edit_user_handler(req: web.Request) -> web.Response:
             conn.execute("ROLLBACK")
             return _last_sysadmin_error("demote")
         params.append(user_id)
-        conn.execute(
-            f"UPDATE users SET {', '.join(sets)} WHERE user_id = ?",
-            params,
-        )
+        try:
+            conn.execute(
+                f"UPDATE users SET {', '.join(sets)} WHERE user_id = ?",
+                params,
+            )
+        except (UnicodeEncodeError, ValueError) as e:
+            # R15-F2: this UPDATE had NO exception handling at all
+            # pre-fix — a bare 500. ``_reject_unencodable_str`` above
+            # should already have caught an unpaired surrogate in
+            # ``email``; this is the same defensive backstop
+            # ``create_user_handler`` gets, so a future refactor can't
+            # reopen the crash silently.
+            conn.execute("ROLLBACK")
+            logger.warning("edit_user update failed: %s", e)
+            return _error(
+                error=_ERROR_VALIDATION,
+                message="could not update user: invalid field content",
+                status=400,
+            )
         row = conn.execute(
             "SELECT user_id, username, email, is_sysadmin, "
             "created_at, last_login_at FROM users WHERE user_id = ?",
@@ -1057,6 +1163,17 @@ async def create_group_handler(req: web.Request) -> web.Response:
                 message=f"group name {name!r} already exists",
                 status=409,
             )
+        except (UnicodeEncodeError, ValueError) as e:
+            # R15-F2 defensive backstop (see create_user_handler). ``name``
+            # is regex-validated above so this shouldn't be reachable
+            # today, but a future field addition to this INSERT must not
+            # silently reopen a bare-500 crash.
+            logger.warning("create_group insert failed: %s", e)
+            return _error(
+                error=_ERROR_VALIDATION,
+                message="could not create group: invalid field content",
+                status=400,
+            )
         row = conn.execute(
             "SELECT group_id, name, is_sysadmin, created_at "
             "FROM groups WHERE group_id = ?",
@@ -1159,6 +1276,18 @@ async def edit_group_handler(req: web.Request) -> web.Response:
                 error=_ERROR_CONFLICT,
                 message="group name already taken",
                 status=409,
+            )
+        except (UnicodeEncodeError, ValueError) as e:
+            # R15-F2 defensive backstop (see edit_user_handler). ``name``
+            # is regex-validated above so this shouldn't be reachable
+            # today, but a future field addition to this UPDATE must not
+            # silently reopen a bare-500 crash.
+            conn.execute("ROLLBACK")
+            logger.warning("edit_group update failed: %s", e)
+            return _error(
+                error=_ERROR_VALIDATION,
+                message="could not update group: invalid field content",
+                status=400,
             )
         # R5-F4: re-evaluate the GLOBAL invariant AFTER the UPDATE has
         # already cleared the flag — the transitive-graph-aware sibling of
@@ -1469,6 +1598,20 @@ async def add_group_member_handler(req: web.Request) -> web.Response:
                 message="could not add member",
                 status=400,
             )
+        except (UnicodeEncodeError, ValueError) as e:
+            # R15-F2: an unpaired surrogate in ``user_id``/``group_id``
+            # fails the UTF-8 bind BEFORE the FK/UNIQUE check ever runs,
+            # so it isn't an ``IntegrityError`` — a real gap distinct
+            # from the two callers guarded by ``_reject_unencodable_str``
+            # (this handler only rejects structured JSON types via
+            # ``_reject_non_str``, not unencodable string content).
+            conn.execute("ROLLBACK")
+            logger.warning("add_group_member insert failed: %s", e)
+            return _error(
+                error=_ERROR_VALIDATION,
+                message="could not add member: invalid field content",
+                status=400,
+            )
     finally:
         conn.close()
     member: dict[str, Any] = {}
@@ -1749,6 +1892,17 @@ async def add_project_membership_handler(req: web.Request) -> web.Response:
                 error=_ERROR_CONFLICT,
                 message="could not add membership",
                 status=409,
+            )
+        except (UnicodeEncodeError, ValueError) as e:
+            # R15-F2: an unpaired surrogate in ``user_id``/``group_id``
+            # fails the UTF-8 bind BEFORE the FK/UNIQUE check ever runs,
+            # so it isn't an ``IntegrityError`` (see add_group_member_
+            # handler's identical sibling gap).
+            logger.warning("add_project_membership insert failed: %s", e)
+            return _error(
+                error=_ERROR_VALIDATION,
+                message="could not add membership: invalid field content",
+                status=400,
             )
     finally:
         conn.close()

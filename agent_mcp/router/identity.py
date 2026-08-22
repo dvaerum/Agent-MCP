@@ -49,6 +49,7 @@ from typing import Any, Iterator
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError, InvalidHashError
 
+from ..utils.json_utils import _strip_control_bytes
 from .migrations_runner import (
     get_router_db_path,
     run_router_migrations_upgrade,
@@ -61,6 +62,7 @@ __all__ = [
     "DEFAULT_SESSION_LIFETIME_DAYS",
     "PASSWORD_MIN_LENGTH",
     "IdentityError",
+    "InvalidEmailError",
     "UsernameAlreadyExistsError",
     "WeakPasswordError",
     "add_project_membership",
@@ -103,6 +105,22 @@ class IdentityError(Exception):
 
 class UsernameAlreadyExistsError(IdentityError):
     """Raised by create_user when the username UNIQUE constraint fails."""
+
+
+class InvalidEmailError(IdentityError):
+    """Raised by ``create_user`` when ``email`` cannot round-trip through
+    UTF-8 (R15-F2 sibling).
+
+    ``email`` on this path is frequently IdP-claim-derived (the SSO JIT-
+    create fork in ``sso.find_or_create_sso_user``) rather than REST-body
+    JSON, so it never passes through ``admin_users_api._json_body``'s
+    sanitizer wiring or its ``_reject_unencodable_str`` guard. A JIT
+    email carrying an unpaired UTF-16 surrogate (however it got there —
+    a malicious/misconfigured IdP, a claim-mapping bug) would otherwise
+    crash the SQLite TEXT bind on the INSERT below with a raw
+    ``UnicodeEncodeError``, exactly like the REST-layer crash this
+    mirrors.
+    """
 
 
 class WeakPasswordError(IdentityError):
@@ -416,7 +434,28 @@ def create_user(
     user is only auto-crowned when the operator opted in). ``is_sysadmin``
     forces the bit on regardless of table emptiness (the proxy-header
     ``default_is_sysadmin`` path).
+
+    ``email`` sanitizer wiring (R15-F2 sibling): this is the ONLY
+    ``create_user`` caller — CLI bootstrap, the setup wizard, AND
+    ``sso.find_or_create_sso_user``'s JIT-create fork — that writes
+    ``email`` to the DB, so it's stripped of the same hidden/spoofing
+    Unicode ``admin_users_api._json_body`` strips on the REST path
+    (``_strip_control_bytes``) and checked for UTF-8 round-trip-ability
+    here, once, for every caller. The IdP-claim-derived SSO path in
+    particular never goes anywhere near ``admin_users_api``'s sanitizer
+    wiring, so without this an unpaired UTF-16 surrogate in an IdP's
+    ``email`` claim would crash the INSERT below exactly like the
+    REST-layer bug this mirrors.
     """
+    if email is not None:
+        email = _strip_control_bytes(email)
+        try:
+            email.encode("utf-8", "strict")
+        except UnicodeEncodeError as e:
+            raise InvalidEmailError(
+                "email contains a character that cannot be represented "
+                "in UTF-8 (e.g. an unpaired surrogate)"
+            ) from e
     user_id = secrets.token_hex(8)  # 16 hex chars
     if password_hash is None and password is not None:
         password_hash = hash_password(password)
@@ -470,6 +509,17 @@ def create_user(
             # open IMMEDIATE transaction before the error propagates.
             raise UsernameAlreadyExistsError(
                 f"username {username!r} already exists"
+            ) from e
+        except UnicodeEncodeError as e:
+            # R15-F2 defensive backstop: the pre-check above should
+            # already have caught an unpaired surrogate in ``email``,
+            # but this converts a raw ``UnicodeEncodeError`` at the bind
+            # site into the same typed error regardless — a future
+            # refactor that skips the pre-check must not let this
+            # escape as an opaque, undocumented exception type.
+            raise InvalidEmailError(
+                "email contains a character that cannot be represented "
+                "in UTF-8 (e.g. an unpaired surrogate)"
             ) from e
 
         if was_empty:
