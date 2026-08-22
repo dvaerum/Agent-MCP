@@ -448,3 +448,174 @@ def test_legitimate_single_diacritic_accented_text_unchanged() -> None:
     given = {"task_title": text}
     result = sanitize_json_input(given)
     assert result["task_title"] == text
+
+
+# ---------------------------------------------------------------------
+# R15-F1 — R14-F3 covered `Cf`/`Zl`/`Zp` plus variation selectors and
+# capped `Mn`/`Me` combining-mark runs, but never considered category
+# `Cs` (Surrogate). A lone/unpaired UTF-16 surrogate code point (e.g.
+# from a JSON `\udXXX` escape not followed by a valid low-surrogate
+# partner) parses fine under `json.loads()` as a real Python string
+# character -- `unicodedata.category('\ud800')` is `'Cs'`, which is in
+# neither `_HIDDEN_FORMAT_CATEGORIES` nor the combining-mark categories,
+# so it survives `sanitize_json_input` completely untouched. A lone
+# surrogate is not valid UTF-8 -- `'\ud800'.encode('utf-8')` raises
+# `UnicodeEncodeError: surrogates not allowed` -- and SQLite's TEXT
+# binding needs a UTF-8-encodable string, so any authenticated write of
+# a free-text field containing an unpaired surrogate escape crashes
+# with an unhandled `UnicodeEncodeError` inside the storage transaction
+# instead of being cleanly sanitized or rejected with a 400.
+#
+# Confirmed live:
+#   POST /agent-mcp/api/<project>/tasks
+#   {"task_title": "surrogate\\ud800test", "task_description": "x"}
+#   -> HTTP 500 {"error":"Failed to create task"}
+#
+# Fix: strip (not cap) any character with `unicodedata.category(ch) ==
+# "Cs"` in `_strip_hidden_unicode` -- same treatment as `Cf`, NOT the
+# cap-not-strip treatment used for combining marks, since a lone
+# surrogate has zero legitimate use in JSON string content.
+#
+# Critical non-regression: a genuine surrogate PAIR (e.g. an emoji like
+# "\U0001F600" / 😀) round-trips fine through `json.loads()` -- Python
+# combines the pair into ONE valid non-`Cs` astral-plane code point
+# before the sanitizer ever sees it -- and must NOT be touched by this
+# fix.
+# ---------------------------------------------------------------------
+
+_LONE_HIGH_SURROGATE = "\ud800"  # unpaired high surrogate
+_LONE_LOW_SURROGATE = "\udc00"  # unpaired low surrogate
+_EMOJI = "\U0001f600"  # 😀 -- a genuine (already-combined) astral code point
+
+
+def test_lone_surrogate_survives_unstripped_before_fix() -> None:
+    """RED: documents the pre-fix bug -- a lone high surrogate is
+    category `Cs`, which `_strip_hidden_unicode` does not touch, so it
+    currently survives `sanitize_json_input` completely unstripped."""
+    assert unicodedata.category(_LONE_HIGH_SURROGATE) == "Cs"
+    given = {"task_title": f"surrogate{_LONE_HIGH_SURROGATE}test"}
+    result = sanitize_json_input(given)
+    # This assertion is the RED: it currently survives (pre-fix), and
+    # once fixed it must be stripped (see test_lone_surrogate_stripped
+    # below for the GREEN version of this exact scenario).
+    assert _LONE_HIGH_SURROGATE not in result["task_title"], (
+        "lone surrogate must be stripped by _strip_hidden_unicode "
+        f"(R15-F1): {result['task_title']!r}"
+    )
+
+
+def test_lone_high_and_low_surrogates_stripped() -> None:
+    """Both lone high (`\\ud800`-`\\udbff`) and lone low
+    (`\\udc00`-`\\udfff`) surrogates must be stripped."""
+    for surrogate in (_LONE_HIGH_SURROGATE, _LONE_LOW_SURROGATE):
+        given = {"task_title": f"a{surrogate}b"}
+        result = sanitize_json_input(given)
+        assert surrogate not in result["task_title"]
+        assert result["task_title"] == "ab"
+
+
+def test_lone_surrogate_from_json_escape_stripped() -> None:
+    """Exact confirmed repro shape: a `\\udXXX`-style JSON escape not
+    followed by a valid low-surrogate partner, on Step 1's well-formed
+    JSON fast path."""
+    raw = '{"task_title": "surrogate\\ud800test"}'
+    result = sanitize_json_input(raw)
+    assert _LONE_HIGH_SURROGATE not in result["task_title"]
+    assert result["task_title"] == "surrogatetest"
+    # The stripped result must be UTF-8-encodable -- the actual failure
+    # mode this bug caused downstream (SQLite TEXT binding).
+    result["task_title"].encode("utf-8")
+
+
+def test_genuine_surrogate_pair_emoji_unaffected() -> None:
+    """CRITICAL non-regression: a genuine surrogate PAIR (a real emoji)
+    must NOT be touched. Python combines the UTF-16 surrogate pair into
+    one valid astral-plane code point before `json.loads()` ever
+    returns it, so this is not category `Cs` and must survive
+    byte-for-byte."""
+    assert unicodedata.category(_EMOJI) != "Cs"
+    given = {"task_title": f"safe{_EMOJI}end"}
+    result = sanitize_json_input(given)
+    assert result["task_title"] == f"safe{_EMOJI}end"
+    assert _EMOJI in result["task_title"]
+    result["task_title"].encode("utf-8")  # must remain encodable
+
+
+def test_genuine_surrogate_pair_emoji_via_json_escapes_unaffected() -> None:
+    """Same non-regression, but via the exact JSON escape form (a valid
+    high+low surrogate pair) that `json.loads()` combines into the
+    emoji before the sanitizer ever runs."""
+    raw = '{"task_title": "safe\\ud83d\\ude00end"}'
+    result = sanitize_json_input(raw)
+    assert result["task_title"] == f"safe{_EMOJI}end"
+    result["task_title"].encode("utf-8")
+
+
+@pytest.mark.asyncio
+async def test_live_task_creation_with_lone_surrogate_no_500(
+    tmp_path,
+) -> None:
+    """Live REST repro: POSTing a task title carrying a lone/unpaired
+    surrogate must not crash the create-task transaction with an
+    unhandled UnicodeEncodeError (bare 500) -- it must be cleanly
+    sanitized and the task created successfully.
+
+    Deliberately NOT using httpx's ``json=`` kwarg here: httpx
+    serializes that client-side via ``json.dumps(..., ensure_ascii=
+    False)`` and then tries to ``.encode('utf-8')`` the result itself,
+    which raises ``UnicodeEncodeError`` *before the request is even
+    sent* -- that's an artifact of the test client, not the bug. The
+    real-world repro (curl / any raw HTTP client) sends the literal
+    ASCII escape-sequence text ``\\ud800`` over the wire; the server
+    decodes that as plain UTF-8 (trivially valid, it's pure ASCII) and
+    only turns it into an actual lone-surrogate Python character once
+    ``json.loads()`` parses it server-side. Sending raw ``content=``
+    bytes reproduces that exact server-side code path."""
+    async with mcp_session(tmp_path) as admin:
+        raw_body = (
+            b'{"task_title": "surrogate\\ud800test", '
+            b'"task_description": "repro R15-F1"}'
+        )
+        r = admin.post(
+            "/api/tasks",
+            content=raw_body,
+            headers={"Content-Type": "application/json"},
+        )
+        assert r.status_code == 200, r.text
+        payload = r.json()
+        task_id = payload["task_id"]
+
+        listing = admin.client.get("/api/tasks").json()
+        matches = [t for t in listing if t.get("task_id") == task_id]
+        assert matches, f"task {task_id} not found in listing"
+        title = matches[0]["title"]
+        assert _LONE_HIGH_SURROGATE not in title, (
+            f"lone surrogate persisted verbatim: {title!r}"
+        )
+        assert title == "surrogatetest", title
+
+
+@pytest.mark.asyncio
+async def test_live_task_creation_with_genuine_emoji_unaffected(
+    tmp_path,
+) -> None:
+    """Non-regression through the live REST path: a real emoji (genuine
+    surrogate pair) in a task title must be created and persisted
+    unchanged."""
+    async with mcp_session(tmp_path) as admin:
+        r = admin.post(
+            "/api/tasks",
+            json={
+                "task_title": f"party{_EMOJI}time",
+                "task_description": "repro R15-F1 non-regression",
+            },
+        )
+        assert r.status_code == 200, r.text
+        payload = r.json()
+        task_id = payload["task_id"]
+
+        listing = admin.client.get("/api/tasks").json()
+        matches = [t for t in listing if t.get("task_id") == task_id]
+        assert matches, f"task {task_id} not found in listing"
+        title = matches[0]["title"]
+        assert title == f"party{_EMOJI}time", title
