@@ -131,7 +131,7 @@ async def test_slow_drip_edit_user_rejects_logged_out_session(
     """
     from agent_mcp.router import admin_users_api
 
-    dev_id = _seed_user("dev-r9f4", is_sysadmin=True)
+    _seed_user("dev-r9f4", is_sysadmin=True)
     victim_id = _seed_user("victim-r9f4", is_sysadmin=False)
 
     client = await aiohttp_client(router_app)
