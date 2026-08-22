@@ -19,14 +19,25 @@ missed the terminal carve-out the canonical unassign producers enforce:
 The fix mirrors those producers: when clearing an assignment, ONLY
 transition status -> 'unassigned' AND fire the unassigned fanout if the
 task's CURRENT status is NOT terminal
-(``{'completed','cancelled','failed'}``). A terminal task may still have
-its ``assigned_to`` cleared, but keeps its terminal status and fires NO
-unassigned notify.
+(``{'completed','cancelled','failed'}``).
 
 RED on origin/main (terminal task -> 'unassigned' + notify fires =
 resurrection); GREEN after the carve-out. The non-terminal BL-R16-1
 behavior (pending / in_progress clear -> 'unassigned' + notify) is
 preserved.
+
+R12-F5 SUPERSESSION: this file originally asserted that a terminal
+task's ``assigned_to`` could still be cleared (200, status preserved,
+no fanout) — BL-R17-1 deliberately allowed that as the one exception to
+the terminal-sink guard. R12-F5 closed that exception: the WHOLE
+clearing operation is now refused (non-2xx) on an already-terminal
+task, not just the status-flip/fanout half of it, so ``assigned_to`` is
+left untouched too. See
+``tests/router/test_sec_r12_clear_assignment_terminal_sink.py`` for the
+full rationale and the combined-call (``status`` + ``assigned_to`` in
+one request) regression coverage. The two terminal-carve-out tests
+below are updated in place to assert the current (post-R12-F5)
+behavior rather than duplicated into the new file.
 """
 
 from __future__ import annotations
@@ -114,19 +125,29 @@ async def test_clear_assignment_keeps_terminal_status(
     tmp_path, terminal_status,
 ) -> None:
     """Clearing a TERMINAL task's assignee must NOT flip it back to
-    'unassigned' — that would resurrect already-finished work."""
+    'unassigned' — that would resurrect already-finished work.
+
+    Post-R12-F5: the whole clear is refused on an already-terminal
+    task (see the module docstring), so this is trivially true — status
+    (and now ``assigned_to`` too) stay untouched."""
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("alice")
         task_id = await _create_task(admin, assigned_to="alice")
         _force_status(task_id, terminal_status, "alice")
 
         r = _clear_assignment(admin, task_id, None)
-        assert r.status_code == 200, r.text
+        assert r.status_code != 200, (
+            f"clearing a {terminal_status!r} task's assignee must be "
+            f"refused (R12-F5), got {r.status_code}: {r.text}"
+        )
 
         row = _row("tasks", "task_id = ?", (task_id,))
         assert row["status"] == terminal_status, (
             f"clearing a {terminal_status!r} task's assignee must keep its "
             f"terminal status, got {row['status']!r} (resurrection)"
+        )
+        assert row["assigned_to"] == "alice", (
+            "R12-F5: a refused clear must not strip assigned_to either"
         )
 
 
@@ -136,7 +157,11 @@ async def test_clear_assignment_terminal_does_not_fire_unassigned(
 ) -> None:
     """Clearing a TERMINAL task's assignee must NOT fan out
     ``unassigned_task_appeared`` — no worker should be woken to re-run
-    finished work."""
+    finished work.
+
+    Post-R12-F5: the clear is refused outright, so the fanout trivially
+    never fires — kept as a named regression so a future loosening of
+    the F5 guard can't silently reintroduce the fanout either."""
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("alice")
         task_id = await _create_task(admin, assigned_to="alice")
@@ -145,7 +170,7 @@ async def test_clear_assignment_terminal_does_not_fire_unassigned(
         unassigned, _notified = _install_spies(monkeypatch)
 
         r = _clear_assignment(admin, task_id, None)
-        assert r.status_code == 200, r.text
+        assert r.status_code != 200, r.text
 
         fired_ids = list(unassigned)
         assert task_id not in fired_ids, (
