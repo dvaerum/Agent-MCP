@@ -138,9 +138,9 @@ def reset_and_snapshot_globals() -> Callable[[], None]:
     # to a tmp DB that's about to be torn down) would otherwise leak
     # into the next test that happens to build an identical filter/sort
     # cache key. Clear all three on both sides of a test.
-    from agent_mcp.tools.task_tools import _VIEW_TASKS_PAGINATION_CACHE
     from agent_mcp.repositories.agent_repository import AgentRepository
     from agent_mcp.repositories.message_repository import MessageRepository
+    from agent_mcp.tools.task_tools import _VIEW_TASKS_PAGINATION_CACHE
 
     _VIEW_TASKS_PAGINATION_CACHE.clear()
     AgentRepository._pagination_cache.clear()

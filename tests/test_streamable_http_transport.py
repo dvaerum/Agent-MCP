@@ -449,8 +449,7 @@ async def test_post_mcp_float_id_returns_400_invalid_request(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
         for id_literal in ("1.5", "-1.5", "0.0", "1e10", "-1e10", "1e30", "2e-3"):
             body = (
-                '{"jsonrpc":"2.0","id":%s,"method":"tools/list","params":{}}'
-                % id_literal
+                f'{{"jsonrpc":"2.0","id":{id_literal},"method":"tools/list","params":{{}}}}'
             ).encode()
             r = _post_mcp_raw(
                 admin.client,
@@ -477,10 +476,7 @@ async def test_post_mcp_huge_bare_integer_id_unaffected_by_id_guard(
         huge_int = 10**30
         r = _post_mcp_raw(
             admin.client,
-            (
-                '{"jsonrpc":"2.0","id":%d,"method":"tools/list","params":{}}'
-                % huge_int
-            ).encode(),
+            (f'{{"jsonrpc":"2.0","id":{huge_int},"method":"tools/list","params":{{}}}}').encode(),
             headers={"Authorization": f"Bearer {admin.admin_token}"},
         )
         assert r.status_code == 200, r.text

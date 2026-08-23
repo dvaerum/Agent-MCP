@@ -33,7 +33,7 @@ message a well-formed call would have gotten.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any
 
 import pytest
 
@@ -148,7 +148,7 @@ async def test_malformed_call_to_policy_gated_tool_by_disallowed_worker_is_denie
 
     @requires_policy(toggle_key, default=False)
     async def _r20f4_stub_impl(
-        arguments: Dict[str, Any], *, principal: Optional[Any] = None
+        arguments: dict[str, Any], *, principal: Any | None = None
     ) -> ToolResult:  # pragma: no cover - never reached when denied
         return Ok(message="ran")
 

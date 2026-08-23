@@ -270,7 +270,7 @@ async def test_assign_task_create_rejects_self_dependency(tmp_path) -> None:
     IS expressible since the caller never knows the future id in
     advance for a real cross-task cycle."""
     async with mcp_session(tmp_path) as admin:
-        alice = await admin.create_worker("alice")
+        await admin.create_worker("alice")
 
         existing = _seed_task("existing", "alice", status="pending")
 
@@ -278,8 +278,8 @@ async def test_assign_task_create_rejects_self_dependency(tmp_path) -> None:
         # of scope here; assert the create path is wired to the same
         # helper via a targeted unit check instead of a full black-box
         # repro (the future id is unknowable to a real caller).
-        from agent_mcp.tools.task_tools import _find_dependency_cycle
         from agent_mcp.db.connection import get_db_connection
+        from agent_mcp.tools.task_tools import _find_dependency_cycle
 
         conn = get_db_connection()
         try:
