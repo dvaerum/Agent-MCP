@@ -318,6 +318,60 @@ def test_query_offset_pagination_survives_concurrent_status_change(
         assert [r["agent_id"] for r in page2] == ["pg-a3", "pg-a2"]
 
 
+def test_query_total_excludes_agent_deleted_mid_sweep(
+    project_dir, reset_globals,
+):
+    """R21-F3: ``total`` must subtract anchored ids that no longer
+    resolve to a live row by read time -- not just report the raw
+    anchor length.
+
+    7 agents anchored at offset=0 -> total 7. One NOT-yet-fetched
+    anchored agent is hard-deleted (``agent_repo.delete``, not merely
+    terminated). Paging through offset=2,4,6 (limit=2 each, same
+    filter) must report total=6 on every remaining page -- the window
+    already correctly omits the deleted row -- and the rows actually
+    delivered across the whole sweep must sum to 6.
+    """
+    with _make_client(project_dir):
+        from agent_mcp.repositories import agent_repo
+
+        base = datetime.datetime(2025, 6, 1)
+        for i in range(1, 8):
+            _seed_agent_at(
+                f"tc-a{i}",
+                token=f"tok-tc-a{i}",
+                status="active",
+                created_at=(base + datetime.timedelta(minutes=i)).isoformat(),
+            )
+
+        filters = {
+            "agent_id_pattern": "tc-a%",
+            "include_terminated": False,
+            "limit": 2,
+        }
+        page1, total1 = agent_repo.query({**filters, "offset": 0})
+        assert total1 == 7
+        delivered = list(page1)
+
+        # tc-a5 (anchored, third-ranked, not yet fetched) is deleted
+        # outright.
+        assert agent_repo.delete("tc-a5") is True
+
+        for offset in (2, 4, 6):
+            page, total = agent_repo.query({**filters, "offset": offset})
+            assert total == 6, (
+                f"total must exclude the anchored-but-deleted agent; "
+                f"offset={offset} reported {total}"
+            )
+            delivered.extend(page)
+
+        assert len(delivered) == 6, (
+            f"rows actually delivered across the full sweep must equal "
+            f"the reported total; delivered="
+            f"{[r['agent_id'] for r in delivered]!r}"
+        )
+
+
 def test_query_status_tombstone_filter_returns_empty(project_dir, reset_globals):
     """An explicit ``status='tombstone'`` filter must return nothing —
     tombstone is a DB-internal FK artefact, never an operator-queryable

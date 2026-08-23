@@ -435,7 +435,17 @@ class TaskQueryEngine:
             (filters, sort), offset=offset, compute=compute_ordered_ids
         )
 
-        total_count = len(ordered_ids)
+        # R21-F3: ``ordered_ids`` is the anchor frozen at sweep-start —
+        # some of those ids may have been deleted outright since. Run
+        # the SAME ``tid in snapshot`` liveness check once, up front,
+        # and derive both ``total_count`` (its length) and the window
+        # (sliced from it below) from that one filtered list — reusing
+        # the identical anchor length would over-count a since-deleted
+        # row, and computing the window's liveness check independently
+        # from the total's is exactly the twin-computation drift this
+        # cache class was already bitten by once (R18-F2).
+        live_ids = [tid for tid in ordered_ids if tid in snapshot]
+        total_count = len(live_ids)
         window_ids = ordered_ids[offset:] if offset else ordered_ids
         if limit is not None:
             window_ids = window_ids[:limit]
