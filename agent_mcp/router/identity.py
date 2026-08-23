@@ -291,6 +291,12 @@ def init_router_db() -> None:
     if bootstrap_username and bootstrap_password:
         try:
             if users_table_is_empty():
+                # Canonical single-source policy check (see its own
+                # docstring) -- every path that mints a NEW operator
+                # password must call this first. Fail-closed: a weak
+                # bootstrap password crashes startup rather than
+                # silently minting a substandard first operator.
+                validate_password_strength(bootstrap_password)
                 create_user(
                     username=bootstrap_username,
                     password=bootstrap_password,

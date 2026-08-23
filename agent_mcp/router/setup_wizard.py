@@ -80,6 +80,11 @@ _REDIRECT_EXEMPT_PREFIXES = (
     "/agent-mcp/assets/",
     "/agent-mcp/api/",
     "/agent-mcp/mcp/",
+    # The SSO handshake itself must be reachable without a session,
+    # same as auth_middleware._UNAUTH_PREFIXES -- else a fresh install
+    # (empty users table) provisioning its first operator via SSO gets
+    # bounced to /setup before the callback ever runs.
+    "/agent-mcp/sso/",
 )
 
 

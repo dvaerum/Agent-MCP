@@ -551,8 +551,10 @@ def router_create_operator_cmd(
     # (the leaf one that runs the HTTP router, in particular).
     from .router.identity import (
         UsernameAlreadyExistsError,
+        WeakPasswordError,
         create_user,
         run_router_migrations_upgrade,
+        validate_password_strength,
     )
 
     # Ensure router.db exists + is migrated before the insert. The
@@ -560,10 +562,18 @@ def router_create_operator_cmd(
     # standalone CLI path has to do it here.
     run_router_migrations_upgrade()
     try:
+        # Canonical single-source policy check -- every path that
+        # mints a NEW operator password must call this first (see its
+        # own docstring). setup_wizard and the REST create-user route
+        # already do; this CLI path was the gap.
+        validate_password_strength(password)
         user_id = create_user(
             username=username, password=password, email=email
         )
     except UsernameAlreadyExistsError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    except WeakPasswordError as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
     click.echo(f"Created operator {username!r} (user_id={user_id}).")
