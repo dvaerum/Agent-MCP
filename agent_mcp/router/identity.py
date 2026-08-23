@@ -685,6 +685,31 @@ def stamp_sso_subject_if_absent(
         )
 
 
+def upgrade_sso_subject(
+    user_id: str,
+    old_subject: str,
+    new_subject: str,
+    conn: sqlite3.Connection | None = None,
+) -> None:
+    """Re-stamp ``sso_subject`` from ``old_subject`` to ``new_subject``.
+
+    R19-F1 self-heal: connection-injectable home (mirroring
+    ``stamp_sso_subject_if_absent``) for sso.py's ``_upgrade_subject``,
+    which advances a row matched via the pre-R18-F1 untagged
+    reconciliation key to the current tagged format. The
+    ``WHERE sso_subject = old_subject`` guard (exact match, not
+    ``IS NULL``) means this only ever advances the exact row that was
+    just matched by that legacy string — it can't overwrite a row that
+    has concurrently already moved on to a different subject.
+    """
+    with _conn_ctx(conn) as c:
+        c.execute(
+            "UPDATE users SET sso_subject = ? "
+            "WHERE user_id = ? AND sso_subject = ?",
+            (new_subject, user_id, old_subject),
+        )
+
+
 # ── Sessions ───────────────────────────────────────────────────────
 
 

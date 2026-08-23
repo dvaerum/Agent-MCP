@@ -434,6 +434,39 @@ def _oidc_subject(iss: str | None, sub: object | None) -> str | None:
     return f"{_OIDC_SUBJECT_PREFIX}{iss}:{type(sub).__name__}:{sub}"
 
 
+def _oidc_subject_legacy(iss: str | None, sub: object | None) -> str | None:
+    """Build the PRE-R18-F1 (untagged) subject key from ``(iss, sub)``.
+
+    R19-F1: R18-F1 retagged the persisted ``sso_subject`` reconciliation
+    key from ``oidc:<iss>:<sub>`` to ``oidc:<iss>:<type>:<sub>`` to close
+    a scalar-collision bug, but every pre-existing SSO user's row still
+    carries the OLD untagged key. ``_oidc_subject``'s tagged lookup
+    misses on such a user's next login; step 2 (verified-email link)
+    then also refuses to help, since it explicitly excludes rows with a
+    non-NULL ``sso_subject`` (the R17-F1-era account-takeover guard) --
+    so the row falls through to JIT-create a duplicate, orphaned
+    account. This reproduces the exact pre-fix format so
+    ``find_or_create_sso_user`` can try it as a FALLBACK lookup key
+    when the tagged lookup misses, and self-heal the row to the new
+    format on a hit (mirroring the ``stamp_sso_subject_if_absent``
+    migrate-forward pattern already used for the email-link path).
+
+    Deliberately reproduces the OLD, non-type-discriminating shape
+    verbatim -- it exists solely to match whatever an old row already
+    has stored, not a "corrected" version of it. It is used only to
+    LOOK UP a pre-existing row; it is never written for a new one, so
+    it cannot reopen the R18-F1 collision (see
+    ``find_or_create_sso_user`` for why the two different types would
+    still upgrade to their own, now-distinguished, tagged keys rather
+    than merging).
+    """
+    if not iss or sub is None:
+        return None
+    if not isinstance(sub, _OIDC_SUBJECT_SCALAR_TYPES):
+        return None
+    return f"{_OIDC_SUBJECT_PREFIX}{iss}:{sub}"
+
+
 def _sanitise_username(raw: str) -> str:
     """Convert an arbitrary IdP-provided name to our slug shape.
 
@@ -466,6 +499,7 @@ def find_or_create_sso_user(
     email: str | None,
     preferred_username: str | None,
     subject: str | None = None,
+    legacy_subject: str | None = None,
     email_verified: bool = False,
     default_is_sysadmin: bool = False,
     bootstrap_sysadmin: bool = False,
@@ -481,6 +515,17 @@ def find_or_create_sso_user(
          keying on it re-minted a new user (and, under
          ``AGENT_MCP_SSO_PROXY_DEFAULT_SYSADMIN``, a fresh sysadmin) on
          every request.
+
+         R19-F1: if the current-format lookup misses and the caller
+         passed ``legacy_subject`` (the OIDC callback computes it via
+         ``_oidc_subject_legacy`` alongside ``subject``), also try that
+         pre-R18-F1, untagged key. A hit means this is a real user who
+         logged in before the R18-F1 key-format retag shipped -- their
+         row still carries the old key, and without this fallback they
+         would fall through to step 3 and get a brand-new, orphaned,
+         non-privileged account every login. On a hit the row is
+         re-stamped to the current tagged format (self-heal), so it
+         only ever takes the fallback path once per user.
 
       2. **Verified-email link.** If ``email`` is present AND the IdP
          asserted ``email_verified is True``, link to a PRE-EXISTING
@@ -517,6 +562,15 @@ def find_or_create_sso_user(
     # 1. Stable-subject reconciliation.
     if subject:
         existing = _find_user_by_subject(subject)
+        if existing is None and legacy_subject:
+            # R19-F1: current-format lookup missed -- try the
+            # pre-R18-F1 untagged key. A hit means a genuine
+            # pre-existing SSO user; self-heal the row to the current
+            # format so this fallback only fires once per user.
+            existing = _find_user_by_subject(legacy_subject)
+            if existing is not None:
+                _upgrade_subject(existing["user_id"], legacy_subject, subject)
+                existing = identity.get_user_by_id(existing["user_id"]) or existing
         if existing is not None:
             identity.touch_last_login(existing["user_id"])
             return existing
@@ -604,6 +658,23 @@ def _stamp_subject_if_absent(user_id: str, subject: str) -> None:
     from .router_store import store
 
     store.stamp_sso_subject_if_absent(user_id, subject)
+
+
+def _upgrade_subject(user_id: str, old_subject: str, new_subject: str) -> None:
+    """Re-stamp a legacy-format ``sso_subject`` to the current format.
+
+    R19-F1 self-heal for the fallback lookup above: once a pre-R18-F1
+    row has been matched via ``_oidc_subject_legacy``, advance it to
+    the current tagged key so subsequent logins hit the direct
+    (non-fallback) lookup. The exact-old-value WHERE guard (not
+    ``IS NULL``, unlike ``_stamp_subject_if_absent``) means this only
+    ever advances the SAME row that was just matched by that exact
+    legacy string — it can't clobber a row that has concurrently
+    already moved on to a different subject.
+    """
+    from .router_store import store
+
+    store.upgrade_sso_subject(user_id, old_subject, new_subject)
 
 
 # ── Group mapping ──────────────────────────────────────────────────
@@ -1340,7 +1411,14 @@ async def handle_oidc_callback(request: web.Request) -> web.StreamResponse:
     preferred_username = preferred_username_claim or sub_claim
     # Stable reconciliation key: (iss, sub). ``iss`` is the validated
     # issuer from the id_token; fall back to the configured issuer.
-    subject = _oidc_subject(claims.get("iss") or cfg.issuer, raw_sub)
+    _iss = claims.get("iss") or cfg.issuer
+    subject = _oidc_subject(_iss, raw_sub)
+    # R19-F1: the pre-R18-F1 untagged form of the same (iss, sub) --
+    # threaded through as a fallback lookup key so a pre-existing SSO
+    # user (whose row still carries the OLD key) reconciles instead of
+    # getting a duplicate JIT-created account. See
+    # ``find_or_create_sso_user``'s step 1 and ``_oidc_subject_legacy``.
+    legacy_subject = _oidc_subject_legacy(_iss, raw_sub)
     groups_claim = claims.get("groups") or []
     if not isinstance(groups_claim, list):
         groups_claim = []
@@ -1352,6 +1430,7 @@ async def handle_oidc_callback(request: web.Request) -> web.StreamResponse:
             email=email,
             preferred_username=preferred_username,
             subject=subject,
+            legacy_subject=legacy_subject,
             email_verified=email_verified,
             # Bootstrap gate (round-9 AC-R9-2): the empty-table first-user
             # sysadmin promotion only fires when the operator opted in. The
