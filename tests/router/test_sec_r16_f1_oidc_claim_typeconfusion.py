@@ -338,10 +338,170 @@ async def test_oidc_subject_missing_sub_unaffected(monkeypatch) -> None:
 
 
 async def test_oidc_subject_str_sub_unaffected(monkeypatch) -> None:
-    """A normal str ``sub`` must be unaffected by the R17-F1 fix."""
+    """A normal str ``sub`` must be unaffected by the R17-F1 fix.
+
+    R18-F1: the key format now carries an explicit type tag (see
+    below) -- the expected literal reflects that, updated from the
+    R17-F1-era untagged format.
+    """
     from agent_mcp.router import sso
 
     assert (
         sso._oidc_subject("https://idp.example.test", "abc-123")
-        == "oidc:https://idp.example.test:abc-123"
+        == "oidc:https://idp.example.test:str:abc-123"
     )
+
+
+# ── R18-F1: scalar-to-string collision in the subject key ──────────
+#
+# R17-F1 (above) widened ``_oidc_subject`` to accept any JSON-scalar
+# ``sub`` but keyed it via plain f-string interpolation, which is NOT
+# type-discriminating: distinct claim TYPES whose ``str()`` forms
+# happen to match (``True``/``"True"``, ``1``/``"1"``, ``1.0``/
+# ``"1.0"``) collapse to the identical ``sso_subject`` key, so a
+# second, genuinely distinct claimant silently reconciles into the
+# first claimant's existing account. A second bug in the same
+# function: ``sub == ""`` produced a truthy, non-None key instead of
+# degrading to "missing" like ``sub is None``.
+
+
+async def test_oidc_subject_bool_true_and_str_true_do_not_collide() -> None:
+    """RED (pre-fix): ``sub=True`` and ``sub="True"`` must produce
+    DIFFERENT keys -- ``str(True) == "True"`` so a naive f-string
+    interpolation collapses them to the same string."""
+    from agent_mcp.router import sso
+
+    key_bool = sso._oidc_subject("https://idp.example.test", True)
+    key_str = sso._oidc_subject("https://idp.example.test", "True")
+    assert key_bool is not None and key_str is not None
+    assert key_bool != key_str
+
+
+async def test_oidc_subject_bool_false_and_str_false_do_not_collide() -> None:
+    """Same collision class as True/"True", for the False/"False" pair."""
+    from agent_mcp.router import sso
+
+    key_bool = sso._oidc_subject("https://idp.example.test", False)
+    key_str = sso._oidc_subject("https://idp.example.test", "False")
+    assert key_bool is not None and key_str is not None
+    assert key_bool != key_str
+
+
+async def test_oidc_subject_int_and_str_do_not_collide() -> None:
+    """``sub=1`` (int) and ``sub="1"`` (str) must produce different
+    keys -- ``str(1) == "1"``."""
+    from agent_mcp.router import sso
+
+    key_int = sso._oidc_subject("https://idp.example.test", 1)
+    key_str = sso._oidc_subject("https://idp.example.test", "1")
+    assert key_int is not None and key_str is not None
+    assert key_int != key_str
+
+
+async def test_oidc_subject_float_and_str_do_not_collide() -> None:
+    """``sub=1.0`` (float) and ``sub="1.0"`` (str) must produce
+    different keys -- ``str(1.0) == "1.0"``."""
+    from agent_mcp.router import sso
+
+    key_float = sso._oidc_subject("https://idp.example.test", 1.0)
+    key_str = sso._oidc_subject("https://idp.example.test", "1.0")
+    assert key_float is not None and key_str is not None
+    assert key_float != key_str
+
+
+async def test_oidc_subject_int_and_float_still_distinct() -> None:
+    """Regression guard: ``sub=1`` (int) vs ``sub=1.0`` (float) were
+    NEVER colliding (``str(1) != str(1.0)``) -- the type-tag fix must
+    not accidentally introduce a false collision here, nor a false
+    NON-collision expectation flip."""
+    from agent_mcp.router import sso
+
+    key_int = sso._oidc_subject("https://idp.example.test", 1)
+    key_float = sso._oidc_subject("https://idp.example.test", 1.0)
+    assert key_int is not None and key_float is not None
+    assert key_int != key_float
+
+
+async def test_oidc_subject_empty_string_treated_as_missing() -> None:
+    """RED (pre-fix): ``sub == ""`` produced a truthy, non-None,
+    collidable key (``oidc:<iss>:``) instead of degrading to "missing"
+    the same way ``sub is None`` already does."""
+    from agent_mcp.router import sso
+
+    assert sso._oidc_subject("https://idp.example.test", "") is None
+
+
+async def test_oidc_subject_whitespace_only_string_correctly_distinct() -> None:
+    """A whitespace-only string is NOT empty and must stay a distinct,
+    usable subject -- only the exact empty string degrades to
+    "missing"."""
+    from agent_mcp.router import sso
+
+    key = sso._oidc_subject("https://idp.example.test", "   ")
+    assert key is not None
+    assert key != sso._oidc_subject("https://idp.example.test", "")
+
+
+async def test_oidc_subject_negative_and_huge_int_no_crash() -> None:
+    """Negative and arbitrarily large ints must not crash and must
+    produce distinct, stable keys."""
+    from agent_mcp.router import sso
+
+    key_neg = sso._oidc_subject("https://idp.example.test", -42)
+    key_huge = sso._oidc_subject(
+        "https://idp.example.test", 10**30,
+    )
+    assert key_neg is not None
+    assert key_huge is not None
+    assert key_neg != key_huge
+
+
+async def test_oidc_subject_int_sub_stable_across_calls() -> None:
+    """R17-F1 regression guard: a normal numeric sub must still
+    produce a STABLE key across repeated calls with the SAME type."""
+    from agent_mcp.router import sso
+
+    key1 = sso._oidc_subject("https://idp.example.test", 424242)
+    key2 = sso._oidc_subject("https://idp.example.test", 424242)
+    assert key1 is not None
+    assert key1 == key2
+
+
+async def test_oidc_callback_bool_and_str_sub_do_not_reconcile_same_user(
+    aiohttp_client, router_app, sso_oidc_env, monkeypatch,
+) -> None:
+    """End-to-end (real callback path): a login with ``sub=True`` and a
+    SEPARATE login with ``sub="True"`` from the same issuer must NOT
+    reconcile into the same local user row -- pre-fix, both collapsed
+    to the identical ``sso_subject`` key ``oidc:<iss>:True`` and the
+    second, genuinely distinct claimant silently inherited the first
+    claimant's account (group memberships, project ACLs, sysadmin
+    bit)."""
+    from agent_mcp.router import identity
+
+    client = await aiohttp_client(router_app)
+
+    cb1 = await _drive_callback(client, monkeypatch, claims={
+        "sub": True,
+        "preferred_username": "booltrueuser",
+        "groups": [],
+    })
+    assert cb1.status in (302, 303), await cb1.text()
+
+    cb2 = await _drive_callback(client, monkeypatch, claims={
+        "sub": "True",
+        "preferred_username": "strtrueuser",
+        "groups": [],
+    })
+    assert cb2.status in (302, 303), await cb2.text()
+
+    row_bool = identity.get_user_by_username("booltrueuser")
+    row_str = identity.get_user_by_username("strtrueuser")
+    assert row_bool is not None
+    assert row_str is not None
+    assert row_bool["user_id"] != row_str["user_id"], (
+        "sub=True and sub='True' collapsed to the same sso_subject "
+        "key -- the second claimant silently reconciled into the "
+        "first claimant's account"
+    )
+    assert row_bool["sso_subject"] != row_str["sso_subject"]
