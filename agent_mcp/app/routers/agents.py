@@ -35,7 +35,6 @@ from ._read_limits import _clamp_section_limit
 from ._wire_validation import require_str as _require_str
 from ..deps import (
     caller_identity,
-    forwarding_route_role,
     require_operator_session,
 )
 from ...core.authorize import AuthRejected
@@ -43,7 +42,6 @@ from ...core.config import logger
 from ...core import session_registry
 from ...core import state
 from ...features import delivery_transport
-from ...core.principal_builder import build_operator_principal
 from ...core.tool_result import (
     Failed as _Failed,
     Ok as _Ok,
@@ -380,32 +378,23 @@ async def register_agent_dashboard_api_route(
         )
 
     operator_id = caller_identity(auth)
-    # AZ-R14-1 (round 14): thread the forwarding caller's REAL signed
-    # ``(project_role, sysadmin)`` instead of a hard-coded ``"operator"``,
-    # mirroring ``_dispatch_helpers._build_route_principal``. This was the
-    # last per-project REST route that built its own ``operator_session``
-    # Principal inline, so it never got the round-5 AC-R5-1 forwarding-role
-    # threading — a forwarding VIEWER reaching here (should the router
-    # method-gate / cookie-authorize ever be bypassed) would otherwise get
-    # the full operator bundle, incl ``agents.register``. The carrier is
-    # armed per-request by ``require_operator_session``'s forwarding branch;
-    # the cookie / operator-tier bearer paths report ``None`` and keep the
-    # historical operator-tier default (those admits are genuinely
-    # operator).
-    threaded = forwarding_route_role()
-    project_role, sysadmin = threaded if threaded is not None else ("operator", False)
-    # arch-B: build via the shared builder so caps resolve through the one
-    # code path. The frontend supplies ``project_name`` explicitly — the
-    # per-project backend doesn't yet derive its own project name from the
-    # request; the Principal field is best-effort plumbing (the tool's
-    # snippet builder reads ``arguments["project_name"]`` first either way).
-    principal = build_operator_principal(
-        user_id=operator_id,
-        kind="operator_session",
-        project_role=project_role,
-        sysadmin=sysadmin,
+    # AZ-R14-1 (round 14) / Finding B (security-arch-hardening-
+    # consolidated.md Phase 1): thread the forwarding caller's REAL
+    # signed ``(project_role, sysadmin)`` instead of a hard-coded
+    # ``"operator"``. This used to be the last per-project REST route
+    # that built its own ``operator_session`` Principal inline (a
+    # 20-line duplicate) because ``_build_route_principal`` couldn't
+    # accept ``project_name`` — it now can, so this route goes through
+    # the one shared helper like every other REST route does. The
+    # frontend supplies ``project_name`` explicitly — the per-project
+    # backend doesn't yet derive its own project name from the request;
+    # the Principal field is best-effort plumbing (the tool's snippet
+    # builder reads ``arguments["project_name"]`` first either way).
+    principal = _build_route_principal(
+        bearer_token=None,
+        operator_session=True,
+        operator_user_id=operator_id,
         project_name=project_name if isinstance(project_name, str) else None,
-        source_token=None,
     )
 
     tool_args = {

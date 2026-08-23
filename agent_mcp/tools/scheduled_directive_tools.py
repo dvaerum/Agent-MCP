@@ -60,11 +60,8 @@ from ..core.tool_result import (
 from ..db.connection import get_db_connection
 from ..db.unit_of_work import unit_of_work
 from ..repositories import agent_repo
+from ..repositories.agent_repository import TERMINAL_AGENT_STATUSES
 from ..repositories import scheduled_directive_repository as repo
-
-
-# Agent statuses that make a row a non-target (mirrors the profile tool).
-TERMINAL_AGENT_STATUSES = ("terminated", "tombstone")
 
 # R16-F3/F4 upper bounds (sibling of PF-R18-1). ``int(<client value>)``
 # must be bounded, not just floored: a huge finite interval passes the

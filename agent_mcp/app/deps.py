@@ -47,6 +47,8 @@ from typing import Any, Optional
 
 from fastapi import HTTPException, Request
 
+from ..router.auth_middleware import _MUTATION_METHODS
+
 
 logger = logging.getLogger(__name__)
 
@@ -99,11 +101,13 @@ def forwarding_route_role() -> Optional[tuple[Optional[str], bool]]:
     return _forwarding_route_role.get()
 
 
-#: HTTP methods that mutate. Kept in lock-step with the router's
-#: ``auth_middleware._MUTATION_METHODS`` so the backend's cookie-path
-#: operator/viewer split matches the wire gate exactly: reads (GET /
-#: HEAD / OPTIONS) admit on either tier; these require operator.
-_MUTATION_METHODS = frozenset({"POST", "PATCH", "DELETE", "PUT"})
+#: HTTP methods that mutate. N3 Tier 1 (security-arch-hardening-
+#: consolidated.md Phase 1): imported (above) from the router's
+#: ``auth_middleware._MUTATION_METHODS`` instead of a verbatim
+#: redeclaration kept in sync only by a comment, so the backend's
+#: cookie-path operator/viewer split matches the wire gate exactly:
+#: reads (GET / HEAD / OPTIONS) admit on either tier; these require
+#: operator.
 
 
 #: Agent rows whose ``agent_role`` is treated as operator-tier for
