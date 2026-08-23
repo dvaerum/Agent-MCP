@@ -437,6 +437,61 @@ def _agent_assignable(cursor, agent_id: str) -> bool:
     return is_live_agent(agent_id, cursor)
 
 
+def _find_dependency_cycle(
+    cursor, task_id: str, proposed_deps: List[str]
+) -> Optional[List[str]]:
+    """Return the cycle chain if wiring ``task_id``'s ``depends_on_tasks``
+    to ``proposed_deps`` would introduce a cycle in the dependency graph,
+    else ``None``.
+
+    R21-F2: ``depends_on_tasks`` previously accepted ANY list with no
+    graph validation at all — two tasks could be pointed at each other
+    (or a task at itself) and silently persisted. Neither
+    ``_advance_dependents_after_completion`` nor
+    ``TaskFilterSpec.health_of`` walk the graph transitively, so a
+    cycle never crashed or infinite-looped; it just produced
+    meaningless auto-advance ordering forever.
+
+    BFS over the EXISTING ``depends_on_tasks`` edges (read fresh from
+    ``cursor`` inside the caller's open transaction), starting from
+    each proposed dependency. If the walk ever reaches back to
+    ``task_id`` itself — the direct self-dependency case is caught on
+    the very first hop — that is a cycle; the returned list is the
+    chain ``[task_id, ..., task_id]`` for a readable error message.
+
+    Shared by the create paths (``assign_task``/``create_self_task``,
+    called right after the new id is minted but before the INSERT) and
+    the update path (``_update_single_task``, where an EXISTING task's
+    edges can be re-pointed to complete a cycle already latent in the
+    graph). At creation time a fresh id has no existing incoming
+    edges, so the walk is structurally guaranteed to find nothing —
+    the guard is still applied there uniformly rather than assumed,
+    since a future change (e.g. client-specified ids) could make that
+    assumption stale.
+    """
+    if not proposed_deps:
+        return None
+    visited: set = set()
+    queue: List[List[str]] = [[task_id, dep] for dep in proposed_deps]
+    while queue:
+        path = queue.pop(0)
+        node = path[-1]
+        if node == task_id:
+            return path
+        if node in visited:
+            continue
+        visited.add(node)
+        cursor.execute(
+            "SELECT depends_on_tasks FROM tasks WHERE task_id = ?", (node,)
+        )
+        row = cursor.fetchone()
+        if not row:
+            continue
+        for nxt in json.loads(row["depends_on_tasks"] or "[]"):
+            queue.append(path + [nxt])
+    return None
+
+
 def _worker_ownership_deny(
     task_id: str, assignee: Optional[str], *, action: str = "update it"
 ) -> str:
@@ -504,6 +559,7 @@ async def _update_single_task(
     new_assigned_to: Optional[str] = None,
     new_depends_on_tasks: Optional[List[str]] = None,
     system_transition: bool = False,
+    validate_dependencies: bool = True,
 ) -> Dict[str, Any]:
     """Helper function to update a single task with smart features.
 
@@ -513,6 +569,16 @@ async def _update_single_task(
     transition can touch a dependent/child owned by a DIFFERENT agent —
     it grants NO admin field powers (title/priority/assignee stay gated
     on ``is_admin_request``). See BL-R29-1.
+
+    ``validate_dependencies`` (default True, R21-F2): when the write is
+    a transition INTO ``completed``, block it unless every entry in the
+    task's effective ``depends_on_tasks`` (the just-validated
+    ``new_depends_on_tasks`` when this same call is also admin-rewiring
+    them, else the currently stored list) is itself already
+    ``completed``. Callers that drive a non-completing system reconcile
+    (dependency auto-advance to ``in_progress``, cascade to
+    ``cancelled``/``failed``) are unaffected — the gate only ever fires
+    on ``new_status == "completed"``.
     """
 
     # Fetch task current data
@@ -593,6 +659,49 @@ async def _update_single_task(
                     f"terminated."
                 ),
             }
+
+    # R21-F2: cycle-reject BEFORE persisting a depends_on_tasks write.
+    # Runs before the validate_dependencies gate below so that gate can
+    # use the just-validated new list as the task's effective deps.
+    if is_admin_request and new_depends_on_tasks is not None:
+        cycle_path = _find_dependency_cycle(
+            cursor, task_id, new_depends_on_tasks
+        )
+        if cycle_path is not None:
+            return {
+                "success": False,
+                "error": (
+                    f"Cannot update depends_on_tasks for task '{task_id}': "
+                    f"would introduce a dependency cycle "
+                    f"({' -> '.join(cycle_path)})."
+                ),
+            }
+
+    # R21-F2: ``validate_dependencies`` used to be read into a local
+    # variable by the caller and never referenced again — a silent
+    # no-op that let a task complete while its own dependency was still
+    # pending, which then auto-advanced that dependency off the
+    # meaningless edge. Block the completion here instead.
+    if new_status == "completed" and validate_dependencies:
+        effective_deps = (
+            new_depends_on_tasks
+            if (is_admin_request and new_depends_on_tasks is not None)
+            else json.loads(task_current_data.get("depends_on_tasks") or "[]")
+        )
+        for dep_id in effective_deps:
+            cursor.execute(
+                "SELECT status FROM tasks WHERE task_id = ?", (dep_id,)
+            )
+            dep_row = cursor.fetchone()
+            if not dep_row or dep_row["status"] != "completed":
+                return {
+                    "success": False,
+                    "error": (
+                        f"Cannot complete task '{task_id}': dependency "
+                        f"'{dep_id}' is not yet completed "
+                        f"(status: {dep_row['status'] if dep_row else 'missing'})."
+                    ),
+                }
 
     updated_at_iso = datetime.datetime.now().isoformat()
 
@@ -2217,6 +2326,23 @@ async def assign_task_tool_impl(
                 if conflict is not None:
                     return conflict
 
+            # R21-F2 (class-sweep sibling of the update-path cycle guard):
+            # applied uniformly even though a freshly-minted ``new_task_id``
+            # structurally cannot already have an incoming edge — see
+            # ``_find_dependency_cycle``'s docstring.
+            if final_depends_on_tasks:
+                cycle_path = _find_dependency_cycle(
+                    cursor, new_task_id, final_depends_on_tasks
+                )
+                if cycle_path is not None:
+                    return Conflict(
+                        reason=(
+                            "Cannot create task with depends_on_tasks "
+                            f"{final_depends_on_tasks}: would introduce a "
+                            f"dependency cycle ({' -> '.join(cycle_path)})."
+                        )
+                    )
+
             # PR 6: task INSERT goes through task_repo with the caller's
             # cursor so it's atomic with the agent UPDATE and audit log.
             from ..repositories import agent_repo, task_repo
@@ -2691,6 +2817,23 @@ async def create_self_task_tool_impl(
                     if _drow is None or _drow["assigned_to"] != requesting_agent_id:
                         return NotFound(resource="task", identifier=_dep_id)
 
+            # R21-F2 (class-sweep sibling of the update-path cycle guard):
+            # applied uniformly even though a freshly-minted ``new_task_id``
+            # structurally cannot already have an incoming edge — see
+            # ``_find_dependency_cycle``'s docstring.
+            if final_depends_on_tasks:
+                cycle_path = _find_dependency_cycle(
+                    cursor, new_task_id, final_depends_on_tasks
+                )
+                if cycle_path is not None:
+                    return Conflict(
+                        reason=(
+                            "Cannot create task with depends_on_tasks "
+                            f"{final_depends_on_tasks}: would introduce a "
+                            f"dependency cycle ({' -> '.join(cycle_path)})."
+                        )
+                    )
+
             # PR 6: task INSERT via task_repo with the caller's cursor.
             from ..repositories import agent_repo, task_repo
             fresh_task = task_repo.create(
@@ -2887,6 +3030,7 @@ async def update_task_status_tool_impl(
                     new_priority,
                     new_assigned_to,
                     new_depends_on_tasks,
+                    validate_dependencies=validate_dependencies,
                 )
                 results.append(result)
 
