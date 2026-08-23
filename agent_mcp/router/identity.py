@@ -441,16 +441,37 @@ def create_user(
     forces the bit on regardless of table emptiness (the proxy-header
     ``default_is_sysadmin`` path).
 
-    ``email`` sanitizer wiring (R15-F2 sibling): this is the ONLY
-    ``create_user`` caller — CLI bootstrap, the setup wizard, AND
-    ``sso.find_or_create_sso_user``'s JIT-create fork — that writes
-    ``email`` to the DB, so it's stripped of the same hidden/spoofing
-    Unicode ``admin_users_api._json_body`` strips on the REST path
+    ``username``/``email`` sanitizer wiring (R15-F2 sibling; N1): this
+    is the ONLY writer of those two columns shared by every caller —
+    CLI bootstrap, the env-var bootstrap, the unauthenticated first-boot
+    setup wizard, the REST create-user endpoint, AND
+    ``sso.find_or_create_sso_user``'s JIT-create fork — so both are
+    stripped of the same hidden/spoofing Unicode
+    ``admin_users_api._json_body`` strips on the REST path
     (``_strip_control_bytes``) here, once, for every caller. The
     IdP-claim-derived SSO path in particular never goes anywhere near
     ``admin_users_api``'s sanitizer wiring, so without this a hidden-
     Unicode spoofing character in an IdP's ``email`` claim would survive
     unstripped into the DB.
+
+    N1 (security-arch hardening pass 2) added ``username`` to that
+    strip: R15-F2 wired up ``email`` and left ``username`` — the field
+    actually rendered as an operator's identity in the users table, the
+    audit log and every membership list — raw. Two of the reachable
+    paths never touch a sanitizing decode at all: the first-boot setup
+    wizard (form-encoded, UNAUTHENTICATED, and deliberately exempt from
+    the body-decode seam — see
+    ``tests/router/test_arch_enforced_sanitization.py``'s exemption
+    table) and SSO JIT-create (the username comes from an IdP claim).
+    An operator called ``ad<ZWSP>min`` was indistinguishable on screen
+    from ``admin``.
+
+    Sanitizing on the WRITE side, not the read side, is the deliberate
+    choice: ``get_user_by_username`` (the login lookup) keeps matching
+    EXACTLY, so a submitted ``ad<ZWSP>min`` still fails to authenticate
+    as the stored ``admin`` rather than being silently folded onto it —
+    stripping at lookup time would be a widening, the opposite of what
+    this sanitizer is for.
 
     R16-F3: an explicit UTF-8-round-trip check (raising
     ``InvalidEmailError`` on an unpaired surrogate) used to run
@@ -466,6 +487,14 @@ def create_user(
     guard if a future edit ever narrows the category set or this strip
     call is removed.
     """
+    # N1: strip ``username`` on the same terms as ``email`` below. Same
+    # R16-F1 type-defensiveness applies — an IdP claim or a CLI caller
+    # can hand this a non-``str``; ``_strip_control_bytes`` passes any
+    # non-string leaf straight through, so a bad type still reaches the
+    # INSERT's own binding error rather than being masked here (there is
+    # no ``InvalidUsernameError`` equivalent to raise, and inventing a
+    # new rejection would be a policy change, not a mechanism one).
+    username = _strip_control_bytes(username)
     if email is not None:
         # R16-F1: OIDC claims (and, in principle, any caller) can hand
         # this a non-``str`` value -- ``sso.handle_oidc_callback``

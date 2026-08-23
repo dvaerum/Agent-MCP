@@ -23,6 +23,7 @@ import mcp.types as mcp_types
 # Project-specific imports
 from ..core.config import logger
 from ..core.auth import get_agent_id, query_agent_status
+from ..utils.json_utils import decode_untrusted_body
 from ..core import session_registry
 from ._dispatch_helpers import ALLOWED_ORIGINS
 from .routers import register_routers
@@ -1731,6 +1732,22 @@ def _bearer_is_active(bearer: str) -> bool:
     return bool(bearer) and bearer in _g.active_agents
 
 
+#: Body-size ceiling for the ``initialize`` sniff below.
+#:
+#: N1 routes this sniff through the shared sanitizing decode seam, which
+#: costs a per-character Unicode-category walk (~0.6 ms/KiB) on top of
+#: the parse. The router caps /mcp bodies at 1 MiB
+#: (``router/app.py::_MCP_MAX_BODY_BYTES``), so decoding an arbitrary
+#: body here just to sniff ``clientInfo`` would hand a caller ~0.6 s of
+#: event-loop CPU per POST that neither the SDK's own parse nor
+#: ``tools/registry.py``'s existing sanitize of the same body would
+#: otherwise cost. A real MCP ``initialize`` request is a few hundred
+#: bytes (protocolVersion + capabilities + clientInfo); 64 KiB is ~100x
+#: that and bounds the walk to ~40 ms. A larger body simply isn't
+#: sniffed — recording is best-effort by design (see the docstring).
+_MAX_CLIENT_INFO_SNIFF_BYTES = 64 * 1024
+
+
 def _maybe_record_client_info(scope, body: bytes) -> None:
     """If ``body`` is an MCP ``initialize`` request, record its
     ``clientInfo`` keyed by the bearer's agent_id.
@@ -1741,12 +1758,32 @@ def _maybe_record_client_info(scope, body: bytes) -> None:
     all silently no-op (the strategy resolver then feature-detects). See
     :mod:`agent_mcp.core.client_info_registry` for why capture happens here
     rather than on the SDK session.
+
+    N1 (security-arch hardening pass 2): this used to ``json.loads`` the
+    body raw, making ``clientInfo.name`` — a fully client-controlled
+    string that is recorded and then RENDERED in the dashboard's agent
+    view — one of the decode points that never met ``utils.json_utils``'s
+    hidden-Unicode strip. A client announcing itself as
+    ``Claude<U+202E>edoC`` got that stored and displayed verbatim. It now
+    decodes through ``json_utils.decode_untrusted_body`` like every other
+    request body.
+
+    The two cheap pre-filters below exist only to keep that seam off the
+    hot path: ``initialize`` is one POST per session, while every
+    tool-call POST also lands here. Both are conservative in the
+    best-effort direction — a body they skip is simply not recorded (the
+    resolver falls back to feature detection), never mis-recorded.
     """
+    if len(body) > _MAX_CLIENT_INFO_SNIFF_BYTES or b"initialize" not in body:
+        return
     try:
-        msg = json.loads(body)
+        # Raises UntrustedBodyError (a ValueError) on a malformed body or
+        # a non-object top level — both mean "not an initialize request"
+        # here, so the existing best-effort catch handles them.
+        msg = decode_untrusted_body(body)
     except Exception:
         return
-    if not isinstance(msg, dict) or msg.get("method") != "initialize":
+    if msg.get("method") != "initialize":
         return
     params = msg.get("params")
     client_info = (params or {}).get("clientInfo") if isinstance(params, dict) else None
