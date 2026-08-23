@@ -70,6 +70,7 @@ __all__ = [
     "OIDCSettings",
     "ProxyHeaderSettings",
     "SSOSettings",
+    "SsoSubject",
     "load_sso_config",
     "get_sso_config",
     "find_or_create_sso_user",
@@ -392,166 +393,300 @@ _PROXY_SUBJECT_PREFIX = "proxy:"
 # reconciliation on a stringified blob.
 _OIDC_SUBJECT_SCALAR_TYPES = (str, int, float, bool)
 
+# ``SsoSubjectValue`` is the union those types spell; kept as an alias
+# so the value type below reads as a real domain type rather than a
+# four-way union repeated at every signature.
+SsoSubjectValue = str | int | float | bool
 
-def _oidc_subject(iss: str | None, sub: object | None) -> str | None:
-    """Build the stable OIDC subject key from ``(iss, sub)``.
+
+def _parse_tagged_scalar(tag: str, raw: str) -> SsoSubjectValue | None:
+    """Parse the ``<sub>`` half of an encoded key back to its scalar.
+
+    The inverse of ``f"{sub}"`` for one specific type tag, and the one
+    place that knows which strings a given scalar type could have
+    produced. Returns None when ``raw`` is NOT something ``str()`` of
+    that type can emit -- ``"007"`` is not a possible ``str(int)``,
+    ``"1"`` is not a possible ``str(float)``, ``"true"`` is not a
+    possible ``str(bool)``. That "could this type have produced this
+    content?" question is the same one both ``SsoSubject.decode`` and
+    ``SsoSubject.is_ambiguous`` ask, so they share this parser instead
+    of each carrying their own copy (the duplication that let R19-F1's
+    fallback and R18-F1's tag drift apart into R20-F1).
+    """
+    if tag == "str":
+        # Every non-empty string is a possible ``str(str)``; the empty
+        # string is not a usable identity (see ``SsoSubject``).
+        return raw or None
+    if tag == "bool":
+        if raw == "True":
+            return True
+        if raw == "False":
+            return False
+        return None
+    if tag == "int":
+        try:
+            as_int = int(raw)
+        except ValueError:
+            return None
+        return as_int if str(as_int) == raw else None
+    if tag == "float":
+        try:
+            as_float = float(raw)
+        except ValueError:
+            return None
+        return as_float if str(as_float) == raw else None
+    return None
+
+
+@dataclass(frozen=True, eq=False)
+class SsoSubject:
+    """The stable OIDC ``(iss, sub)`` reconciliation key, as a value.
 
     Per the OIDC spec ``sub`` is unique+stable only WITHIN an issuer,
-    so both parts are needed. Returns None when either is missing (a
-    spec-noncompliant id_token) — the caller then falls back to the
-    verified-email / JIT-create path rather than keying on a partial
-    identifier.
+    so both parts are needed. This type replaces the bare f-string that
+    was the site of five consecutive pentest findings (R16-F1 → R20-F1)
+    because that one interpolation silently carried FOUR distinct
+    responsibilities; here each is a separate, independently-testable
+    member:
 
-    ``sub`` deliberately accepts more than ``str``: any JSON scalar
-    (str/int/float/bool) is safe input and produces a stable key.
-    R17-F1: an earlier fix (R16-F1) mistakenly fed this the SAME
-    str-only-coerced value used for the (genuinely ``str``-only)
-    ``preferred_username`` fallback, which silently degraded a non-str
-    ``sub`` (e.g. a numeric IdP subject id) to None on EVERY login --
-    defeating subject-based reconciliation and re-minting a fresh
-    orphaned user each time instead of crashing. Only a missing
-    ``sub``, an empty string, or a non-scalar shape (dict/list, e.g. a
-    misserialised multi-valued attribute) degrades to None here.
+      (a) ``encode()``   — the persisted ``users.sso_subject`` key.
+      (b) ``type_tag``   — the scalar-type discriminator inside it.
+      (c) ``legacy_lookup_key()`` — the pre-R18-F1 UNTAGGED key, for
+          finding (never minting) a row written before the retag.
+      (d) ``is_ambiguous()`` — the refuse-on-ambiguity rule that says
+          when (c) must be withheld entirely.
 
-    R18-F1: the key embeds ``type(sub).__name__`` alongside the value
-    rather than plain f-string-interpolating ``sub`` bare. A bare
-    interpolation is NOT type-discriminating -- ``str(True) ==
-    "True"`` and ``str(1) == "1"``, so ``sub=True`` and ``sub="True"``
-    (or ``sub=1``/``sub="1"``, ``sub=1.0``/``sub="1.0"``) collapsed to
-    the identical key, silently reconciling two logically distinct
-    IdP-side identities into one local account. The type name is safe
-    to splice in unescaped: it always comes from the fixed, code-
-    controlled ``_OIDC_SUBJECT_SCALAR_TYPES`` tuple, never from
-    IdP-supplied data. An empty string is treated the same as a
-    missing ``sub`` (rather than producing a truthy, collidable
-    ``oidc:<iss>:str:`` key) for the same reason a missing claim is:
-    it carries no usable identity.
+    ``decode()`` is (a)'s inverse, so the persisted format is
+    round-trippable and testable as a property rather than by reading
+    an f-string.
+
+    **Construction enforces the acceptance rules**, so no call site can
+    build an unusable subject:
+
+      * ``iss`` must be a non-empty ``str``.
+      * ``sub`` must be one of ``_OIDC_SUBJECT_SCALAR_TYPES``. R17-F1:
+        this is deliberately wider than ``str`` -- an earlier fix
+        (R16-F1) fed the stable key the same str-only coercion used for
+        the ``preferred_username`` fallback, which silently degraded a
+        numeric IdP subject id to None on EVERY login and re-minted a
+        fresh orphaned user each time. A dict/list ``sub`` (a
+        misserialised multi-valued attribute) is still refused: a
+        stringified blob is not an identity.
+      * R18-F1: an empty-string ``sub`` is refused like a missing one
+        -- it carries no usable identity, and admitting it would mint a
+        truthy, collidable ``oidc:<iss>:str:`` key.
+
+    Use ``from_claims()`` at the IdP boundary, where "unusable claim"
+    means "fall through to the verified-email / JIT-create path"
+    rather than "raise".
+
+    Equality is TYPE-EXACT (``SsoSubject(i, True) != SsoSubject(i, 1)``)
+    even though Python's own ``True == 1 == 1.0``. Collapsing those is
+    precisely the R18-F1 account-reconciliation bug, so the value type
+    must not reintroduce it for dict/set-based callers.
     """
-    if not iss or sub is None or sub == "":
+
+    iss: str
+    sub: SsoSubjectValue
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.iss, str) or not self.iss:
+            raise ValueError("SsoSubject requires a non-empty str issuer")
+        if not isinstance(self.sub, _OIDC_SUBJECT_SCALAR_TYPES):
+            raise TypeError(
+                "SsoSubject requires a JSON-scalar sub "
+                f"(got {type(self.sub).__name__})",
+            )
+        if isinstance(self.sub, str) and not self.sub:
+            raise ValueError("SsoSubject requires a non-empty sub")
+
+    # ── construction from untrusted claims ─────────────────────────
+
+    @classmethod
+    def from_claims(
+        cls, iss: object | None, sub: object | None,
+    ) -> SsoSubject | None:
+        """Build from raw id_token claims, or None if unusable.
+
+        None means "this id_token carries no usable stable identity" --
+        the caller falls back to the verified-email / JIT-create path
+        rather than keying reconciliation on a partial identifier.
+
+        A non-``str`` ``iss`` is unreachable in production (Authlib
+        validates ``iss`` against the origin-pinned discovery issuer
+        before these claims are returned) but is refused here anyway,
+        fail-closed, rather than keying an account on a ``repr()``.
+        """
+        if not isinstance(iss, str) or not iss:
+            return None
+        if sub is None or not isinstance(sub, _OIDC_SUBJECT_SCALAR_TYPES):
+            return None
+        if isinstance(sub, str) and not sub:
+            return None
+        return cls(iss, sub)
+
+    # ── (b) the type-discrimination tag ────────────────────────────
+
+    @property
+    def type_tag(self) -> str:
+        """The scalar-type discriminator embedded in the encoded key.
+
+        R18-F1: safe to splice in unescaped -- it always comes from the
+        fixed, code-controlled ``_OIDC_SUBJECT_SCALAR_TYPES`` tuple
+        (``__post_init__`` guarantees it), never from IdP-supplied data.
+        """
+        return type(self.sub).__name__
+
+    # ── (a) the persisted reconciliation key ───────────────────────
+
+    def encode(self) -> str:
+        """The ``users.sso_subject`` value for this subject.
+
+        R18-F1: the type tag sits between issuer and value because a
+        bare interpolation is NOT type-discriminating -- ``str(True) ==
+        "True"``, ``str(1) == "1"``, ``str(1.0) == "1.0"`` -- so
+        ``sub=True`` and ``sub="True"`` collapsed onto one key and
+        silently reconciled two distinct IdP identities into one local
+        account.
+
+        This is a PERSISTED format: changing these bytes orphans every
+        existing SSO row (that is R19-F1) and needs a migration, not a
+        refactor.
+        """
+        return f"{_OIDC_SUBJECT_PREFIX}{self.iss}:{self.type_tag}:{self.sub}"
+
+    @classmethod
+    def decode(cls, encoded: str) -> SsoSubject | None:
+        """Parse a stored key back into a subject, or None if it isn't one.
+
+        Guaranteed total and non-inventing: for ANY input, the result is
+        either None or a subject whose ``encode()`` is byte-identical to
+        the input (the implementation re-encodes each candidate split
+        and rejects any that doesn't match). So a stored row can never
+        be attributed to a subject that would have been persisted under
+        a different key.
+
+        ``decode(x.encode()) == x`` exactly, for any subject whose
+        ``iss`` does not itself embed a ``:<type-tag>:`` marker. Real
+        issuers are https URLs and cannot; for a pathological issuer
+        that can, the split is ambiguous by construction (the format
+        has no escaping — deliberately, since it is the already-
+        persisted one) and decode returns the leftmost split that
+        re-encodes identically.
+        """
+        if not isinstance(encoded, str):
+            return None
+        if not encoded.startswith(_OIDC_SUBJECT_PREFIX):
+            return None
+        body = encoded[len(_OIDC_SUBJECT_PREFIX):]
+
+        candidates: list[tuple[int, str]] = []
+        for scalar in _OIDC_SUBJECT_SCALAR_TYPES:
+            marker = f":{scalar.__name__}:"
+            start = 0
+            while (found := body.find(marker, start)) != -1:
+                candidates.append((found, scalar.__name__))
+                start = found + 1
+
+        for index, tag in sorted(candidates):
+            iss = body[:index]
+            value = _parse_tagged_scalar(tag, body[index + len(tag) + 2:])
+            if not iss or value is None:
+                continue
+            subject = cls(iss, value)
+            if subject.encode() == encoded:
+                return subject
         return None
-    if not isinstance(sub, _OIDC_SUBJECT_SCALAR_TYPES):
-        return None
-    return f"{_OIDC_SUBJECT_PREFIX}{iss}:{type(sub).__name__}:{sub}"
 
+    # ── (d) the refuse-on-ambiguity rule ───────────────────────────
 
-def _looks_like_canonical_int(s: str) -> bool:
-    """True iff ``s`` is EXACTLY what ``str(int(s))`` would produce.
+    def is_ambiguous(self) -> bool:
+        """True iff this sub's UNTAGGED content could have been produced
+        by a scalar type other than its own.
 
-    Used by ``_legacy_subject_is_ambiguous`` -- e.g. ``"1"`` qualifies
-    (``str(int("1")) == "1"``) but ``"007"`` or ``"1.0"`` don't (a real
-    ``int`` sub can never stringify to either).
-    """
-    try:
-        return str(int(s)) == s
-    except ValueError:
-        return False
+        R20-F1: R19-F1's legacy fallback matches on the pre-R18-F1
+        untagged key (``oidc:<iss>:<sub>``), which by construction can't
+        record which scalar type produced it -- exactly the collision
+        R16-F1/R17-F1/R18-F1 fixed for the tagged key. Reopening a
+        lookup on the untagged shape reopens that collision: a legacy
+        row minted from one type's ``sub`` could be matched -- and
+        self-healed into -- by a DIFFERENT type's same-content login.
 
+        Git-history verified (R17-F1 #705 / R18-F1 #708): the "legacy
+        rows are provably str-only" premise does NOT hold. The key
+        builder started accepting int/float/bool at R17-F1 while STILL
+        emitting the untagged format; the tag arrived in the LATER
+        R18-F1 commit. So a deployment that ran R17-F1 before upgrading
+        could have persisted an untagged row minted from a non-str
+        ``sub``, and a one-directional fix ("only match if the caller's
+        sub is str") would leave the mirror case open.
 
-def _looks_like_canonical_float(s: str) -> bool:
-    """True iff ``s`` is EXACTLY what ``str(float(s))`` would produce."""
-    try:
-        return str(float(s)) == s
-    except ValueError:
-        return False
+        Both directions therefore fall out of one question -- could some
+        OTHER accepted scalar type have produced this exact content?
 
+          * A non-``str`` sub is unconditionally ambiguous: a
+            hypothetical ``str`` sub of that content always stringifies
+            to itself, so ``str`` is always an alternate producer.
+          * A ``str`` sub is ambiguous iff its content is also a
+            canonical ``int``/``float`` repr or exactly
+            ``"True"``/``"False"`` -- the collision family R18-F1
+            documented (int/float/bool never collide with each other via
+            ``str()``, only with a same-content ``str``).
+        """
+        content = f"{self.sub}"
+        return any(
+            _parse_tagged_scalar(scalar.__name__, content) is not None
+            for scalar in _OIDC_SUBJECT_SCALAR_TYPES
+            if scalar.__name__ != self.type_tag
+        )
 
-def _legacy_subject_is_ambiguous(sub: object) -> bool:
-    """True iff the bare, untagged ``str(sub)`` legacy key content could
-    have been produced by MORE THAN ONE of ``_OIDC_SUBJECT_SCALAR_TYPES``.
+    # ── (c) the legacy-format fallback key ─────────────────────────
 
-    R20-F1: R19-F1's legacy fallback matches on the pre-R18-F1 UNTAGGED
-    key (``oidc:<iss>:<sub>``), which by construction can't record which
-    scalar TYPE originally produced it -- that's exactly the collision
-    R16-F1/R17-F1/R18-F1 fixed for the tagged key
-    (``str(1) == str("1")``, ``str(True) == str("True")``). Reopening a
-    lookup on the untagged shape reopens that same collision: a legacy
-    row minted from one type's ``sub`` can be matched -- and self-healed
-    into -- by a DIFFERENT type's same-content login.
+    def legacy_lookup_key(self) -> str | None:
+        """The PRE-R18-F1 (untagged) key, or None if it must be withheld.
 
-    Git-history verified (R17-F1 #705 / R18-F1 #708): a "legacy rows are
-    provably str-only" premise does NOT hold -- ``_oidc_subject``
-    started accepting int/float/bool at R17-F1 while STILL emitting the
-    untagged format; the type tag wasn't added until the LATER, separate
-    R18-F1 commit. So a real deployment that ran R17-F1 before upgrading
-    to R18-F1 could have persisted an untagged row from a non-str
-    ``sub``. A fix that only checks the CURRENT caller's type (e.g.
-    "only match if the caller's sub is str") is one-directional and
-    leaves the mirror case open (a str claimant hijacking a legacy row
-    that was actually minted from a same-content int/float/bool sub).
+        R19-F1: R18-F1 retagged the persisted key from
+        ``oidc:<iss>:<sub>`` to ``oidc:<iss>:<type>:<sub>``, but every
+        pre-existing SSO row still carried the OLD key. The tagged
+        lookup misses on such a user's next login; step 2 (verified-email
+        link) also refuses, since it excludes rows with a non-NULL
+        ``sso_subject`` (the R17-F1-era takeover guard) -- so the login
+        fell through to JIT-create a duplicate, orphaned account. This
+        reproduces the exact pre-fix format so ``find_or_create_sso_user``
+        can try it as a FALLBACK lookup key and self-heal the row
+        forward on a hit.
 
-    This checks BOTH directions by asking: could some scalar type OTHER
-    than ``type(sub)`` have produced the identical ``str(sub)`` content?
+        Deliberately reproduces the OLD, non-type-discriminating shape
+        verbatim -- it exists solely to match what an old row already
+        stores, not a "corrected" version of it. It is used only to LOOK
+        UP a pre-existing row; it is never written for a new one.
 
-      * A non-``str`` ``sub`` is unconditionally ambiguous: a
-        hypothetical ``str`` sub with that exact content always
-        stringifies to itself, so ``str`` is always an alternate
-        producer.
-      * A ``str`` ``sub`` is ambiguous iff its content also happens to
-        be a canonical ``int``/``float`` repr, or is exactly
-        ``"True"``/``"False"`` -- the only collision family R18-F1
-        documented (int/float/bool never collide with each other via
-        ``str()``, only with a same-content ``str``).
+        R20-F1: None for an ambiguous sub (see ``is_ambiguous``), so the
+        fallback lookup -- and the self-heal it triggers -- is never
+        attempted for a sub whose originating type can't be verified
+        from the untagged key alone. Closing it here, at the source,
+        rather than trusting each caller to re-check. The cost is real
+        but narrow and accepted: a genuine legacy user whose original
+        ``sub`` happens to be numeric/bool-shaped never self-heals and
+        gets a fresh JIT-created row instead.
+        """
+        if self.is_ambiguous():
+            return None
+        return f"{_OIDC_SUBJECT_PREFIX}{self.iss}:{self.sub}"
 
-    An ambiguous sub therefore gets NO legacy fallback key at all (see
-    ``_oidc_subject_legacy``): the login falls through to step 2/3
-    rather than risk matching -- and self-healing into -- a row whose
-    true originating type can't be verified. The cost is a real but
-    narrow one: a genuine legacy user whose original ``sub`` happens to
-    be a numeric/bool-like string can never self-heal via this fallback
-    and gets a fresh JIT-created row instead -- an acceptable trade for
-    closing an account-takeover vector, and out of scope of R19-F1's
-    demonstrated target population (non-numeric string subs).
-    """
-    if not isinstance(sub, str):
-        return True
-    if sub in ("True", "False"):
-        return True
-    if _looks_like_canonical_int(sub):
-        return True
-    if _looks_like_canonical_float(sub):
-        return True
-    return False
+    # ── type-exact equality (see the class docstring) ──────────────
 
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, SsoSubject):
+            return NotImplemented
+        return (
+            self.iss == other.iss
+            and self.type_tag == other.type_tag
+            and self.sub == other.sub
+        )
 
-def _oidc_subject_legacy(iss: str | None, sub: object | None) -> str | None:
-    """Build the PRE-R18-F1 (untagged) subject key from ``(iss, sub)``.
-
-    R19-F1: R18-F1 retagged the persisted ``sso_subject`` reconciliation
-    key from ``oidc:<iss>:<sub>`` to ``oidc:<iss>:<type>:<sub>`` to close
-    a scalar-collision bug, but every pre-existing SSO user's row still
-    carries the OLD untagged key. ``_oidc_subject``'s tagged lookup
-    misses on such a user's next login; step 2 (verified-email link)
-    then also refuses to help, since it explicitly excludes rows with a
-    non-NULL ``sso_subject`` (the R17-F1-era account-takeover guard) --
-    so the row falls through to JIT-create a duplicate, orphaned
-    account. This reproduces the exact pre-fix format so
-    ``find_or_create_sso_user`` can try it as a FALLBACK lookup key
-    when the tagged lookup misses, and self-heal the row to the new
-    format on a hit (mirroring the ``stamp_sso_subject_if_absent``
-    migrate-forward pattern already used for the email-link path).
-
-    Deliberately reproduces the OLD, non-type-discriminating shape
-    verbatim -- it exists solely to match whatever an old row already
-    has stored, not a "corrected" version of it. It is used only to
-    LOOK UP a pre-existing row; it is never written for a new one.
-
-    R20-F1: unlike R19-F1's original version of this function, a HIT
-    here is not automatically safe to self-heal into -- the untagged
-    shape is exactly the non-type-discriminating format R16-F1/R17-F1/
-    R18-F1 fixed, so offering it as a lookup key for an AMBIGUOUS sub
-    (see ``_legacy_subject_is_ambiguous``) would reopen that collision.
-    Returning None here for an ambiguous sub means
-    ``find_or_create_sso_user`` never attempts the fallback lookup for
-    it at all, closing the hole at the source rather than trusting the
-    caller to re-check.
-    """
-    if not iss or sub is None:
-        return None
-    if not isinstance(sub, _OIDC_SUBJECT_SCALAR_TYPES):
-        return None
-    if _legacy_subject_is_ambiguous(sub):
-        return None
-    return f"{_OIDC_SUBJECT_PREFIX}{iss}:{sub}"
+    def __hash__(self) -> int:
+        return hash((self.iss, self.type_tag, self.sub))
 
 
 def _sanitise_username(raw: str) -> str:
@@ -605,7 +740,7 @@ def find_or_create_sso_user(
 
          R19-F1: if the current-format lookup misses and the caller
          passed ``legacy_subject`` (the OIDC callback computes it via
-         ``_oidc_subject_legacy`` alongside ``subject``), also try that
+         ``SsoSubject.legacy_lookup_key`` alongside ``subject``), also try that
          pre-R18-F1, untagged key. A hit means this is a real user who
          logged in before the R18-F1 key-format retag shipped -- their
          row still carries the old key, and without this fallback they
@@ -615,8 +750,8 @@ def find_or_create_sso_user(
          only ever takes the fallback path once per user.
 
          R20-F1: ``legacy_subject`` is None whenever the current sub is
-         "ambiguous" (see ``_legacy_subject_is_ambiguous`` /
-         ``_oidc_subject_legacy``) -- i.e. its untagged string form
+         "ambiguous" (see ``SsoSubject.is_ambiguous`` /
+         ``SsoSubject.legacy_lookup_key``) -- i.e. its untagged string form
          could have been produced by more than one accepted scalar
          type. This function trusts that None-means-don't-try contract
          from the caller rather than re-deriving it, so an ambiguous
@@ -762,7 +897,7 @@ def _upgrade_subject(user_id: str, old_subject: str, new_subject: str) -> None:
     """Re-stamp a legacy-format ``sso_subject`` to the current format.
 
     R19-F1 self-heal for the fallback lookup above: once a pre-R18-F1
-    row has been matched via ``_oidc_subject_legacy``, advance it to
+    row has been matched via ``SsoSubject.legacy_lookup_key``, advance it to
     the current tagged key so subsequent logins hit the direct
     (non-fallback) lookup. The exact-old-value WHERE guard (not
     ``IS NULL``, unlike ``_stamp_subject_if_absent``) means this only
@@ -1373,34 +1508,21 @@ async def init_oidc_login_handler(request: web.Request) -> web.StreamResponse:
 
 
 def _cookie_secure_flag(request: web.Request) -> bool:
-    """Same heuristic as ``login.cookie_secure_flag`` — kept local so
-    this module doesn't take a hard import on the login submodule.
+    """Delegate to the canonical ``login.cookie_secure_flag``.
 
-    Includes the same fail-closed override: when
-    ``AGENT_MCP_REQUIRE_SECURE_COOKIES`` is set the flag is always
-    True so no SSO session / flow cookie is ever issued without
-    ``Secure``.
-
-    Honours ``X-Forwarded-Proto`` only when the direct peer is a
-    trusted proxy (``rate_limit.request_from_trusted_proxy``) — the
-    header is client-settable, so an untrusted peer must not drive the
-    Secure decision (R6-F3, pentest-all round 6: OBS7 class-sweep miss
-    — this module's docstring already claimed the "same heuristic" as
-    ``login.cookie_secure_flag`` but never actually applied the gate).
+    This used to be a verbatim re-implementation "kept local so this
+    module doesn't take a hard import on the login submodule" — a
+    self-declared duplicate that had already drifted once and produced
+    R6-F3 (pentest-all round 6: the copy claimed the "same heuristic"
+    but never applied the trusted-proxy gate to ``X-Forwarded-Proto``,
+    so an untrusted peer could drive the ``Secure`` decision). Two
+    copies of a fail-closed cookie rule is one copy too many; the
+    import cost is a lazy function-local import, which this module
+    already uses for ``login``'s cookie constants a few lines below.
     """
-    require = os.environ.get("AGENT_MCP_REQUIRE_SECURE_COOKIES")
-    if require is not None and require.strip().lower() in (
-        "1", "true", "yes", "on",
-    ):
-        return True
-    from agent_mcp.router.rate_limit import request_from_trusted_proxy
-    if request_from_trusted_proxy(request):
-        forwarded = request.headers.get("X-Forwarded-Proto", "").lower()
-        if forwarded == "https":
-            return True
-        if forwarded == "http":
-            return False
-    return request.url.scheme == "https"
+    from .login import cookie_secure_flag
+
+    return cookie_secure_flag(request)
 
 
 async def handle_oidc_callback(request: web.Request) -> web.StreamResponse:
@@ -1483,10 +1605,10 @@ async def handle_oidc_callback(request: web.Request) -> web.StreamResponse:
     # ``identity.create_user``, ``_sanitise_username``, or
     # ``find_linkable_user_by_email`` -- all of which assume ``str``.
     # R17-F1: ``sub`` is deliberately NOT included in that "degrade
-    # non-str to None" posture below -- see ``_oidc_subject``'s
-    # docstring for why the stable-identity-key use of ``sub`` needs a
-    # wider (JSON-scalar) type acceptance than the username-fallback
-    # use does.
+    # non-str to None" posture below -- see ``SsoSubject``'s docstring
+    # for why the stable-identity-key use of ``sub`` needs a wider
+    # (JSON-scalar) type acceptance than the username-fallback use
+    # does.
     raw_email = claims.get("email")
     email = raw_email if isinstance(raw_email, str) else None
     # Strict boolean check: an IdP that omits the claim, or sends a
@@ -1500,7 +1622,7 @@ async def handle_oidc_callback(request: web.Request) -> web.StreamResponse:
     raw_sub = claims.get("sub")
     # ``sub_claim`` is the str-only coercion, used ONLY for the
     # preferred_username fallback below (``_sanitise_username`` needs a
-    # ``str`` for ``.lower()``). ``_oidc_subject`` gets the RAW claim
+    # ``str`` for ``.lower()``). ``SsoSubject`` gets the RAW claim
     # instead (R17-F1) -- it accepts any JSON scalar and is the ONLY
     # input to the stable reconciliation key, so degrading a non-str
     # (but still scalar, e.g. numeric) sub to None here would silently
@@ -1510,13 +1632,20 @@ async def handle_oidc_callback(request: web.Request) -> web.StreamResponse:
     # Stable reconciliation key: (iss, sub). ``iss`` is the validated
     # issuer from the id_token; fall back to the configured issuer.
     _iss = claims.get("iss") or cfg.issuer
-    subject = _oidc_subject(_iss, raw_sub)
+    # ADR-0024: one typed value owns the key, its type tag, the legacy
+    # fallback shape and the ambiguity refusal; this call site just asks
+    # it for the two lookup keys.
+    oidc_subject = SsoSubject.from_claims(_iss, raw_sub)
+    subject = oidc_subject.encode() if oidc_subject is not None else None
     # R19-F1: the pre-R18-F1 untagged form of the same (iss, sub) --
     # threaded through as a fallback lookup key so a pre-existing SSO
     # user (whose row still carries the OLD key) reconciles instead of
-    # getting a duplicate JIT-created account. See
-    # ``find_or_create_sso_user``'s step 1 and ``_oidc_subject_legacy``.
-    legacy_subject = _oidc_subject_legacy(_iss, raw_sub)
+    # getting a duplicate JIT-created account. R20-F1: None whenever the
+    # sub is ambiguous. See ``find_or_create_sso_user``'s step 1 and
+    # ``SsoSubject.legacy_lookup_key``.
+    legacy_subject = (
+        oidc_subject.legacy_lookup_key() if oidc_subject is not None else None
+    )
     groups_claim = claims.get("groups") or []
     if not isinstance(groups_claim, list):
         groups_claim = []

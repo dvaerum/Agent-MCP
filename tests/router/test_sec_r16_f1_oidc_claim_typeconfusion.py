@@ -256,12 +256,27 @@ async def test_oidc_callback_survives_dict_preferred_username_claim(
     assert row is not None, "expected JIT-created user under sub-fallback slug"
 
 
+def _subject_key(iss: object | None, sub: object | None) -> str | None:
+    """The persisted ``users.sso_subject`` key for ``(iss, sub)``.
+
+    ADR-0024 (Phase 3 / Finding C): the f-string helper these tests
+    used to call (``sso._oidc_subject``) is now the ``SsoSubject``
+    value type. Same inputs, same string (or None) out — every
+    assertion below is unchanged from the R16-F1/R17-F1/R18-F1
+    originals, so they still pin the exact same properties.
+    """
+    from agent_mcp.router.sso import SsoSubject
+
+    subject = SsoSubject.from_claims(iss, sub)
+    return subject.encode() if subject is not None else None
+
+
 # ── R17-F1: non-str ``sub`` must still reconcile identity ──────────
 #
 # R16-F1 (above) applied its str-only ``sub`` coercion to BOTH of
 # ``sub``'s uses: the (genuinely str-only) preferred_username fallback,
-# AND ``_oidc_subject``'s stable reconciliation key -- which only
-# f-string-interpolates ``sub`` and never needed a str guard. That
+# AND the stable reconciliation key (``SsoSubject`` today) -- which
+# only interpolated ``sub`` and never needed a str guard. That
 # regressed a numeric (or bool/float) ``sub`` to a permanently-None
 # subject, defeating subject-based reconciliation: every login from
 # such an IdP re-minted a brand-new orphaned user instead of matching
@@ -330,11 +345,9 @@ async def test_oidc_callback_int_sub_username_fallback_still_safe(
 
 async def test_oidc_subject_missing_sub_unaffected(monkeypatch) -> None:
     """A genuinely absent ``sub`` (no sub at all) must still degrade
-    ``_oidc_subject`` to None -- no regression to the pre-existing
+    ``SsoSubject`` to None -- no regression to the pre-existing
     "no sub" path."""
-    from agent_mcp.router import sso
-
-    assert sso._oidc_subject("https://idp.example.test", None) is None
+    assert _subject_key("https://idp.example.test", None) is None
 
 
 async def test_oidc_subject_str_sub_unaffected(monkeypatch) -> None:
@@ -344,17 +357,15 @@ async def test_oidc_subject_str_sub_unaffected(monkeypatch) -> None:
     below) -- the expected literal reflects that, updated from the
     R17-F1-era untagged format.
     """
-    from agent_mcp.router import sso
-
     assert (
-        sso._oidc_subject("https://idp.example.test", "abc-123")
+        _subject_key("https://idp.example.test", "abc-123")
         == "oidc:https://idp.example.test:str:abc-123"
     )
 
 
 # ── R18-F1: scalar-to-string collision in the subject key ──────────
 #
-# R17-F1 (above) widened ``_oidc_subject`` to accept any JSON-scalar
+# R17-F1 (above) widened ``SsoSubject`` to accept any JSON-scalar
 # ``sub`` but keyed it via plain f-string interpolation, which is NOT
 # type-discriminating: distinct claim TYPES whose ``str()`` forms
 # happen to match (``True``/``"True"``, ``1``/``"1"``, ``1.0``/
@@ -369,20 +380,16 @@ async def test_oidc_subject_bool_true_and_str_true_do_not_collide() -> None:
     """RED (pre-fix): ``sub=True`` and ``sub="True"`` must produce
     DIFFERENT keys -- ``str(True) == "True"`` so a naive f-string
     interpolation collapses them to the same string."""
-    from agent_mcp.router import sso
-
-    key_bool = sso._oidc_subject("https://idp.example.test", True)
-    key_str = sso._oidc_subject("https://idp.example.test", "True")
+    key_bool = _subject_key("https://idp.example.test", True)
+    key_str = _subject_key("https://idp.example.test", "True")
     assert key_bool is not None and key_str is not None
     assert key_bool != key_str
 
 
 async def test_oidc_subject_bool_false_and_str_false_do_not_collide() -> None:
     """Same collision class as True/"True", for the False/"False" pair."""
-    from agent_mcp.router import sso
-
-    key_bool = sso._oidc_subject("https://idp.example.test", False)
-    key_str = sso._oidc_subject("https://idp.example.test", "False")
+    key_bool = _subject_key("https://idp.example.test", False)
+    key_str = _subject_key("https://idp.example.test", "False")
     assert key_bool is not None and key_str is not None
     assert key_bool != key_str
 
@@ -390,10 +397,8 @@ async def test_oidc_subject_bool_false_and_str_false_do_not_collide() -> None:
 async def test_oidc_subject_int_and_str_do_not_collide() -> None:
     """``sub=1`` (int) and ``sub="1"`` (str) must produce different
     keys -- ``str(1) == "1"``."""
-    from agent_mcp.router import sso
-
-    key_int = sso._oidc_subject("https://idp.example.test", 1)
-    key_str = sso._oidc_subject("https://idp.example.test", "1")
+    key_int = _subject_key("https://idp.example.test", 1)
+    key_str = _subject_key("https://idp.example.test", "1")
     assert key_int is not None and key_str is not None
     assert key_int != key_str
 
@@ -401,10 +406,8 @@ async def test_oidc_subject_int_and_str_do_not_collide() -> None:
 async def test_oidc_subject_float_and_str_do_not_collide() -> None:
     """``sub=1.0`` (float) and ``sub="1.0"`` (str) must produce
     different keys -- ``str(1.0) == "1.0"``."""
-    from agent_mcp.router import sso
-
-    key_float = sso._oidc_subject("https://idp.example.test", 1.0)
-    key_str = sso._oidc_subject("https://idp.example.test", "1.0")
+    key_float = _subject_key("https://idp.example.test", 1.0)
+    key_str = _subject_key("https://idp.example.test", "1.0")
     assert key_float is not None and key_str is not None
     assert key_float != key_str
 
@@ -414,10 +417,8 @@ async def test_oidc_subject_int_and_float_still_distinct() -> None:
     NEVER colliding (``str(1) != str(1.0)``) -- the type-tag fix must
     not accidentally introduce a false collision here, nor a false
     NON-collision expectation flip."""
-    from agent_mcp.router import sso
-
-    key_int = sso._oidc_subject("https://idp.example.test", 1)
-    key_float = sso._oidc_subject("https://idp.example.test", 1.0)
+    key_int = _subject_key("https://idp.example.test", 1)
+    key_float = _subject_key("https://idp.example.test", 1.0)
     assert key_int is not None and key_float is not None
     assert key_int != key_float
 
@@ -426,29 +427,23 @@ async def test_oidc_subject_empty_string_treated_as_missing() -> None:
     """RED (pre-fix): ``sub == ""`` produced a truthy, non-None,
     collidable key (``oidc:<iss>:``) instead of degrading to "missing"
     the same way ``sub is None`` already does."""
-    from agent_mcp.router import sso
-
-    assert sso._oidc_subject("https://idp.example.test", "") is None
+    assert _subject_key("https://idp.example.test", "") is None
 
 
 async def test_oidc_subject_whitespace_only_string_correctly_distinct() -> None:
     """A whitespace-only string is NOT empty and must stay a distinct,
     usable subject -- only the exact empty string degrades to
     "missing"."""
-    from agent_mcp.router import sso
-
-    key = sso._oidc_subject("https://idp.example.test", "   ")
+    key = _subject_key("https://idp.example.test", "   ")
     assert key is not None
-    assert key != sso._oidc_subject("https://idp.example.test", "")
+    assert key != _subject_key("https://idp.example.test", "")
 
 
 async def test_oidc_subject_negative_and_huge_int_no_crash() -> None:
     """Negative and arbitrarily large ints must not crash and must
     produce distinct, stable keys."""
-    from agent_mcp.router import sso
-
-    key_neg = sso._oidc_subject("https://idp.example.test", -42)
-    key_huge = sso._oidc_subject(
+    key_neg = _subject_key("https://idp.example.test", -42)
+    key_huge = _subject_key(
         "https://idp.example.test", 10**30,
     )
     assert key_neg is not None
@@ -459,10 +454,8 @@ async def test_oidc_subject_negative_and_huge_int_no_crash() -> None:
 async def test_oidc_subject_int_sub_stable_across_calls() -> None:
     """R17-F1 regression guard: a normal numeric sub must still
     produce a STABLE key across repeated calls with the SAME type."""
-    from agent_mcp.router import sso
-
-    key1 = sso._oidc_subject("https://idp.example.test", 424242)
-    key2 = sso._oidc_subject("https://idp.example.test", 424242)
+    key1 = _subject_key("https://idp.example.test", 424242)
+    key2 = _subject_key("https://idp.example.test", 424242)
     assert key1 is not None
     assert key1 == key2
 

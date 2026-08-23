@@ -7,6 +7,17 @@
 * Supersedes: nothing
 * Builds on: ADR-0013 (operator login), ADR-0014 (REST admin API)
 
+Amended by ADR-0024 (2026-08-23): the **User matching algorithm**
+bullet below — and the proxy-header section's "same algorithm as
+OIDC's" reference to it — no longer describe the code. Matching is by
+a stable `(iss, sub)` reconciliation key persisted in
+`users.sso_subject`, with email demoted to a *verified-only* link into
+pre-existing rows; that key is now the `SsoSubject` value type. See
+[ADR-0024](0024-sso-subject-value-type.md) for the current algorithm
+and the five pentest rounds (R16-F1 → R20-F1) that produced it.
+Everything else in this ADR — the modes, the mutex, PKCE/nonce, group
+mapping, trusted-source enforcement, the schema change — is unchanged.
+
 ## Context
 
 Phase 1 (ADR-0013) introduced router-side operator identity backed by a
@@ -62,7 +73,8 @@ Three modes:
   `GET /agent-mcp/sso/callback` validates the cookie matches the
   `state` query param, exchanges the code, decodes claims, finds-or-
   creates the local user, and mints the standard session cookie.
-* **User matching algorithm**: match by `email` claim → existing
+* **User matching algorithm** (superseded — see ADR-0024): match by
+  `email` claim → existing
   `users.email`. On miss, create a new user with sanitised
   `preferred_username` (lowercase, dashes only), `email = email`,
   `password_hash = NULL` (the user has no password — the IdP owns the
@@ -90,7 +102,9 @@ Three modes:
   host). `X-Forwarded-For` is **not** consulted for trust
   decisions — that header is operator-supplied, and the IP check IS
   the gatekeeper that prevents header spoofing.
-* **JIT user creation**: same algorithm as OIDC's, with one extra
+* **JIT user creation**: same algorithm as OIDC's (superseded — see
+  ADR-0024; the proxy path's stable subject is the raw trusted header
+  value in its own `proxy:` namespace), with one extra
   knob: `AGENT_MCP_SSO_PROXY_DEFAULT_SYSADMIN` (default `false`).
   When set true, every JIT-created user via the proxy-header path
   gets `is_sysadmin = TRUE`. Only safe when the upstream proxy is
