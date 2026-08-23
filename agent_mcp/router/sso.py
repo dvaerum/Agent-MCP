@@ -63,6 +63,8 @@ from urllib.parse import urlsplit
 
 from aiohttp import web
 
+from ..utils.json_utils import decode_untrusted_body
+
 
 __all__ = [
     "SSOConfigError",
@@ -1241,11 +1243,22 @@ def _encode_flow_cookie(state: _FlowState) -> str:
 
 
 def _decode_flow_cookie(raw: str) -> _FlowState | None:
+    """Decode the SSO flow-state cookie.
+
+    N1 (security-arch-hardening-consolidated.md): the flow cookie is
+    unsigned base64(JSON), hence attacker-craftable like any other
+    untrusted decode point -- routed through the shared
+    ``json_utils.decode_untrusted_body`` seam (which strips hidden-
+    format Unicode) instead of a bare ``json.loads``. Deliberately
+    deferred by N1's own PR to land alongside Phase 3's sso.py rework;
+    Phase 3 has since merged without touching this function, so this
+    closes the gap directly.
+    """
     import base64
     try:
         padded = raw + "=" * (-len(raw) % 4)
         data = base64.urlsafe_b64decode(padded.encode())
-        parsed = json.loads(data)
+        parsed = decode_untrusted_body(data)
         # Fail closed on a missing/empty nonce. Authlib's validate_nonce
         # is gated on `if nonce_value:` — an EMPTY expected nonce skips
         # the comparison entirely, so an id_token minted for a DIFFERENT
