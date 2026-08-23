@@ -284,12 +284,19 @@ def test_task_notes_entry_gate_blocks_viewer_admits_operator() -> None:
     """The add/edit/delete entry gate (operator OR agent_bearer) now
     uses ``system.config.write`` for the operator path; viewer-tier
     operators are denied (tightening) but every agent_bearer still
-    admits as before."""
-    from agent_mcp.core.tool_result import PermissionDenied
+    admits as before.
+
+    Phase 2 (Finding A): the gate moved verbatim onto the impls as
+    ``@requires_predicate(_is_agent_or_operator_caller)``, so a denial
+    RAISES ``AuthRejected`` instead of returning ``PermissionDenied``.
+    The clauses are unchanged — this test still pins exactly who is
+    admitted and who is denied.
+    """
+    from agent_mcp.core.authorize import AuthRejected
 
     # Import the impls and run them with bad arguments — the entry
     # gate is what we're testing, so a clean entry should fall
-    # through to the Invalid path (not PermissionDenied).
+    # through to the Invalid path (no denial at all).
     async def _exercise():
         from agent_mcp.tools.task_notes_tools import (
             add_task_note_tool_impl,
@@ -299,24 +306,22 @@ def test_task_notes_entry_gate_blocks_viewer_admits_operator() -> None:
 
         # Operator admits → falls past gate to Invalid (no task_id).
         op = _operator_principal(project_role="operator")
-        result = await add_task_note_tool_impl({}, principal=op)
-        assert not isinstance(result, PermissionDenied)
+        await add_task_note_tool_impl({}, principal=op)
 
         # Viewer denied at gate.
         viewer = _operator_principal(project_role="viewer")
-        result = await add_task_note_tool_impl({}, principal=viewer)
-        assert isinstance(result, PermissionDenied)
+        with pytest.raises(AuthRejected):
+            await add_task_note_tool_impl({}, principal=viewer)
 
         # Agent bearer admits → falls past gate.
         worker = _agent_bearer(agent_role="worker", agent_id="wkr")
-        result = await add_task_note_tool_impl({}, principal=worker)
-        assert not isinstance(result, PermissionDenied)
+        await add_task_note_tool_impl({}, principal=worker)
 
         # Same gate semantics on edit + delete.
-        result = await edit_task_note_tool_impl({}, principal=viewer)
-        assert isinstance(result, PermissionDenied)
-        result = await delete_task_note_tool_impl({}, principal=viewer)
-        assert isinstance(result, PermissionDenied)
+        with pytest.raises(AuthRejected):
+            await edit_task_note_tool_impl({}, principal=viewer)
+        with pytest.raises(AuthRejected):
+            await delete_task_note_tool_impl({}, principal=viewer)
 
     import asyncio
     asyncio.run(_exercise())
@@ -346,8 +351,14 @@ def test_task_notes_is_admin_flag_uses_tasks_assign() -> None:
 
 def test_update_file_metadata_entry_gate_uses_system_config_write() -> None:
     """``update_file_metadata`` gates on ``system.config.write`` —
-    admits operator-tier + sysadmin, denies viewer + agents."""
-    from agent_mcp.core.tool_result import Invalid, PermissionDenied
+    admits operator-tier + sysadmin, denies viewer + agents.
+
+    Phase 2 (Finding A): the single-capability in-body check became
+    ``@requires_capability("system.config.write", reason=...)`` on the
+    impl, so denials RAISE ``AuthRejected``. Same cap, same admissions.
+    """
+    from agent_mcp.core.authorize import AuthRejected
+    from agent_mcp.core.tool_result import Invalid
 
     async def _exercise():
         from agent_mcp.tools.file_metadata_tools import (
@@ -366,17 +377,17 @@ def test_update_file_metadata_entry_gate_uses_system_config_write() -> None:
 
         # Viewer: denied at gate.
         viewer = _operator_principal(project_role="viewer")
-        result = await update_file_metadata_tool_impl({}, principal=viewer)
-        assert isinstance(result, PermissionDenied)
+        with pytest.raises(AuthRejected):
+            await update_file_metadata_tool_impl({}, principal=viewer)
 
         # Worker agent: denied at gate (lacks system.config.write).
         worker = _agent_bearer(agent_role="worker", agent_id="wkr")
-        result = await update_file_metadata_tool_impl({}, principal=worker)
-        assert isinstance(result, PermissionDenied)
+        with pytest.raises(AuthRejected):
+            await update_file_metadata_tool_impl({}, principal=worker)
 
         # None principal: denied.
-        result = await update_file_metadata_tool_impl({}, principal=None)
-        assert isinstance(result, PermissionDenied)
+        with pytest.raises(AuthRejected):
+            await update_file_metadata_tool_impl({}, principal=None)
 
     import asyncio
     asyncio.run(_exercise())

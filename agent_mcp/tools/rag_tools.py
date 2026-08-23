@@ -19,7 +19,7 @@ requirement instead of it being invisible inside the body.
 from typing import Any, Dict, Optional
 
 from .registry import register_tool
-from ..core.authorize import requires_predicate
+from ..core.authorize import agent_bearer_with_capability, requires_predicate
 from ..core.config import logger
 from ..core.principal import Principal
 from ..core.tool_result import Failed, Invalid, Ok, ToolResult
@@ -28,28 +28,14 @@ from ..utils.audit_utils import log_audit
 from ..features.rag.query import RAG_ERROR_SENTINELS, query_rag_system
 
 
-def _is_rag_capable_agent(principal: Optional[Principal]) -> bool:
-    """True iff ``principal`` may query the project RAG corpus.
-
-    SEC Wave-B (Finding 2): gates on the ``rag.query`` capability, not
-    the bare ``kind``. The pre-Wave-B ``kind == "agent_bearer"`` check
-    admitted a bearer whose ``agent_role`` is None (empty capability
-    bundle) — a token that carries no caps could still read the RAG
-    corpus. The ``kind`` check is retained so operators (who DO carry
-    ``rag.query`` in their project bundle) stay rejected — this tool is
-    agent-only by design; a later UX PR can widen if needed.
-
-    Phase 2 (Finding A): this is a genuine compound predicate (a ``kind``
-    discriminator AND a capability), NOT a single capability test, so it
-    is declared via ``@requires_predicate`` rather than
-    ``@requires_capability`` — flattening it to ``Cap("rag.query")``
-    would widen the tool to operator-session callers, a policy change.
-    """
-    return (
-        principal is not None
-        and principal.kind == "agent_bearer"
-        and principal.has_capability("rag.query")
-    )
+#: SEC Wave-B (Finding 2): agent-only AND ``rag.query``-gated. The
+#: ``kind`` half keeps operators out (they DO carry ``rag.query`` in
+#: their project bundle — this tool is agent-only by design); the
+#: capability half keeps an ``agent_role``-less bearer (empty bundle)
+#: out. See :func:`agent_mcp.core.authorize.agent_bearer_with_capability`
+#: for why neither half can be dropped — flattening to
+#: ``Cap("rag.query")`` would widen the tool, a policy change.
+_is_rag_capable_agent = agent_bearer_with_capability("rag.query")
 
 
 # --- ask_project_rag tool ---

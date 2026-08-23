@@ -16,6 +16,7 @@ import datetime
 from typing import Any, Dict, Optional
 
 from .registry import register_tool
+from ..core.authorize import agent_bearer_with_capability, requires_predicate
 from ..core.config import logger
 from ..core import globals as g
 # R8-F1: explicit maxLength bound for the path-shaped filepath field.
@@ -27,35 +28,31 @@ from ..core.tool_result import (
     Conflict,
     Invalid,
     Ok,
-    PermissionDenied,
     ToolResult,
 )
 from ..utils.audit_utils import log_audit
 # No DB interactions for these specific tools as they manage in-memory state (g.file_map)
 
+#: SEC round-2 (defense-in-depth): agent-only AND ``files.use``-gated.
+#: The in-memory file map keys on ``agent_id`` (claim / release /
+#: lookup are per-agent verbs), which operator sessions don't carry, so
+#: the ``kind`` half is load-bearing and the tool cannot be reduced to
+#: ``Cap("files.use")``. See
+#: :func:`agent_mcp.core.authorize.agent_bearer_with_capability`.
+_is_file_capable_agent = agent_bearer_with_capability("files.use")
+
+
 # --- check_file_status tool ---
+@requires_predicate(
+    _is_file_capable_agent,
+    "Unauthorized: agent token with files.use capability required to "
+    "check file status",
+)
 async def check_file_status_tool_impl(
     arguments: Dict[str, Any],
     *,
     principal: Optional[Principal] = None,
 ) -> ToolResult:
-    # SEC round-2 (defense-in-depth): gate on the ``files.use``
-    # capability, not the bare ``kind`` (mirrors ``rag_tools.py`` under
-    # SEC Wave-B / Finding 2). The prior ``kind == "agent_bearer"``
-    # check admitted a bearer whose ``agent_role`` is None (empty
-    # capability bundle). The ``kind`` check is retained so operator
-    # sessions stay rejected — the in-memory file map keys on
-    # ``agent_id``, which operators don't carry; this tool is
-    # agent-only by design.
-    if (
-        principal is None
-        or principal.kind != "agent_bearer"
-        or not principal.has_capability("files.use")
-    ):
-        return PermissionDenied(
-            reason="agent token with files.use capability required to check file status"
-        )
-
     filepath_arg = arguments.get("filepath")
     if not filepath_arg or not isinstance(filepath_arg, str):
         return Invalid(
@@ -132,22 +129,16 @@ async def check_file_status_tool_impl(
     )
 
 # --- update_file_status tool ---
+@requires_predicate(
+    _is_file_capable_agent,
+    "Unauthorized: agent token with files.use capability required to "
+    "update file status",
+)
 async def update_file_status_tool_impl(
     arguments: Dict[str, Any],
     *,
     principal: Optional[Principal] = None,
 ) -> ToolResult:
-    # SEC round-2 (defense-in-depth): gate on the ``files.use``
-    # capability, not the bare ``kind`` (see check_file_status above).
-    if (
-        principal is None
-        or principal.kind != "agent_bearer"
-        or not principal.has_capability("files.use")
-    ):
-        return PermissionDenied(
-            reason="agent token with files.use capability required to update file status"
-        )
-
     filepath_arg = arguments.get("filepath")
     new_status = arguments.get("status")  # e.g., "editing", "reading", "released"
 

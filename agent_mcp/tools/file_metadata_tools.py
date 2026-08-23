@@ -2,15 +2,18 @@
 """File-metadata MCP tools.
 
 Wave 6 PR 1 migration — both tools take a :class:`Principal` and
-return :data:`ToolResult`. The legacy decorators are gone; the
-admission moves into the impl:
+return :data:`ToolResult`. Phase 2 / Finding A moved admission back
+OUT of the body and onto the impl, where the registry can see it:
 
-* ``view_file_metadata`` — agent_bearer AND ``files.use``
-  capability (SEC round-2 defense-in-depth; the legacy gate was
-  ``@requires("any")`` / bare ``kind``).
-* ``update_file_metadata`` — operator-tier only (matches the legacy
-  ``@requires_role("operator")`` and the ``visibility="operator"``
-  declaration on registration).
+* ``view_file_metadata`` — ``@requires_predicate`` over
+  ``agent_bearer_with_capability("files.use")``: agent_bearer AND the
+  ``files.use`` capability (SEC round-2 defense-in-depth; the legacy
+  gate was ``@requires("any")`` / bare ``kind``).
+* ``update_file_metadata`` — ``@requires_capability("system.config.write")``,
+  operator-tier only (matches the legacy ``@requires_role("operator")``
+  and the ``visibility="operator"`` declaration on registration), with
+  the hand-written worker guidance carried on the decorator's
+  ``reason=``.
 
 Operator-session callers calling ``view_file_metadata`` are not
 admitted today because the metadata read had no use case for the
@@ -24,6 +27,11 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from .registry import register_tool
+from ..core.authorize import (
+    agent_bearer_with_capability,
+    requires_capability,
+    requires_predicate,
+)
 # R8-F1: explicit maxLength bound for the path-shaped filepath field.
 # See core/schema_limits.py for the rationale.
 from ..core.schema_limits import PATH_MAX_LEN
@@ -34,7 +42,6 @@ from ..core.tool_result import (
     Failed,
     Invalid,
     Ok,
-    PermissionDenied,
     ToolResult,
 )
 from ..utils.audit_utils import log_audit
@@ -83,28 +90,23 @@ def _normalize_filepath(
 
 
 # --- view_file_metadata tool ---
+#: Same agent-only + ``files.use`` shape as ``file_management_tools``:
+#: metadata working-dir resolution keys on ``agent_id``, so the ``kind``
+#: half is load-bearing. See
+#: :func:`agent_mcp.core.authorize.agent_bearer_with_capability`.
+_is_file_capable_agent = agent_bearer_with_capability("files.use")
+
+
+@requires_predicate(
+    _is_file_capable_agent,
+    "Unauthorized: agent token with files.use capability required to "
+    "view file metadata",
+)
 async def view_file_metadata_tool_impl(
     arguments: Dict[str, Any],
     *,
     principal: Optional[Principal] = None,
 ) -> ToolResult:
-    # SEC round-2 (defense-in-depth): gate on the ``files.use``
-    # capability, not the bare ``kind`` (mirrors ``rag_tools.py`` under
-    # SEC Wave-B / Finding 2). The prior ``kind == "agent_bearer"``
-    # check admitted a bearer whose ``agent_role`` is None (empty
-    # capability bundle). The ``kind`` check is retained so operator
-    # sessions stay rejected — metadata working-dir resolution keys on
-    # ``agent_id``, which operators don't carry; this read is
-    # agent-only by design (the dashboard has no use case for it today).
-    if (
-        principal is None
-        or principal.kind != "agent_bearer"
-        or not principal.has_capability("files.use")
-    ):
-        return PermissionDenied(
-            reason="agent token with files.use capability required to view file metadata"
-        )
-
     filepath_arg = arguments.get("filepath")
     if not filepath_arg or not isinstance(filepath_arg, str):
         return Invalid(
@@ -216,30 +218,32 @@ async def view_file_metadata_tool_impl(
 
 
 # --- update_file_metadata tool ---
-# Access table classifies this as "any" (workers see it in tools/list)
-# but the impl gates operator-only. We preserve current enforcement
-# (the access.py mismatch is a pre-existing visibility quirk;
-# tightening tools/list would be a separate behavior-change PR).
+# Phase 2 (Finding A): the gate WAS the in-body one-liner
+# ``principal is None or not principal.has_capability("system.config.write")``
+# -- a single capability test, so it maps exactly onto
+# ``@requires_capability`` (unlike this module's sibling read tool,
+# whose ``kind``-AND-cap rule needs a predicate). The stale
+# "access table classifies this as any" note that used to sit here is
+# gone: the derivation now reads the live cap and yields "operator",
+# matching the ``visibility="operator"`` declaration at registration.
+@requires_capability(
+    "system.config.write",
+    # The worker-facing wording is deliberate and pinned by
+    # tests/test_worker_msg_file_tools_clarity.py — it names the tier,
+    # what to ask for, and the read tool that still works. Carried on
+    # the decorator so the message survives the move out of the body.
+    reason=(
+        "Unauthorized: Updating file metadata is an operator-only "
+        "action; a worker agent cannot record file metadata. Ask a "
+        "project operator to set it. (You can still read metadata with "
+        "view_file_metadata.)"
+    ),
+)
 async def update_file_metadata_tool_impl(
     arguments: Dict[str, Any],
     *,
     principal: Optional[Principal] = None,
 ) -> ToolResult:
-    # Wave 9 PR 3: gate on the operator-tier capability marker.
-    # ``system.config.write`` is present in
-    # PROJECT_ROLE_BUNDLES["operator"] and short-circuited by the
-    # sysadmin wildcard; viewer-tier operators (read-only) lack the
-    # cap and are correctly denied. Replaces the legacy
-    # ``has_role("operator")`` which over-broadly admitted viewers.
-    if principal is None or not principal.has_capability("system.config.write"):
-        return PermissionDenied(
-            reason=(
-                "Updating file metadata is an operator-only action; a worker "
-                "agent cannot record file metadata. Ask a project operator to "
-                "set it. (You can still read metadata with view_file_metadata.)"
-            )
-        )
-
     filepath_arg = arguments.get("filepath")
     metadata_to_set = arguments.get("metadata")  # This is a Dict[str, Any]
 

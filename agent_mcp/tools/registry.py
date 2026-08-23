@@ -769,7 +769,16 @@ async def dispatch_tool_call(
             )
             if required_cap is not None:
                 from ..core.authorize import check_capability_gate
-                check_capability_gate(effective_principal, required_cap)
+                # The optional per-tool denial text rides on the wrapper
+                # alongside the cap so this pre-schema gate and the
+                # decorator's own gate produce the SAME message.
+                check_capability_gate(
+                    effective_principal,
+                    required_cap,
+                    getattr(
+                        implementation_func, "_required_capability_reason", None
+                    ),
+                )
             elif required_policy_keys:
                 from ..core.authorize import check_policy_gate
                 required_policy_default = getattr(

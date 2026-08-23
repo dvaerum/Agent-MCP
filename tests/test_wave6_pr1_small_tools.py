@@ -39,7 +39,6 @@ from agent_mcp.core.tool_result import (
     Invalid,
     NotFound,
     Ok,
-    PermissionDenied,
 )
 from tests.harness import dispatch_expecting_denial, make_principal, mcp_session
 
@@ -462,18 +461,11 @@ async def test_update_file_status_conflict_when_claimed_by_other(
 async def test_check_file_status_rejects_operator(tmp_path) -> None:
     """File-claim verbs are agent-keyed; operator session is
     rejected (pre-Wave-6 semantic preserved)."""
-    from agent_mcp.tools.registry import dispatch_tool_call
-
     async with mcp_session(tmp_path):
-        p = _operator_principal()
-        result = await dispatch_tool_call(
+        await dispatch_expecting_denial(
             "check_file_status",
             {"filepath": "/tmp/anything.txt"},
-            principal=p,
-        )
-
-        assert isinstance(result, PermissionDenied), (
-            f"expected PermissionDenied, got {result!r}"
+            principal=_operator_principal(),
         )
 
 
@@ -536,21 +528,16 @@ async def test_view_file_metadata_ok_returns_parsed_data(tmp_path) -> None:
 
 async def test_update_file_metadata_requires_operator(tmp_path) -> None:
     """Worker agents are rejected; only operator-tier passes."""
-    from agent_mcp.tools.registry import dispatch_tool_call
-
     async with mcp_session(tmp_path) as admin:
         worker = await admin.create_worker("alice")
         p_worker = _agent_principal("alice", bearer=worker.token)
-        result = await dispatch_tool_call(
+        await dispatch_expecting_denial(
             "update_file_metadata",
             {
                 "filepath": "/tmp/x.txt",
                 "metadata": {"k": "v"},
             },
             principal=p_worker,
-        )
-        assert isinstance(result, PermissionDenied), (
-            f"expected PermissionDenied for worker, got {result!r}"
         )
 
 
