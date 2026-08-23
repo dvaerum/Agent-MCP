@@ -111,13 +111,14 @@ async def test_get_agent_messages_requires_messages_view(tmp_path) -> None:
     )
 
     async with mcp_session(tmp_path) as admin:
-        denied = await get_agent_messages_tool_impl(
-            {}, principal=_empty_cap_bearer()
-        )
-        assert isinstance(denied, PermissionDenied), (
-            f"empty-cap bearer must be denied message reads, got {denied!r}"
-        )
-        assert "messages.view" in denied.reason
+        # Phase 2 (Finding A): the identity + cap pair is now the
+        # ``@requires_predicate`` on the impl, so the denial raises
+        # ``AuthRejected`` — same two clauses, same decision, same 403.
+        with pytest.raises(AuthRejected) as excinfo:
+            await get_agent_messages_tool_impl(
+                {}, principal=_empty_cap_bearer()
+            )
+        assert "messages.view" in excinfo.value.reason
 
         alice = await admin.create_worker("alice")
         ok = await get_agent_messages_tool_impl(

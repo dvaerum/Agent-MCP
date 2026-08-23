@@ -103,6 +103,63 @@ def _resolve_principal(
     return None
 
 
+# ── Phase 2 / Finding A: the entry gates, declared at the impl ──────
+#
+# Each tool below opened with the same shape: resolve the Principal
+# (kwarg, else the ``request_auth_token`` ContextVar) and reject if the
+# result doesn't identify a caller. ``@requires_predicate`` runs that
+# decision BEFORE jsonschema validation (closing the R20-F4/R21-F1
+# pre-auth schema-shape oracle) and makes it visible to the registry.
+#
+# The decorator's own fallback, ``_synthesize_principal_from_arguments``,
+# resolves an absent ``principal=`` through
+# ``build_agent_bearer_principal`` off the SAME ContextVar that
+# :func:`_resolve_principal` reads — so the predicate sees exactly the
+# Principal the in-body gate would have seen. The in-body
+# ``_resolve_principal`` calls stay (now no-ops on the dispatch path,
+# since the decorator forwards the resolved Principal) because the
+# module's helpers still read ``principal`` positionally further down.
+
+
+def _is_authenticated_caller(principal: Optional[Principal]) -> bool:
+    """Any resolvable identity. ``send_agent_message``'s entry gate.
+
+    Deliberately weak: the real authorization for a send is
+    argument-dependent (recipient, message_type, the
+    worker-to-worker toggle) and lives in
+    :func:`check_send_message_permission`, which cannot run before the
+    arguments are known. Stamping the entry gate still buys the
+    pre-schema denial for a caller with no identity at all.
+    """
+    return principal is not None
+
+
+def _is_identified_agent(principal: Optional[Principal]) -> bool:
+    """A Principal that names an agent (``agent_id`` set).
+
+    The event tools are per-agent by construction — the cursor, the
+    waiter queue and the wake signal all key on ``agent_id`` — so an
+    operator/forwarding Principal (``agent_id`` None) has nothing to
+    poll for. Kept as an ``agent_id`` test rather than a capability so
+    the admitted set is byte-identical to the in-body check, which
+    deliberately did NOT require a capability.
+    """
+    return principal is not None and bool(principal.agent_id)
+
+
+def _can_read_own_messages(principal: Optional[Principal]) -> bool:
+    """``_is_identified_agent`` AND the ``messages.view`` capability.
+
+    Composes the two in-body gates ``get_agent_messages`` ran in order:
+    the identity check, then the cap check that closed the empty-bundle
+    bearer class (an ``agent_bearer`` with ``agent_role`` None named an
+    ``agent_id`` yet held zero caps).
+    """
+    return _is_identified_agent(principal) and principal.has_capability(
+        "messages.view"
+    )
+
+
 # arch-B: the operator-tier predicate is defined once in
 # ``core.principal_builder``. Bound to the historical private name so the
 # call sites below (and the tests pinning it) keep working through the
@@ -310,6 +367,10 @@ _REPLY_HINT_TEXT = (
 )
 
 
+@requires_predicate(
+    _is_authenticated_caller,
+    "Unauthorized: Valid token or operator session required",
+)
 async def send_agent_message_tool_impl(
     arguments: Dict[str, Any],
     *,
@@ -329,11 +390,6 @@ async def send_agent_message_tool_impl(
     :func:`_sender_label`.
     """
     principal = _resolve_principal(arguments, principal)
-    if principal is None:
-        return PermissionDenied(
-            reason="Valid token or operator session required"
-        )
-
     sender_id = _sender_label(principal)
 
     recipient_id = arguments.get("recipient_id")
@@ -590,6 +646,11 @@ async def send_agent_message_tool_impl(
         return Failed(message=f"Unexpected error sending message: {e}")
 
 
+@requires_predicate(
+    _can_read_own_messages,
+    "Unauthorized: Valid agent token with the messages.view capability "
+    "required to retrieve messages",
+)
 async def get_agent_messages_tool_impl(
     arguments: Dict[str, Any],
     *,
@@ -606,21 +667,6 @@ async def get_agent_messages_tool_impl(
     :func:`_resolve_principal`'s token fallback).
     """
     principal = _resolve_principal(arguments, principal)
-    if principal is None or not principal.agent_id:
-        return PermissionDenied(
-            reason="Valid agent token required to retrieve messages"
-        )
-
-    # Reads require the ``messages.view`` capability — a no-op for worker +
-    # manager agents (both bundles carry it) and sysadmin. It DENIES the one
-    # over-admit the identity-only gate above let through: an ``agent_bearer``
-    # that identified an ``agent_id`` yet held zero caps (``agent_role`` None
-    # → empty bundle). Same empty-bearer class ``ask_project_rag`` closed.
-    if not principal.has_capability("messages.view"):
-        return PermissionDenied(
-            reason="messages.view capability required to retrieve messages"
-        )
-
     agent_id = principal.agent_id
 
     include_sent = arguments.get("include_sent", False)
@@ -2049,6 +2095,10 @@ def assemble_event_feed(
     return events, next_cursor
 
 
+@requires_predicate(
+    _is_identified_agent,
+    "Unauthorized: Valid agent token required to long-poll events",
+)
 async def wait_for_events_tool_impl(
     arguments: Dict[str, Any],
     *,
@@ -2086,10 +2136,6 @@ async def wait_for_events_tool_impl(
         serializes the row update under the write queue.
     """
     principal = _resolve_principal(arguments, principal)
-    if principal is None or not principal.agent_id:
-        return PermissionDenied(
-            reason="Valid agent token required to long-poll events"
-        )
     agent_id = principal.agent_id
 
     since = arguments.get("since")
@@ -2571,6 +2617,10 @@ async def wait_for_events_tool_impl(
         g.unregister_waiter(agent_id, waiter_queue)
 
 
+@requires_predicate(
+    _is_identified_agent,
+    "Unauthorized: Valid agent token required to fetch events",
+)
 async def fetch_events_since_tool_impl(
     arguments: Dict[str, Any],
     *,
@@ -2593,10 +2643,6 @@ async def fetch_events_since_tool_impl(
     Same agent-identity gate as :func:`wait_for_events_tool_impl`.
     """
     principal = _resolve_principal(arguments, principal)
-    if principal is None or not principal.agent_id:
-        return PermissionDenied(
-            reason="Valid agent token required to fetch events"
-        )
     agent_id = principal.agent_id
 
     cursor = arguments.get("cursor")

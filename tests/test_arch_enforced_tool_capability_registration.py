@@ -52,19 +52,11 @@ CAPABILITY_FREE_TOOLS = frozenset({"test"})
 
 
 # Tools still gated ONLY by an in-body check — the Phase 2 migration
-# backlog. This set must SHRINK, never grow: each file's migration PR
-# removes its tools from here. The assertion below is an exact-set
-# comparison (not a subset) so a newly-added ungated tool cannot hide
-# inside a stale allowlist.
-UNSTAMPED_MIGRATION_GAPS = frozenset(
-    {
-        # agent_communication_tools.py
-        "fetch_events_since",
-        "get_agent_messages",
-        "send_agent_message",
-        "wait_for_events",
-    }
-)
+# backlog. It is now EMPTY: every registered tool declares its
+# requirement where the registry can see it. Keep it that way — the
+# assertion below is an exact-set comparison, so re-adding a name here
+# is a deliberate, reviewable act rather than a silent regression.
+UNSTAMPED_MIGRATION_GAPS: frozenset[str] = frozenset()
 
 
 def declared_requirement(impl):
