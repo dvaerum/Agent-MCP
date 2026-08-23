@@ -761,12 +761,46 @@ async def _proxy_to_backend(
     # POST SSE-body shape for tools that stream progress) pass
     # through verbatim.
 
-    # Materialise the request body up front. The previous streaming-
-    # response code path interleaved request writes with response
-    # reads; the pure pass-through `await up.read()` below doesn't, so
-    # a streamed `data=req.content` could finish with an empty body
-    # upstream. Reading first guarantees the full body reaches the
-    # backend before we wait on its response.
+    # Materialise the request body up front. TWO independent reasons —
+    # the second one is load-bearing for SECURITY and is not visible
+    # from the code alone:
+    #
+    # 1. Proxying correctness. The previous streaming-response code path
+    #    interleaved request writes with response reads; the pure
+    #    pass-through `await up.read()` below doesn't, so a streamed
+    #    `data=req.content` could finish with an empty body upstream.
+    #    Reading first guarantees the full body reaches the backend
+    #    before we wait on its response.
+    #
+    # 2. FLAG-R7-1 — this read is the ONLY thing keeping the OBS-R11-1
+    #    stale-Principal class closed on the backend REST surface. Every
+    #    one of the 40+ FastAPI handlers under `agent_mcp/app/routers/`
+    #    has the recurring shape: resolve
+    #    `Depends(require_operator_session)`, THEN
+    #    `await get_sanitized_json_body(request)`, THEN write. There is
+    #    no `revalidat*` call anywhere in `agent_mcp/app/` outside the
+    #    two SSE keep-alive loops — nothing on that side re-checks after
+    #    its own body-read yield point. The reason a slow-drip caller
+    #    cannot exploit it (round-7's lane live-tested it: a slow-drip
+    #    `DELETE /messages/<id>` racing a concurrent role demotion,
+    #    correctly 403'd) is that the entire attacker-paced window is
+    #    consumed HERE, at the router, before the connection to the
+    #    backend is even opened a few lines down — so the backend's own
+    #    fresh auth check always runs against a body that already
+    #    arrived in full.
+    #
+    #    Consequence: forwarding a STREAM instead of these bytes (e.g.
+    #    `data=req.content`, for large uploads) reopens that whole bug
+    #    class across every backend REST route in a single move, with
+    #    every per-handler test still green, because nothing on the
+    #    backend side would notice. Do not make this read incremental
+    #    without first giving the backend surface its own re-validation
+    #    seam — the FastAPI analogue of
+    #    `perm_gates.read_body_and_revalidate`. The dependency is pinned,
+    #    behaviourally and by AST, in
+    #    `tests/router/test_arch_n2_proxy_buffers_before_backend.py`;
+    #    that file's docstring carries the full rationale and the
+    #    deployment scoping.
     try:
         req_body = await req.read()
     except ConnectionError as exc:
