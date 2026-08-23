@@ -193,6 +193,7 @@ def _build_route_principal(
     bearer_token: Optional[str],
     operator_session: bool,
     operator_user_id: Optional[str],
+    project_name: Optional[str] = None,
 ) -> Optional[Principal]:
     """Construct the Principal the REST seam threads into the dispatcher.
 
@@ -215,6 +216,12 @@ def _build_route_principal(
     the historical operator-tier default: those paths are genuinely
     operator (the cookie mutation admit is authorized as operator
     upstream; the bearer resolves an operator-tier agent row).
+
+    Finding B (security-arch-hardening-consolidated.md Phase 1):
+    ``project_name`` is best-effort plumbing for routes whose tool call
+    needs it explicitly (e.g. ``agents.register`` — the per-project
+    backend doesn't yet derive its own project name from the request).
+    Every other call site omits it and keeps the historical ``None``.
     """
     from ..core.principal_builder import (
         build_agent_bearer_principal,
@@ -240,7 +247,7 @@ def _build_route_principal(
             kind="operator_session",
             project_role=project_role,
             sysadmin=sysadmin,
-            project_name=None,
+            project_name=project_name,
             source_token=bearer_token,
         )
     if bearer_token:

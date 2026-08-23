@@ -1,11 +1,20 @@
 # Proposal: Security-architecture hardening (authorization seam + SSO identity type)
 
-* Status: **Proposed** (Phase 0 — Findings H, G — landed: PRs #717, #718)
+* Status: **Proposed** (Phase 0 — Findings H, G — landed: PRs #717, #718.
+  Step 0's 3 fix-now bugs — landed: PR #721. Phase 1 — Findings B, F, N3
+  Tier 1 — in flight.)
 * Date: 2026-08-23
-* Source: security-focused `/improve-codebase-architecture` review, run in
-  parallel with pentest-all round 21 (see
-  `~/.claude/plans/pentest-all-Agent-MCP.md` for the full pentest ledger this
-  review draws on)
+* Source: two security-focused `/improve-codebase-architecture` passes.
+  Pass 1 ran parallel with pentest-all round 21 (see
+  `~/.claude/plans/pentest-all-Agent-MCP.md` for the full pentest ledger it
+  draws on) and produced Findings A–H below. Pass 2 (follow-up, after
+  Phase 0 landed) sanity-checked A–F's sequencing and surfaced Findings
+  N1–N6. Pass 2's own HTML report is an ephemeral `/tmp` artifact, not
+  committed (see `docs/learnings/plan-file-citations.md` for why that's a
+  deliberate non-problem here) — its file:line evidence is folded into
+  each N-finding below verbatim. The full execution plan (this doc's
+  ordering plus the exact TDD/delivery steps per item) lives in
+  `~/.claude/plans/security-arch-hardening-consolidated.md`.
 * Related but distinct: [capability-based-authz.md](capability-based-authz.md)
   — that proposal is about *replacing role tiers with capabilities*
   (`has_role` → `has_capability`), and per its own status note is already
@@ -45,9 +54,11 @@ top of it).
 
 ## Findings covered
 
+Pass 1 (Findings A–H):
+
 | ID | Finding | Files | Strength | Effort |
 |---|---|---|---|---|
-| A | Capability is a decorator, not a registration argument — 37/53 MCP tools bypass the pre-schema authz gate | `tools/registry.py`, `tools/access.py`, all `tools/*.py` | Strong | Medium |
+| A | Capability is a decorator, not a registration argument — 20/49 MCP tools bypass the pre-schema authz gate (re-verified counts, pass 2; was stale 37/53 pre-R21-F1) | `tools/registry.py`, `tools/access.py`, all `tools/*.py` | Strong | Medium |
 | B | `_build_route_principal` hardcodes `project_name=None` → one route duplicates identity construction | `app/_dispatch_helpers.py`, `app/routers/agents.py` | Strong | Trivial |
 | C | SSO subject key is an unescaped f-string carrying 4 responsibilities | `router/sso.py` | Strong | Medium |
 | D | Backend REST identity is an untyped 3-shape dict + a ContextVar side-channel | `app/deps.py`, `core/operator_tier.py` | Worth exploring | High |
@@ -55,6 +66,19 @@ top of it).
 | F | Agent liveness checked 6 ways, one hand-duplicated constant | `repositories/agent_repository.py`, `tools/scheduled_directive_tools.py` | Speculative | Trivial |
 | G | Arch-enforcement test scans a hardcoded 2-module allowlist | `tests/router/test_arch_enforced_revalidation.py` | Speculative | Trivial |
 | H | No `CONTEXT.md` — the same identity concept has 3–5 names across modules | repo root | Speculative | Trivial |
+
+Pass 2 (Findings N1–N6, follow-up review, informed by the same pentest
+ledger — see `~/.claude/plans/security-arch-hardening-consolidated.md`
+for full file:line detail on each):
+
+| ID | Finding | Strength | Effort |
+|---|---|---|---|
+| N1 | Sanitization is a helper you must remember to call, not a seam — 11 ledger findings across 9 rounds, 5 live bypasses | Strong | Medium |
+| N2 | The one structurally-enforced revalidation invariant covers 1 of 3 request surfaces (router admin; backend REST relies on an undocumented proxy-buffering side effect, FLAG-R7-1) | Strong | Medium |
+| N3 | "What kind of request is this?" answered 11 times by 5 modules — Tier 1 (pure-copy subtractions) done in Phase 1; the SSO-vs-rate_limit trusted-proxy disagreement was investigated and deliberately NOT force-fit (see Phase 1 below); Tier 2 (derived classification) deferred | Strong | Medium |
+| N4 | `Registry.visibility` is a listing filter wearing an authorization name for 2 of 3 catalogs — informational input to Phase 2 and Phase 4, no PR of its own | Strong | Low to surface |
+| N5 | Long-lived stream re-validation is a convention (4 copies, 1 pattern, 0 seams), not a seam — nothing broken today, pure future-proofing | Worth exploring | Low-medium |
+| N6 | Credential lifecycle has no owning module — mint/compare consolidated, redact/rotate scattered; includes 2 fix-now items (Step 0) plus a structural half deferred to Phase 5 | Worth exploring | Medium |
 
 ## Sequencing
 
@@ -76,31 +100,65 @@ Two hard constraints shape the order:
    `capability`, `operator-tier`, `catalog role` — pick one term per concept
    now, not mid-refactor).
 
-### Phase 0 — now, zero file overlap, start immediately
+### Phase 0 — **done** (PRs #717, #718)
 
-- **H — CONTEXT.md.** Write the identity/authorization glossary: `Principal`,
-  `capability`, `operator-tier` vs `sysadmin` vs `catalog role "admin"` (pick
-  ONE canonical term for each and note the others as deprecated synonyms to
-  grep-replace over time), `agent bearer`, `forwarding header`. ~1 hour,
-  no code change, no risk.
-- **G — dynamic module discovery.** `test_arch_enforced_revalidation.py`
-  currently hardcodes 2 target modules; walk every module importing
-  `perm_gates.require_capability` instead. Pure test-infra change, own
-  worktree, own PR, no production code touched — safe to land immediately
-  regardless of round 21's state.
+- **H — CONTEXT.md.** Landed. Identity/authorization glossary pins
+  `Principal`, `capability`, `operator-tier` vs `sysadmin` vs `catalog role
+  "admin"`, `agent bearer`, `forwarding header`.
+- **G — dynamic module discovery.** Landed. `test_arch_enforced_revalidation.py`
+  now discovers targets by AST-parsing for `perm_gates.require_capability`
+  imports instead of a hardcoded 2-module list — immediately found a third
+  module (`admin_sso_api.py`) the old list silently skipped.
 
-### Phase 1 — as soon as round 21 merges, quick wins
+### Step 0 — **done** (PR #721): 3 fix-now bugs, no architectural dependency
+
+Surfaced by pass 2, none blocking or blocked by anything else: a plaintext
+bearer token logged at WARNING (`admin_tools.py`), password-strength policy
+skipped at 2 of 4 mint sites (env bootstrap + CLI `create-operator`), and an
+SSO fresh-install lockout (`setup_wizard._REDIRECT_EXEMPT_PREFIXES` missing
+the SSO callback path).
+
+### Phase 1 — quick wins (in flight)
 
 - **B — thread `project_name` through `_build_route_principal`.** One
   optional parameter + delete the 20-line inline duplicate in
-  `app/routers/agents.py`. TDD: RED test is a forwarding-VIEWER hitting
-  `agents.py`'s route and getting the full operator bundle (mirrors AZ-R14-1's
-  original repro). Trivial effort, own PR.
+  `app/routers/agents.py`. TDD: RED test asserts `_build_route_principal`
+  accepts and threads `project_name` (fails with `TypeError` pre-fix); the
+  existing AZ-R14-1 regression suite (forwarding-VIEWER → viewer-role
+  Principal, not full operator) guards the refactor doesn't reintroduce
+  the original bug.
 - **F — dedupe the liveness constant.** `scheduled_directive_tools.py:67`
   imports `TERMINAL_AGENT_STATUSES` from `agent_repository.py` instead of
-  redeclaring it. RED test: assert identity (`is`) between the two names
-  before the fix would fail; after, it's a no-op import. Trivial, bundle with
-  B in the same PR if file-disjoint, else its own tiny PR.
+  redeclaring it. RED test: identity (`is`) assertion between the two names.
+- **N3 Tier 1 (subtraction only).** `app/deps.py`'s verbatim
+  `_MUTATION_METHODS` copy → import from `auth_middleware`. **The
+  `sso.is_trusted_proxy_source` vs `rate_limit` disagreement was
+  investigated and deliberately NOT fixed here**: `rate_limit`'s default
+  trusted-proxy set includes loopback (`127.0.0.1,::1`) unconditionally,
+  while `sso.is_trusted_proxy_source` was deliberately built with *no*
+  implicit trust — only the operator-configured
+  `AGENT_MCP_SSO_PROXY_TRUSTED_IPS` allowlist. Delegating to the
+  "canonical" `rate_limit` helper (pass 2's literal recommendation) would
+  have widened SSO's proxy-header trust to implicitly include loopback,
+  a real regression caught by the existing
+  `test_trusted_header_from_untrusted_source_rejected` test. This is a
+  genuine architectural question — should SSO's trust model gain an
+  explicit, narrowly-scoped UDS-fronted carve-out, and on whose terms —
+  not a mechanical dedup. Surfaced to the operator rather than force-fit;
+  N3 Tier 2 (below) is where this should be revisited with a real design,
+  not a copy-paste delegation.
+
+### N1 — parallel with Phase 2 (pass 2's top recommendation)
+
+**Sanitization is a helper you must remember to call, not a seam.** File-
+disjoint from Phase 2 (`tools/` vs `router/` + `app/main_app.py`), and the
+enforcement mechanism (an AST discovery test) is the same idiom Phase 0's
+Finding G just proved works. Collapse the three existing wrappers
+(`get_sanitized_json_body`, `admin_users_api._json_body`,
+`router/app.py:2223`'s `_parse_json_body`) into one entry point, fix the 5
+live bypasses (project create/rename, `identity.create_user`'s `username`,
+`main_app.py` clientInfo, `sso.py`'s flow cookie, form-encoded credential
+paths), and add `test_arch_enforced_sanitization.py`.
 
 ### Phase 2 — the structural lever
 
@@ -121,15 +179,28 @@ Two hard constraints shape the order:
     the in-body call into the `requires=` kwarg) and independently
     verifiable, so this can be one PR per file or a few grouped PRs, not one
     giant PR.
-  - Last step: delete `access.py`'s step-3 hand-synced `visibility=` fallback
-    and the four in-body denial helpers
-    (`admin_tools._require_capability`,
+  - Last step: **shrink** (per N4, do not delete outright) `access.py`'s
+    step-3 hand-synced `visibility=` fallback and the four in-body denial
+    helpers (`admin_tools._require_capability`,
     `project_settings_tools._deny_without_config_write_cap`, the 2 verbatim
     three-clause compounds in `file_management_tools.py`/
-    `file_metadata_tools.py`) once zero call sites remain — same
-    subtraction-is-the-completion-proof shape as the capability-based-authz
-    proposal's own Phase 3.
+    `file_metadata_tools.py`) once zero call sites remain for tools that
+    aren't `@requires_predicate`-gated. `core/authorize.py:398-402`
+    documents that a `@requires_predicate` tool (already 1 shipped via
+    R21-F1's `broadcast_admin_message`, at least 3 more candidates:
+    `ask_project_rag`, `check_file_status`, `view_file_metadata`) cannot
+    derive a `tools/list` tier, so `visibility=` is the only signal for
+    those and must survive.
   - This phase's own worktree, off whatever `main` is once round 21 merges.
+
+### N4 — read before scoping Phase 2's last step and Phase 4 (no PR of its own)
+
+`Registry.visibility` is authoritative for LIST on all three catalogs
+(Prompts/Resources/Tools) but only re-checked at verb time for Prompts —
+Resources' read path and Tools' dispatch path each use a different,
+parallel mechanism. Two consequences already folded into Phase 2 (above)
+and Phase 4 (below); this entry exists so a future reader doesn't
+rediscover the asymmetry mid-implementation.
 
 ### Phase 3 — parallel with Phase 2, independent files
 
@@ -148,6 +219,23 @@ Two hard constraints shape the order:
     live pentest target (BUILTIN mode, not PROXY_HEADER), this phase is safe
     to land without needing a live OIDC IdP to test against — the unit/
     property tests are the real gate here, not an end-to-end SSO login.
+  - **Widened per N3**: fold in `sso._cookie_secure_flag` (`:1375-1404`, an
+    admitted duplicate of `login.cookie_secure_flag` that already produced
+    R6-F3) — same file, already checked out, cheap to add.
+
+### N2 — after Phase 2
+
+**Widen the arch-enforcement invariant to all 3 request surfaces.**
+`test_arch_enforced_revalidation.py` (post-Phase-0) discovers targets
+dynamically but only globs `agent_mcp/router/*.py` — router admin is
+enforced, backend REST (40+ handlers) relies on `_proxy_to_backend`'s
+buffer-then-forward as an *undocumented* security property (FLAG-R7-1),
+MCP tools have 2 ad-hoc re-checks. Sequenced after Phase 2 because its
+first question — does backend REST need its own adapter, or is it
+genuinely immune because the proxy buffers? — is easier to answer once
+Phase 2 has established what a per-surface authorization adapter looks
+like. An acceptable outcome is documenting + testing the buffering
+invariant explicitly rather than building a redundant adapter.
 
 ### Phase 4 — after Phase 2 lands (needs its adapter shape)
 
@@ -161,6 +249,28 @@ Two hard constraints shape the order:
   - TDD: RED tests are the R21-F4 repro (admin cross-agent resource read) plus
     the existing non-admin-denied regression test, both now going through
     `decide()`.
+  - **Per N4**: `decide()` must consult `entry.visibility` on the Resources
+    **read** path, not just derive from listing — today `resources/read`
+    uses a parallel `catalog_role` check that never looks at
+    `entry.visibility`, benign only because both live resources are
+    `visibility="any"`. MCP resource *subscriptions* are confirmed out of
+    scope — `main_app.py` never registers them, so the vendored SDK never
+    advertises the capability.
+
+### N3 Tier 2 + N5 — after Phase 4, or explicitly deferred
+
+Lower urgency, both "generalize an idiom that already works," nothing
+broken today. **N3 Tier 2**: derive request classification (public-path?
+delivery route? which project?) from route-registration metadata instead
+of hand-maintained literal tuples, mirroring `app.py`'s existing
+`_add_admin_trailing_slash_aliases` idiom — this is also where the
+Phase-1-deferred SSO-trusted-proxy question belongs, designed properly
+rather than delegated wholesale. **N5**: fuse the four independently-
+implemented long-lived-stream re-validation loops (`events.py`,
+`delivery.py`, `main_app.py`'s SSE pump, `wait_for_events`) behind one
+seam, mirroring `perm_gates`' fusion idiom applied to the streaming
+lifecycle. Fine to defer past this plan's initial pass if time-boxed —
+flag explicitly rather than silently dropping.
 
 ### Phase 5 — largest effort, do last
 
@@ -177,6 +287,18 @@ Two hard constraints shape the order:
     unexpected callers relying on the dict shape (40+ handlers) — budget the
     most review time here, and consider doing it as several smaller PRs
     (one subsystem of routers at a time) rather than one big-bang migration.
+- **N6 structural half — do alongside D** (every response builder gets
+  touched anyway): consolidate the four independent agent-bearer redaction
+  mechanics (`admin_tools.py:2093` string-overwrite, `composition.py:443`+
+  `:410-418` pop+rename, `composition.py:266-277` SQL column allowlist,
+  `settings.py:101-112` binary 403-or-plaintext) into one redactor — all
+  four already agree on the *who* (`is_confirmed_operator_tier`), only the
+  *what* differs. Surface (don't unilaterally decide in this PR) the
+  `rotate_token()` question: it exists, fully implements
+  rotate-with-cache-rekey, has zero callers — either give it a caller or
+  delete it; that's a product decision for the operator, not a refactor
+  call. (N6's two fix-now items — the plaintext-bearer log line and the
+  password-policy gap — are already done, Step 0/PR #721.)
 
 ## Delivery mechanics (same discipline as pentest-all's fix agents)
 

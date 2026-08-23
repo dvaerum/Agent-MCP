@@ -137,6 +137,42 @@ def test_agent_bearer_caps_identical_across_construction_sites(
     assert rest.capabilities == caps
 
 
+def test_route_principal_threads_project_name_for_operator_session() -> None:
+    """Finding B (security-arch-hardening-consolidated.md Phase 1):
+    ``_build_route_principal`` must accept and thread ``project_name``
+    for the operator_session shape, the same way it already threads
+    ``project_role``/``sysadmin``. Before this fix, the only per-project
+    REST route needing project_name (agents.py's register route) had to
+    build its own ``operator_session`` Principal inline via
+    ``build_operator_principal`` directly instead of routing through
+    this shared helper -- a 20-line duplicate of AZ-R14-1's forwarding-
+    role threading that this fix deletes.
+    """
+    from agent_mcp.app._dispatch_helpers import _build_route_principal
+
+    built = _build_route_principal(
+        bearer_token=None,
+        operator_session=True,
+        operator_user_id="op-1",
+        project_name="demo-project",
+    )
+    assert built is not None
+    assert built.project_name == "demo-project"
+
+
+def test_route_principal_project_name_defaults_to_none() -> None:
+    """Regression: every existing call site that doesn't pass
+    project_name (memories.py, settings.py, tasks.py, messages.py,
+    schedules.py, composition.py) must keep getting None, unchanged."""
+    from agent_mcp.app._dispatch_helpers import _build_route_principal
+
+    built = _build_route_principal(
+        bearer_token=None, operator_session=True, operator_user_id="op-1",
+    )
+    assert built is not None
+    assert built.project_name is None
+
+
 def test_agent_bearer_builder_uses_resolve_capabilities(monkeypatch) -> None:
     """The shared agent_bearer builder's caps ARE
     ``resolve_capabilities(...)`` for the identity — the single path."""
