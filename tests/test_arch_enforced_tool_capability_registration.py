@@ -63,16 +63,6 @@ UNSTAMPED_MIGRATION_GAPS = frozenset(
         "get_agent_messages",
         "send_agent_message",
         "wait_for_events",
-        # file_management_tools.py
-        "check_file_status",
-        "update_file_status",
-        # file_metadata_tools.py
-        "update_file_metadata",
-        "view_file_metadata",
-        # task_notes_tools.py
-        "add_task_note",
-        "delete_task_note",
-        "edit_task_note",
     }
 )
 

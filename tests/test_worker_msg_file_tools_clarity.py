@@ -27,9 +27,9 @@ import sqlite3
 import pytest
 
 from agent_mcp.core.principal import Principal
-from agent_mcp.core.tool_result import Conflict, Failed, Ok, PermissionDenied
+from agent_mcp.core.tool_result import Conflict, Failed, Ok
 from agent_mcp.tools.registry import dispatch_tool_call
-from tests.harness import make_principal, mcp_session
+from tests.harness import dispatch_expecting_denial, make_principal, mcp_session
 
 pytestmark = pytest.mark.asyncio
 
@@ -121,16 +121,17 @@ async def test_update_file_metadata_worker_denial_explains_and_guides(
     it's operator-only, to ask an operator, and that read still works."""
     async with mcp_session(tmp_path) as admin:
         worker = await admin.create_worker("alice")
-        result = await dispatch_tool_call(
+        # Phase 2 (Finding A): the gate is now
+        # ``@requires_capability("system.config.write", reason=...)`` on
+        # the impl, so the denial raises ``AuthRejected``. The wording
+        # below is carried verbatim on the decorator's ``reason=`` — the
+        # whole point of that kwarg is that moving a single-capability
+        # gate out of the body must not cost the worker its guidance.
+        reason = await dispatch_expecting_denial(
             "update_file_metadata",
             {"filepath": "/tmp/x.txt", "metadata": {"k": "v"}},
             principal=_worker("alice", bearer=worker.token),
         )
-
-        assert isinstance(result, PermissionDenied), (
-            f"expected PermissionDenied, got {result!r}"
-        )
-        reason = result.reason
         assert "operator-only action" in reason
         assert "a worker agent cannot record file metadata" in reason
         assert "Ask a project operator to set it" in reason

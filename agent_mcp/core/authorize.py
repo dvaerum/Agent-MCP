@@ -142,8 +142,25 @@ def _synthesize_principal_from_arguments(
     return build_agent_bearer_principal(raw_token)
 
 
-def check_capability_gate(principal: Optional[Principal], cap: str) -> None:
+def check_capability_gate(
+    principal: Optional[Principal],
+    cap: str,
+    reason: Optional[str] = None,
+) -> None:
     """Raise :class:`AuthRejected` iff ``principal`` lacks ``cap``.
+
+    ``reason`` overrides the generic ``"Unauthorized: capability 'x'
+    required"`` text for the cap-missing branch. Phase 2 (Finding A):
+    several tools whose gate IS a single capability had hand-written
+    in-body denials carrying actionable worker guidance ("this is an
+    operator-only action; ask a project operator; you can still read
+    with view_file_metadata"), pinned by
+    ``tests/test_worker_msg_file_tools_clarity.py``. Without this
+    override, moving such a gate to the decorator would either lose
+    that message or push the author to reach for
+    :func:`requires_predicate` purely for its custom ``reason`` — using
+    the wrong gate shape for a single-cap check. The DECISION is
+    unaffected either way; only the wording is.
 
     R20-F4: the single evaluation of "does this principal carry this
     capability", shared by the :func:`requires_capability` wrapper AND
@@ -158,12 +175,16 @@ def check_capability_gate(principal: Optional[Principal], cap: str) -> None:
     for ``tools/list`` visibility).
     """
     if principal is None:
-        raise AuthRejected("Unauthorized: Valid token required")
+        raise AuthRejected(reason or "Unauthorized: Valid token required")
     if not principal.has_capability(cap):
-        raise AuthRejected(f"Unauthorized: capability {cap!r} required")
+        raise AuthRejected(
+            reason or f"Unauthorized: capability {cap!r} required"
+        )
 
 
-def requires_capability(cap: str) -> Callable[[ToolImpl], ToolImpl]:
+def requires_capability(
+    cap: str, *, reason: Optional[str] = None
+) -> Callable[[ToolImpl], ToolImpl]:
     """Authorise a tool entry point against a single capability.
 
     Wave 9 PR 0 — the single capability gate. ``cap`` must be a
@@ -181,6 +202,11 @@ def requires_capability(cap: str) -> Callable[[ToolImpl], ToolImpl]:
     synthesis fallback so direct in-process / unit-test calls that
     don't supply ``principal=`` keep working via the
     ``request_auth_token`` ContextVar.
+
+    ``reason`` (keyword-only) replaces the generic denial text with a
+    tool-specific, actionable one — see :func:`check_capability_gate`.
+    Use it when the tool already had a hand-written worker-facing
+    message worth keeping; it does not change who is admitted.
     """
     from .capabilities import KNOWN_CAPABILITIES
 
@@ -202,15 +228,20 @@ def requires_capability(cap: str) -> Callable[[ToolImpl], ToolImpl]:
         ) -> Any:
             if principal is None:
                 principal = _synthesize_principal_from_arguments(arguments)
-            check_capability_gate(principal, cap)
+            check_capability_gate(principal, cap, reason)
             if forward_principal:
                 return await func(arguments, principal=principal, **kwargs)
             return await func(arguments, **kwargs)
 
         # Expose the cap on the wrapper so the visibility map in
         # ``agent_mcp.tools.access`` can rebuild "this tool requires
-        # cap X" without re-parsing the source.
+        # cap X" without re-parsing the source. The reason rides along
+        # so ``dispatch_tool_call``'s pre-schema gate (which re-runs
+        # ``check_capability_gate`` itself) produces the SAME message
+        # this wrapper would have — otherwise the denial text would
+        # depend on which of the two gates fired first.
         wrapper._required_capability = cap  # type: ignore[attr-defined]
+        wrapper._required_capability_reason = reason  # type: ignore[attr-defined]
         return wrapper
 
     return decorator
@@ -326,6 +357,38 @@ def requires_policy(
 
 
 PredicateFn = Callable[[Optional[Principal]], bool]
+
+
+def agent_bearer_with_capability(cap: str) -> PredicateFn:
+    """Predicate: an ``agent_bearer`` Principal that carries ``cap``.
+
+    The recurring "agent-only AND capability-gated" shape (four tools
+    at time of writing: ``ask_project_rag`` on ``rag.query``,
+    ``check_file_status`` / ``update_file_status`` /
+    ``view_file_metadata`` on ``files.use``). Both halves are load-
+    bearing and neither can be dropped:
+
+    * the ``kind`` half keeps operator-session callers out — those
+      tools key on ``agent_id``, which an operator doesn't carry, and
+      operators DO hold the caps in their project bundle, so a bare
+      capability check would widen them;
+    * the capability half keeps an ``agent_role``-less bearer (empty
+      capability bundle) out — the empty-bearer class closed in SEC
+      Wave-B / SEC round 2.
+
+    Defined once here rather than per-module so the four copies cannot
+    drift; pass it to :func:`requires_predicate` with a tool-specific
+    reason.
+    """
+
+    def _predicate(principal: Optional[Principal]) -> bool:
+        return (
+            principal is not None
+            and principal.kind == "agent_bearer"
+            and principal.has_capability(cap)
+        )
+
+    return _predicate
 
 
 def check_predicate_gate(

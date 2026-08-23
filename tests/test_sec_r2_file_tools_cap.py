@@ -30,7 +30,11 @@ import pytest
 from agent_mcp.core.principal import Principal
 from agent_mcp.core.tool_result import Ok, PermissionDenied
 from agent_mcp.tools.registry import dispatch_tool_call
-from tests.harness import make_principal, mcp_session
+from tests.harness import (
+    dispatch_expecting_denial,
+    make_principal,
+    mcp_session,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -107,14 +111,20 @@ async def test_file_tool_denies_empty_caps_bearer(
 
     This is the RED case: the pre-fix ``kind``-only gate admitted this
     caller.
+
+    Phase 2 (Finding A): the same two-clause rule now lives in
+    ``@requires_predicate(agent_bearer_with_capability("files.use"))``
+    on each impl, so the denial raises ``AuthRejected`` instead of
+    returning ``PermissionDenied`` — same clauses, same decision, same
+    403 / isError=True.
     """
     async with mcp_session(tmp_path):
         p = _bearer("nobody", role=None)
         assert not p.has_capability("files.use")  # precondition
-        result = await dispatch_tool_call(tool_name, arguments, principal=p)
-        assert isinstance(result, PermissionDenied), (
-            f"{tool_name}: empty-caps bearer should be denied, got {result!r}"
+        reason = await dispatch_expecting_denial(
+            tool_name, arguments, principal=p
         )
+        assert "files.use" in reason, reason
 
 
 @pytest.mark.parametrize("tool_name,arguments", _FILE_TOOLS)
@@ -126,10 +136,10 @@ async def test_file_tool_denies_viewer_operator(
     async with mcp_session(tmp_path):
         p = _viewer_operator()
         assert not p.has_capability("files.use")  # precondition
-        result = await dispatch_tool_call(tool_name, arguments, principal=p)
-        assert isinstance(result, PermissionDenied), (
-            f"{tool_name}: viewer operator should be denied, got {result!r}"
+        reason = await dispatch_expecting_denial(
+            tool_name, arguments, principal=p
         )
+        assert "files.use" in reason, reason
 
 
 @pytest.mark.parametrize(

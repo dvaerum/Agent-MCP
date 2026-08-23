@@ -38,6 +38,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
+from ..core.authorize import requires_predicate
 from ..core.config import logger
 from ..core.principal import Principal
 from ..core.tool_result import (
@@ -46,7 +47,6 @@ from ..core.tool_result import (
     Invalid,
     NotFound,
     Ok,
-    PermissionDenied,
     ToolResult,
 )
 from ..db.actions import task_notes_db
@@ -124,6 +124,30 @@ def _classify_db_error(err: str, note_id: int) -> ToolResult:
     return Failed(message=err)
 
 
+def _is_agent_or_operator_caller(principal: Optional[Principal]) -> bool:
+    """True iff ``principal`` may reach the task-note write surface.
+
+    The identical outer gate all three note tools opened with, lifted
+    verbatim: any ``agent_bearer`` (the per-task ownership matrix below
+    governs WHICH task it may annotate), or an operator-tier caller
+    holding ``system.config.write``.
+
+    Phase 2 (Finding A): declared with ``@requires_predicate`` because
+    it is a compound ``kind``-OR-capability rule, not a single
+    capability test — ``Cap("system.config.write")`` would lock every
+    worker out, and no capability alone reproduces the ``kind`` arm.
+    """
+    if principal is None:
+        return False
+    return principal.kind == "agent_bearer" or principal.has_capability(
+        "system.config.write"
+    )
+
+
+@requires_predicate(
+    _is_agent_or_operator_caller,
+    "Unauthorized: agent or operator token required to add a task note",
+)
 async def add_task_note_tool_impl(
     arguments: Dict[str, Any],
     *,
@@ -142,14 +166,6 @@ async def add_task_note_tool_impl(
     is a cross-agent stored-injection primitive (same class as the
     viewer project_context write already fixed).
     """
-    if principal is None or (
-        principal.kind != "agent_bearer"
-        and not principal.has_capability("system.config.write")
-    ):
-        return PermissionDenied(
-            reason="agent or operator token required to add a task note"
-        )
-
     task_id = arguments.get("task_id")
     text = arguments.get("text")
     if not task_id:
@@ -246,6 +262,10 @@ async def add_task_note_tool_impl(
     )
 
 
+@requires_predicate(
+    _is_agent_or_operator_caller,
+    "Unauthorized: agent or operator token required to edit a task note",
+)
 async def edit_task_note_tool_impl(
     arguments: Dict[str, Any],
     *,
@@ -260,14 +280,6 @@ async def edit_task_note_tool_impl(
     worker-authored notes. Worker agents must be the original
     author.
     """
-    if principal is None or (
-        principal.kind != "agent_bearer"
-        and not principal.has_capability("system.config.write")
-    ):
-        return PermissionDenied(
-            reason="agent or operator token required to edit a task note"
-        )
-
     note_id_raw = arguments.get("note_id")
     new_text = arguments.get("text")
     if note_id_raw is None:
@@ -319,6 +331,10 @@ async def edit_task_note_tool_impl(
     )
 
 
+@requires_predicate(
+    _is_agent_or_operator_caller,
+    "Unauthorized: agent or operator token required to delete a task note",
+)
 async def delete_task_note_tool_impl(
     arguments: Dict[str, Any],
     *,
@@ -326,14 +342,6 @@ async def delete_task_note_tool_impl(
 ) -> ToolResult:
     """Delete a task note. Same ownership/moderation contract as
     :func:`edit_task_note_tool_impl`."""
-    if principal is None or (
-        principal.kind != "agent_bearer"
-        and not principal.has_capability("system.config.write")
-    ):
-        return PermissionDenied(
-            reason="agent or operator token required to delete a task note"
-        )
-
     note_id_raw = arguments.get("note_id")
     if note_id_raw is None:
         return Invalid(field="note_id", message="`note_id` is required.")
