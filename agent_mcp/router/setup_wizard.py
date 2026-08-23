@@ -30,6 +30,7 @@ from typing import Callable, Awaitable
 from aiohttp import web
 
 from . import identity
+from . import path_policy
 from .login import (
     _form_str,
     _render,
@@ -65,27 +66,12 @@ def users_table_is_empty() -> bool:
 
 
 # Paths that must remain reachable while the users table is empty.
-# /setup is obvious; /assets is exempt so the wizard's CSS/fonts (none
-# today, but a future PR may add them) load. The /api/ and /mcp/
-# surfaces are exempt because they are machine-to-machine (REST API,
-# MCP transport); redirecting them to an HTML wizard would break the
-# agent-side bearer flow and every pre-Phase-1 dashboard/CI
-# integration that hits the JSON API directly. The wizard is
-# HTML-targeted; only HTML-rendering paths need the bounce.
-#
-# ADR 0014 retired the ``/__*`` namespace; the admin surface now lives
-# under ``/api/router/...`` (covered by the ``/api/`` prefix).
-_REDIRECT_EXEMPT_PREFIXES = (
-    "/agent-mcp/setup",
-    "/agent-mcp/assets/",
-    "/agent-mcp/api/",
-    "/agent-mcp/mcp/",
-    # The SSO handshake itself must be reachable without a session,
-    # same as auth_middleware._UNAUTH_PREFIXES -- else a fresh install
-    # (empty users table) provisioning its first operator via SSO gets
-    # bounced to /setup before the callback ever runs.
-    "/agent-mcp/sso/",
-)
+# N3 Tier 2: the list itself (and the rationale for each entry, plus
+# why it deliberately differs from the auth-bypass allowlist rather
+# than being merged with it) lives in ``path_policy`` — the single home
+# for the router's path classification. Re-exported here because tests
+# and the nix VM suite reference this name.
+_REDIRECT_EXEMPT_PREFIXES = path_policy.REDIRECT_EXEMPT_PREFIXES
 
 
 @web.middleware
@@ -101,7 +87,7 @@ async def empty_users_redirect_middleware(
     path = mount.canonical_path(request)
     if not path.startswith("/agent-mcp"):
         return await handler(request)
-    if any(path.startswith(p) for p in _REDIRECT_EXEMPT_PREFIXES):
+    if path_policy.is_redirect_exempt(path):
         return await handler(request)
     if users_table_is_empty():
         raise web.HTTPSeeOther(location=mount.external_path(request, "/setup"))
