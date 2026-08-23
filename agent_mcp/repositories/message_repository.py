@@ -934,20 +934,9 @@ class MessageRepository:
         try:
             with get_session() as session:
                 def compute_ordered_ids() -> List[str]:
-                    id_stmt = select(AgentMessage.message_id)
-                    _unused = select(AgentMessage.message_id)
-                    id_stmt, _unused = self._apply_query_filters(
-                        id_stmt, _unused, filters,
+                    return self._compute_ordered_ids(
+                        session, filters, oldest_first=oldest_first,
                     )
-                    order_col = (
-                        AgentMessage.timestamp.asc()
-                        if oldest_first
-                        else AgentMessage.timestamp.desc()
-                    )
-                    id_stmt = id_stmt.order_by(
-                        order_col, AgentMessage.message_id.asc(),
-                    )
-                    return [row[0] for row in session.execute(id_stmt).all()]
 
                 ordered_ids = self._pagination_cache.get_or_anchor(
                     cache_key, offset=offset, compute=compute_ordered_ids,
@@ -1002,6 +991,13 @@ class MessageRepository:
         ``offset`` (the ``admin_tools`` stat-counter call sites), this
         always recomputes fresh — safe, since those callers never
         paginate.
+
+        R18-F2: the ordered-id list anchored here comes from the same
+        :meth:`_compute_ordered_ids` helper :meth:`query` uses (same
+        ``ORDER BY``) — previously this method's own unordered
+        closure clobbered ``query``'s anchor on every single request
+        (not just under concurrency), corrupting every subsequent
+        page of the sweep.
         """
         filters = filters or {}
         offset = int(filters.get("offset", 0) or 0)
@@ -1011,12 +1007,9 @@ class MessageRepository:
         try:
             with get_session() as session:
                 def compute_ordered_ids() -> List[str]:
-                    id_stmt = select(AgentMessage.message_id)
-                    _unused = select(AgentMessage.message_id)
-                    id_stmt, _unused = self._apply_query_filters(
-                        id_stmt, _unused, filters,
+                    return self._compute_ordered_ids(
+                        session, filters, oldest_first=False,
                     )
-                    return [row[0] for row in session.execute(id_stmt).all()]
 
                 ordered_ids = self._pagination_cache.get_or_anchor(
                     cache_key, offset=offset, compute=compute_ordered_ids,
@@ -1056,6 +1049,47 @@ class MessageRepository:
             filters.get("q"),
             oldest_first,
         )
+
+    def _compute_ordered_ids(
+        self,
+        session: Any,
+        filters: Dict[str, Any],
+        *,
+        oldest_first: bool,
+    ) -> List[str]:
+        """The ONE ``ORDER BY`` used to populate ``self._pagination_cache``.
+
+        R18-F2: ``query`` and ``count_query`` share a single
+        ``StableOrderCache`` entry per filter shape (see
+        ``_pagination_key``), and ``get_or_anchor`` unconditionally
+        overwrites that entry whenever called with ``offset == 0`` —
+        which happens on every single request, since
+        ``list_messages_api_route`` calls ``query()`` then
+        ``count_query()`` back-to-back with identical filters. Before
+        this fix each method defined its OWN ``compute_ordered_ids``
+        closure; ``count_query``'s had no ``.order_by()`` at all, so
+        it clobbered ``query``'s correctly-ordered anchor with
+        whatever order SQLite's query planner happened to pick for an
+        unordered scan (observed both as an incidental match AND as a
+        genuinely different order depending on which index the
+        planner chose for a given filter shape — i.e. an unordered
+        SELECT's row order is unspecified and must never be relied on
+        for pagination). Both call sites now route through this one
+        method so the two orderings structurally cannot drift apart
+        again.
+        """
+        id_stmt = select(AgentMessage.message_id)
+        count_stmt = select(AgentMessage.message_id)
+        id_stmt, _unused = self._apply_query_filters(
+            id_stmt, count_stmt, filters,
+        )
+        order_col = (
+            AgentMessage.timestamp.asc()
+            if oldest_first
+            else AgentMessage.timestamp.desc()
+        )
+        id_stmt = id_stmt.order_by(order_col, AgentMessage.message_id.asc())
+        return [row[0] for row in session.execute(id_stmt).all()]
 
     @staticmethod
     def _apply_query_filters(
