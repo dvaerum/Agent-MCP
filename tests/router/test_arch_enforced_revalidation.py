@@ -83,6 +83,25 @@ bare yield point is "covered" only when *some* marker call — including
 occurs anywhere LATER in the function, at any nesting depth. A handler
 with a bare yield point and no marker after it anywhere is exactly the
 R14-F2 shape.
+
+Finding G (security-authz-architecture-hardening.md, Phase 0): this
+file itself used to hardcode the 2-module allowlist below as
+``_TARGET_MODULES = [("agent_mcp.router.admin_api", ...), (...
+admin_users_api", ...)]``, with a comment admitting "a future third
+file getting the same shape should be added here rather than silently
+going unchecked" — exactly the opt-in-and-forget shape this whole test
+exists to catch, just recurring in the test's own plumbing. The module
+list is now discovered dynamically by walking ``agent_mcp/router/``
+and AST-parsing each file for a real
+``from .perm_gates import require_capability`` statement (module-level
+or lazy, both occur in this codebase) — the same "does this module use
+the pattern" question a human reviewer would ask, answered
+mechanically instead of by someone remembering to update a list. This
+immediately discovered a third module, ``admin_sso_api.py``
+(``register_admin_sso_routes``), which the old hardcoded list silently
+never covered — see ``test_dynamic_discovery_is_superset_of_history``
+below, which pins that the new mechanism can never regress to covering
+FEWER modules than the list it replaces.
 """
 
 from __future__ import annotations
@@ -102,14 +121,102 @@ _COMBINED_HELPERS = {
     "read_body_and_revalidate", "revalidated_lock", "revalidate_after",
 }
 
-# (module dotted path, route-registration function name) pairs to scan.
-# Both are the two files OBS-R11-1 names explicitly as the recurring
-# class's blast radius; a future third file getting the same shape
-# should be added here rather than silently going unchecked.
-_TARGET_MODULES = [
-    ("agent_mcp.router.admin_api", "register_admin_routes"),
-    ("agent_mcp.router.admin_users_api", "register_admin_users_routes"),
+_ROUTER_PACKAGE = "agent_mcp.router"
+
+# Module stems that can never be a route-registration module using this
+# pattern: the package/entry-point shims, and ``perm_gates`` itself
+# (which DEFINES ``require_capability``, so it always fails the "does
+# this module IMPORT it" test below anyway — excluded explicitly so a
+# stray self-referential import inside perm_gates.py's own tests-style
+# code could never make it discover itself).
+_EXCLUDED_MODULE_STEMS = {"__init__", "__main__", "perm_gates"}
+
+#: The 2-module allowlist this file hardcoded before Finding G's
+#: dynamic discovery replaced it. Kept only so
+#: ``test_dynamic_discovery_is_superset_of_history`` can assert the
+#: new mechanism never silently regresses to covering FEWER modules
+#: than the hand-maintained list it replaces.
+_HISTORICAL_TARGET_MODULES = [
+    "agent_mcp.router.admin_api",
+    "agent_mcp.router.admin_users_api",
 ]
+
+
+def _router_package_dir() -> Path:
+    """Filesystem directory backing ``agent_mcp.router``, resolved via
+    the package's own ``__file__`` (not a path relative to this test
+    file) so discovery is correct regardless of where pytest runs
+    from."""
+    import agent_mcp.router as _pkg
+
+    return Path(_pkg.__file__).parent
+
+
+def _imports_require_capability(tree: ast.Module) -> bool:
+    """True iff ``tree`` contains a real
+    ``from .perm_gates import ... require_capability`` statement —
+    module-level or lazily inside a function (both idioms are common
+    in this codebase's route-registration handlers) — as opposed to a
+    mere textual mention of the name in a comment or docstring (e.g.
+    ``single_tenant.py``, which references ``perm_gates.require_capability``
+    in prose but never imports or calls it, and must NOT be discovered
+    as a target module on that basis)."""
+    return any(
+        isinstance(node, ast.ImportFrom)
+        and node.module == "perm_gates"
+        and any(alias.name == "require_capability" for alias in node.names)
+        for node in ast.walk(tree)
+    )
+
+
+def _discover_target_modules() -> list[str]:
+    """Every ``agent_mcp.router`` module that actually imports
+    ``perm_gates.require_capability``, found by walking the package
+    directory and AST-parsing each file — replaces the hand-maintained
+    ``_HISTORICAL_TARGET_MODULES`` allowlist (Finding G)."""
+    discovered = []
+    for path in sorted(_router_package_dir().glob("*.py")):
+        if path.stem in _EXCLUDED_MODULE_STEMS:
+            continue
+        tree = ast.parse(path.read_text())
+        if _imports_require_capability(tree):
+            discovered.append(f"{_ROUTER_PACKAGE}.{path.stem}")
+    return discovered
+
+
+# Dotted module paths to scan. Previously a hardcoded 2-entry allowlist
+# (see ``_HISTORICAL_TARGET_MODULES``); now discovered dynamically —
+# see the module docstring's "Finding G" section.
+_TARGET_MODULES = _discover_target_modules()
+
+
+def test_dynamic_discovery_is_superset_of_history() -> None:
+    """Finding G's own regression guard: the dynamically-discovered
+    module set must never cover FEWER modules than the hardcoded list
+    it replaced — that would be a silent coverage regression in the
+    detector itself, worse than not changing it at all.
+
+    Also logs (via the assertion message / a print, visible with
+    ``pytest -s`` or on failure) exactly which modules the dynamic
+    discovery found beyond the historical list, so a reviewer can see
+    the mechanism is doing real work rather than degenerating back to
+    the same 2 entries."""
+    discovered = set(_TARGET_MODULES)
+    historical = set(_HISTORICAL_TARGET_MODULES)
+    missing = historical - discovered
+    assert not missing, (
+        f"dynamic discovery via _discover_target_modules() no longer "
+        f"finds {missing!r}, which the old hardcoded "
+        f"_HISTORICAL_TARGET_MODULES list covered — this is a coverage "
+        f"regression in the detector itself."
+    )
+    added = discovered - historical
+    print(
+        f"arch-enforced-revalidation dynamic discovery: "
+        f"{len(discovered)} module(s) found, "
+        f"{len(added)} beyond the historical 2-module allowlist: "
+        f"{sorted(added)!r}"
+    )
 
 
 def _call_func_name(node: ast.AST) -> str | None:
@@ -121,15 +228,17 @@ def _call_func_name(node: ast.AST) -> str | None:
     return None
 
 
-def _find_gate_vars(register_fn: ast.FunctionDef) -> dict[str, str]:
+def _find_gate_vars(module_tree: ast.Module) -> dict[str, str]:
     """``{var_name: capability_string}`` for every
-    ``var = require_capability("cap")`` assignment inside the route-
-    registration function (e.g. ``project_lifecycle_gate``,
-    ``users_gate``). A handler is "capability-gated" iff one of these
-    variable names appears anywhere in its route-registration call
-    expression."""
+    ``var = require_capability("cap")`` assignment anywhere in
+    ``module_tree`` (e.g. ``project_lifecycle_gate``, ``users_gate``,
+    ``sso_gate``) — module-wide rather than scoped to one named
+    route-registration function, so this works regardless of how many
+    registration functions a module defines or what they're called. A
+    handler is "capability-gated" iff one of these variable names
+    appears anywhere in its route-registration call expression."""
     gates: dict[str, str] = {}
-    for node in ast.walk(register_fn):
+    for node in ast.walk(module_tree):
         if (
             isinstance(node, ast.Assign)
             and len(node.targets) == 1
@@ -144,12 +253,14 @@ def _find_gate_vars(register_fn: ast.FunctionDef) -> dict[str, str]:
 
 
 def _route_registrations(
-    register_fn: ast.FunctionDef,
+    module_tree: ast.Module,
     gate_vars: dict[str, str],
     handler_names: set[str],
 ) -> list[tuple[str, str, bool]]:
     """``[(http_method, handler_name, is_capability_gated), ...]`` for
-    every ``app.router.add_<method>(path, <handler-expr>)`` call.
+    every ``app.router.add_<method>(path, <handler-expr>)`` call
+    anywhere in ``module_tree`` — module-wide rather than scoped to one
+    named route-registration function (see ``_find_gate_vars``).
 
     ``<handler-expr>`` is usually a nested call chain — ``gated(cap_gate
     (handler))`` or ``gated(cap_gate(_require_project_operator_membership
@@ -159,7 +270,7 @@ def _route_registrations(
     assuming a fixed nesting depth.
     """
     out: list[tuple[str, str, bool]] = []
-    for node in ast.walk(register_fn):
+    for node in ast.walk(module_tree):
         if not (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
@@ -372,9 +483,17 @@ def test_unprotected_yield_points_still_catches_r13f1_second_lock_shape() -> Non
 def _collect_gated_mutation_handlers() -> list[tuple[str, str, ast.AsyncFunctionDef]]:
     """``[(module_name, handler_name, function_node), ...]`` for every
     capability-gated handler registered under a mutation HTTP verb,
-    across every module in ``_TARGET_MODULES``."""
+    across every module in ``_TARGET_MODULES``.
+
+    Scans each module's WHOLE tree (not a single named
+    route-registration function) for gate-variable assignments and
+    route-registration calls — see ``_find_gate_vars`` /
+    ``_route_registrations`` — so this works uniformly across modules
+    with different route-registration function names (e.g.
+    ``register_admin_routes`` vs. ``register_admin_sso_routes``)
+    without this collector needing to know any of those names."""
     discovered: list[tuple[str, str, ast.AsyncFunctionDef]] = []
-    for module_name, register_fn_name in _TARGET_MODULES:
+    for module_name in _TARGET_MODULES:
         mod = importlib.import_module(module_name)
         tree = ast.parse(Path(mod.__file__).read_text())
         handler_defs = {
@@ -382,15 +501,9 @@ def _collect_gated_mutation_handlers() -> list[tuple[str, str, ast.AsyncFunction
             for node in tree.body
             if isinstance(node, ast.AsyncFunctionDef)
         }
-        register_fn = next(
-            node
-            for node in tree.body
-            if isinstance(node, ast.FunctionDef)
-            and node.name == register_fn_name
-        )
-        gate_vars = _find_gate_vars(register_fn)
+        gate_vars = _find_gate_vars(tree)
         for method, handler_name, gated in _route_registrations(
-            register_fn, gate_vars, set(handler_defs),
+            tree, gate_vars, set(handler_defs),
         ):
             if gated and method in _MUTATION_METHODS:
                 discovered.append(
