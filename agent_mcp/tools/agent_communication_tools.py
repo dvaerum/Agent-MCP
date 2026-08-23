@@ -17,6 +17,11 @@ from ..core.schema_limits import IDENTIFIER_MAX_LEN, MESSAGE_MAX_LEN
 from ..core import globals as g
 from ..core.authorize import requires_predicate
 from ..core.principal import Principal
+from ..core.stream_gates import (
+    Liveness,
+    RevalidatingStream,
+    StreamRevoked,
+)
 from ..core.principal_builder import (
     build_agent_bearer_principal,
     is_operator_tier,
@@ -2375,6 +2380,24 @@ async def wait_for_events_tool_impl(
                 agent_id, float(_reminder_interval), _rnow
             )
 
+        # N5: this long-poll is the fourth of the four long-lived
+        # authenticated channels (with the /api/events, delivery and
+        # GET /mcp SSE streams) and drives its slice loop through the
+        # SAME seam. It keeps its OWN pair of arguments — a live
+        # single-row DB read of ``agents.status`` + both auto-event-loop
+        # toggles (costlier but most current, unlike the SSE pump's
+        # in-memory cache read) at a 2s cadence (unlike their 15s
+        # heartbeat) — because the differing staleness tolerance is the
+        # real difference between these streams; only the structure is
+        # shared. ``_check_auto_event_loop_flags``' ``(enabled, reason)``
+        # maps positionally onto ``Liveness``, and the reason it carries
+        # is what ``stop_listening`` reports back to the agent.
+        gate = RevalidatingStream(
+            waiter_queue,
+            liveness=lambda: Liveness(*_check_auto_event_loop_flags(agent_id)),
+            interval=_FLAG_RECHECK_INTERVAL_SECONDS,
+        )
+
         while True:
             now_mono = asyncio.get_event_loop().time()
             now_iso = datetime.datetime.now().isoformat()
@@ -2486,15 +2509,33 @@ async def wait_for_events_tool_impl(
                     pass
             try:
                 # Block until either (a) the EventBus puts something on
-                # our queue or (b) the slice expires. The item returned
-                # by ``.get()`` is the wake trigger — keep it so it
-                # joins the rest of the drain below. (Otherwise the
-                # event we just consumed gets dropped on the floor
-                # because ``drain_waiter_queue`` only sees what's
-                # still on the queue.)
-                first_item = await asyncio.wait_for(
-                    waiter_queue.get(), timeout=slice_timeout
+                # our queue or (b) the slice expires — through the N5
+                # seam, so the ``_check_auto_event_loop_flags`` re-check
+                # is not a second step this loop has to remember: the
+                # gate runs it before handing back EITHER outcome (a
+                # dequeued item, which is about to become event content,
+                # or an expired slice, whose branch below can itself
+                # return a scheduled fire / idle reminder). ``timeout=``
+                # only ever SHORTENS this slice — the 2s flag-recheck
+                # cadence is the gate's, clamped there, not something a
+                # future wake condition computed here can widen.
+                #
+                # The item returned by the queue is the wake trigger —
+                # keep it so it joins the rest of the drain below.
+                # (Otherwise the event we just consumed gets dropped on
+                # the floor because ``drain_waiter_queue`` only sees
+                # what's still on the queue.)
+                sl = await gate.next_slice(timeout=slice_timeout)
+            except StreamRevoked as revoked:
+                stop_evt = _stop_listening_event(
+                    revoked.reason or "auto_event_loop is OFF"
                 )
+                g.drain_waiter_queue(waiter_queue)
+                return _envelope(
+                    [stop_evt], since, profile_review=review_section
+                )
+            if not sl.idle:
+                first_item = sl.item
                 # Newest-wins: a newer wait_for_events for this agent
                 # superseded us. Close this (stale/duplicate) call with a
                 # connection_superseded event — NOT stop_listening: the loop
@@ -2509,16 +2550,12 @@ async def wait_for_events_tool_impl(
                         [_superseded_event()], since,
                         profile_review=review_section,
                     )
-                # Woken — recheck flags first; the wake may have come
-                # from `wake_for_flag_recheck` (toggle flip), in which
-                # case the new flag state requires stop_listening.
-                enabled, reason = _check_auto_event_loop_flags(agent_id)
-                if not enabled:
-                    stop_evt = _stop_listening_event(
-                        reason or "auto_event_loop is OFF"
-                    )
-                    g.drain_waiter_queue(waiter_queue)
-                    return _envelope([stop_evt], since, profile_review=review_section)
+                # (Woken — the flags were rechecked by the gate above,
+                # BEFORE this item was handed over: the wake may have
+                # come from `wake_for_flag_recheck` (toggle flip) or the
+                # agent may have been terminated mid-hold, in which case
+                # the gate raised StreamRevoked and we already returned
+                # stop_listening.)
                 # Drain everything that accumulated — our own private
                 # synthetic queue (plus the first_item we already
                 # popped to release ``queue.get()``) — and hand it to the
@@ -2551,17 +2588,14 @@ async def wait_for_events_tool_impl(
                 # Wake with no events for this caller's ``since`` cursor —
                 # treat as a spurious wake (e.g. flag toggle that flips
                 # back) and loop for another slice.
-            except asyncio.TimeoutError:
-                # Slice expired without a wake — recheck flags so an
-                # operator who flips a toggle during a long wait sees
-                # it within `_FLAG_RECHECK_INTERVAL_SECONDS`.
-                enabled, reason = _check_auto_event_loop_flags(agent_id)
-                if not enabled:
-                    stop_evt = _stop_listening_event(
-                        reason or "auto_event_loop is OFF"
-                    )
-                    g.drain_waiter_queue(waiter_queue)
-                    return _envelope([stop_evt], since, profile_review=review_section)
+            else:
+                # Slice expired without a wake. The flags were already
+                # rechecked by the gate above — an operator who flips a
+                # toggle during a long wait is seen within
+                # `_FLAG_RECHECK_INTERVAL_SECONDS`, and a terminated
+                # agent never reaches this branch (which can itself
+                # return content: the scheduled-fire and idle-reminder
+                # paths at the top of the next iteration).
                 # Heartbeat: keep a heartbeat-capable client's idle timer
                 # alive across the long silent hold. Sent at most once per
                 # HEARTBEAT_INTERVAL_SECONDS regardless of the tighter flag

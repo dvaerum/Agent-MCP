@@ -77,7 +77,7 @@ for full file:line detail on each):
 | N2 | The one structurally-enforced revalidation invariant covers 1 of 3 request surfaces (router admin; backend REST relies on an undocumented proxy-buffering side effect, FLAG-R7-1) — **done**: both remaining surfaces investigated and their real invariants pinned instead of adapters built, see N2 below | Strong | Medium |
 | N3 | "What kind of request is this?" answered 11 times by 5 modules — Tier 1 (pure-copy subtractions) done in Phase 1; the SSO-vs-rate_limit trusted-proxy disagreement was investigated and deliberately NOT force-fit (see Phase 1 below); Tier 2 (derived classification) deferred | Strong | Medium |
 | N4 | `Registry.visibility` is a listing filter wearing an authorization name for 2 of 3 catalogs — informational input to Phase 2 and Phase 4, no PR of its own | Strong | Low to surface |
-| N5 | Long-lived stream re-validation is a convention (4 copies, 1 pattern, 0 seams), not a seam — nothing broken today, pure future-proofing | Worth exploring | Low-medium |
+| N5 | Long-lived stream re-validation is a convention (4 copies, 1 pattern, 0 seams), not a seam — nothing broken today, pure future-proofing — **done**: `core/stream_gates.RevalidatingStream` + an AST discovery test, all 4 streams migrated keeping their own predicate and cadence, see N5 below | Worth exploring | Low-medium |
 | N6 | Credential lifecycle has no owning module — mint/compare consolidated, redact/rotate scattered; includes 2 fix-now items (Step 0) plus a structural half deferred to Phase 5 | Worth exploring | Medium |
 
 ## Sequencing
@@ -363,12 +363,56 @@ delivery route? which project?) from route-registration metadata instead
 of hand-maintained literal tuples, mirroring `app.py`'s existing
 `_add_admin_trailing_slash_aliases` idiom — this is also where the
 Phase-1-deferred SSO-trusted-proxy question belongs, designed properly
-rather than delegated wholesale. **N5**: fuse the four independently-
-implemented long-lived-stream re-validation loops (`events.py`,
-`delivery.py`, `main_app.py`'s SSE pump, `wait_for_events`) behind one
-seam, mirroring `perm_gates`' fusion idiom applied to the streaming
-lifecycle. Fine to defer past this plan's initial pass if time-boxed —
-flag explicitly rather than silently dropping.
+rather than delegated wholesale. Fine to defer past this plan's initial
+pass if time-boxed — flag explicitly rather than silently dropping.
+
+**N5 — done (this PR).** `core/stream_gates.RevalidatingStream` is the
+streaming-lifecycle analogue of `perm_gates.read_body_and_revalidate`:
+`await gate.next_slice()` IS the bounded wait AND the liveness re-check,
+so the next event cannot be obtained without a fresh verdict. All four
+streams (`events.py`, `delivery.py`, `main_app.py`'s GET /mcp pump,
+`wait_for_events`) now drive their loop through it.
+
+- **Structure is shared; policy is not.** Each stream passes its OWN
+  liveness predicate and its OWN cadence as constructor arguments. The
+  three predicates have genuinely different staleness/cost
+  characteristics (`_bearer_is_active` in-memory cache read,
+  `is_active_agent` canonical `LIVE_AGENT_SQL` repository predicate,
+  `_check_auto_event_loop_flags` live single-row DB read, plus
+  `/api/events`' re-run of a whole FastAPI dependency), and the cadences
+  differ 15s vs 2s — unifying either would have been a policy change
+  wearing a refactor's clothes. What IS unified: the bounded wait, the
+  post-dequeue re-check (SEC-B-F2's half — the one that gets dropped
+  when the loop is hand-copied), the re-check before an idle tick, and
+  the clamp that stops a caller-supplied `timeout=` from ever
+  *lengthening* a slice beyond the stream's cadence.
+- **Fail-closed ergonomics.** Revocation raises `StreamRevoked` rather
+  than returning a flag, so a stream author who forgets to handle it
+  loses the stream instead of delivering on a stale verdict.
+- **The actual deliverable is the discovery test.**
+  `tests/test_arch_enforced_stream_revalidation.py` AST-walks the whole
+  `agent_mcp` package for awaited zero-arg `.get()` calls (the
+  queue-dequeue shape, bare or `wait_for`-wrapped) and fails on any that
+  isn't the single one inside the seam — so the *fifth* stream trips a
+  test instead of inheriting nothing. Its RED half is kept permanently:
+  the same detector is run against a synthetic hand-rolled stream and
+  must flag it, so the rule can't decay into one that detects nothing.
+- Verified no behaviour changed by keeping every per-stream regression
+  suite unmodified and green: `test_sec_r5f1_events_revalidation.py`,
+  `test_delivery_bearer_liveness.py`,
+  `test_sec_r29_terminate_sse_revoke.py`,
+  `test_sec_b_stream_teardown_symmetry.py`, plus the four
+  `test_wait_for_events*.py` files.
+- Design note (reviewed, deliberate): the seam takes its verdict AFTER
+  the wait — immediately before handing back either an item or an idle
+  tick — where the hand-rolled loops took it before the wait and again
+  after a dequeue. Detection latency and the "never deliver on a stale
+  verdict" property are identical (the post-idle check sits at the same
+  wall-clock instant the old top-of-loop check would have run one
+  statement later, and the open-time gate still covers the first wait);
+  it strictly widens coverage, because the old shape left the *idle*
+  branch unchecked — which matters for `wait_for_events`, whose idle
+  branch can itself return scheduled-fire and idle-reminder content.
 
 ### Phase 5 — largest effort, do last
 
