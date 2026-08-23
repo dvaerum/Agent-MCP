@@ -60,5 +60,7 @@ in the same React app.
 
 ## Links
 
-- Plan: `/home/dennis/.claude/plans/prancy-napping-pie.md` decision #3.
+- Plan: originally decision #3 of the "prancy-napping-pie" working
+  plan — an ephemeral Claude Code plan-mode file, never committed to
+  this repo, no longer available. This ADR is the durable record.
 - Phase 3.5 PR (when it ships) for the dashboard ops port.

@@ -44,3 +44,39 @@ Don't change `addopts` itself to fix this — that would slow down every
 solo run (CI included) to fix a problem that only exists when multiple
 suites overlap. The override belongs on the command line of whichever
 invocation is actually sharing the box.
+
+## A second, worse bottleneck: the shared host's Ollama backend has `-np 1`
+
+CPU/RAM contention (above) degrades gracefully — more workers just get
+slower. The host's Ollama `llama-server` (used by RAG/embedding tests)
+does not: it's launched with `-np 1`, hard single-request concurrency,
+so every concurrent test suite's embedding calls pile into one strict
+FIFO queue regardless of how many pytest workers each suite has.
+
+Observed running 4 fix agents' full suites concurrently (pentest-all
+round 21, alongside the live vm-dev VM's own RAG traffic and a
+completeness-review agent also hitting the same Ollama instance): the
+connection count to `:11434` fluctuated between 15 and 72 concurrent
+callers, and individual test suites sat blocked in `epoll_wait` on an
+established Ollama connection for minutes at a time with zero CPU
+movement — genuinely progressing, not hung, just queued. Total elapsed
+time for all 4 suites to finish was well over 2 hours; a normal solo
+full-suite run on this repo is ~10-15 minutes.
+
+**This means concurrent full-suite runs can be net SLOWER than running
+them one at a time**, not just less courteous — unlike the CPU/RAM
+case where more concurrency at least keeps making progress, N suites
+fighting over one Ollama request slot make each other wait rather than
+share throughput. If you know ahead of time that several fix agents'
+suites will all exercise RAG/embedding tests, prefer running their
+full-suite gates **sequentially** (one worktree's suite completes and
+opens its PR before the next starts) rather than dispatching all of
+them in parallel and letting them queue.
+
+How to tell this apart from a genuine hang while it's happening:
+`ss -tnp | grep :11434` on the suspect PID — an `ESTAB` connection to
+the local Ollama port that keeps existing (or gets replaced by a fresh
+one on a new ephemeral port) across repeated checks is the queue, not
+a hang. `ps aux | grep ollama` should also still show the
+`llama-server` process burning real CPU — if it's also idle, that's a
+different, actual problem.

@@ -2,7 +2,8 @@
 
 * Status: Accepted
 * Date: 2026-07-14
-* Plan: `prancy-napping-pie.md` Wave 11
+* Plan: "prancy-napping-pie" Wave 11 — ephemeral plan file, never
+  committed, no longer available; this ADR is the durable record
 * Supersedes: nothing
 * Builds on: ADR-0013 (operator login), ADR-0015 (SSO via OIDC + proxy-header trust)
 

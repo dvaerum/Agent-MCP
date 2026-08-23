@@ -99,7 +99,9 @@ card: "uses in last 7d / last-used-by / Extend / Remove" buttons.
 
 ## Links
 
-- Plan: `/home/dennis/.claude/plans/prancy-napping-pie.md` decisions #4 + #5.
+- Plan: originally decisions #4 + #5 of the "prancy-napping-pie" working
+  plan — an ephemeral Claude Code plan-mode file, never committed to
+  this repo, no longer available. This ADR is the durable record.
 - PR #85: Phase 1b rename + alias data model.
 - PR #86: Phase 1c `serverInfo.instructions` injection +
   `mcp_sessions.alias_used` migration.
