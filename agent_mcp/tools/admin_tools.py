@@ -15,22 +15,31 @@ from ..core.config import logger, AGENT_COLORS  # AGENT_COLORS for register_agen
 from ..core.schema_limits import IDENTIFIER_MAX_LEN, PATH_MAX_LEN
 from ..core import globals as g
 from ..core.auth import generate_token  # For register_agent, terminate_agent
-# Wave 6 PR 5 — migrated to Principal + ToolResult. The
-# ``@requires_role("operator")`` decorator is replaced by an inline
-# capability check at the top of each tool (the decorator's wrapper
-# signature locks the inner function to
-# ``(arguments) -> list[TextContent]`` and can't forward the
-# Principal kwarg the dispatcher passes to migrated tools). Wave 9
-# PR 3 narrows the check from the role-tier ``has_role("operator")``
-# bridge to the per-action capability the tool actually performs
+# Wave 6 PR 5 — migrated to Principal + ToolResult. Wave 9 PR 3
+# narrowed the gate from the role-tier ``has_role("operator")`` bridge
+# to the per-action capability the tool actually performs
 # (``agents.register``, ``agents.terminate``, ``agents.view``,
-# ``system.view``) — each tool declares its cap at the call site so
-# the gate names the action. Tool visibility in ``tools/list`` is
-# still gated by the ``visibility="operator"`` kwarg on each
-# ``register_tool(...)`` call below — that's the source of truth
+# ``system.view``). At the time, the gate was applied as an inline
+# ``_require_capability(principal, cap)`` check at the top of each
+# tool rather than the ``@requires_capability`` decorator, because the
+# decorator's wrapper couldn't yet forward the Principal kwarg to a
+# migrated impl. That limitation is gone (the decorator forwards
+# ``principal=`` whenever the wrapped impl declares the parameter —
+# see ``core/authorize._func_accepts_principal``), and the in-body
+# form left a gap: ``dispatch_tool_call`` only consults the
+# ``_required_capability`` attribute the decorator stamps to gate
+# BEFORE jsonschema validation (R20-F4); a tool that gates in-body has
+# no such stamp, so a malformed call from an unauthorized caller
+# reached schema validation first and leaked the tool's exact
+# required-field shape (R21-F1). Every operator-tier tool below is now
+# ``@requires_capability``-decorated so the pre-schema gate covers it
+# too. Tool visibility in ``tools/list`` is still gated by the
+# ``visibility="operator"`` kwarg on each ``register_tool(...)`` call
+# below — that's the source of truth
 # read by ``tools/access._derive_access_level`` once the decorator
 # is gone.
 from ..core.principal import Principal
+from ..core.authorize import requires_capability
 from ..core.agent_profile_defaults import MANAGER_DEFAULT_PROFILE
 from ..core.operator_tier import (
     is_confirmed_operator_tier as _shared_is_confirmed_operator_tier,
@@ -256,6 +265,7 @@ class _UnitOfWorkAbort(Exception):
         self.result = result
 
 
+@requires_capability("agents.register")
 async def register_agent_tool_impl(
     arguments: Dict[str, Any],
     *,
@@ -284,9 +294,6 @@ async def register_agent_tool_impl(
             Optional; falls back to ``$AGENT_MCP_EXTERNAL_URL`` and
             then to a placeholder constant.
     """
-    denied = _require_capability(principal, "agents.register")
-    if denied is not None:
-        return denied
 
     # Accept both the new ``name`` shape (per the Wave 7 plan) and
     # the legacy ``agent_id`` field so the dashboard's existing
@@ -544,26 +551,25 @@ async def register_agent_tool_impl(
 
 # --- view_status tool ---
 # Original logic from main.py: lines 1242-1268 (view_status_tool function)
+@requires_capability("system.config.write")
 async def view_status_tool_impl(
     arguments: Dict[str, Any],
     *,
     principal: Optional[Principal] = None,
 ) -> ToolResult:
-    """Report active agents + server status — operator-only."""
-    # SECURITY (viewer-read-gating, 2026-07-08): gated on
-    # ``system.config.write`` — the operator-only system capability —
-    # NOT ``system.view``. ``system.view`` is in the VIEWER project-role
-    # bundle (core/capabilities.py::PROJECT_ROLE_BUNDLES), so gating on
-    # it let a read-only viewer who called this tool directly over the
-    # MCP wire (it's hidden from their tools/list, but visibility is not
-    # enforcement) read every agent's status + absolute working
-    # directory. ``system.config.write`` is held by operators + sysadmin
-    # but not viewers, so it names the operator tier that may see
-    # system-level oversight data. Sysadmin admits via the wildcard.
-    denied = _require_capability(principal, "system.config.write")
-    if denied is not None:
-        return denied
+    """Report active agents + server status — operator-only.
 
+    SECURITY (viewer-read-gating, 2026-07-08): gated on
+    ``system.config.write`` — the operator-only system capability —
+    NOT ``system.view``. ``system.view`` is in the VIEWER project-role
+    bundle (core/capabilities.py::PROJECT_ROLE_BUNDLES), so gating on
+    it let a read-only viewer who called this tool directly over the
+    MCP wire (it's hidden from their tools/list, but visibility is not
+    enforcement) read every agent's status + absolute working
+    directory. ``system.config.write`` is held by operators + sysadmin
+    but not viewers, so it names the operator tier that may see
+    system-level oversight data. Sysadmin admits via the wildcard.
+    """
     log_audit(
         principal.actor_label() if principal else "operator",
         "view_status",
@@ -694,15 +700,13 @@ def _reconcile_reassigned_tasks(
 
 # --- terminate_agent tool ---
 # Original logic from main.py: lines 1270-1316 (terminate_agent_tool function)
+@requires_capability("agents.terminate")
 async def terminate_agent_tool_impl(
     arguments: Dict[str, Any],
     *,
     principal: Optional[Principal] = None,
 ) -> ToolResult:
     """Soft-terminate an agent (flips status) — operator-only."""
-    denied = _require_capability(principal, "agents.terminate")
-    if denied is not None:
-        return denied
 
     agent_id_to_terminate = arguments.get("agent_id")
 
@@ -1048,7 +1052,8 @@ def _gather_purge_preview(cursor, agent_id: str) -> Dict[str, Any]:
 # verb, so they gate on ``agents.terminate`` — the agents.* write cap the
 # operator bundle carries and the REST routes' ``require_operator_session``
 # resolves to. Auth-equivalent, no privilege change (sysadmin wildcards;
-# viewer/worker lacks it → PermissionDenied → 403).
+# viewer/worker lacks it → AuthRejected → 403).
+@requires_capability("agents.terminate")
 async def restore_agent_tool_impl(
     arguments: Dict[str, Any],
     *,
@@ -1066,9 +1071,6 @@ async def restore_agent_tool_impl(
     ``g.agent_working_dirs`` cache rebuild registers post-commit
     (emit-iff-commit — a rollback re-adds nothing).
     """
-    denied = _require_capability(principal, "agents.terminate")
-    if denied is not None:
-        return denied
 
     agent_id = arguments.get("agent_id")
     if not agent_id or not isinstance(agent_id, str):
@@ -1168,6 +1170,7 @@ async def restore_agent_tool_impl(
         return Failed(message=f"Unexpected error restoring agent: {e}")
 
 
+@requires_capability("agents.terminate")
 async def edit_agent_tool_impl(
     arguments: Dict[str, Any],
     *,
@@ -1190,9 +1193,6 @@ async def edit_agent_tool_impl(
     values are already validated. The tool's inputSchema validates the same
     fields on the MCP path.
     """
-    denied = _require_capability(principal, "agents.terminate")
-    if denied is not None:
-        return denied
 
     agent_id = arguments.get("agent_id")
     if not agent_id or not isinstance(agent_id, str):
@@ -1632,6 +1632,7 @@ async def reconnect_all_agents_tool_impl(
     )
 
 
+@requires_capability("agents.terminate")
 async def purge_agent_tool_impl(
     arguments: Dict[str, Any],
     *,
@@ -1653,9 +1654,6 @@ async def purge_agent_tool_impl(
     the REST adapter (refuse a bare DELETE); a direct MCP call to this
     operator-tier tool is already a deliberate purge.
     """
-    denied = _require_capability(principal, "agents.terminate")
-    if denied is not None:
-        return denied
 
     agent_id = arguments.get("agent_id")
     if not agent_id or not isinstance(agent_id, str):
@@ -1855,20 +1853,20 @@ async def purge_agent_tool_impl(
 
 # --- view_audit_log tool ---
 # Original logic from main.py: lines 1387-1408 (view_audit_log_tool function)
+@requires_capability("system.config.write")
 async def view_audit_log_tool_impl(
     arguments: Dict[str, Any],
     *,
     principal: Optional[Principal] = None,
 ) -> ToolResult:
-    """Read recent audit-log entries — operator-only."""
-    # SECURITY (viewer-read-gating, 2026-07-08): gated on
-    # ``system.config.write`` (operator-only system cap), NOT
-    # ``system.view`` — the audit log discloses operator user_ids and
-    # every agent action, and ``system.view`` is in the VIEWER bundle.
-    # See view_status_tool_impl for the full rationale.
-    denied = _require_capability(principal, "system.config.write")
-    if denied is not None:
-        return denied
+    """Read recent audit-log entries — operator-only.
+
+    SECURITY (viewer-read-gating, 2026-07-08): gated on
+    ``system.config.write`` (operator-only system cap), NOT
+    ``system.view`` — the audit log discloses operator user_ids and
+    every agent action, and ``system.view`` is in the VIEWER bundle.
+    See view_status_tool_impl for the full rationale.
+    """
 
     filter_agent_id = arguments.get("agent_id")  # Optional filter
     filter_action = arguments.get("action")  # Optional filter
@@ -1947,6 +1945,7 @@ async def view_audit_log_tool_impl(
 
 
 # --- get_agent_tokens tool ---
+@requires_capability("agents.register")
 async def get_agent_tokens_tool_impl(
     arguments: Dict[str, Any],
     *,
@@ -1956,20 +1955,18 @@ async def get_agent_tokens_tool_impl(
     Retrieve agent tokens with advanced filtering capabilities.
     Supports filtering by status, agent_id pattern, creation date range,
     and more. Operator-only.
+
+    SECURITY (FINDING 2): agent bearer tokens are operator-tier
+    secrets. The viewer bundle holds ``agents.view`` (see
+    core/capabilities.py::PROJECT_ROLE_BUNDLES), so gating on it leaked
+    every agent's plaintext bearer to read-only viewers, who could
+    replay a harvested token to escalate to write. Gate on an
+    operator-only cap instead: ``agents.register`` is the operation
+    that MINTS + returns an agent bearer, so the privilege to view
+    existing agent tokens belongs to the same tier. Viewers (and agent
+    bearers, which lack this cap) are denied here; the masking check
+    below is the second, defense-in-depth layer.
     """
-    # SECURITY (FINDING 2): agent bearer tokens are operator-tier
-    # secrets. The viewer bundle holds ``agents.view`` (see
-    # core/capabilities.py::PROJECT_ROLE_BUNDLES), so gating on it leaked
-    # every agent's plaintext bearer to read-only viewers, who could
-    # replay a harvested token to escalate to write. Gate on an
-    # operator-only cap instead: ``agents.register`` is the operation
-    # that MINTS + returns an agent bearer, so the privilege to view
-    # existing agent tokens belongs to the same tier. Viewers (and agent
-    # bearers, which lack this cap) are denied here; the masking check
-    # below is the second, defense-in-depth layer.
-    denied = _require_capability(principal, "agents.register")
-    if denied is not None:
-        return denied
 
     # Extract and validate filter parameters
     filter_status = arguments.get(

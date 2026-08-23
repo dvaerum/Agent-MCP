@@ -555,19 +555,22 @@ async def test_backup_project_context_worker_returns_permission_denied(
     tmp_path,
 ) -> None:
     """An agent_bearer Principal (worker or manager) cannot back
-    up. Explicit :class:`PermissionDenied` — REST adapter maps
-    to 403 with the reason in the envelope."""
+    up. R21-F1 moved the gate onto ``@requires_capability`` (was an
+    in-body ``_is_admin_principal`` check returning
+    ``PermissionDenied``) — it now raises :class:`AuthRejected`; the
+    REST adapter maps it to 403 with the reason in the envelope."""
+    from agent_mcp.core.authorize import AuthRejected
     from agent_mcp.tools.registry import dispatch_tool_call
 
     async with mcp_session(tmp_path):
-        result = await dispatch_tool_call(
-            "backup_project_context",
-            {},
-            principal=_worker_principal(),
-        )
+        with pytest.raises(AuthRejected) as excinfo:
+            await dispatch_tool_call(
+                "backup_project_context",
+                {},
+                principal=_worker_principal(),
+            )
 
-    assert isinstance(result, PermissionDenied)
-    assert "operator" in result.reason.lower()
+    assert "system.config.write" in str(excinfo.value)
 
 
 async def test_backup_project_context_operator_returns_ok(tmp_path) -> None:

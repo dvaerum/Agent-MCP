@@ -42,6 +42,7 @@ from ..core.config import logger
 from ..core.operator_tier import (
     is_confirmed_operator_tier as _shared_is_confirmed_operator_tier,
 )
+from ..core.authorize import requires_capability
 from ..core.principal import Principal
 from ..core.settings_schema import SECRET_SETTING_KEYS
 from ..core.tool_result import (
@@ -49,7 +50,6 @@ from ..core.tool_result import (
     Invalid,
     NotFound,
     Ok,
-    PermissionDenied,
     ToolResult,
 )
 from ..db.actions.agent_actions_db import log_agent_action_to_db
@@ -96,25 +96,6 @@ def _is_confirmed_operator_tier(principal: Optional[Principal]) -> bool:
     )
 
 
-def _deny_without_config_write_cap(
-    principal: Optional[Principal],
-) -> Optional[PermissionDenied]:
-    """The settings store is operator-only: every access (read AND
-    write) requires ``system.config.write`` — present in the operator
-    project-role bundle, absent from every agent-role bundle, and
-    short-circuited by the sysadmin wildcard."""
-    if principal is None or not principal.has_capability(
-        "system.config.write"
-    ):
-        return PermissionDenied(
-            reason=(
-                "system.config.write capability required for the "
-                "project settings store"
-            )
-        )
-    return None
-
-
 def redact_settings_row(
     row: Dict[str, Any], *, confirmed_operator_tier: bool,
 ) -> Dict[str, Any]:
@@ -133,16 +114,13 @@ def redact_settings_row(
 # --- view_project_settings ------------------------------------------------
 
 
+@requires_capability("system.config.write")
 async def view_project_settings_tool_impl(
     arguments: Dict[str, Any],
     *,
     principal: Optional[Principal] = None,
 ) -> ToolResult:
     """Return every ``project_settings`` row (operator-only read)."""
-    denied = _deny_without_config_write_cap(principal)
-    if denied is not None:
-        return denied
-
     requesting_actor = _actor_label(principal)
     log_audit(requesting_actor, "view_project_settings", {})
 
@@ -175,6 +153,7 @@ async def view_project_settings_tool_impl(
 # --- update_project_settings ----------------------------------------------
 
 
+@requires_capability("system.config.write")
 async def update_project_settings_tool_impl(
     arguments: Dict[str, Any],
     *,
@@ -182,11 +161,13 @@ async def update_project_settings_tool_impl(
 ) -> ToolResult:
     """Upsert a ``config_*`` row in the settings store.
 
-    Gate order: (1) the key must be ``config_*`` (Invalid otherwise —
-    knowledge belongs in the project_context tools), (2) the
-    ``system.config.write`` cap. Value is JSON-encoded on write exactly
-    like the context tools, keeping the coercion helpers' read contract
-    unchanged.
+    The ``system.config.write`` cap gate runs first (the decorator, so
+    ``dispatch_tool_call`` denies an unauthorized caller before
+    jsonschema even sees the arguments — R21-F1); the key must be
+    ``config_*`` (Invalid otherwise — knowledge belongs in the
+    project_context tools) is checked after, for an already-authorized
+    caller. Value is JSON-encoded on write exactly like the context
+    tools, keeping the coercion helpers' read contract unchanged.
     """
     context_key = arguments.get("context_key")
     context_value = arguments.get("context_value")
@@ -203,10 +184,6 @@ async def update_project_settings_tool_impl(
                 "project_context tools for knowledge"
             ),
         )
-
-    denied = _deny_without_config_write_cap(principal)
-    if denied is not None:
-        return denied
 
     if context_value is None and "context_value" not in arguments:
         return Invalid(
@@ -273,6 +250,7 @@ async def update_project_settings_tool_impl(
 # --- delete_project_settings ----------------------------------------------
 
 
+@requires_capability("system.config.write")
 async def delete_project_settings_tool_impl(
     arguments: Dict[str, Any],
     *,
@@ -281,17 +259,14 @@ async def delete_project_settings_tool_impl(
     """Delete a ``config_*`` row from the settings store.
 
     Same gate as :func:`update_project_settings_tool_impl` (the
-    ``system.config.write`` cap). Fires the post-write wakes for the
+    ``system.config.write`` cap, now enforced by the decorator ahead of
+    schema validation — R21-F1). Fires the post-write wakes for the
     deleted key too: a deleted toggle reverts to its default, so worker
     tool visibility / in-flight waiters may need to re-evaluate.
     """
     context_key = arguments.get("context_key")
     if not context_key or not isinstance(context_key, str):
         return Invalid(field="context_key", message="context_key is required")
-
-    denied = _deny_without_config_write_cap(principal)
-    if denied is not None:
-        return denied
 
     requesting_actor = _actor_label(principal)
     log_audit(

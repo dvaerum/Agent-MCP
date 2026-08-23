@@ -44,7 +44,6 @@ from agent_mcp.core.tool_result import (
     Invalid,
     NotFound,
     Ok,
-    PermissionDenied,
 )
 from tests.harness import make_principal, mcp_session, with_principal
 
@@ -107,28 +106,32 @@ async def test_view_status_returns_ok_with_typed_data_for_operator(tmp_path) -> 
 async def test_view_status_rejects_worker_principal_as_permission_denied(
     tmp_path,
 ) -> None:
-    """Worker-tier principal calling ``view_status`` returns
-    :class:`PermissionDenied` (not raised) — the typed-return contract."""
+    """Worker-tier principal calling ``view_status`` is rejected.
+
+    R21-F1 moved the gate onto ``@requires_capability`` (was an
+    in-body check returning ``PermissionDenied``) — it now raises
+    :class:`AuthRejected`."""
+    from agent_mcp.core.authorize import AuthRejected
     from agent_mcp.tools.admin_tools import view_status_tool_impl
 
     async with mcp_session(tmp_path):
-        result = await view_status_tool_impl(
-            {}, principal=_worker_principal()
-        )
+        with pytest.raises(AuthRejected) as excinfo:
+            await view_status_tool_impl(
+                {}, principal=_worker_principal()
+            )
 
-    assert isinstance(result, PermissionDenied)
-    assert "operator" in result.reason.lower()
+    assert "system.config.write" in str(excinfo.value)
 
 
 async def test_view_status_rejects_none_principal(tmp_path) -> None:
     """Unauthenticated call (no Principal) is rejected with
-    :class:`PermissionDenied`."""
+    :class:`AuthRejected` (R21-F1: was ``PermissionDenied``)."""
+    from agent_mcp.core.authorize import AuthRejected
     from agent_mcp.tools.admin_tools import view_status_tool_impl
 
     async with mcp_session(tmp_path):
-        result = await view_status_tool_impl({}, principal=None)
-
-    assert isinstance(result, PermissionDenied)
+        with pytest.raises(AuthRejected):
+            await view_status_tool_impl({}, principal=None)
 
 
 async def test_view_status_via_mcp_wire_renders_unauthorized_for_worker(
@@ -252,15 +255,17 @@ async def test_create_agent_invalid_agent_id_returns_invalid(tmp_path) -> None:
 
 
 async def test_create_agent_rejects_worker_principal(tmp_path) -> None:
+    """R21-F1: register_agent's gate is now ``@requires_capability``
+    (raises ``AuthRejected``) instead of an in-body check."""
+    from agent_mcp.core.authorize import AuthRejected
     from agent_mcp.tools.admin_tools import register_agent_tool_impl
 
     async with mcp_session(tmp_path):
-        result = await register_agent_tool_impl(
-            {"agent_id": "should-not-exist"},
-            principal=_worker_principal(),
-        )
-
-    assert isinstance(result, PermissionDenied)
+        with pytest.raises(AuthRejected):
+            await register_agent_tool_impl(
+                {"agent_id": "should-not-exist"},
+                principal=_worker_principal(),
+            )
 
 
 # ── terminate_agent ──────────────────────────────────────────────
@@ -365,14 +370,16 @@ async def test_view_audit_log_returns_typed_entries(tmp_path) -> None:
 
 
 async def test_view_audit_log_rejects_worker(tmp_path) -> None:
+    """R21-F1: view_audit_log's gate is now ``@requires_capability``
+    (raises ``AuthRejected``) instead of an in-body check."""
+    from agent_mcp.core.authorize import AuthRejected
     from agent_mcp.tools.admin_tools import view_audit_log_tool_impl
 
     async with mcp_session(tmp_path):
-        result = await view_audit_log_tool_impl(
-            {}, principal=_worker_principal(),
-        )
-
-    assert isinstance(result, PermissionDenied)
+        with pytest.raises(AuthRejected):
+            await view_audit_log_tool_impl(
+                {}, principal=_worker_principal(),
+            )
 
 
 # ── get_agent_tokens ─────────────────────────────────────────────
@@ -409,14 +416,16 @@ async def test_get_agent_tokens_returns_typed_pagination(tmp_path) -> None:
 
 
 async def test_get_agent_tokens_rejects_worker(tmp_path) -> None:
+    """R21-F1: get_agent_tokens's gate is now ``@requires_capability``
+    (raises ``AuthRejected``) instead of an in-body check."""
+    from agent_mcp.core.authorize import AuthRejected
     from agent_mcp.tools.admin_tools import get_agent_tokens_tool_impl
 
     async with mcp_session(tmp_path):
-        result = await get_agent_tokens_tool_impl(
-            {}, principal=_worker_principal(),
-        )
-
-    assert isinstance(result, PermissionDenied)
+        with pytest.raises(AuthRejected):
+            await get_agent_tokens_tool_impl(
+                {}, principal=_worker_principal(),
+            )
 
 
 # Wave 7 PR 3 (coordinator transition): ``relaunch_agent_tool_impl`` was

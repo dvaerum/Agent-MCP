@@ -15,6 +15,7 @@ from ..core.config import logger
 # schema properties. See core/schema_limits.py for the rationale.
 from ..core.schema_limits import IDENTIFIER_MAX_LEN, MESSAGE_MAX_LEN
 from ..core import globals as g
+from ..core.authorize import requires_predicate
 from ..core.principal import Principal
 from ..core.principal_builder import (
     build_agent_bearer_principal,
@@ -803,6 +804,10 @@ async def get_agent_messages_tool_impl(
             conn.close()
 
 
+@requires_predicate(
+    lambda p: p is not None and _is_operator_tier(p),
+    "Unauthorized: operator role required to broadcast",
+)
 async def broadcast_admin_message_tool_impl(
     arguments: Dict[str, Any],
     *,
@@ -812,23 +817,24 @@ async def broadcast_admin_message_tool_impl(
     Admin-only tool to broadcast a message to all active agents.
 
     Wave 6 PR 2: migrated to the Principal + ToolResult contract.
-    The pre-migration ``@requires_role("operator")`` gate is replaced
-    with an inline :func:`_is_operator_tier` check (operator session,
-    sysadmin, or the legacy ``"admin"`` agent label — see the helper's
-    docstring for why the label is treated as operator-tier in the
-    harness). Each fan-out call to
-    :func:`send_agent_message_tool_impl` carries the SAME principal,
-    so sender-id attribution stays consistent across the broadcast.
+    The pre-migration ``@requires_role("operator")`` gate is now
+    ``@requires_predicate`` wrapping :func:`_is_operator_tier`
+    (operator session, sysadmin, or the legacy ``"admin"`` agent label
+    — see the helper's docstring for why the label is treated as
+    operator-tier in the harness). R21-F1: was an in-body check before
+    schema validation existed as a decoupled pre-dispatch gate; moved
+    to the decorator so ``dispatch_tool_call`` denies an unauthorized
+    caller BEFORE running jsonschema on the arguments (closing a
+    schema-shape oracle), without changing who is authorized. Each
+    fan-out call to :func:`send_agent_message_tool_impl` carries the
+    SAME principal, so sender-id attribution stays consistent across
+    the broadcast.
     """
     # retire-system-token Wave 5: parameter renamed from
     # ``admin_token`` — the value is a manager-tier per-agent token (or
     # the operator session passes via the @requires_role gate without
     # needing a token here). It was never the god-key after Wave 1.
     principal = _resolve_principal(arguments, principal)
-    if principal is None or not _is_operator_tier(principal):
-        return PermissionDenied(
-            reason="Operator role required to broadcast"
-        )
 
     message_content = arguments.get("message")
     message_type = arguments.get("message_type", "broadcast")

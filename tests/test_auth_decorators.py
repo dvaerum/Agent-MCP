@@ -226,33 +226,32 @@ async def test_dispatcher_translates_authrejected_to_iserror(
     (replacing the old `_AUTH_FAILURE_RE` text-matching shim).
 
     Post-Wave-6 PR 5: ``view_status`` is migrated to take a
-    :class:`Principal` and return :class:`ToolResult`. Auth failure
-    now flows as a typed :class:`PermissionDenied` return rather
-    than a raised :class:`AuthRejected`; the REST adapter maps it to
-    403 and the MCP wire renderer turns it into ``"Unauthorized:
-    ..."`` text. The point this test pins — that ``view_status``
+    :class:`Principal` and return :class:`ToolResult`. R21-F1 then
+    moved the ``system.config.write`` gate onto ``@requires_capability``
+    (was an in-body ``_require_capability`` call) so
+    ``dispatch_tool_call``'s pre-schema gate can see it — auth failure
+    is back to a raised :class:`AuthRejected` (the REST adapter maps it
+    to 403 and the MCP wire renderer turns it into ``"Unauthorized:
+    ..."`` text). The point this test pins — that ``view_status``
     rejects a garbage token — survives unchanged; only the surface
-    shape (returned variant vs. raised exception) flipped with the
-    typed-result migration.
+    shape (returned variant vs. raised exception) flipped, twice now.
     """
     monkeypatch.setenv("MCP_PROJECT_DIR", str(project_dir))
     from starlette.testclient import TestClient
 
     from agent_mcp.app.main_app import create_app
-    from agent_mcp.core.tool_result import PermissionDenied
+    from agent_mcp.core.authorize import AuthRejected
     from agent_mcp.tools.registry import dispatch_tool_call
 
     app = create_app(project_dir=str(project_dir))
     with TestClient(app):
         # view_status is operator-tier. Calling with garbage must be rejected.
         with with_bearer("deadbeef" * 4):
-            result = await dispatch_tool_call(
-                "view_status",
-                {"token": "deadbeef" * 4},
-            )
-        assert isinstance(result, PermissionDenied), (
-            f"view_status with garbage token must be rejected; got {result!r}"
-        )
+            with pytest.raises(AuthRejected):
+                await dispatch_tool_call(
+                    "view_status",
+                    {"token": "deadbeef" * 4},
+                )
 
 
 @pytest.mark.asyncio

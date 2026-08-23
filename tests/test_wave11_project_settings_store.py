@@ -575,21 +575,25 @@ async def test_update_project_settings_rejects_non_config_key(
 @pytest.mark.asyncio
 async def test_delete_project_settings_gates(tmp_path: Path) -> None:
     async with mcp_session(tmp_path) as admin:
-        from agent_mcp.core.tool_result import (
-            Ok,
-            PermissionDenied,
-        )
+        from agent_mcp.core.authorize import AuthRejected
+        from agent_mcp.core.tool_result import Ok
         from agent_mcp.tools.registry import dispatch_tool_call
 
         _seed_setting("config_allow_worker_to_worker", True)
 
         worker = await admin.create_worker("settings-del-worker")
-        denied = await dispatch_tool_call(
-            "delete_project_settings",
-            {"context_key": "config_allow_worker_to_worker"},
-            principal=worker._principal(),
-        )
-        assert isinstance(denied, PermissionDenied)
+        # R21-F1: the cap gate is now ``@requires_capability`` (moved
+        # off the in-body ``_deny_without_config_write_cap`` helper so
+        # the pre-schema gate in ``dispatch_tool_call`` can see it) —
+        # it raises ``AuthRejected`` instead of returning
+        # ``PermissionDenied``. Same denial decision, different
+        # mechanism.
+        with pytest.raises(AuthRejected):
+            await dispatch_tool_call(
+                "delete_project_settings",
+                {"context_key": "config_allow_worker_to_worker"},
+                principal=worker._principal(),
+            )
 
         operator = make_principal(
             kind="operator_session",
@@ -625,25 +629,25 @@ async def test_view_project_settings_redaction(tmp_path: Path) -> None:
             assert "SENTINEL-VIEW-BEARER" in text
 
         # A non-confirmed operator-session principal gets the mask.
-        from agent_mcp.core.tool_result import Ok
+        from agent_mcp.core.authorize import AuthRejected
         from agent_mcp.tools.registry import dispatch_tool_call
 
         # kind=forwarding_header + no project_role visible would lack the
         # cap; use an operator whose tier is nonetheless confirmed only
         # via project_role — so instead exercise the mask through the
         # REST seam test above. Here: viewer-tier caller is DENIED
-        # outright (no system.config.write).
+        # outright (no system.config.write) — R21-F1: the gate is now
+        # ``@requires_capability`` and raises ``AuthRejected`` rather
+        # than returning a ``PermissionDenied`` ToolResult.
         viewer = make_principal(
             kind="operator_session",
             user_id="viewer-1",
             project_role="viewer",
         )
-        denied = await dispatch_tool_call(
-            "view_project_settings", {}, principal=viewer,
-        )
-        assert not isinstance(denied, Ok), (
-            "viewer must not read the settings store via the MCP tool"
-        )
+        with pytest.raises(AuthRejected):
+            await dispatch_tool_call(
+                "view_project_settings", {}, principal=viewer,
+            )
 
 
 @pytest.mark.asyncio
