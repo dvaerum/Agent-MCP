@@ -1,7 +1,7 @@
 # Agent-MCP/mcp_template/mcp_server_src/tools/agent_tools.py
 from typing import Dict, Any, Optional
 
-from .registry import register_tool
+from .registry import Cap, register_tool
 from ..core.config import logger
 from ..core.authorize import requires_capability
 from ..core.principal import Principal
@@ -69,7 +69,8 @@ def register_agent_tools():
             "required": [],
             "additionalProperties": False
         },
-        implementation=get_system_prompt_tool_impl
+        implementation=get_system_prompt_tool_impl,
+        requires=Cap("mcp.connect"),
     )
 
 # Call registration when this module is imported

@@ -468,3 +468,172 @@ def requires_predicate(
         return wrapper
 
     return decorator
+
+
+# ── Registration-time requirement declarations (Phase 2, Finding A) ──
+#
+# The decorators above are where enforcement LIVES: they wrap the impl,
+# so the gate travels with the function object and fires for the
+# in-process callers that invoke a tool impl directly
+# (``app/routers/agents.py``, ``app/routers/schedules.py``,
+# ``task_tools.request_assistance``, ``broadcast_admin_message``'s
+# fan-out, ``task_placement.validator``). Moving enforcement to
+# registration would silently un-gate every one of those call sites, so
+# it stays on the decorator.
+#
+# What was missing is a DECLARATION at the catalogue: nothing forced a
+# tool author to state an authorization story at all, and
+# ``register_tool`` happily accepted an impl with no gate whatsoever.
+# That is the "opt-in-and-forget" shape (OBS-R11-1) this finding closes.
+# The types below are that declaration. ``register_tool`` requires one
+# and VERIFIES it against the decorator's stamp at import time, so:
+#
+#   * registering a tool without stating its authorization is impossible
+#     (``requires=`` has no default);
+#   * claiming a requirement the impl doesn't actually enforce is an
+#     ImportError, not a silent lie (the class of drift ``access.py``'s
+#     module docstring warns about);
+#   * ``PUBLIC`` is the only way to register an ungated tool, and it is
+#     greppable, reviewable, and pinned by
+#     ``tests/test_arch_enforced_tool_capability_registration.py``'s
+#     allowlist.
+
+
+class ToolRequirement:
+    """Base class for the ``register_tool(requires=...)`` vocabulary."""
+
+    __slots__ = ()
+
+    def verify(self, impl: Callable) -> Optional[str]:
+        """Return an error string if ``impl``'s stamp contradicts this
+        declaration, else None."""
+        raise NotImplementedError  # pragma: no cover - abstract
+
+
+def _stamp_of(impl: Callable) -> str:
+    """Human-readable description of what ``impl`` actually enforces."""
+    cap = getattr(impl, "_required_capability", None)
+    if cap is not None:
+        return f"@requires_capability({cap!r})"
+    policy_keys = getattr(impl, "_required_policy_keys", None)
+    if policy_keys:
+        return f"@requires_policy{tuple(policy_keys)!r}"
+    if getattr(impl, "_required_predicate", None) is not None:
+        reason = getattr(impl, "_required_predicate_reason", None)
+        return f"@requires_predicate(reason={reason!r})"
+    return "no @requires_* decorator"
+
+
+class Cap(ToolRequirement):
+    """The tool is gated on exactly one capability.
+
+    Must match a ``@requires_capability(cap)`` on the implementation.
+    """
+
+    __slots__ = ("cap",)
+
+    def __init__(self, cap: str) -> None:
+        self.cap = cap
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging only
+        return f"Cap({self.cap!r})"
+
+    def verify(self, impl: Callable) -> Optional[str]:
+        actual = getattr(impl, "_required_capability", None)
+        if actual == self.cap:
+            return None
+        return (
+            f"declares requires=Cap({self.cap!r}) but the implementation "
+            f"carries {_stamp_of(impl)}"
+        )
+
+
+class Policy(ToolRequirement):
+    """The tool is gated on the worker-toggle policy over ``keys``.
+
+    Must match a ``@requires_policy(*keys, default=...)`` on the
+    implementation.
+    """
+
+    __slots__ = ("keys", "default")
+
+    def __init__(self, *keys: str, default: Optional[bool] = None) -> None:
+        self.keys = tuple(keys)
+        self.default = default
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging only
+        return f"Policy{self.keys!r}"
+
+    def verify(self, impl: Callable) -> Optional[str]:
+        actual = getattr(impl, "_required_policy_keys", None)
+        actual_default = getattr(impl, "_required_policy_default", None)
+        if tuple(actual or ()) == self.keys and actual_default == self.default:
+            return None
+        return (
+            f"declares requires=Policy{self.keys!r} (default={self.default!r}) "
+            f"but the implementation carries {_stamp_of(impl)}"
+        )
+
+
+class Predicate(ToolRequirement):
+    """The tool is gated on an arbitrary Principal predicate.
+
+    Identified by the denial ``reason`` rather than by the function
+    object, so the registration site doesn't have to import (and
+    re-state) the predicate itself. ``reason`` is the user-visible
+    denial text, which is the part worth pinning at the catalogue.
+
+    Predicate-gated tools cannot derive a ``tools/list`` tier
+    (``requires_predicate``'s docstring explains why), so these are
+    exactly the tools that must keep an explicit ``visibility=`` kwarg
+    when they are not ``"any"``.
+    """
+
+    __slots__ = ("reason",)
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging only
+        return f"Predicate({self.reason!r})"
+
+    def verify(self, impl: Callable) -> Optional[str]:
+        if getattr(impl, "_required_predicate", None) is None:
+            return (
+                "declares requires=Predicate(...) but the implementation "
+                f"carries {_stamp_of(impl)}"
+            )
+        actual_reason = getattr(impl, "_required_predicate_reason", None)
+        if actual_reason != self.reason:
+            return (
+                "declares requires=Predicate(reason=...) whose text differs "
+                f"from the implementation's: declared {self.reason!r}, "
+                f"actual {actual_reason!r}"
+            )
+        return None
+
+
+class _Public(ToolRequirement):
+    """The tool requires NO authorization. See :data:`PUBLIC`."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging only
+        return "PUBLIC"
+
+    def verify(self, impl: Callable) -> Optional[str]:
+        stamp = _stamp_of(impl)
+        if stamp == "no @requires_* decorator":
+            return None
+        return (
+            f"declares requires=PUBLIC but the implementation carries {stamp} "
+            "— an enforced gate must be declared, not hidden behind PUBLIC"
+        )
+
+
+#: Explicit "this tool is callable by anyone, including unauthenticated
+#: callers". The ONLY way to register a tool with no authorization, and
+#: deliberately a named constant so it greps. Adding one is a security
+#: decision: justify it at the call site and in the allowlist in
+#: ``tests/test_arch_enforced_tool_capability_registration.py``.
+PUBLIC = _Public()

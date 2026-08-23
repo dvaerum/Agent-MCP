@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from .registry import register_tool
+from .registry import Predicate, register_tool
 from ..core.authorize import requires_predicate
 from ..core.config import logger
 from ..core.principal import Principal
@@ -49,11 +49,16 @@ def _principal_can_view_roster(principal: Optional[Principal]) -> bool:
     )
 
 
-@requires_predicate(
-    _principal_can_view_roster,
+#: One home for the denial text: the decorator enforces it, the
+#: ``register_tool(requires=Predicate(...))`` declaration pins it, and
+#: ``register_tool`` fails the import if the two ever disagree.
+_ROSTER_DENIED = (
     "Unauthorized: An authenticated agent or operator is required to view "
-    "the agent roster.",
+    "the agent roster."
 )
+
+
+@requires_predicate(_principal_can_view_roster, _ROSTER_DENIED)
 async def view_agents_tool_impl(
     arguments: Dict[str, Any],
     *,
@@ -104,6 +109,7 @@ def register_agent_roster_tools() -> None:
             "additionalProperties": False,
         },
         implementation=view_agents_tool_impl,
+        requires=Predicate(_ROSTER_DENIED),
         visibility="worker",
     )
 

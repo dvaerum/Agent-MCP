@@ -14,6 +14,16 @@ from ..core.schema_limits import DEFAULT_STRING_MAX_LEN as _DEFAULT_STRING_MAX_L
 # Typed auth-failure exception from the decorator surface; the
 # dispatcher catches it explicitly so the audit log line is uniform.
 from ..core.authorize import AuthRejected
+# Phase 2 / Finding A: the ``register_tool(requires=...)`` vocabulary.
+# Re-exported here so a tool module needs one import for both halves of
+# a registration (``from .registry import register_tool, Cap``).
+from ..core.authorize import (  # noqa: F401 — re-exported for call sites
+    PUBLIC,
+    Cap,
+    Policy,
+    Predicate,
+    ToolRequirement as _ToolRequirement,
+)
 # Shared Registry[T] core (Candidate B, 2026-06-02 architecture
 # review). Tools live in `tool_registry` alongside resources +
 # prompts; the legacy `tool_schemas` / `tool_implementations` dicts
@@ -437,33 +447,55 @@ def register_tool(
     input_schema: Dict[str, Any],
     implementation: Callable[..., Awaitable[List[mcp_types.TextContent]]],
     *,
-    visibility: str = "any",
+    requires: _ToolRequirement,
+    visibility: Optional[str] = None,
 ):
     """
     Registers a tool's schema and its implementation.
     This function will be called by each tool module to register itself.
 
+    ``requires`` (REQUIRED, no default) — the tool's authorization
+    declaration, one of :class:`agent_mcp.core.authorize.Cap`,
+    :class:`~agent_mcp.core.authorize.Policy`,
+    :class:`~agent_mcp.core.authorize.Predicate`, or
+    :data:`~agent_mcp.core.authorize.PUBLIC`. Phase 2 / Finding A of the
+    security-architecture hardening plan: no tool may enter the
+    catalogue without stating an authorization story, closing the
+    "opt-in-and-forget" shape (OBS-R11-1) that recurred 15+ times across
+    ``pentest-all``'s 21 rounds.
+
+    The declaration is VERIFIED against what ``implementation``
+    actually enforces (its ``@requires_*`` stamp) and a mismatch raises
+    ``ValueError`` at import time. Enforcement deliberately stays on the
+    decorator rather than being applied here: several tool impls are
+    invoked directly in-process (``app/routers/agents.py``,
+    ``app/routers/schedules.py``, ``task_tools.request_assistance``,
+    ``broadcast_admin_message``'s fan-out,
+    ``task_placement.validator``), and a gate applied at registration
+    would not travel to those callers. Declaring here + enforcing on the
+    function object gives one greppable catalogue-level statement that
+    cannot silently disagree with the live gate.
+
     ``visibility``: one of ``"operator"``, ``"manager"``, ``"worker"``,
-    ``"any"``, or ``"worker-if-toggled:<key>[,<key>...]"``. Surfaces the
-    access policy at the registration site so the registry /
-    ``tools/list`` filter / UI can introspect it without re-reading
-    source. Defaults to ``"any"``.
+    ``"any"``, or ``"worker-if-toggled:<key>[,<key>...]"``. Omit it
+    (the default) unless it is doing real work — for a ``Cap`` /
+    ``Policy`` tool the tier is DERIVED from the live gate (arch-r3
+    #1+5) and the kwarg is only honoured as a tighten-only override, so
+    a kwarg that merely restates the derived tier is noise that can
+    drift. It IS the sole signal for a ``Predicate``-gated tool (an
+    arbitrary predicate maps to no tier — see
+    ``core/authorize.requires_predicate``) and for ``PUBLIC`` tools.
 
-    For a tool gated by ``@requires_capability`` the visibility is
-    DERIVED from the cap (arch-r3 #1+5); this kwarg then acts as a
-    tighten-only override (it may hide the tool from a role the cap
-    admits, never advertise it to a role the cap rejects). For a tool
-    whose cap check is in-body (no ``_required_capability`` on the
-    wrapper) the kwarg is the sole visibility signal.
-
-    Enforcement of the policy lives at the call site in the impl's
-    ``@requires_capability(...)`` / ``@requires_policy(...)`` decorator
-    (or an in-body ``_require_capability`` check) — the kwarg here is
-    metadata for the visibility filter, not the auth gate, and serves
-    only as a tighten-only override of the cap-derived tier. See
-    :mod:`agent_mcp.tools.access` for the derivation rationale.
+    See :mod:`agent_mcp.tools.access` for the derivation rationale.
     """
     global tool_schemas, tool_implementations
+
+    problem = requires.verify(implementation)
+    if problem is not None:
+        raise ValueError(f"register_tool({name!r}): {problem}")
+
+    if visibility is None:
+        visibility = "any"
 
     # Check for duplicate tool names
     if name in tool_implementations:

@@ -57,18 +57,43 @@ capability bundles (:func:`_visibility_for_capability`):
 The ``visibility=`` kwarg survives ONLY as an explicit override, and
 ONLY in the tighten direction — it may hide a tool from a role the cap
 would admit (a UX choice), never advertise a tool the cap gate rejects
-(that was the leak). Two legitimate override classes remain:
+(that was the leak).
 
-1. **in-body cap checks** — tools gated by an in-body
-   ``_require_capability(principal, ...)`` (register_agent,
-   terminate_agent, view_status, …) set no ``_required_capability``
-   on the wrapper, so the derivation can't see their cap;
-   ``visibility="operator"`` is the only signal.
+Phase 2 / Finding A (security-architecture hardening) — the fallback
+SHRANK, it did not vanish
+------------------------------------------------------------------
+
+The first override class used to be "in-body cap checks": tools whose
+capability test lived inside the tool body set no
+``_required_capability`` on the wrapper, so the derivation could not see
+their cap and ``visibility="operator"`` was the only signal. **That
+class no longer exists** — every registered tool now declares its
+requirement on the impl (``@requires_capability`` /
+``@requires_policy`` / ``@requires_predicate``) AND restates it at
+``register_tool(requires=...)``, which verifies the two agree at import
+time. 19 hand-synced ``visibility=`` kwargs that merely echoed a
+derivable tier were deleted with that migration; the invariant test
+``tests/test_arch_enforced_tool_capability_registration.py::
+test_visibility_kwarg_only_survives_where_it_does_real_work`` keeps
+them from creeping back.
+
+Two legitimate override classes remain (N4: the fallback cannot go to
+zero):
+
+1. **predicate-gated tools** — ``@requires_predicate`` wraps an
+   arbitrary boolean over the Principal (an OR of two caps, a
+   ``kind``-AND-cap compound, an operator-tier helper). There is no
+   capability to map to a tier, so ``core/authorize.requires_predicate``
+   deliberately does NOT expose the predicate to this derivation and the
+   kwarg is the tool's only ``tools/list`` signal (``view_agents``,
+   ``send_agent_message``, ``broadcast_admin_message``). A
+   predicate-gated tool whose tier is ``"any"`` simply omits it.
 2. **deliberate tighten** — a worker-callable cap the maintainer
    still keeps out of a worker's tools/list (create_task,
-   bulk_task_operations carry ``tasks.create`` / ``tasks.update`` but
-   are admin-orchestration surfaces). The kwarg tightens ``"worker"``
-   → ``"operator"``; it is honored because it only restricts.
+   bulk_task_operations, update_task carry ``tasks.create`` /
+   ``tasks.update`` / ``tasks.assign`` but are admin-orchestration
+   surfaces). The kwarg tightens ``"worker"`` → ``"operator"``; it is
+   honored because it only restricts.
 
 Per-entry the derivation reads:
 
@@ -76,7 +101,8 @@ Per-entry the derivation reads:
   → cap tier, with a tightening kwarg override;
 * the impl's ``_required_policy_keys`` (from ``@requires_policy``)
   → ``"worker-if-toggled:<keys>"``;
-* otherwise the registry entry's ``meta.declared_visibility`` (kwarg).
+* otherwise the registry entry's ``meta.declared_visibility`` (kwarg) —
+  post-Phase-2 that means a predicate-gated or PUBLIC tool.
 """
 from __future__ import annotations
 
@@ -152,12 +178,11 @@ def _derive_access_level(entry) -> str:
     2. The impl's ``_required_policy_keys`` (from ``@requires_policy``)
        → renders to ``"worker-if-toggled:<comma-joined-keys>"``.
     3. The registry entry's ``meta.declared_visibility`` (the
-       ``visibility=`` kwarg). The only signal for tools gated by an
-       in-body ``_require_capability`` call (which sets no
-       ``_required_capability`` on the wrapper) — e.g. register_agent,
-       terminate_agent, view_status. Recognised values: ``"operator"``,
-       ``"manager"``, ``"worker"``, ``"any"``, or
-       ``"worker-if-toggled:<keys>"``.
+       ``visibility=`` kwarg). Post-Phase-2 this is the sole signal for
+       ``@requires_predicate``-gated tools (an arbitrary predicate maps
+       to no tier) and for ``PUBLIC`` tools — see the module docstring.
+       Recognised values: ``"operator"``, ``"manager"``, ``"worker"``,
+       ``"any"``, or ``"worker-if-toggled:<keys>"``.
     4. Fallback: ``"any"`` (matches the pre-PR-W1c implicit default).
     """
     impl = entry.meta.implementation
@@ -441,9 +466,11 @@ def is_visible_to_role(tool_name: str, role: str) -> bool:
         # runtime so a forgotten classification doesn't break a worker.
         logger.warning(
             "tools/list filter: tool %r has no access classification; "
-            "defaulting to visible. Add a `visibility=` kwarg to its "
-            "register_tool() call (and `@requires_capability(...)` if "
-            "the policy is more restrictive than 'any').",
+            "defaulting to visible. Declare its gate on the impl "
+            "(`@requires_capability(...)` / `@requires_policy(...)` / "
+            "`@requires_predicate(...)`) and restate it at "
+            "register_tool(requires=...); add an explicit `visibility=` "
+            "kwarg only if the tool is predicate-gated or PUBLIC.",
             tool_name,
         )
         return True

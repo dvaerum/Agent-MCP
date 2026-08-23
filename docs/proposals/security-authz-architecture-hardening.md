@@ -58,7 +58,7 @@ Pass 1 (Findings A–H):
 
 | ID | Finding | Files | Strength | Effort |
 |---|---|---|---|---|
-| A | Capability is a decorator, not a registration argument — 20/49 MCP tools bypass the pre-schema authz gate (re-verified counts, pass 2; was stale 37/53 pre-R21-F1) | `tools/registry.py`, `tools/access.py`, all `tools/*.py` | Strong | Medium |
+| A | Capability is a decorator, not a registration argument — 20/49 MCP tools bypass the pre-schema authz gate (re-verified counts, pass 2; was stale 37/53 pre-R21-F1) — **done**, see Phase 2 | `tools/registry.py`, `tools/access.py`, all `tools/*.py` | Strong | Medium |
 | B | `_build_route_principal` hardcodes `project_name=None` → one route duplicates identity construction | `app/_dispatch_helpers.py`, `app/routers/agents.py` | Strong | Trivial |
 | C | SSO subject key is an unescaped f-string carrying 4 responsibilities | `router/sso.py` | Strong | Medium |
 | D | Backend REST identity is an untyped 3-shape dict + a ContextVar side-channel | `app/deps.py`, `core/operator_tier.py` | Worth exploring | High |
@@ -177,38 +177,75 @@ will hit them rather than restated here:
   `email`); the reasoning and its tests are in
   `tests/router/test_arch_n1_form_credentials.py`.
 
-### Phase 2 — the structural lever
+### Phase 2 — the structural lever — **done** (PRs #723, #726, #728, #729, this PR)
 
-- **A — capability as a registration argument.** This is the big one:
-  `register_tool(..., requires=Cap("agents.terminate"))` becomes a required
-  argument (no default), stamped automatically so `dispatch_tool_call`'s
-  pre-schema gate and `access.py`'s visibility derivation both see it.
-  - TDD: RED test is a parametrized sweep over all 53 tool names asserting
-    each carries a stamped requirement OR is explicitly declared
-    capability-free (a tiny allowlist for the truly public tools, if any
-    exist) — this test should fail loudly today for the ~34 remaining
-    undecorated tools (3 will already be fixed by R21-F1 once it merges).
-  - Migrate file-by-file (`admin_tools.py`'s 12, `project_context_tools.py`'s
-    7, `agent_communication_tools.py`'s 5, `project_settings_tools.py`'s 3,
-    `task_notes_tools.py`'s 3, `file_management_tools.py`/
-    `file_metadata_tools.py`'s 4, `rag_tools.py`, `agent_roster_tools.py`) —
-    each migration is mechanical (move the existing capability string from
-    the in-body call into the `requires=` kwarg) and independently
-    verifiable, so this can be one PR per file or a few grouped PRs, not one
-    giant PR.
-  - Last step: **shrink** (per N4, do not delete outright) `access.py`'s
-    step-3 hand-synced `visibility=` fallback and the four in-body denial
-    helpers (`admin_tools._require_capability`,
-    `project_settings_tools._deny_without_config_write_cap`, the 2 verbatim
-    three-clause compounds in `file_management_tools.py`/
-    `file_metadata_tools.py`) once zero call sites remain for tools that
-    aren't `@requires_predicate`-gated. `core/authorize.py:398-402`
-    documents that a `@requires_predicate` tool (already 1 shipped via
-    R21-F1's `broadcast_admin_message`, at least 3 more candidates:
-    `ask_project_rag`, `check_file_status`, `view_file_metadata`) cannot
-    derive a `tools/list` tier, so `visibility=` is the only signal for
-    those and must survive.
-  - This phase's own worktree, off whatever `main` is once round 21 merges.
+- **A — capability as a registration argument.** `register_tool(...,
+  requires=Cap("agents.terminate"))` is now a REQUIRED keyword argument
+  (no default), and it is **verified** against what the implementation
+  actually enforces: a declaration that contradicts the impl's
+  `@requires_*` stamp — or a `PUBLIC` declaration on a gated impl — is a
+  `ValueError` at import time, not a silent lie.
+  - **Enforcement deliberately stayed on the decorator.** The obvious
+    reading of "capability as a registration argument" is to have
+    `register_tool` apply the gate. That would have been a real
+    regression: five call sites invoke a tool impl DIRECTLY, in-process
+    (`app/routers/agents.py`, `app/routers/schedules.py` ×3,
+    `tools/task_tools.request_assistance`,
+    `agent_communication_tools.broadcast_admin_message`'s fan-out,
+    `features/task_placement/validator.py`), and a gate applied at
+    registration does not travel to any of them. The declaration lives
+    at the catalogue; enforcement lives on the function object; import
+    time proves they agree.
+  - Vocabulary: `Cap(cap)`, `Policy(*keys, default=)`,
+    `Predicate(reason)`, `PUBLIC` — all in `core/authorize.py`,
+    re-exported from `tools/registry.py`.
+  - Final counts: **49 tools, 48 gated, 1 `PUBLIC`** (`test`, the
+    fixed-string MCP connectivity probe). The 19 previously in-body-only
+    tools were migrated file-by-file across four PRs.
+  - RED: `tests/test_arch_enforced_tool_capability_registration.py` —
+    a self-discovering sweep over the LIVE registry (no hand-maintained
+    tool list) plus a frozen `tools/list`-tier snapshot for all 49, so no
+    migration step could change who sees what by accident. It failed for
+    19 tools at the start.
+  - **One deliberate tier change in the whole migration**:
+    `view_project_context` derives `"worker"` instead of `"any"` now that
+    the derivation can see its `memories.view` cap. Not a policy change —
+    the cap gate already rejected anonymous callers; the tool just stops
+    being advertised to a caller that could never invoke it.
+  - Predicate vs capability was decided per tool by reading the check
+    being replaced. Compound rules (`kind == "agent_bearer" AND cap`,
+    `cap_a OR cap_b`, `authenticated AND NOT viewer-tier`) became
+    `@requires_predicate`; flattening any of them into a capability
+    string would have widened or narrowed the admitted set.
+  - `requires_capability(cap, reason=...)` was added so a single-cap gate
+    can keep a hand-written, worker-actionable denial message
+    (`update_file_metadata`'s, pinned by
+    `tests/test_worker_msg_file_tools_clarity.py`) instead of being
+    downgraded to the generic text or misusing `@requires_predicate` to
+    keep it.
+  - **`visibility=` shrank** (per N4, not deleted): 19 kwargs that merely
+    echoed a derivable tier are gone; **6 remain**, each doing real work
+    — 3 predicate-gated tools whose tier cannot be derived
+    (`view_agents`, `send_agent_message`, `broadcast_admin_message`) and
+    3 deliberate tightens (`create_task`, `bulk_task_operations`,
+    `update_task`). A new invariant test fails if a redundant kwarg
+    creeps back.
+  - The four in-body denial helpers the original plan named:
+    `project_settings_tools._deny_without_config_write_cap` no longer
+    existed (that module had already migrated to
+    `@requires_capability`); the two `file_management_tools` /
+    `file_metadata_tools` compounds became the shared
+    `core/authorize.agent_bearer_with_capability(cap)` predicate factory
+    (one definition, four call sites); `admin_tools._require_capability`
+    **stays** — it still has four live callers
+    (`disconnect_agent` / `reconnect_agent` / the two fleet-wide
+    variants), which are REST-only impls, not registered MCP tools.
+  - **Bug found and class-swept while migrating** (PR #726): a REST
+    adapter that dispatches a tool without an `except AuthRejected` arm
+    reports a routine 403 denial as a **500**. Two per-site fixes
+    (AC-R5-1, R21-F1) had not converged the class; 10 unguarded sites
+    remained, 6 of them live. Fixed at all 10 with a self-discovering AST
+    backstop (`tests/test_arch_enforced_authrejected_403.py`).
 
 ### N4 — read before scoping Phase 2's last step and Phase 4 (no PR of its own)
 

@@ -33,7 +33,7 @@ import re
 import sqlite3
 from typing import Any, Dict, List, Optional
 
-from .registry import register_tool
+from .registry import Cap, register_tool
 # R8-F1: explicit maxLength bound for the identifier-shaped
 # context_key field. See core/schema_limits.py for the rationale.
 from ..core.schema_limits import IDENTIFIER_MAX_LEN
@@ -335,7 +335,7 @@ def register_project_settings_tools() -> None:
             "additionalProperties": False,
         },
         implementation=view_project_settings_tool_impl,
-        visibility="operator",
+        requires=Cap("system.config.write"),
     )
 
     register_tool(
@@ -372,7 +372,7 @@ def register_project_settings_tools() -> None:
             "additionalProperties": False,
         },
         implementation=update_project_settings_tool_impl,
-        visibility="operator",
+        requires=Cap("system.config.write"),
     )
 
     register_tool(
@@ -395,7 +395,7 @@ def register_project_settings_tools() -> None:
             "additionalProperties": False,
         },
         implementation=delete_project_settings_tool_impl,
-        visibility="operator",
+        requires=Cap("system.config.write"),
     )
 
 

@@ -26,7 +26,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from .registry import register_tool
+from .registry import Cap, Predicate, register_tool
 from ..core.authorize import (
     agent_bearer_with_capability,
     requires_capability,
@@ -97,11 +97,13 @@ def _normalize_filepath(
 _is_file_capable_agent = agent_bearer_with_capability("files.use")
 
 
-@requires_predicate(
-    _is_file_capable_agent,
+_VIEW_DENIED = (
     "Unauthorized: agent token with files.use capability required to "
-    "view file metadata",
+    "view file metadata"
 )
+
+
+@requires_predicate(_is_file_capable_agent, _VIEW_DENIED)
 async def view_file_metadata_tool_impl(
     arguments: Dict[str, Any],
     *,
@@ -394,6 +396,7 @@ def register_file_metadata_tools():
             "additionalProperties": False,
         },
         implementation=view_file_metadata_tool_impl,
+        requires=Predicate(_VIEW_DENIED),
     )
 
     register_tool(
@@ -416,13 +419,13 @@ def register_file_metadata_tools():
             "additionalProperties": False,
         },
         implementation=update_file_metadata_tool_impl,
+        requires=Cap("system.config.write"),
         # Operator-only at call-time (impl checks
         # ``principal.has_capability("system.config.write")``); the
         # old hand-maintained TOOL_ACCESS classified this "any" (a
         # pre-existing visibility quirk: workers saw it in tools/list
         # but the call always failed). PR-W1c aligns visibility with
         # call-time enforcement.
-        visibility="operator",
     )
 
 

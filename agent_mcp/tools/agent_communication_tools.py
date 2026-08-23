@@ -8,7 +8,7 @@ import sqlite3
 from typing import List, Dict, Any, Optional
 import os
 
-from .registry import register_tool, request_auth_token
+from .registry import Predicate, register_tool, request_auth_token
 from . import access as _access  # Canonical home for _get_config_bool
 from ..core.config import logger
 # R8-F1: explicit maxLength bounds for identifier/message-shaped
@@ -119,6 +119,19 @@ def _resolve_principal(
 # ``_resolve_principal`` calls stay (now no-ops on the dispatch path,
 # since the decorator forwards the resolved Principal) because the
 # module's helpers still read ``principal`` positionally further down.
+
+
+#: One home per denial text: the decorator enforces it, the
+#: ``register_tool(requires=Predicate(...))`` declaration pins it, and
+#: ``register_tool`` fails the import if the two ever disagree.
+_SEND_DENIED = "Unauthorized: Valid token or operator session required"
+_READ_MESSAGES_DENIED = (
+    "Unauthorized: Valid agent token with the messages.view capability "
+    "required to retrieve messages"
+)
+_WAIT_DENIED = "Unauthorized: Valid agent token required to long-poll events"
+_FETCH_DENIED = "Unauthorized: Valid agent token required to fetch events"
+_BROADCAST_DENIED = "Unauthorized: operator role required to broadcast"
 
 
 def _is_authenticated_caller(principal: Optional[Principal]) -> bool:
@@ -367,10 +380,7 @@ _REPLY_HINT_TEXT = (
 )
 
 
-@requires_predicate(
-    _is_authenticated_caller,
-    "Unauthorized: Valid token or operator session required",
-)
+@requires_predicate(_is_authenticated_caller, _SEND_DENIED)
 async def send_agent_message_tool_impl(
     arguments: Dict[str, Any],
     *,
@@ -646,11 +656,7 @@ async def send_agent_message_tool_impl(
         return Failed(message=f"Unexpected error sending message: {e}")
 
 
-@requires_predicate(
-    _can_read_own_messages,
-    "Unauthorized: Valid agent token with the messages.view capability "
-    "required to retrieve messages",
-)
+@requires_predicate(_can_read_own_messages, _READ_MESSAGES_DENIED)
 async def get_agent_messages_tool_impl(
     arguments: Dict[str, Any],
     *,
@@ -851,8 +857,7 @@ async def get_agent_messages_tool_impl(
 
 
 @requires_predicate(
-    lambda p: p is not None and _is_operator_tier(p),
-    "Unauthorized: operator role required to broadcast",
+    lambda p: p is not None and _is_operator_tier(p), _BROADCAST_DENIED
 )
 async def broadcast_admin_message_tool_impl(
     arguments: Dict[str, Any],
@@ -2095,10 +2100,7 @@ def assemble_event_feed(
     return events, next_cursor
 
 
-@requires_predicate(
-    _is_identified_agent,
-    "Unauthorized: Valid agent token required to long-poll events",
-)
+@requires_predicate(_is_identified_agent, _WAIT_DENIED)
 async def wait_for_events_tool_impl(
     arguments: Dict[str, Any],
     *,
@@ -2617,10 +2619,7 @@ async def wait_for_events_tool_impl(
         g.unregister_waiter(agent_id, waiter_queue)
 
 
-@requires_predicate(
-    _is_identified_agent,
-    "Unauthorized: Valid agent token required to fetch events",
-)
+@requires_predicate(_is_identified_agent, _FETCH_DENIED)
 async def fetch_events_since_tool_impl(
     arguments: Dict[str, Any],
     *,
@@ -2765,6 +2764,7 @@ def register_agent_communication_tools():
             "additionalProperties": False
         },
         implementation=send_agent_message_tool_impl,
+        requires=Predicate(_SEND_DENIED),
         visibility=(
             "worker-if-toggled:config_allow_worker_to_worker"
         ),
@@ -2812,7 +2812,8 @@ def register_agent_communication_tools():
             "required": [],
             "additionalProperties": False
         },
-        implementation=get_agent_messages_tool_impl
+        implementation=get_agent_messages_tool_impl,
+        requires=Predicate(_READ_MESSAGES_DENIED),
     )
     
     register_tool(
@@ -2851,6 +2852,7 @@ def register_agent_communication_tools():
             "additionalProperties": False
         },
         implementation=broadcast_admin_message_tool_impl,
+        requires=Predicate(_BROADCAST_DENIED),
         visibility="operator",
     )
 
@@ -2883,6 +2885,7 @@ def register_agent_communication_tools():
             "additionalProperties": False,
         },
         implementation=fetch_events_since_tool_impl,
+        requires=Predicate(_FETCH_DENIED),
     )
 
     register_tool(
@@ -2925,6 +2928,7 @@ def register_agent_communication_tools():
             "additionalProperties": False,
         },
         implementation=wait_for_events_tool_impl,
+        requires=Predicate(_WAIT_DENIED),
     )
 
 

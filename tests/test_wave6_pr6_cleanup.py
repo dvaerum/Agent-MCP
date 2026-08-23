@@ -157,6 +157,7 @@ async def test_tool_result_wrap_helper_no_longer_called_for_lists() -> None:
 
     from agent_mcp.core.tool_result import Failed
     from agent_mcp.tools.registry import (
+        PUBLIC,
         dispatch_tool_call,
         register_tool,
         tool_implementations,
@@ -173,6 +174,10 @@ async def test_tool_result_wrap_helper_no_longer_called_for_lists() -> None:
         description="probe",
         input_schema={"type": "object", "properties": {}},
         implementation=_legacy_returner,
+        # Phase 2 (Finding A): `requires=` is a required registration
+        # argument. This probe exercises the RETURN-SHAPE contract, not
+        # authorization, so it declares PUBLIC explicitly.
+        requires=PUBLIC,
     )
     try:
         result = await dispatch_tool_call("_pr6_legacy_shape_probe", {})

@@ -7,7 +7,7 @@ import sqlite3  # For database operations
 from pathlib import Path  # For request_assistance
 from typing import List, Dict, Any, Optional
 
-from .registry import register_tool
+from .registry import Cap, Policy, register_tool
 from . import access as _access  # Canonical home for _get_config_bool
 # R8-F1: explicit maxLength bounds for identifier/title-shaped schema
 # properties (task_id, agent_id, task_title, ...). See
@@ -5517,9 +5517,9 @@ def register_task_tools():
             "additionalProperties": False,
         },
         implementation=assign_task_tool_impl,
-        visibility=(
-            "worker-if-toggled:config_allow_worker_self_assign,"
-            "config_allow_worker_create_unassigned"
+        requires=Policy(
+            "config_allow_worker_self_assign",
+            "config_allow_worker_create_unassigned",
         ),
     )
 
@@ -5572,6 +5572,7 @@ def register_task_tools():
             "additionalProperties": False,
         },
         implementation=create_self_task_tool_impl,
+        requires=Cap("tasks.create"),
     )
 
     register_tool(
@@ -5658,9 +5659,7 @@ def register_task_tools():
             "additionalProperties": False,
         },
         implementation=update_task_status_tool_impl,
-        visibility=(
-            "worker-if-toggled:config_allow_worker_update_own_status"
-        ),
+        requires=Policy("config_allow_worker_update_own_status"),
     )
 
     register_tool(
@@ -5724,6 +5723,7 @@ def register_task_tools():
             "additionalProperties": False,
         },
         implementation=update_task_tool_impl,
+        requires=Cap("tasks.assign"),
         visibility="operator",
     )
 
@@ -5890,6 +5890,7 @@ def register_task_tools():
             "additionalProperties": False,
         },
         implementation=view_tasks_tool_impl,
+        requires=Cap("tasks.view"),
     )
 
     register_tool(
@@ -5972,6 +5973,7 @@ def register_task_tools():
             "additionalProperties": False,
         },
         implementation=search_tasks_tool_impl,
+        requires=Cap("tasks.view"),
     )
 
     register_tool(
@@ -5999,6 +6001,7 @@ def register_task_tools():
             "additionalProperties": False,
         },
         implementation=request_assistance_tool_impl,
+        requires=Cap("coordination.assist"),
     )
 
     register_tool(
@@ -6068,6 +6071,7 @@ def register_task_tools():
             "additionalProperties": False,
         },
         implementation=bulk_task_operations_tool_impl,
+        requires=Cap("tasks.update"),
         # @requires_capability("tasks.update") on the impl (admin gets
         # full control; per-op ownership check rejects worker writes on
         # non-owned tasks), but the tool's purpose is admin-orchestrated
@@ -6097,7 +6101,7 @@ def register_task_tools():
             "additionalProperties": False,
         },
         implementation=delete_task_tool_impl,
-        visibility="operator",
+        requires=Cap("tasks.delete"),
     )
 
     # E1 (arch-deepening): the real tool behind ``POST /api/tasks``. The
@@ -6152,6 +6156,7 @@ def register_task_tools():
             "additionalProperties": False,
         },
         implementation=create_task_tool_impl,
+        requires=Cap("tasks.create"),
         visibility="operator",
     )
 

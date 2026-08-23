@@ -15,7 +15,7 @@ import os
 import datetime
 from typing import Any, Dict, Optional
 
-from .registry import register_tool
+from .registry import Predicate, register_tool
 from ..core.authorize import agent_bearer_with_capability, requires_predicate
 from ..core.config import logger
 from ..core import globals as g
@@ -43,11 +43,17 @@ _is_file_capable_agent = agent_bearer_with_capability("files.use")
 
 
 # --- check_file_status tool ---
-@requires_predicate(
-    _is_file_capable_agent,
+_CHECK_DENIED = (
     "Unauthorized: agent token with files.use capability required to "
-    "check file status",
+    "check file status"
 )
+_UPDATE_DENIED = (
+    "Unauthorized: agent token with files.use capability required to "
+    "update file status"
+)
+
+
+@requires_predicate(_is_file_capable_agent, _CHECK_DENIED)
 async def check_file_status_tool_impl(
     arguments: Dict[str, Any],
     *,
@@ -129,11 +135,7 @@ async def check_file_status_tool_impl(
     )
 
 # --- update_file_status tool ---
-@requires_predicate(
-    _is_file_capable_agent,
-    "Unauthorized: agent token with files.use capability required to "
-    "update file status",
-)
+@requires_predicate(_is_file_capable_agent, _UPDATE_DENIED)
 async def update_file_status_tool_impl(
     arguments: Dict[str, Any],
     *,
@@ -315,7 +317,8 @@ def register_file_management_tools():
             "required": ["filepath"],
             "additionalProperties": False
         },
-        implementation=check_file_status_tool_impl
+        implementation=check_file_status_tool_impl,
+        requires=Predicate(_CHECK_DENIED),
     )
 
     register_tool(
@@ -334,7 +337,8 @@ def register_file_management_tools():
             "required": ["filepath", "status"],
             "additionalProperties": False
         },
-        implementation=update_file_status_tool_impl
+        implementation=update_file_status_tool_impl,
+        requires=Predicate(_UPDATE_DENIED),
     )
 
 # Call registration when this module is imported
