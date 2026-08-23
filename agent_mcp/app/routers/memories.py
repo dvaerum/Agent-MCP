@@ -28,6 +28,7 @@ from starlette.requests import Request
 from .._dispatch_helpers import _build_route_principal
 from ._wire_validation import require_str as _require_str
 from ..deps import caller_identity, require_operator_session
+from ...core.authorize import AuthRejected
 from ...core.config import logger
 from ...core.tool_result import (
     Ok,
@@ -149,6 +150,13 @@ async def create_memory_api_route(
             },
             principal=principal,
         )
+    except AuthRejected as e:
+        # AC-R5-1 / R21-F1 class: a tool's @requires_* gate RAISES, so
+        # without this arm a routine denial (e.g. a forwarding VIEWER that
+        # passes require_operator_session but lacks the tool's cap) lands
+        # in the generic 500 below. Rationale + sweep:
+        # tests/test_arch_enforced_authrejected_403.py.
+        return JSONResponse({"error": e.reason}, status_code=403)
     except ToolInputValidationError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
     except Exception as e:  # pragma: no cover - defensive
@@ -264,6 +272,13 @@ async def update_memory_api_route(
             arguments,
             principal=principal,
         )
+    except AuthRejected as e:
+        # AC-R5-1 / R21-F1 class: a tool's @requires_* gate RAISES, so
+        # without this arm a routine denial (e.g. a forwarding VIEWER that
+        # passes require_operator_session but lacks the tool's cap) lands
+        # in the generic 500 below. Rationale + sweep:
+        # tests/test_arch_enforced_authrejected_403.py.
+        return JSONResponse({"error": e.reason}, status_code=403)
     except ToolInputValidationError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
     except Exception as e:  # pragma: no cover - defensive
@@ -344,6 +359,13 @@ async def delete_memory_api_route(
             {"context_key": context_key, "force_delete": force_delete},
             principal=principal,
         )
+    except AuthRejected as e:
+        # AC-R5-1 / R21-F1 class: a tool's @requires_* gate RAISES, so
+        # without this arm a routine denial (e.g. a forwarding VIEWER that
+        # passes require_operator_session but lacks the tool's cap) lands
+        # in the generic 500 below. Rationale + sweep:
+        # tests/test_arch_enforced_authrejected_403.py.
+        return JSONResponse({"error": e.reason}, status_code=403)
     except ToolInputValidationError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
     except Exception as e:  # pragma: no cover - defensive

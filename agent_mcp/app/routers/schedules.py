@@ -25,6 +25,7 @@ from starlette.requests import Request
 
 from .._dispatch_helpers import _build_route_principal
 from ..deps import caller_identity, require_operator_session
+from ...core.authorize import AuthRejected
 from ...core.config import logger
 from ...core.tool_result import Ok, tool_result_to_http
 from ...db.connection import get_db_connection
@@ -108,6 +109,13 @@ async def create_schedule_api_route(
         result = await create_scheduled_directive_tool_impl(
             data, principal=_operator_principal(auth),
         )
+    except AuthRejected as e:
+        # AC-R5-1 / R21-F1 class: a tool's @requires_* gate RAISES, so
+        # without this arm a routine denial (e.g. a forwarding VIEWER that
+        # passes require_operator_session but lacks the tool's cap) lands
+        # in the generic 500 below. Rationale + sweep:
+        # tests/test_arch_enforced_authrejected_403.py.
+        return JSONResponse({"error": e.reason}, status_code=403)
     except Exception as e:
         # Defense-in-depth (R16-F3): these handlers call the tool impl
         # DIRECTLY (bypassing dispatch_tool_call's envelope), so an impl
@@ -140,6 +148,13 @@ async def update_schedule_api_route(
         result = await update_scheduled_directive_tool_impl(
             args, principal=_operator_principal(auth),
         )
+    except AuthRejected as e:
+        # AC-R5-1 / R21-F1 class: a tool's @requires_* gate RAISES, so
+        # without this arm a routine denial (e.g. a forwarding VIEWER that
+        # passes require_operator_session but lacks the tool's cap) lands
+        # in the generic 500 below. Rationale + sweep:
+        # tests/test_arch_enforced_authrejected_403.py.
+        return JSONResponse({"error": e.reason}, status_code=403)
     except Exception as e:
         # Defense-in-depth (R16-F3) — see create handler above.
         logger.error("update_schedule failed: %s", e, exc_info=True)
@@ -161,6 +176,13 @@ async def delete_schedule_api_route(
             {"directive_id": directive_id},
             principal=_operator_principal(auth),
         )
+    except AuthRejected as e:
+        # AC-R5-1 / R21-F1 class: a tool's @requires_* gate RAISES, so
+        # without this arm a routine denial (e.g. a forwarding VIEWER that
+        # passes require_operator_session but lacks the tool's cap) lands
+        # in the generic 500 below. Rationale + sweep:
+        # tests/test_arch_enforced_authrejected_403.py.
+        return JSONResponse({"error": e.reason}, status_code=403)
     except Exception as e:
         # Defense-in-depth (R16-F3) — see create handler above.
         logger.error("delete_schedule failed: %s", e, exc_info=True)

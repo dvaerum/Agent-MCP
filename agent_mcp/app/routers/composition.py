@@ -923,6 +923,12 @@ async def create_sample_memories_route(
             {"updates": sample_memories},
             principal=principal,
         )
+    except AuthRejected as e:
+        # AC-R5-1 / R21-F1 class — see the sibling arm on update_task
+        # above and tests/test_arch_enforced_authrejected_403.py.
+        return JSONResponse(
+            {"success": False, "error": e.reason}, status_code=403
+        )
     except ToolInputValidationError as e:
         return JSONResponse({"success": False, "error": str(e)}, status_code=400)
     except Exception as e:  # pragma: no cover - defensive
