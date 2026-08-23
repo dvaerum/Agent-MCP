@@ -321,6 +321,89 @@ def sanitize_json_input(input_data: Union[str, bytes, Dict, List, Any]) -> Union
         logger.error(f"Aggressive JSON parsing failed: {e_cleaned}, cleaned data (excerpt): {error_excerpt}")
         raise ValueError(f"Failed to parse JSON even after aggressive sanitization: {e_cleaned}")
 
+class UntrustedBodyError(ValueError):
+    """Raised by :func:`decode_untrusted_body` for any body it refuses.
+
+    ``str()`` of this exception is deliberately CLIENT-SAFE: every tier
+    surfaces it verbatim (the aiohttp wrappers embed it in their 400
+    envelope, the FastAPI handlers do ``{"error": str(e)}``), so it must
+    never carry interpreter or library internals — see R20-F3, where a
+    raw ``RecursionError``'s "maximum recursion depth exceeded" reached
+    the client. A ``ValueError`` subclass so the ~26 existing
+    ``except ValueError`` call sites keep working unchanged.
+    """
+
+
+def decode_untrusted_body(raw: Union[str, bytes]) -> Dict:
+    """THE decode seam: turn untrusted request bytes into a Python dict.
+
+    N1 (security-arch hardening pass 2). Untrusted bytes become Python
+    data at several structurally independent points in this codebase,
+    and eleven findings across nine ``pentest-all`` rounds (R3-F1,
+    R4-F3, R4-F4, R5-F8, R5-F9, R13-F2, R14-F3, R15-F1, R15-F2, R16-F3,
+    R20-F2) were all the same bug: one of those points did a bare
+    ``json.loads`` and skipped :func:`sanitize_json_input`. Each fix
+    widened WHAT the sanitizer strips or WHEN it runs; none made
+    skipping it structurally impossible, so the next decode point
+    someone added inherited nothing.
+
+    This function is the one entry point every request-handling module
+    decodes through. It is what ``tests/router/
+    test_arch_enforced_sanitization.py`` checks for the *absence* of: an
+    AST walk over ``agent_mcp/router/`` + ``agent_mcp/app/`` flags any
+    raw decode call that is not routed through here and is not on that
+    file's declared-exemption list. Adding a twelfth decode point
+    therefore fails a test instead of quietly reintroducing the class.
+
+    Three wrappers used to implement this inline, near-identically:
+    :func:`get_sanitized_json_body` (Starlette/FastAPI tier),
+    ``admin_users_api._json_body`` and ``router.app._parse_json_body``
+    (aiohttp tier). They are now thin call-throughs to this. Two
+    differences between them were checked and deliberately KEPT at the
+    call sites rather than folded in here, because each is that tier's
+    API contract rather than a sanitization property:
+
+      * **empty body.** The aiohttp wrappers map ``b""`` to ``{}`` (a
+        few POSTs legitimately take no fields); the FastAPI tier has
+        always rejected it. Both keep doing that — the check stays
+        immediately above their call to this function, where the
+        decision is visible.
+      * **error envelope.** ``_parse_json_body`` reports
+        ``invalid_json``, ``_json_body`` reports ``validation_error``,
+        and the FastAPI handlers map a bare ``ValueError`` themselves.
+        Unifying those would be a client-visible API change.
+
+    Returns the parsed body as a ``dict`` with every string leaf run
+    through :func:`_strip_control_bytes`. Raises
+    :class:`UntrustedBodyError` (a ``ValueError``) on a malformed body,
+    a top-level non-object, or a body deep enough to trip CPython's own
+    recursion guard.
+    """
+    try:
+        parsed = sanitize_json_input(raw)
+    except RecursionError as exc:
+        # PF-R20-1/R20-F3: ~3000+ levels of nesting trips CPython's
+        # recursion guard inside json.loads() *or* inside
+        # _strip_control_bytes's own dict/list walk. Neither message
+        # belongs in a response.
+        logger.error(f"Request body too deeply nested to parse: {exc}")
+        raise UntrustedBodyError("request body is too deeply nested") from exc
+    except ValueError as exc:
+        # PF-R21-1: covers JSONDecodeError AND the UnicodeDecodeError an
+        # invalid-UTF8 body raises — both ValueError subclasses, and the
+        # narrower JSONDecodeError-only guard used to let the latter
+        # escape to an uncaught 500.
+        msg = exc.msg if isinstance(exc, json.JSONDecodeError) else str(exc)
+        raise UntrustedBodyError(
+            f"request body is not valid JSON: {msg}"
+        ) from exc
+    if not isinstance(parsed, dict):
+        # PF-R12-1: a top-level list/string/scalar parses cleanly and
+        # then blows up at the caller's ``data.get(...)`` as a 500.
+        raise UntrustedBodyError("request body must be a JSON object")
+    return parsed
+
+
 # Helper function for API request handling
 # Original location: main.py lines 126-143
 async def get_sanitized_json_body(request: Any) -> Dict: # 'request: Request' if Starlette is imported
@@ -338,52 +421,47 @@ async def get_sanitized_json_body(request: Any) -> Dict: # 'request: Request' if
         ValueError: If the request body is not valid JSON, cannot be
             processed, or does not decode to a top-level JSON object.
 
+    N1: this is now a thin adapter — read the bytes off a Starlette
+    request, hand them to :func:`decode_untrusted_body`. Everything the
+    body-shape docstring below used to describe (the PF-R12-1 top-level
+    object guard, the PF-R20-1/R20-F3 recursion-depth guard, the
+    PF-R21-1 invalid-UTF8 guard) lives in that one shared seam now, so
+    the aiohttp tier's two wrappers and this one cannot drift apart on
+    any of it.
+
     Container-shape guard (PF-R12-1): every FastAPI ``app/routers/*``
     caller of this helper immediately does ``data.get(...)`` /
     ``data[key]`` — they all expect a JSON *object*. A top-level
     non-dict body (a bare list ``[1,2,3]``, a JSON string, or a scalar)
     parses cleanly, then raises ``AttributeError`` / ``TypeError`` at the
-    ``.get()`` site and surfaces as an uncaught 500. Enforcing
-    ``isinstance(parsed, dict)`` HERE turns that class of type-confusion
-    into a clean ``ValueError`` the callers already map to 400 — matching
-    the aiohttp ``router/`` tier's ``_parse_json_body`` object guard. No
-    caller of this helper legitimately expects a top-level array; the
-    lower-level :func:`sanitize_json_input` (used by the tool-argument
-    path in ``tools/registry.py``) is deliberately left unguarded so it
-    can still return list/scalar values.
+    ``.get()`` site and surfaces as an uncaught 500. The seam turns that
+    class of type-confusion into a clean ``ValueError`` the callers
+    already map to 400. No caller of this helper legitimately expects a
+    top-level array; the lower-level :func:`sanitize_json_input` (used
+    by the tool-argument path in ``tools/registry.py``) is deliberately
+    left unguarded so it can still return list/scalar values.
+
+    Empty body: rejected here (and mapped to 400 by every caller),
+    unlike the aiohttp tier's ``{}``. See
+    :func:`decode_untrusted_body`'s docstring for why that difference
+    is kept at the call sites rather than folded into the seam.
     """
     try:
         # Get the raw body data
         raw_body = await request.body() # This is usually bytes
-
-        # Sanitize and parse it (sanitize_json_input now handles bytes decoding)
-        parsed = sanitize_json_input(raw_body)
-        if not isinstance(parsed, dict):
-            raise ValueError("request body must be a JSON object")
-        return parsed
-    except ValueError as ve: # Catch ValueError from sanitize_json_input or body decoding
-        logger.error(f"Failed to get/sanitize request body: {ve}")
-        raise ValueError(f"Invalid request body: {ve}") # Re-raise with context
-    except RecursionError as re_exc:
-        # R20-F3: a deeply-nested body (~3000+ levels) trips CPython's
-        # own recursion guard inside json.loads() / the dict-list walk
-        # in sanitize_json_input -- not a crash (the guard is caught
-        # cleanly here), just an interpreter-internal exception whose
-        # default str() ("maximum recursion depth exceeded") has no
-        # business reaching the client. Mirrors
-        # admin_users_api._json_body's ``except (ValueError,
-        # RecursionError)`` handling (PF-R20-1); this helper is the ONE
-        # chokepoint 8 routers share (settings/memories/tasks/agents/
-        # composition/delivery/messages/schedules), so it needed the
-        # same guard. The real message stays server-side only.
-        logger.error(f"Request body too deeply nested to parse: {re_exc}")
-        raise ValueError("request body is too deeply nested")
     except Exception as e:
-        # Catching other potential exceptions from request.body() or unexpected issues.
+        # Catching potential exceptions from request.body() itself (a
+        # client disconnect mid-upload, an ASGI-server error).
         # R20-F3: the client-visible message stays static -- str(e) can
         # carry interpreter/library-internal detail; the real detail is
-        # already logged above with exc_info for debugging.
+        # already logged here with exc_info for debugging.
         logger.error(f"Unexpected error processing request body: {e}", exc_info=True)
         raise ValueError("Error processing request body")
+
+    try:
+        return decode_untrusted_body(raw_body)
+    except UntrustedBodyError as ube:
+        logger.error(f"Failed to get/sanitize request body: {ube}")
+        raise
 
 # --- End JSON Sanitization Utility ---
