@@ -69,13 +69,6 @@ UNSTAMPED_MIGRATION_GAPS = frozenset(
         # file_metadata_tools.py
         "update_file_metadata",
         "view_file_metadata",
-        # project_context_tools.py
-        "bulk_update_project_context",
-        "create_project_context",
-        "delete_project_context",
-        "update_project_context",
-        "validate_context_consistency",
-        "view_project_context",
         # task_notes_tools.py
         "add_task_note",
         "delete_task_note",
@@ -232,7 +225,15 @@ EXPECTED_ACCESS_LEVELS = {
     "view_agents": "worker",
     "view_audit_log": "operator",
     "view_file_metadata": "any",
-    "view_project_context": "any",
+    # Phase 2 (Finding A) DELIBERATE tier change, the only one in the
+    # whole migration: stamping ``@requires_capability("memories.view")``
+    # lets the derivation see the live cap, which sits in the worker
+    # bundle -> "worker" (was the ``visibility=`` default "any"). No
+    # policy change -- the cap gate ALREADY rejected anonymous callers,
+    # who hold no capabilities; the tool merely stops being advertised
+    # to a caller that could never invoke it. This is exactly the leak
+    # ``test_tool_visibility_capability_coupling`` was written to force.
+    "view_project_context": "worker",
     "view_project_settings": "operator",
     "view_status": "operator",
     "view_tasks": "worker",

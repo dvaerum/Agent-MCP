@@ -43,7 +43,7 @@ import pytest
 
 from agent_mcp.core.authorize import AuthRejected
 from agent_mcp.core.capabilities import PROJECT_ROLE_BUNDLES, SYSADMIN_WILDCARD
-from agent_mcp.core.tool_result import Ok, PermissionDenied
+from agent_mcp.core.tool_result import Ok
 from tests.harness import make_principal, mcp_session
 
 # ── helpers ──────────────────────────────────────────────────────────
@@ -146,7 +146,13 @@ async def test_viewer_with_unrelated_group_memories_create_denied(
     must be denied by ``create_project_context`` — the ``/mcp``-reachable
     tool LIVE-EXPLOITED in R2-F3.
 
-    RED on main: ``Ok`` (the memory is created). GREEN: ``PermissionDenied``.
+    RED on main: ``Ok`` (the memory is created). GREEN: denied.
+
+    Phase 2 (Finding A): the tool's gate moved from an in-body pair
+    (``_requires_authenticated_caller`` + ``_deny_viewer_tier_write``)
+    to a ``@requires_predicate`` composing those SAME two helpers, so the
+    denial now raises ``AuthRejected`` instead of returning
+    ``PermissionDenied``. Same admission decision, same 403 on the wire.
     """
     async with mcp_session(tmp_path):
         from agent_mcp.tools.project_context_tools import (
@@ -157,14 +163,11 @@ async def test_viewer_with_unrelated_group_memories_create_denied(
             monkeypatch, {"memories.create"}
         )
 
-        result = await create_project_context_tool_impl(
-            {"context_key": "r2f3-exploit", "context_value": "pwned"},
-            principal=principal,
-        )
-
-        assert isinstance(result, PermissionDenied), (
-            f"expected PermissionDenied, got {result!r}"
-        )
+        with pytest.raises(AuthRejected):
+            await create_project_context_tool_impl(
+                {"context_key": "r2f3-exploit", "context_value": "pwned"},
+                principal=principal,
+            )
 
         from agent_mcp.db.connection import get_db_connection
 
@@ -195,14 +198,11 @@ async def test_viewer_without_group_cap_also_denied_control(
 
         principal = _viewer_principal_with_group_caps(monkeypatch, set())
 
-        result = await create_project_context_tool_impl(
-            {"context_key": "r2f3-control", "context_value": "nope"},
-            principal=principal,
-        )
-
-        assert isinstance(result, PermissionDenied), (
-            f"expected PermissionDenied, got {result!r}"
-        )
+        with pytest.raises(AuthRejected):
+            await create_project_context_tool_impl(
+                {"context_key": "r2f3-control", "context_value": "nope"},
+                principal=principal,
+            )
 
 
 @pytest.mark.asyncio

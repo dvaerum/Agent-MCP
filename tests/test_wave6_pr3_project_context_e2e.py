@@ -38,9 +38,8 @@ from agent_mcp.core.tool_result import (
     Invalid,
     NotFound,
     Ok,
-    PermissionDenied,
 )
-from tests.harness import make_principal, mcp_session
+from tests.harness import dispatch_expecting_denial, make_principal, mcp_session
 
 pytestmark = pytest.mark.asyncio
 
@@ -215,19 +214,27 @@ async def test_view_project_context_worker_sees_secret_keys(
 
 
 async def test_view_project_context_anonymous_rejected(tmp_path) -> None:
-    """A None Principal at the dispatch boundary surfaces as
-    :class:`PermissionDenied`. Defence-in-depth: the per-tool gate
-    matches the legacy ``@requires("any")`` rejection at the wire
-    level. Wave 6 PR 6: with no bearer in arguments and no explicit
-    principal, the dispatcher's arguments-token synthesis also
-    returns None, so the tool's own gate fires.
+    """A None Principal at the dispatch boundary is DENIED.
+
+    Defence-in-depth: the per-tool gate matches the legacy
+    ``@requires("any")`` rejection at the wire level. Wave 6 PR 6: with
+    no bearer in arguments and no explicit principal, the dispatcher's
+    arguments-token synthesis also returns None, so the tool's own gate
+    fires.
+
+    Phase 2 (Finding A): the gate is now
+    ``@requires_capability("memories.view")`` on the impl, so the denial
+    arrives as a raised ``AuthRejected`` rather than a returned
+    ``PermissionDenied``. Same admission decision (the in-body pair was
+    "authenticated AND memories.view", and every non-None Principal
+    passed the identity half), same 403 / isError=True on the wire.
     """
-    from agent_mcp.tools.registry import dispatch_tool_call, request_auth_token
+    from agent_mcp.tools.registry import request_auth_token
 
     async with mcp_session(tmp_path):
         cv_token = request_auth_token.set(None)
         try:
-            result = await dispatch_tool_call(
+            reason = await dispatch_expecting_denial(
                 "view_project_context",
                 {},
                 principal=None,
@@ -235,9 +242,7 @@ async def test_view_project_context_anonymous_rejected(tmp_path) -> None:
         finally:
             request_auth_token.reset(cv_token)
 
-    assert isinstance(result, PermissionDenied), (
-        f"anonymous caller must surface as PermissionDenied; got {result!r}"
-    )
+    assert reason.lower().startswith("unauthorized"), reason
 
 
 # ── update_project_context — Ok / Invalid / PermissionDenied ──────

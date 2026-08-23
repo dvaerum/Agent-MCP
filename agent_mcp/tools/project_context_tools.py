@@ -289,7 +289,7 @@ from ..core.config import logger
 # DEFAULT_STRING_MAX_LEN from the dispatcher's generic backstop.
 from ..core.schema_limits import IDENTIFIER_MAX_LEN
 from ..core import globals as g  # Not directly used here, but auth uses it
-from ..core.authorize import requires_capability
+from ..core.authorize import requires_capability, requires_predicate
 from ..core.principal import Principal
 from ..core.tool_result import (
     Conflict,
@@ -465,6 +465,57 @@ def _requires_authenticated_caller(
     return PermissionDenied(
         reason="Valid token or operator session required"
     )
+
+
+# ── Phase 2 / Finding A: the same gates, declared at the impl ────────
+#
+# The two helpers above were called in-body at the top of each tool.
+# An in-body gate is invisible to ``dispatch_tool_call``'s pre-schema
+# authorization check (R20-F4 / R21-F1) and to ``tools/access.py``'s
+# visibility derivation, which is the "opt-in-and-forget" shape the
+# security-architecture hardening plan exists to close. The predicates
+# below wrap the EXACT SAME helpers — no re-implementation, so the two
+# can't drift — and are stamped on each impl via ``@requires_predicate``
+# so the gate runs before jsonschema validation and the registry can
+# introspect it.
+#
+# These are predicates rather than ``@requires_capability`` because the
+# real rule is compound: an agent bearer is admitted on identity alone
+# (the per-key creator-ownership matrix in ``_check_write_authorization``
+# governs it further, per-argument), while an operator-path caller must
+# additionally hold the memories-write capability. Flattening either
+# arm into a single capability string would change who passes.
+
+
+def _is_authenticated_caller(principal: Optional[Principal]) -> bool:
+    """Predicate form of :func:`_requires_authenticated_caller`."""
+    return _requires_authenticated_caller(principal) is None
+
+
+def _can_write_project_context(capability: str):
+    """Build the write-gate predicate for one memories-write ``capability``.
+
+    Composes the two existing in-body gates in the order they ran:
+    :func:`_requires_authenticated_caller` then
+    :func:`_deny_viewer_tier_write`.
+    """
+
+    def _predicate(principal: Optional[Principal]) -> bool:
+        return (
+            _requires_authenticated_caller(principal) is None
+            and _deny_viewer_tier_write(principal, capability) is None
+        )
+
+    return _predicate
+
+
+#: One ``AuthRejected`` message has to cover both arms of the composed
+#: write gate (the decorator takes a static reason), so it names both.
+_WRITE_DENIED_REASON = (
+    "Unauthorized: Valid token or operator session required, and "
+    "viewer-tier operators cannot mutate project context (read-only "
+    "project membership)"
+)
 
 
 def _analyze_context_health(context_entries: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -709,6 +760,13 @@ def _create_context_backup(
 
 # --- view_project_context tool ---
 # Original logic from main.py: lines 1411-1465 (view_project_context_tool function)
+# Phase 2 (Finding A): the in-body pair (identity gate + ``memories.view``)
+# collapses EXACTLY to ``check_capability_gate`` — ``_requires_authenticated_caller``
+# admits every non-None Principal (``PrincipalKind`` is a closed Literal of the
+# three kinds it lists), so "authenticated AND has memories.view" is
+# "has memories.view". Stamped as a capability, which also lets
+# ``tools/access.py`` derive the tools/list tier from the live cap.
+@requires_capability("memories.view")
 async def view_project_context_tool_impl(
     arguments: Dict[str, Any],
     *,
@@ -723,23 +781,6 @@ async def view_project_context_tool_impl(
     shared knowledge — there is no content-based secret redaction on the
     read path any more.
     """
-    denied = _requires_authenticated_caller(principal)
-    if denied is not None:
-        return denied
-
-    # Reads require the ``memories.view`` capability. This is a no-op for
-    # every legitimate caller — viewer + operator project-role bundles carry
-    # it, so do the worker + manager agent-role bundles, and sysadmin holds
-    # the wildcard. What it DENIES is the one real over-admit the identity-
-    # only gate above let through: an ``agent_bearer`` whose ``agent_role``
-    # is ``None`` (a malformed token → empty capability bundle) could read
-    # project context with zero caps. This mirrors the ``rag.query`` gate
-    # ``ask_project_rag`` already added to close the same empty-bearer class.
-    if not principal.has_capability("memories.view"):
-        return PermissionDenied(
-            reason="memories.view capability required to read project context"
-        )
-
     context_key_filter = arguments.get("context_key")  # Optional specific key
     search_query_filter = arguments.get("search_query")  # Optional search query
 
@@ -1273,6 +1314,9 @@ async def _handle_bulk_context_update(
     )
 
 
+@requires_predicate(
+    _can_write_project_context("memories.update"), _WRITE_DENIED_REASON
+)
 async def update_project_context_tool_impl(
     arguments: Dict[str, Any],
     *,
@@ -1288,16 +1332,6 @@ async def update_project_context_tool_impl(
     ``verify_token(token, "admin")`` semantics during the Wave 6
     window.
     """
-    denied = _requires_authenticated_caller(principal)
-    if denied is not None:
-        return denied
-
-    # SEC1: operator-path viewers are read-only; deny them here before
-    # the per-key ownership matrix (which treats them like a worker).
-    viewer_denied = _deny_viewer_tier_write(principal, "memories.update")
-    if viewer_denied is not None:
-        return viewer_denied
-
     # Support both single and bulk operations
     context_key_to_update = arguments.get("context_key")
     context_value_to_set = arguments.get("context_value")
@@ -1452,6 +1486,9 @@ def _bulk_update_inline(
         return None, response_parts
 
 
+@requires_predicate(
+    _can_write_project_context("memories.update"), _WRITE_DENIED_REASON
+)
 async def bulk_update_project_context_tool_impl(
     arguments: Dict[str, Any],
     *,
@@ -1472,16 +1509,6 @@ async def bulk_update_project_context_tool_impl(
     :func:`_requires_authenticated_caller`; ``is_admin`` resolved
     from :func:`_is_admin_principal`.
     """
-    denied = _requires_authenticated_caller(principal)
-    if denied is not None:
-        return denied
-
-    # SEC1: operator-path viewers are read-only (see
-    # _deny_viewer_tier_write); block before the per-key ownership matrix.
-    viewer_denied = _deny_viewer_tier_write(principal, "memories.update")
-    if viewer_denied is not None:
-        return viewer_denied
-
     updates = arguments.get("updates", [])  # List of update operations
     requesting_agent_id = _actor_label(principal)
 
@@ -1629,6 +1656,9 @@ def _create_context_inline(
         return None
 
 
+@requires_predicate(
+    _can_write_project_context("memories.create"), _WRITE_DENIED_REASON
+)
 async def create_project_context_tool_impl(
     arguments: Dict[str, Any],
     *,
@@ -1655,15 +1685,6 @@ async def create_project_context_tool_impl(
     ownership matrix — the same surface ``update_project_context`` already
     exposes for its insert branch, so no new privilege opens.
     """
-    denied = _requires_authenticated_caller(principal)
-    if denied is not None:
-        return denied
-
-    # SEC1: operator-path viewers are read-only; deny before the per-key
-    # ownership matrix (which would otherwise treat them like a worker).
-    viewer_denied = _deny_viewer_tier_write(principal, "memories.create")
-    if viewer_denied is not None:
-        return viewer_denied
 
     context_key = arguments.get("context_key")
     context_value = arguments.get("context_value")
@@ -1914,6 +1935,10 @@ async def backup_project_context_tool_impl(
 
 
 # --- validate_context_consistency tool ---
+@requires_predicate(
+    _is_authenticated_caller,
+    "Unauthorized: Valid token or operator session required",
+)
 async def validate_context_consistency_tool_impl(
     arguments: Dict[str, Any],
     *,
@@ -1924,10 +1949,6 @@ async def validate_context_consistency_tool_impl(
     Gate: was ``@requires("any")``. Behaviour preserved via
     :func:`_requires_authenticated_caller`.
     """
-    denied = _requires_authenticated_caller(principal)
-    if denied is not None:
-        return denied
-
     requesting_agent_id = _actor_label(principal)
 
     # Log audit
@@ -2313,6 +2334,9 @@ def register_project_context_tools():
     )
 
 
+@requires_predicate(
+    _can_write_project_context("memories.delete"), _WRITE_DENIED_REASON
+)
 async def delete_project_context_tool_impl(
     arguments: Dict[str, Any],
     *,
@@ -2330,17 +2354,6 @@ async def delete_project_context_tool_impl(
     ``is_admin`` for the per-key creator-ownership matrix resolved
     via :func:`_is_admin_principal`.
     """
-    denied = _requires_authenticated_caller(principal)
-    if denied is not None:
-        return denied
-
-    # SEC1: operator-path viewers are read-only (see
-    # _deny_viewer_tier_write); block deletes before the per-key
-    # ownership matrix would otherwise let a viewer remove its own keys.
-    viewer_denied = _deny_viewer_tier_write(principal, "memories.delete")
-    if viewer_denied is not None:
-        return viewer_denied
-
     context_keys = arguments.get("context_keys", [])
     context_key = arguments.get("context_key")
     force_delete = arguments.get("force_delete", False)

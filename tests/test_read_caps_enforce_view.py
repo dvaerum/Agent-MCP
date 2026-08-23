@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import pytest
 
+from agent_mcp.core.authorize import AuthRejected
 from agent_mcp.core.principal import Principal
 from agent_mcp.core.tool_result import PermissionDenied
 from tests.harness import make_principal, mcp_session
@@ -83,14 +84,16 @@ async def test_view_project_context_requires_memories_view(tmp_path) -> None:
     )
 
     async with mcp_session(tmp_path) as admin:
-        # RED before the fix: an empty-cap bearer was ADMITTED to context reads.
-        denied = await view_project_context_tool_impl(
-            {}, principal=_empty_cap_bearer()
-        )
-        assert isinstance(denied, PermissionDenied), (
-            f"empty-cap bearer must be denied context reads, got {denied!r}"
-        )
-        assert "memories.view" in denied.reason
+        # RED before the fix: an empty-cap bearer was ADMITTED to context
+        # reads. Phase 2 (Finding A): the gate is now
+        # ``@requires_capability("memories.view")`` on the impl, so the
+        # denial raises ``AuthRejected`` instead of returning
+        # ``PermissionDenied`` — same cap, same decision, same 403.
+        with pytest.raises(AuthRejected) as excinfo:
+            await view_project_context_tool_impl(
+                {}, principal=_empty_cap_bearer()
+            )
+        assert "memories.view" in excinfo.value.reason
 
         # No-op for a real worker (its bundle carries memories.view).
         alice = await admin.create_worker("alice")
