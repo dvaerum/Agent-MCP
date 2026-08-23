@@ -74,7 +74,7 @@ for full file:line detail on each):
 | ID | Finding | Strength | Effort |
 |---|---|---|---|
 | N1 | Sanitization is a helper you must remember to call, not a seam — 11 ledger findings across 9 rounds, 5 live bypasses | Strong | Medium |
-| N2 | The one structurally-enforced revalidation invariant covers 1 of 3 request surfaces (router admin; backend REST relies on an undocumented proxy-buffering side effect, FLAG-R7-1) | Strong | Medium |
+| N2 | The one structurally-enforced revalidation invariant covers 1 of 3 request surfaces (router admin; backend REST relies on an undocumented proxy-buffering side effect, FLAG-R7-1) — **done**: both remaining surfaces investigated and their real invariants pinned instead of adapters built, see N2 below | Strong | Medium |
 | N3 | "What kind of request is this?" answered 11 times by 5 modules — Tier 1 (pure-copy subtractions) done in Phase 1; the SSO-vs-rate_limit trusted-proxy disagreement was investigated and deliberately NOT force-fit (see Phase 1 below); Tier 2 (derived classification) deferred | Strong | Medium |
 | N4 | `Registry.visibility` is a listing filter wearing an authorization name for 2 of 3 catalogs — informational input to Phase 2 and Phase 4, no PR of its own | Strong | Low to surface |
 | N5 | Long-lived stream re-validation is a convention (4 copies, 1 pattern, 0 seams), not a seam — nothing broken today, pure future-proofing | Worth exploring | Low-medium |
@@ -277,7 +277,7 @@ rediscover the asymmetry mid-implementation.
     admitted duplicate of `login.cookie_secure_flag` that already produced
     R6-F3) — same file, already checked out, cheap to add.
 
-### N2 — after Phase 2
+### N2 — after Phase 2 — **done**
 
 **Widen the arch-enforcement invariant to all 3 request surfaces.**
 `test_arch_enforced_revalidation.py` (post-Phase-0) discovers targets
@@ -290,6 +290,41 @@ genuinely immune because the proxy buffers? — is easier to answer once
 Phase 2 has established what a per-surface authorization adapter looks
 like. An acceptable outcome is documenting + testing the buffering
 invariant explicitly rather than building a redundant adapter.
+
+**Outcome (that acceptable one, for both remaining surfaces).** The
+investigation found no adapter is warranted today, and the two new test
+files carry the full reasoning rather than repeating it here:
+
+- **Backend REST** — genuinely immune *as deployed*, and the reason is
+  a single line: `_proxy_to_backend` materialises the whole client body
+  before it opens the backend socket, and both proxy entry points
+  (`backend_api_handler` for the entire `/api/<project>/…` surface,
+  `backend_mcp_handler` for `/mcp`) route through it, so the
+  caller-paced window is spent at the router. Pinned behaviourally and
+  by AST in
+  `tests/router/test_arch_n2_proxy_buffers_before_backend.py`, with the
+  security rationale added to the comment at the body-materialisation
+  step in `router/app.py` (it previously gave only the
+  proxying-correctness reason). **Scope caveat, deliberately not closed
+  here:** a backend reached *directly* (the misconfiguration posture
+  `app/deps.py::_backend_project_name` already hardens against) has no
+  buffering in front of it and the class is open there. Closing that
+  means a re-validation adapter across 40+ FastAPI handlers, which
+  wants Finding D's typed `Principal` first — Phase 5, not N2.
+- **MCP tools** — the plan's framing of "2 ad-hoc `_agent_assignable`
+  re-checks" does not survive contact: `_agent_assignable` validates the
+  assignment *target*'s liveness inside the write transaction, not the
+  *caller*'s authority, so it is not a re-validation analogue at all and
+  extending it would have enforced the wrong thing. What the surface
+  actually rests on is checked instead, per registered tool (49
+  parametrized cases, discovered from the live registry) in
+  `tests/test_arch_n2_tool_surface_yield_points.py`: the tool layer holds
+  no transport/stream handle, so no caller-paced yield point can exist
+  in it, and `dispatch_tool_call` has zero yield points before *or*
+  between its authorization gate and the tool invocation — `perm_gates`'
+  fusion property, arrived at by construction and therefore exactly as
+  easy to break with one added `await`. `wait_for_events`' indefinite
+  hold is a stream lifetime, which is **N5**'s subject, not this one's.
 
 ### Phase 4 — after Phase 2 lands (needs its adapter shape)
 

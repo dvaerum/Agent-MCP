@@ -102,6 +102,27 @@ immediately discovered a third module, ``admin_sso_api.py``
 never covered — see ``test_dynamic_discovery_is_superset_of_history``
 below, which pins that the new mechanism can never regress to covering
 FEWER modules than the list it replaces.
+
+Scope: this file covers ONE of three request surfaces
+--------------------------------------------------------
+The discovery above walks ``agent_mcp/router/`` only. That is
+deliberate, not an oversight — the other two surfaces have the same
+check → yield → write shape but a different reason for being safe, so
+applying THIS file's rule (every yield point must be fused with a
+``perm_gates`` re-check) to them would either discover nothing or
+demand an adapter that closes no reachable window. Finding N2 of
+``docs/proposals/security-authz-architecture-hardening.md``
+investigated both and pinned each surface's actual invariant in its own
+file; read those rather than widening the glob here:
+
+* backend REST (FastAPI, ``agent_mcp/app/routers/``, 40+ handlers) →
+  ``tests/router/test_arch_n2_proxy_buffers_before_backend.py``
+  (FLAG-R7-1: the caller-paced window is consumed by the router's
+  buffer-then-forward proxy before the backend is reached);
+* MCP tools (``agent_mcp/tools/``, 49 registered) →
+  ``tests/test_arch_n2_tool_surface_yield_points.py`` (the tool layer
+  holds no transport handle, and ``dispatch_tool_call`` has no yield
+  point between its authorization gate and the tool call).
 """
 
 from __future__ import annotations
