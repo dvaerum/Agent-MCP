@@ -404,10 +404,16 @@ def test_update_file_metadata_entry_gate_uses_system_config_write() -> None:
 )
 def test_admin_tool_require_capability_per_tool(tool_name, cap) -> None:
     """Each admin tool's entry check now names the per-action
-    capability via ``_require_capability(principal, "<cap>")``. A
-    principal carrying ONLY the matching cap admits past the gate;
-    a principal carrying only an unrelated cap denies with
-    :class:`PermissionDenied`."""
+    capability via ``@requires_capability("<cap>")`` (R21-F1: moved off
+    the in-body ``_require_capability(principal, "<cap>")`` call so
+    ``dispatch_tool_call``'s pre-schema gate can see it — see
+    ``core/authorize.requires_capability``). A principal carrying
+    ONLY the matching cap admits past the gate; a principal carrying
+    only an unrelated cap raises :class:`AuthRejected` (the decorator
+    raises instead of returning ``PermissionDenied`` — a mechanism
+    change, not a policy change: the same principals are admitted /
+    denied as before)."""
+    from agent_mcp.core.authorize import AuthRejected
     from agent_mcp.core.tool_result import PermissionDenied
     from agent_mcp.tools import admin_tools as _admin
     impl = getattr(_admin, tool_name)
@@ -427,15 +433,16 @@ def test_admin_tool_require_capability_per_tool(tool_name, cap) -> None:
         # Pick a cap deliberately different from the tool's gate.
         other = "memories.view" if cap != "memories.view" else "files.use"
         p_deny = with_capabilities(other)
-        result = await impl({}, principal=p_deny)
-        assert isinstance(result, PermissionDenied), (
+        with pytest.raises(AuthRejected) as excinfo:
+            await impl({}, principal=p_deny)
+        assert cap in str(excinfo.value), (
             f"{tool_name} should deny principal lacking {cap} "
-            f"(has only {other!r}), got {result!r}"
+            f"(has only {other!r}), got {excinfo.value}"
         )
 
         # None principal denies.
-        result = await impl({}, principal=None)
-        assert isinstance(result, PermissionDenied)
+        with pytest.raises(AuthRejected):
+            await impl({}, principal=None)
 
     import asyncio
     asyncio.run(_exercise())

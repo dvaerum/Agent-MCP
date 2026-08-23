@@ -744,20 +744,28 @@ async def dispatch_tool_call(
             # to a caller who was never going to be allowed to invoke
             # it. Only a WELL-FORMED unauthorized call reached the
             # (correct) capability denial below. Consulting the same
-            # `_required_capability` / `_required_policy_keys`
-            # attributes `tools/access.py` already reads off the
-            # wrapper — via the exact gate-check helpers the
-            # `@requires_capability` / `@requires_policy` decorators
-            # themselves call — closes that pre-auth oracle: the same
-            # AuthRejected a well-formed call would raise now fires
-            # first, regardless of whether the arguments would also
-            # have failed schema validation. Tools with no stamped
-            # attribute (the cap check lives in-body, e.g.
-            # `terminate_agent`) are unaffected — their own in-body
-            # check still runs after schema validation, unchanged.
+            # `_required_capability` / `_required_policy_keys` /
+            # `_required_predicate` attributes `tools/access.py`
+            # already reads off the wrapper — via the exact gate-check
+            # helpers the `@requires_capability` / `@requires_policy` /
+            # `@requires_predicate` decorators themselves call — closes
+            # that pre-auth oracle: the same AuthRejected a well-formed
+            # call would raise now fires first, regardless of whether
+            # the arguments would also have failed schema validation.
+            # Tools with no stamped attribute (the cap check lives
+            # fully in-body with no decorator at all) are unaffected —
+            # their own in-body check still runs after schema
+            # validation, unchanged. R21-F1 added `_required_predicate`
+            # for the tools that gated in-body via a shared boolean
+            # helper (`_is_operator_tier`, `_is_admin_principal`, …)
+            # instead of a capability string / toggle set — the same
+            # class of pre-schema leak, closed the same way.
             required_cap = getattr(implementation_func, "_required_capability", None)
             required_policy_keys = getattr(
                 implementation_func, "_required_policy_keys", None
+            )
+            required_predicate = getattr(
+                implementation_func, "_required_predicate", None
             )
             if required_cap is not None:
                 from ..core.authorize import check_capability_gate
@@ -769,6 +777,16 @@ async def dispatch_tool_call(
                 )
                 check_policy_gate(
                     effective_principal, required_policy_keys, required_policy_default
+                )
+            elif required_predicate is not None:
+                from ..core.authorize import check_predicate_gate
+                required_predicate_reason = getattr(
+                    implementation_func,
+                    "_required_predicate_reason",
+                    "Unauthorized",
+                )
+                check_predicate_gate(
+                    effective_principal, required_predicate, required_predicate_reason
                 )
 
             # -32602 regression fix: clean arguments before schema

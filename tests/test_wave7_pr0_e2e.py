@@ -31,7 +31,7 @@ import json
 import pytest
 
 from agent_mcp.core.principal import Principal
-from agent_mcp.core.tool_result import Ok, PermissionDenied
+from agent_mcp.core.tool_result import Ok
 from tests.harness import make_principal, mcp_session
 
 pytestmark = pytest.mark.asyncio
@@ -262,33 +262,37 @@ async def test_terminate_marks_row_terminated_and_revokes_token(
 
 
 async def test_register_agent_requires_operator_principal(tmp_path) -> None:
-    """A worker-tier ``agent_bearer`` principal is rejected with
-    :class:`PermissionDenied`. Operator-only enforcement matches every
+    """A worker-tier ``agent_bearer`` principal is rejected.
+
+    R21-F1 moved the gate onto ``@requires_capability`` (was an
+    in-body check returning ``PermissionDenied``) — it now raises
+    :class:`AuthRejected`. Operator-only enforcement matches every
     other tool in ``admin_tools.py``."""
+    from agent_mcp.core.authorize import AuthRejected
     from agent_mcp.tools.admin_tools import register_agent_tool_impl
 
     async with mcp_session(tmp_path):
-        result = await register_agent_tool_impl(
-            {"name": "wave7-pr0-not-allowed"},
-            principal=_worker_principal(),
-        )
+        with pytest.raises(AuthRejected) as excinfo:
+            await register_agent_tool_impl(
+                {"name": "wave7-pr0-not-allowed"},
+                principal=_worker_principal(),
+            )
 
-    assert isinstance(result, PermissionDenied)
-    assert "operator" in result.reason.lower()
+    assert "agents.register" in str(excinfo.value)
 
 
 async def test_register_agent_rejects_none_principal(tmp_path) -> None:
-    """Unauthenticated call (no Principal threaded through) collapses
-    to :class:`PermissionDenied`. Matches the rest of admin_tools."""
+    """Unauthenticated call (no Principal threaded through) raises
+    :class:`AuthRejected` (R21-F1: was ``PermissionDenied``)."""
+    from agent_mcp.core.authorize import AuthRejected
     from agent_mcp.tools.admin_tools import register_agent_tool_impl
 
     async with mcp_session(tmp_path):
-        result = await register_agent_tool_impl(
-            {"name": "wave7-pr0-no-principal"},
-            principal=None,
-        )
-
-    assert isinstance(result, PermissionDenied)
+        with pytest.raises(AuthRejected):
+            await register_agent_tool_impl(
+                {"name": "wave7-pr0-no-principal"},
+                principal=None,
+            )
 
 
 # ── 5. snippet shape extras (async to share the module pytestmark) ──

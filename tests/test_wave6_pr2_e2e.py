@@ -290,19 +290,26 @@ async def test_broadcast_worker_denied(tmp_path) -> None:
     """A plain worker bearer cannot broadcast — the new gate refuses
     any principal that's not operator-tier (or the legacy ``admin``
     label).
+
+    R21-F1: the gate moved from an in-body ``_is_operator_tier`` check
+    (returning ``PermissionDenied``) to ``@requires_predicate`` wrapping
+    the SAME predicate (raising ``AuthRejected``) — see
+    ``core/authorize.requires_predicate`` — so ``dispatch_tool_call``'s
+    pre-schema gate can see it. Same denial decision, different
+    mechanism.
     """
+    from agent_mcp.core.authorize import AuthRejected
     from agent_mcp.tools.agent_communication_tools import (
         broadcast_admin_message_tool_impl,
     )
 
     async with mcp_session(tmp_path) as admin:
         bob = await admin.create_worker("bob")
-        result = await broadcast_admin_message_tool_impl(
-            {"message": "i should not be able to"},
-            principal=_worker_principal("bob", bob.token),
-        )
-
-    assert isinstance(result, PermissionDenied)
+        with pytest.raises(AuthRejected):
+            await broadcast_admin_message_tool_impl(
+                {"message": "i should not be able to"},
+                principal=_worker_principal("bob", bob.token),
+            )
 
 
 # ── wait_for_events ─────────────────────────────────────────────

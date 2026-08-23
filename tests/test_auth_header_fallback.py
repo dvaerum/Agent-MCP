@@ -70,10 +70,13 @@ async def test_dispatch_without_contextvar_and_without_token_returns_auth_failur
 
     Wave 6 PR 6: no Principal is supplied and the dispatcher's
     arguments-token fallback finds none, so the migrated tool
-    receives ``principal=None`` and surfaces
-    :class:`PermissionDenied`.
+    receives ``principal=None``. R21-F1 moved ``view_status``'s cap
+    gate onto ``@requires_capability`` (was in-body), so the None
+    principal is now caught by ``dispatch_tool_call``'s pre-schema
+    gate and raises :class:`AuthRejected` rather than returning
+    ``PermissionDenied``.
     """
-    from agent_mcp.core.tool_result import PermissionDenied
+    from agent_mcp.core.authorize import AuthRejected
     from agent_mcp.tools.registry import (
         dispatch_tool_call,
         request_auth_token,
@@ -83,8 +86,8 @@ async def test_dispatch_without_contextvar_and_without_token_returns_auth_failur
         # Make sure the contextvar is empty for this test.
         request_auth_token.set(None)
 
-        result = await dispatch_tool_call("view_status", {})
-        assert isinstance(result, PermissionDenied)
+        with pytest.raises(AuthRejected):
+            await dispatch_tool_call("view_status", {})
 
 
 async def test_dispatch_admits_view_status_with_operator_session_contextvar(

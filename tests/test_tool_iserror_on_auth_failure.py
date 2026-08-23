@@ -23,28 +23,27 @@ import pytest
 
 @pytest.mark.asyncio
 async def test_dispatch_tool_call_returns_permission_denied_on_bad_token() -> None:
-    """A tool that's gated by an operator-only check returns
-    :class:`PermissionDenied` when the caller has no operator
+    """A tool that's gated by an operator-only check raises
+    :class:`AuthRejected` when the caller has no operator
     principal — even if a (wrong) token is supplied in arguments.
 
     Wave 6 PR 5: ``view_status`` is migrated to take a
     :class:`Principal` and return a :class:`ToolResult`. The bridge
     in ``dispatch_tool_call`` derives a Principal from the
     legacy ContextVars; outside ``mcp_session``, no contextvar is
-    set, so the derived principal is None and the inline
-    operator check returns :class:`PermissionDenied`.
+    set, so the derived principal is None. R21-F1 moved the gate onto
+    ``@requires_capability`` (was an in-body check returning
+    ``PermissionDenied``), so the dispatcher's pre-schema gate now
+    raises :class:`AuthRejected` instead.
     """
-    from agent_mcp.core.tool_result import PermissionDenied
+    from agent_mcp.core.authorize import AuthRejected
     from agent_mcp.tools.registry import dispatch_tool_call
 
-    result = await dispatch_tool_call(
-        "view_status",
-        {"token": "deadbeef" * 4},
-    )
-    assert isinstance(result, PermissionDenied), (
-        f"expected PermissionDenied for unauthenticated view_status; "
-        f"got {result!r}"
-    )
+    with pytest.raises(AuthRejected):
+        await dispatch_tool_call(
+            "view_status",
+            {"token": "deadbeef" * 4},
+        )
 
 
 @pytest.mark.asyncio

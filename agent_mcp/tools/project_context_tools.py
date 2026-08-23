@@ -289,6 +289,7 @@ from ..core.config import logger
 # DEFAULT_STRING_MAX_LEN from the dispatcher's generic backstop.
 from ..core.schema_limits import IDENTIFIER_MAX_LEN
 from ..core import globals as g  # Not directly used here, but auth uses it
+from ..core.authorize import requires_capability
 from ..core.principal import Principal
 from ..core.tool_result import (
     Conflict,
@@ -1751,6 +1752,7 @@ async def create_project_context_tool_impl(
 
 
 # --- backup_project_context tool ---
+@requires_capability("system.config.write")
 async def backup_project_context_tool_impl(
     arguments: Dict[str, Any],
     *,
@@ -1759,16 +1761,18 @@ async def backup_project_context_tool_impl(
     """Wave 6 PR 3 — Principal + ToolResult migration.
 
     Policy: was ``@requires_role("operator")`` — operator-only. Now
-    expressed via :func:`_is_admin_principal` (admits operator
-    sessions + sysadmins; rejects worker / manager-tier agents). The
+    ``@requires_capability("system.config.write")`` — the same cap
+    :func:`_is_admin_principal` checks (admits operator sessions +
+    sysadmins; rejects worker / manager-tier agents), moved to the
+    decorator (R21-F1) so ``dispatch_tool_call`` denies an
+    unauthorized caller BEFORE running jsonschema on the arguments —
+    the in-body ``_is_admin_principal`` call had no attribute for the
+    dispatcher's pre-schema gate to see, so a malformed call leaked
+    the tool's schema shape to an unauthorized caller. The
     `visibility="operator"` kwarg on the register_tool() call below
     keeps the tools/list filter aligned so worker / manager bearers
     don't even see this tool in their catalogue.
     """
-    if not _is_admin_principal(principal):
-        return PermissionDenied(
-            reason="Operator session required to back up project context"
-        )
 
     backup_name = arguments.get("backup_name")  # Optional custom backup name
     include_health_report = arguments.get(

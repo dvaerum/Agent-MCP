@@ -323,3 +323,85 @@ def requires_policy(
         return wrapper
 
     return decorator
+
+
+PredicateFn = Callable[[Optional[Principal]], bool]
+
+
+def check_predicate_gate(
+    principal: Optional[Principal],
+    predicate: PredicateFn,
+    reason: str,
+) -> None:
+    """Raise :class:`AuthRejected` iff ``predicate(principal)`` is falsy.
+
+    R21-F1: generalizes :func:`check_capability_gate` /
+    :func:`check_policy_gate` for tools whose authorization isn't a
+    single capability string or toggle set but an arbitrary boolean
+    check over the Principal — e.g. ``is_operator_tier`` (capability
+    OR the legacy ``agent_id == "admin"`` label the test harness
+    seeds). Shared by the :func:`requires_predicate` wrapper AND
+    ``dispatch_tool_call``'s pre-schema-validation gate, so the two
+    evaluations can never diverge (same rationale as the capability /
+    policy gates).
+    """
+    if not predicate(principal):
+        raise AuthRejected(reason)
+
+
+def requires_predicate(
+    predicate: PredicateFn,
+    reason: str,
+) -> Callable[[ToolImpl], ToolImpl]:
+    """Authorise a tool entry point against an arbitrary Principal predicate.
+
+    R21-F1: for tools whose authorization was an in-body call to a
+    shared boolean helper that is MORE than a single capability check
+    (e.g. ``_is_operator_tier`` — a capability OR the legacy
+    ``agent_id == "admin"`` label) rather than
+    ``@requires_capability`` / ``@requires_policy``. A helper that
+    reduces to a single ``principal.has_capability(cap)`` check should
+    use ``@requires_capability(cap)`` directly instead — this decorator
+    is for the cases that genuinely need an arbitrary predicate. Those
+    helpers set no ``_required_capability`` / ``_required_policy_keys``
+    attribute, so ``dispatch_tool_call``'s R20-F4 pre-schema gate
+    couldn't see them — a malformed call from an unauthorized caller
+    reached ``jsonschema.validate`` first, leaking the tool's exact
+    schema shape. Wrapping the SAME predicate in this decorator stamps
+    ``_required_predicate`` (mirroring ``_required_capability``) so the
+    dispatcher's pre-schema gate covers it too, with no change to the
+    predicate itself — the authorization DECISION is identical, only
+    WHEN it runs moves earlier.
+
+    Pass ``reason`` as the exact ``AuthRejected`` message; keep it
+    short (it reaches agent transcripts / REST error bodies verbatim).
+    """
+
+    def decorator(func: ToolImpl) -> ToolImpl:
+        forward_principal = _func_accepts_principal(func)
+
+        @functools.wraps(func)
+        async def wrapper(
+            arguments: Dict[str, Any],
+            *,
+            principal: Optional[Principal] = None,
+            **kwargs: Any,
+        ) -> Any:
+            if principal is None:
+                principal = _synthesize_principal_from_arguments(arguments)
+            check_predicate_gate(principal, predicate, reason)
+            if forward_principal:
+                return await func(arguments, principal=principal, **kwargs)
+            return await func(arguments, **kwargs)
+
+        # Exposed for `dispatch_tool_call`'s pre-schema gate (registry.py).
+        # Deliberately NOT consulted by `tools.access._derive_access_level`
+        # — an arbitrary predicate can't be mapped to a worker/manager/
+        # operator visibility tier the way a capability or toggle set can,
+        # so predicate-gated tools keep using the `visibility=` kwarg as
+        # their sole `tools/list` signal (same as an in-body cap check).
+        wrapper._required_predicate = predicate  # type: ignore[attr-defined]
+        wrapper._required_predicate_reason = reason  # type: ignore[attr-defined]
+        return wrapper
+
+    return decorator

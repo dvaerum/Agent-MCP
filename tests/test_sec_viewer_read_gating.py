@@ -27,7 +27,7 @@ import json
 import pytest
 
 from agent_mcp.core.principal import Principal
-from agent_mcp.core.tool_result import Ok, PermissionDenied
+from agent_mcp.core.tool_result import Ok
 from tests.harness import make_principal, mcp_session
 
 pytestmark = pytest.mark.asyncio
@@ -85,17 +85,21 @@ def _sysadmin_principal(user_id: str = "root") -> Principal:
 
 async def test_view_status_denies_viewer(tmp_path) -> None:
     """A viewer-tier caller (``system.view`` only) must be denied — the
-    live-reproduced leak of agent statuses + absolute working dirs."""
+    live-reproduced leak of agent statuses + absolute working dirs.
+
+    R21-F1: the gate is now ``@requires_capability`` (moved off the
+    in-body ``_require_capability`` call) — it raises ``AuthRejected``
+    instead of returning ``PermissionDenied``. Same denial decision,
+    different mechanism.
+    """
+    from agent_mcp.core.authorize import AuthRejected
     from agent_mcp.tools.admin_tools import view_status_tool_impl
 
     async with mcp_session(tmp_path):
-        result = await view_status_tool_impl(
-            {}, principal=_viewer_principal()
-        )
-
-    assert isinstance(result, PermissionDenied), (
-        f"viewer must not reach view_status payload; got {result!r}"
-    )
+        with pytest.raises(AuthRejected):
+            await view_status_tool_impl(
+                {}, principal=_viewer_principal()
+            )
 
 
 async def test_view_status_allows_operator(tmp_path) -> None:
@@ -125,17 +129,18 @@ async def test_view_status_allows_sysadmin(tmp_path) -> None:
 
 async def test_view_audit_log_denies_viewer(tmp_path) -> None:
     """A viewer-tier caller must be denied — the audit log discloses
-    operator user_ids and every agent action."""
+    operator user_ids and every agent action.
+
+    R21-F1: raises ``AuthRejected`` now (see test_view_status_denies_viewer).
+    """
+    from agent_mcp.core.authorize import AuthRejected
     from agent_mcp.tools.admin_tools import view_audit_log_tool_impl
 
     async with mcp_session(tmp_path):
-        result = await view_audit_log_tool_impl(
-            {}, principal=_viewer_principal()
-        )
-
-    assert isinstance(result, PermissionDenied), (
-        f"viewer must not reach the audit log; got {result!r}"
-    )
+        with pytest.raises(AuthRejected):
+            await view_audit_log_tool_impl(
+                {}, principal=_viewer_principal()
+            )
 
 
 async def test_view_audit_log_allows_operator(tmp_path) -> None:

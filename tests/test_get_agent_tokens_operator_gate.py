@@ -33,7 +33,7 @@ import pytest
 
 from agent_mcp.core import globals as g
 from agent_mcp.core.principal import Principal
-from agent_mcp.core.tool_result import Ok, PermissionDenied
+from agent_mcp.core.tool_result import Ok
 from tests.harness import make_principal, mcp_session
 
 pytestmark = pytest.mark.asyncio
@@ -142,22 +142,27 @@ def _result_blob(result: Ok) -> str:
 
 async def test_viewer_only_caller_never_gets_plaintext_tokens(tmp_path) -> None:
     """A viewer-tier caller (``agents.view`` only) is denied — never
-    plaintext. This is the live-reproduced leak."""
+    plaintext. This is the live-reproduced leak.
+
+    R21-F1: the gate is now ``@requires_capability`` (moved off the
+    in-body ``_require_capability`` call so the pre-schema gate in
+    ``dispatch_tool_call`` can see it) — it raises ``AuthRejected``
+    instead of returning ``PermissionDenied``. Same denial decision,
+    different mechanism.
+    """
+    from agent_mcp.core.authorize import AuthRejected
     from agent_mcp.tools.admin_tools import get_agent_tokens_tool_impl
 
     async with mcp_session(tmp_path):
         token = await _seed_agent("victim-a")
 
-        result = await get_agent_tokens_tool_impl(
-            {}, principal=_viewer_principal()
-        )
+        with pytest.raises(AuthRejected) as excinfo:
+            await get_agent_tokens_tool_impl(
+                {}, principal=_viewer_principal()
+            )
 
-    # Denied is the expected outcome (viewer lacks the operator gate cap).
-    assert isinstance(result, PermissionDenied), (
-        f"viewer must not reach the token payload; got {result!r}"
-    )
     # Belt-and-braces: the token must not appear in any denial text.
-    assert token not in (result.reason or "")
+    assert token not in str(excinfo.value)
 
 
 # ── 2. operator opt-in gets real tokens (no regression) ──────────────
@@ -229,14 +234,14 @@ async def test_non_operator_tier_opt_in_still_masked(tmp_path) -> None:
 
 
 async def test_worker_bearer_rejected(tmp_path) -> None:
+    from agent_mcp.core.authorize import AuthRejected
     from agent_mcp.tools.admin_tools import get_agent_tokens_tool_impl
 
     async with mcp_session(tmp_path):
-        result = await get_agent_tokens_tool_impl(
-            {}, principal=_worker_principal()
-        )
-
-    assert isinstance(result, PermissionDenied)
+        with pytest.raises(AuthRejected):
+            await get_agent_tokens_tool_impl(
+                {}, principal=_worker_principal()
+            )
 
 
 # ── 4. audit records the real caller, not literal "admin" ────────────

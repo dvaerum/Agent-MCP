@@ -38,6 +38,7 @@ from ..deps import (
     forwarding_route_role,
     require_operator_session,
 )
+from ...core.authorize import AuthRejected
 from ...core.config import logger
 from ...core import session_registry
 from ...core import state
@@ -423,6 +424,14 @@ async def register_agent_dashboard_api_route(
         result = await register_agent_tool_impl(
             tool_args, principal=principal,
         )
+    except AuthRejected as e:
+        # R21-F1: register_agent_tool_impl's cap gate is now
+        # ``@requires_capability`` (raises) instead of an in-body
+        # ``_require_capability`` call (returned ``PermissionDenied``).
+        # A forwarding VIEWER passes ``require_operator_session``
+        # (any operator-tier session) but lacks ``agents.register`` —
+        # that must still map to 403, not the generic 500 below.
+        return JSONResponse({"message": e.reason}, status_code=403)
     except Exception as e:  # pragma: no cover - defensive
         logger.error(
             "Error in register_agent_dashboard_api_route: %s", e,
@@ -503,6 +512,14 @@ async def _dispatch_agent_lifecycle_tool(
         return await dispatch_tool_call(
             tool_name, arguments, principal=principal,
         )
+    except AuthRejected as e:
+        # AC-R5-1 / R21-F1: the tool's ``agents.terminate`` gate is now
+        # ``@requires_capability`` (raises ``AuthRejected``) rather than
+        # an in-body check (returned ``PermissionDenied``). A forwarding
+        # VIEWER passes ``require_operator_session`` (any operator-tier
+        # session admits) but lacks ``agents.terminate`` — that denial
+        # must still map to 403, not fall into the generic 500 below.
+        return JSONResponse({"error": e.reason}, status_code=403)
     except ToolInputValidationError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
     except Exception as e:  # pragma: no cover - defensive
