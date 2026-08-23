@@ -166,27 +166,28 @@ def resolve_agent_id_for_uri(
     handler didn't thread a Principal (in-process / test callers with
     only a bearer), one is built from the token so the decision is
     identical.
+
+    R21-F4: the admin check MUST run before requiring the caller's own
+    ``bearer_agent_id`` to resolve. Every real operator-tier Principal
+    reachable in production (cookie-session via
+    :func:`agent_mcp.core.principal_builder.build_operator_principal`,
+    and the router's signed forwarding-header proxy path) is built with
+    ``agent_id=None`` — that's the whole point of admin cross-agent
+    access, the caller doesn't need an agent_id of their own, they're
+    reading someone else's by design. Requiring a truthy
+    ``bearer_agent_id`` first made the admin branch below unreachable
+    for any of them.
     """
     from ..core.principal_builder import build_agent_bearer_principal, catalog_role
 
     if principal is None and caller_token:
         principal = build_agent_bearer_principal(caller_token)
 
-    # The bearer's own agent_id scopes "read your own"; fall back to the
-    # token resolver when the Principal carries no agent_id (it's the
-    # same lookup get_agent_id would do).
-    bearer_agent_id = principal.agent_id if principal is not None else None
-    if not bearer_agent_id and caller_token:
-        bearer_agent_id = get_agent_id(caller_token)
-    if not bearer_agent_id:
-        raise ResourceReadError(
-            "Unauthorized: token does not resolve to an agent",
-            code=INTERNAL_ERROR,
-        )
-
     # Match the URI against any registered resource's prefix to extract
     # the agent_id segment. Walking the registry keeps the helper open
     # to additional resource types without re-touching this function.
+    # Resolved before either branch below: an unknown URI must fail the
+    # same way regardless of caller tier.
     uri_agent_id: Optional[str] = None
     for entry in resource_registry._entries.values():  # type: ignore[attr-defined]
         prefix = entry.meta.uri_prefix
@@ -199,9 +200,23 @@ def resolve_agent_id_for_uri(
         )
 
     # Admin (per the shared catalog_role) can read any agent's resource
-    # (operational visibility). Other callers may only read their own.
+    # (operational visibility) — checked BEFORE requiring the caller's
+    # own bearer_agent_id, since admin cross-agent access is exactly the
+    # case where the caller legitimately has no agent_id of their own.
     if catalog_role(principal) == "admin":
         return uri_agent_id
+
+    # Non-admin: the bearer's own agent_id scopes "read your own"; fall
+    # back to the token resolver when the Principal carries no agent_id
+    # (it's the same lookup get_agent_id would do).
+    bearer_agent_id = principal.agent_id if principal is not None else None
+    if not bearer_agent_id and caller_token:
+        bearer_agent_id = get_agent_id(caller_token)
+    if not bearer_agent_id:
+        raise ResourceReadError(
+            "Unauthorized: token does not resolve to an agent",
+            code=INTERNAL_ERROR,
+        )
     if uri_agent_id != bearer_agent_id:
         raise ResourceReadError(
             "Unauthorized: callers may only read their own inbox / "
