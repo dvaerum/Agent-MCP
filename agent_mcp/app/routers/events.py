@@ -36,7 +36,6 @@ stream from the JSON Accept-version gate).
 
 from __future__ import annotations
 
-import asyncio
 import json
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -44,6 +43,7 @@ from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
 from ..deps import caller_identity, require_operator_session
+from ...core.stream_gates import RevalidatingStream, StreamRevoked
 from ...features import operator_events
 
 
@@ -59,13 +59,18 @@ router = APIRouter(prefix="/api", tags=["events"])
 PING_SECONDS = 15
 
 # How often an OPEN operator stream re-checks that its session is still
-# valid (R5-F1). Mirrors the delivery stream's REVALIDATE_SECONDS
-# (delivery.py, R13-F2) and the GET /mcp pump's per-heartbeat
-# `_bearer_is_active` re-check (main_app.py:1336, AC-R29-1): a stream
-# authenticates ONCE at open, then this loop pumps indefinitely, so a
-# revoked cookie / dropped project membership must tear it down rather
-# than survive it. Kept ≤ PING_SECONDS so revocation latency never
-# exceeds one keepalive interval.
+# valid (R5-F1). A stream authenticates ONCE at open, then pumps
+# indefinitely, so a revoked cookie / dropped project membership must
+# tear it down rather than survive it. Kept ≤ PING_SECONDS so revocation
+# latency never exceeds one keepalive interval.
+#
+# N5: the loop enforcing that is no longer hand-rolled here — this is
+# the CADENCE half of the two arguments this stream hands to the shared
+# ``core.stream_gates.RevalidatingStream`` seam (the other being
+# ``_still_authorized``, this stream's own predicate). The three sibling
+# streams (delivery.py R13-F2, main_app.py's GET /mcp pump AC-R29-1,
+# wait_for_events' 2s flag-recheck slice) pass their own pair to the
+# same seam.
 REVALIDATE_SECONDS = PING_SECONDS
 
 
@@ -98,31 +103,30 @@ async def operator_events_stream(
 
     async def event_gen():
         sub = operator_events.subscribe(user_id=user_id)
+        # R5-F1, via the N5 seam: the bounded wait and the re-validation
+        # are ONE call, so an event can't be dequeued without
+        # ``_still_authorized`` having just run (before the wait AND
+        # after the dequeue was the hand-rolled shape; the seam folds
+        # both into the single verdict that precedes every hand-back).
+        # EventSourceResponse cancels this coroutine on client
+        # disconnect (a blocked get() unblocks into the finally below);
+        # pings are emitted by sse-starlette independently of this loop.
+        gate = RevalidatingStream(
+            sub.queue,
+            liveness=lambda: _still_authorized(request),
+            # Re-read per slice, not captured: the R5-F1 regression
+            # tests monkeypatch this module attribute.
+            interval=lambda: REVALIDATE_SECONDS,
+        )
         try:
             while True:
-                # R5-F1: re-validate before every wait — teardown on
-                # revocation. EventSourceResponse cancels this coroutine
-                # on client disconnect (a blocked get() unblocks into the
-                # finally below); pings are emitted by sse-starlette
-                # independently of this loop.
-                if not await _still_authorized(request):
-                    return
                 try:
-                    # Bounded wait so revocation is noticed within
-                    # REVALIDATE_SECONDS even when no event arrives; on
-                    # timeout we loop back to the liveness check above.
-                    item = await asyncio.wait_for(
-                        sub.queue.get(), timeout=REVALIDATE_SECONDS
-                    )
-                except asyncio.TimeoutError:
-                    continue
-                # Re-validate post-dequeue: an event may have been
-                # queued before revocation and only reach the front of
-                # the FIFO afterwards — never wire it to a caller who is
-                # no longer authorized.
-                if not await _still_authorized(request):
+                    sl = await gate.next_slice()
+                except StreamRevoked:
                     return
-                yield {"data": json.dumps(item)}
+                if sl.idle:
+                    continue
+                yield {"data": json.dumps(sl.item)}
         finally:
             operator_events.unsubscribe(sub)
 

@@ -18,7 +18,6 @@ so no router change is needed for the stream.
 
 from __future__ import annotations
 
-import asyncio
 import json
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
@@ -26,6 +25,7 @@ from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
 from ...core.auth import get_agent_id
+from ...core.stream_gates import RevalidatingStream, StreamRevoked
 from ...features import delivery_transport
 from ...repositories.agent_repository import is_active_agent
 from ...utils.json_utils import get_sanitized_json_body
@@ -38,10 +38,15 @@ router = APIRouter(prefix="/api", tags=["delivery"])
 PING_SECONDS = 15
 
 # How often an OPEN delivery stream re-checks that its bearer is still
-# live (R13-F2). Mirrors the GET /mcp pump, which re-validates every
-# heartbeat so a stream opened BEFORE revocation is torn down rather than
-# surviving it (main_app.py:1336, AC-R29-1 class). Kept ≤ PING_SECONDS so
+# live (R13-F2) — a stream opened BEFORE revocation must be torn down
+# rather than survive it (AC-R29-1 class). Kept ≤ PING_SECONDS so
 # revocation latency never exceeds one keepalive interval.
+#
+# N5: the CADENCE half of what this stream hands the shared
+# ``core.stream_gates.RevalidatingStream`` seam; ``is_active_agent`` (the
+# canonical LIVE_AGENT_SQL repository predicate — deliberately NOT the
+# GET /mcp pump's cheaper in-memory cache read, see the seam's module
+# docstring) is the other half.
 REVALIDATE_SECONDS = PING_SECONDS
 
 
@@ -81,32 +86,29 @@ async def delivery_stream(
 
     async def frame_gen():
         sub = delivery_transport.subscribe(agent_id)
+        # R13-F2, via the N5 seam: a stream authenticates its bearer ONCE
+        # at open then pumps indefinitely, so the wait for the next frame
+        # and the liveness re-check are ONE call — no frame is dequeued
+        # without ``is_active_agent`` having just run, and none is wired
+        # to a bearer that went away while it sat in the FIFO.
+        # EventSourceResponse still cancels this on client disconnect,
+        # unblocking into the finally below.
+        gate = RevalidatingStream(
+            sub.queue,
+            liveness=lambda: is_active_agent(agent_id),
+            # Re-read per slice, not captured: the R13-F2 regression test
+            # monkeypatches this module attribute.
+            interval=lambda: REVALIDATE_SECONDS,
+        )
         try:
             while True:
-                # R13-F2: re-validate liveness before every emit. A stream
-                # authenticates its bearer ONCE at open, then pumps
-                # indefinitely; on mid-stream revocation we must tear down
-                # rather than keep pushing to a terminated bearer (the same
-                # contract the GET /mcp pump enforces at main_app.py:1336).
-                if not is_active_agent(agent_id):
-                    return
                 try:
-                    # Bounded wait so revocation is noticed within
-                    # REVALIDATE_SECONDS even when no frame arrives; on
-                    # timeout we loop back to the liveness check above.
-                    # EventSourceResponse still cancels this on client
-                    # disconnect, unblocking into the finally below.
-                    frame = await asyncio.wait_for(
-                        sub.queue.get(), timeout=REVALIDATE_SECONDS
-                    )
-                except asyncio.TimeoutError:
-                    continue
-                # Re-validate post-dequeue: a frame may have been queued
-                # before revocation and only reach the front of the FIFO
-                # afterwards — never wire it to a bearer that went away.
-                if not is_active_agent(agent_id):
+                    sl = await gate.next_slice()
+                except StreamRevoked:
                     return
-                yield {"data": json.dumps(frame)}
+                if sl.idle:
+                    continue
+                yield {"data": json.dumps(sl.item)}
         finally:
             delivery_transport.unsubscribe(sub)
 

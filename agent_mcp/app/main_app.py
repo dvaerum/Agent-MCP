@@ -25,6 +25,7 @@ from ..core.config import logger
 from ..core.auth import get_agent_id, query_agent_status
 from ..utils.json_utils import decode_untrusted_body
 from ..core import session_registry
+from ..core.stream_gates import RevalidatingStream, StreamRevoked
 from ._dispatch_helpers import ALLOWED_ORIGINS
 from .routers import register_routers
 from .server_lifecycle import application_startup, application_shutdown
@@ -1637,11 +1638,16 @@ class _McpAsgiApp:
         successful payload + heartbeat so the periodic pruner doesn't
         evict still-live sessions.
 
-        Self-validation (AC-R29-1): a GET /mcp stream authenticates its
-        bearer ONCE at open, then this loop pumps indefinitely. On every
-        iteration we re-check that the bearer is still live (the same
-        cache-only predicate the ``/mcp`` auth gate uses). If the agent
-        was terminated / the token revoked, we break so the surrounding
+        Self-validation (AC-R29-1), fused via the N5 seam: a GET /mcp
+        stream authenticates its bearer ONCE at open, then this loop
+        pumps indefinitely, so ``core.stream_gates.RevalidatingStream``
+        makes the bounded wait and the ``_bearer_is_active`` re-check
+        ONE call — the cache-only predicate the ``/mcp`` auth gate uses
+        runs immediately before every heartbeat tick AND before every
+        dequeued payload is handed back (SEC-B-F2: a payload queued
+        BEFORE revocation must not reach the wire just because it
+        happened to be in front of the CLOSE_STREAM sentinel). On
+        revocation the seam raises and we return, so the surrounding
         `_handle_get` tears the stream down — the push channel never
         trusts its open-time auth beyond one heartbeat interval, so
         revocation is complete across this channel too, not just the
@@ -1649,19 +1655,38 @@ class _McpAsgiApp:
         ``CLOSE_STREAM`` sentinel to wake this loop immediately rather
         than waiting for the next heartbeat tick.
         """
+        gate = RevalidatingStream(
+            queue,
+            liveness=lambda: _bearer_is_active(bearer),
+            # Per-instance attribute, re-read each slice: the AC-R29-1 /
+            # SEC-B regression tests set it on the pump object.
+            interval=lambda: self._HEARTBEAT_INTERVAL_SECONDS,
+        )
         while True:
-            # Re-validate before every emit — teardown on revocation.
-            if not _bearer_is_active(bearer):
-                logger.info(
-                    "session_registry: bearer revoked — closing GET /mcp "
-                    "stream session=%s", session_id,
-                )
-                return
             try:
-                payload = await asyncio.wait_for(
-                    queue.get(), timeout=self._HEARTBEAT_INTERVAL_SECONDS
-                )
-            except asyncio.TimeoutError:
+                sl = await gate.next_slice()
+            except StreamRevoked as revoked:
+                # Same two log lines as before the seam: a revocation
+                # noticed on a dequeued DATA payload says so (that
+                # payload is being dropped), while one noticed on an
+                # idle tick — or on the CLOSE_STREAM sentinel, which was
+                # never wire-bound content — is a plain teardown.
+                if (
+                    revoked.discarded is not None
+                    and revoked.discarded is not session_registry.CLOSE_STREAM
+                ):
+                    logger.info(
+                        "session_registry: bearer revoked — discarding "
+                        "queued payload, closing GET /mcp stream "
+                        "session=%s", session_id,
+                    )
+                else:
+                    logger.info(
+                        "session_registry: bearer revoked — closing GET "
+                        "/mcp stream session=%s", session_id,
+                    )
+                return
+            if sl.idle:
                 await send({
                     "type": "http.response.body",
                     "body": b": heartbeat\n\n",
@@ -1673,27 +1698,14 @@ class _McpAsgiApp:
                     pass
                 continue
 
-            # Active teardown wake (AC-R29-1): loop back so the
-            # top-of-loop self-validation runs now and returns if the
-            # bearer is revoked, instead of serialising the sentinel
-            # onto the wire.
+            payload = sl.item
+            # Active teardown wake (AC-R29-1): loop back so the seam's
+            # next verdict runs now and ends the stream if the bearer is
+            # revoked, instead of serialising the sentinel onto the wire.
+            # (A sentinel that arrives with the bearer ALREADY evicted
+            # never reaches here — the seam raised on it.)
             if payload is session_registry.CLOSE_STREAM:
                 continue
-
-            # Re-validate again post-dequeue: a data payload may have
-            # been queued BEFORE revocation and only reach the front
-            # of the FIFO after CLOSE_STREAM was enqueued behind it
-            # (or before revocation happened at all). Without this
-            # check the loop would still wire-write one already-queued
-            # payload to a bearer that left `active_agents` between
-            # the top-of-loop check and here.
-            if not _bearer_is_active(bearer):
-                logger.info(
-                    "session_registry: bearer revoked — discarding "
-                    "queued payload, closing GET /mcp stream "
-                    "session=%s", session_id,
-                )
-                return
 
             data = json.dumps(payload).encode("utf-8")
             await send({
