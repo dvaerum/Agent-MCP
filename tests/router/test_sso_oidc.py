@@ -833,6 +833,49 @@ async def test_decode_flow_cookie_rejects_missing_nonce():
     assert flow is not None and flow.nonce == "real-nonce"
 
 
+# ── N1 bypass #4: the flow cookie must decode through the shared
+# sanitization seam, not a bare json.loads (security-arch-hardening-
+# consolidated.md, N1 finding) ────────────────────────────────────────
+#
+# The flow cookie is unsigned base64(JSON) -- attacker-craftable, per
+# the nonce tests above -- so it's an untrusted decode point like any
+# other. N1's own discovery test (test_arch_enforced_sanitization.py)
+# declared this one exempt/deferred rather than missed; this closes it.
+
+
+async def test_decode_flow_cookie_strips_hidden_unicode():
+    """A flow-cookie field carrying a hidden-format Unicode character
+    (e.g. a zero-width space) must come back stripped, the same way
+    every other untrusted decode point does via
+    ``json_utils.decode_untrusted_body`` -- not silently preserved by a
+    bare ``json.loads``.
+    """
+    import sys
+
+    sso = sys.modules.get("agent_mcp.router.sso")
+    if sso is None:
+        import importlib
+        sso = importlib.import_module("agent_mcp.router.sso")
+
+    zwsp = "\u200b"  # ZERO WIDTH SPACE, a Cf character
+    poisoned = _b64url_nopad(
+        json.dumps(
+            {
+                "state": f"s{zwsp}tate",
+                "verifier": "v" * 43,
+                "nonce": "real-nonce",
+            }
+        ).encode()
+    )
+    flow = sso._decode_flow_cookie(poisoned)
+    assert flow is not None
+    assert zwsp not in flow.state, (
+        "the flow cookie must decode through the shared sanitization "
+        "seam (json_utils.decode_untrusted_body), which strips hidden-"
+        "format Unicode -- a bare json.loads leaves it untouched"
+    )
+
+
 async def test_sso_callback_rejects_nonceless_flow_cookie(
     aiohttp_client, router_app, sso_oidc_env, monkeypatch,
 ):

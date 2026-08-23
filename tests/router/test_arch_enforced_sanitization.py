@@ -164,20 +164,6 @@ _DECLARED_EXEMPTIONS: dict[tuple[str, str, str], str] = {
         "verification — a sanitizing pass over it could only corrupt a "
         "key or mask a malformed one."
     ),
-    # ── Deliberately deferred to another workstream ──
-    ("router/sso.py", "_decode_flow_cookie", "json.loads"): (
-        "IS an untrusted decode (the flow cookie is unsigned "
-        "base64(JSON) and therefore attacker-craftable) and IS in "
-        "scope for N1 — deliberately DEFERRED, not missed. Phase 3 of "
-        "the same hardening plan (Finding C, the ``SsoSubject`` value "
-        "type) is reworking ``sso.py`` heavily; fixing it here would "
-        "collide with that work. The blast radius is small in the "
-        "meantime: the three decoded fields (state / verifier / nonce) "
-        "are compared for equality against server-generated values and "
-        "never persisted or rendered, so hidden-format characters can "
-        "only make a flow fail closed. Phase 3 must route this through "
-        f"``json_utils.{_SEAM}`` and delete this entry."
-    ),
     # ── Form-encoded credential bodies: DECLARED EXEMPTION ──
     #
     # These two are the "do form bodies join the same seam?" scope
