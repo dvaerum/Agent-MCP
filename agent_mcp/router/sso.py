@@ -402,23 +402,36 @@ def _oidc_subject(iss: str | None, sub: object | None) -> str | None:
     verified-email / JIT-create path rather than keying on a partial
     identifier.
 
-    ``sub`` deliberately accepts more than ``str``: this function only
-    f-string-interpolates it, so any JSON scalar (str/int/float/bool)
-    is safe input and produces a stable key. R17-F1: an earlier fix
-    (R16-F1) mistakenly fed this the SAME str-only-coerced value used
-    for the (genuinely ``str``-only) ``preferred_username`` fallback,
-    which silently degraded a non-str ``sub`` (e.g. a numeric IdP
-    subject id) to None on EVERY login -- defeating subject-based
-    reconciliation and re-minting a fresh orphaned user each time
-    instead of crashing. Only a missing ``sub`` or a non-scalar shape
-    (dict/list, e.g. a misserialised multi-valued attribute) degrades
-    to None here.
+    ``sub`` deliberately accepts more than ``str``: any JSON scalar
+    (str/int/float/bool) is safe input and produces a stable key.
+    R17-F1: an earlier fix (R16-F1) mistakenly fed this the SAME
+    str-only-coerced value used for the (genuinely ``str``-only)
+    ``preferred_username`` fallback, which silently degraded a non-str
+    ``sub`` (e.g. a numeric IdP subject id) to None on EVERY login --
+    defeating subject-based reconciliation and re-minting a fresh
+    orphaned user each time instead of crashing. Only a missing
+    ``sub``, an empty string, or a non-scalar shape (dict/list, e.g. a
+    misserialised multi-valued attribute) degrades to None here.
+
+    R18-F1: the key embeds ``type(sub).__name__`` alongside the value
+    rather than plain f-string-interpolating ``sub`` bare. A bare
+    interpolation is NOT type-discriminating -- ``str(True) ==
+    "True"`` and ``str(1) == "1"``, so ``sub=True`` and ``sub="True"``
+    (or ``sub=1``/``sub="1"``, ``sub=1.0``/``sub="1.0"``) collapsed to
+    the identical key, silently reconciling two logically distinct
+    IdP-side identities into one local account. The type name is safe
+    to splice in unescaped: it always comes from the fixed, code-
+    controlled ``_OIDC_SUBJECT_SCALAR_TYPES`` tuple, never from
+    IdP-supplied data. An empty string is treated the same as a
+    missing ``sub`` (rather than producing a truthy, collidable
+    ``oidc:<iss>:str:`` key) for the same reason a missing claim is:
+    it carries no usable identity.
     """
-    if not iss or sub is None:
+    if not iss or sub is None or sub == "":
         return None
     if not isinstance(sub, _OIDC_SUBJECT_SCALAR_TYPES):
         return None
-    return f"{_OIDC_SUBJECT_PREFIX}{iss}:{sub}"
+    return f"{_OIDC_SUBJECT_PREFIX}{iss}:{type(sub).__name__}:{sub}"
 
 
 def _sanitise_username(raw: str) -> str:
