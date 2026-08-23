@@ -254,6 +254,19 @@ class RouterStore:
         ``sso._stamp_subject_if_absent``'s inline connect)."""
         _identity.stamp_sso_subject_if_absent(user_id, subject, conn=conn)
 
+    def upgrade_sso_subject(
+        self,
+        user_id: str,
+        old_subject: str,
+        new_subject: str,
+        *,
+        conn: Optional[sqlite3.Connection] = None,
+    ) -> None:
+        """Re-stamp a legacy-format subject to the current tagged
+        format on a fallback-lookup hit (R19-F1 self-heal; was
+        ``sso._upgrade_subject``'s inline connect)."""
+        _identity.upgrade_sso_subject(user_id, old_subject, new_subject, conn=conn)
+
     # ── SSO group reads/writes (sso inline connects) ───────────────
 
     def ensure_group(
