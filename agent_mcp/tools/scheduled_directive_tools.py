@@ -37,7 +37,7 @@ import datetime
 import secrets
 from typing import Any, Dict, Optional
 
-from .registry import register_tool
+from .registry import Cap, Policy, register_tool
 # R8-F1: explicit maxLength bound for identifier-shaped fields
 # (agent_id, directive_id). See core/schema_limits.py for the
 # rationale; `prompt` is free text and inherits DEFAULT_STRING_MAX_LEN
@@ -717,9 +717,9 @@ def register_scheduled_directive_tools() -> None:
             "additionalProperties": False,
         },
         implementation=create_scheduled_directive_tool_impl,
-        visibility=(
-            "worker-if-toggled:config_allow_worker_self_schedule,"
-            "config_allow_manager_curate_schedules"
+        requires=Policy(
+            "config_allow_worker_self_schedule",
+            "config_allow_manager_curate_schedules",
         ),
     )
 
@@ -746,6 +746,7 @@ def register_scheduled_directive_tools() -> None:
             "additionalProperties": False,
         },
         implementation=list_scheduled_directives_tool_impl,
+        requires=Cap("coordination.wait"),
     )
 
     register_tool(
@@ -796,9 +797,9 @@ def register_scheduled_directive_tools() -> None:
             "additionalProperties": False,
         },
         implementation=update_scheduled_directive_tool_impl,
-        visibility=(
-            "worker-if-toggled:config_allow_worker_self_schedule,"
-            "config_allow_manager_curate_schedules"
+        requires=Policy(
+            "config_allow_worker_self_schedule",
+            "config_allow_manager_curate_schedules",
         ),
     )
 
@@ -818,9 +819,9 @@ def register_scheduled_directive_tools() -> None:
             "additionalProperties": False,
         },
         implementation=delete_scheduled_directive_tool_impl,
-        visibility=(
-            "worker-if-toggled:config_allow_worker_self_schedule,"
-            "config_allow_manager_curate_schedules"
+        requires=Policy(
+            "config_allow_worker_self_schedule",
+            "config_allow_manager_curate_schedules",
         ),
     )
 

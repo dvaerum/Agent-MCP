@@ -1,7 +1,7 @@
 # Agent-MCP/mcp_template/mcp_server_src/tools/utility_tools.py
 from typing import Dict, Any, Optional
 
-from .registry import register_tool
+from .registry import PUBLIC, register_tool
 from ..core.config import logger
 from ..core.principal import Principal
 from ..core.tool_result import Ok, ToolResult
@@ -38,7 +38,8 @@ def register_utility_tools():
             "properties": {}, # No properties
             "additionalProperties": False
         },
-        implementation=test_tool_impl
+        implementation=test_tool_impl,
+        requires=PUBLIC,
     )
 
 # Call registration when this module is imported

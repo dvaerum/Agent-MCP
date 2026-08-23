@@ -18,7 +18,7 @@ requirement instead of it being invisible inside the body.
 
 from typing import Any, Dict, Optional
 
-from .registry import register_tool
+from .registry import Predicate, register_tool
 from ..core.authorize import agent_bearer_with_capability, requires_predicate
 from ..core.config import logger
 from ..core.principal import Principal
@@ -39,11 +39,13 @@ _is_rag_capable_agent = agent_bearer_with_capability("rag.query")
 
 
 # --- ask_project_rag tool ---
-@requires_predicate(
-    _is_rag_capable_agent,
+_RAG_DENIED = (
     "Unauthorized: agent token with rag.query capability required to "
-    "query project RAG",
+    "query project RAG"
 )
+
+
+@requires_predicate(_is_rag_capable_agent, _RAG_DENIED)
 async def ask_project_rag_tool_impl(
     arguments: Dict[str, Any],
     *,
@@ -138,7 +140,8 @@ def register_rag_tools():
             "required": ["query"],
             "additionalProperties": False
         },
-        implementation=ask_project_rag_tool_impl
+        implementation=ask_project_rag_tool_impl,
+        requires=Predicate(_RAG_DENIED),
     )
 
 # Call registration when this module is imported

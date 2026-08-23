@@ -281,7 +281,7 @@ def _creator_mismatch_error(context_key: str, creator: str) -> "PermissionDenied
 from sqlalchemy import func, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 
-from .registry import register_tool
+from .registry import Cap, Predicate, register_tool
 from ..core.config import logger
 # R8-F1: explicit maxLength bound for the identifier-shaped
 # context_key / backup_name fields. See core/schema_limits.py for the
@@ -301,7 +301,6 @@ from ..core.tool_result import (
     ToolResult,
 )
 from ..utils.audit_utils import log_audit
-from ..db.connection import get_db_connection
 from ..db.engine import get_session
 from ..db.models import ProjectContext
 from ..db.actions.agent_actions_db import log_agent_action_to_db
@@ -511,6 +510,11 @@ def _can_write_project_context(capability: str):
 
 #: One ``AuthRejected`` message has to cover both arms of the composed
 #: write gate (the decorator takes a static reason), so it names both.
+#: Reason for the identity-only gate (``validate_context_consistency``).
+_AUTHENTICATED_DENIED_REASON = (
+    "Unauthorized: Valid token or operator session required"
+)
+
 _WRITE_DENIED_REASON = (
     "Unauthorized: Valid token or operator session required, and "
     "viewer-tier operators cannot mutate project context (read-only "
@@ -1935,10 +1939,7 @@ async def backup_project_context_tool_impl(
 
 
 # --- validate_context_consistency tool ---
-@requires_predicate(
-    _is_authenticated_caller,
-    "Unauthorized: Valid token or operator session required",
-)
+@requires_predicate(_is_authenticated_caller, _AUTHENTICATED_DENIED_REASON)
 async def validate_context_consistency_tool_impl(
     arguments: Dict[str, Any],
     *,
@@ -2132,6 +2133,7 @@ def register_project_context_tools():
             "additionalProperties": False,
         },
         implementation=view_project_context_tool_impl,
+        requires=Cap("memories.view"),
     )
 
     register_tool(
@@ -2171,6 +2173,7 @@ def register_project_context_tools():
             "additionalProperties": False,
         },
         implementation=update_project_context_tool_impl,
+        requires=Predicate(_WRITE_DENIED_REASON),
     )
 
     register_tool(
@@ -2205,6 +2208,7 @@ def register_project_context_tools():
             "additionalProperties": False,
         },
         implementation=create_project_context_tool_impl,
+        requires=Predicate(_WRITE_DENIED_REASON),
     )
 
     register_tool(
@@ -2251,6 +2255,7 @@ def register_project_context_tools():
             "additionalProperties": False,
         },
         implementation=bulk_update_project_context_tool_impl,
+        requires=Predicate(_WRITE_DENIED_REASON),
     )
 
     register_tool(
@@ -2286,7 +2291,7 @@ def register_project_context_tools():
             "additionalProperties": False,
         },
         implementation=backup_project_context_tool_impl,
-        visibility="operator",
+        requires=Cap("system.config.write"),
     )
 
     register_tool(
@@ -2300,6 +2305,7 @@ def register_project_context_tools():
             "additionalProperties": False,
         },
         implementation=validate_context_consistency_tool_impl,
+        requires=Predicate(_AUTHENTICATED_DENIED_REASON),
     )
 
     register_tool(
@@ -2331,6 +2337,7 @@ def register_project_context_tools():
             "additionalProperties": False,
         },
         implementation=delete_project_context_tool_impl,
+        requires=Predicate(_WRITE_DENIED_REASON),
     )
 
 

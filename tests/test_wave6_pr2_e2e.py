@@ -223,10 +223,18 @@ async def test_get_agent_messages_returns_ok_with_messages_list(
 
 
 async def test_get_agent_messages_no_principal_denies(tmp_path) -> None:
-    """Without an identifying Principal (and no token fallback),
-    the tool returns ``PermissionDenied`` — the gate that replaced
-    ``@requires("any")`` is principal-driven.
+    """Without an identifying Principal (and no token fallback), the
+    tool DENIES — the gate that replaced ``@requires("any")`` is
+    principal-driven.
+
+    Phase 2 (Finding A): that gate is now ``@requires_predicate`` on
+    the impl, so the denial arrives as a raised ``AuthRejected``
+    instead of a returned ``PermissionDenied``. Same decision, same
+    403 / isError=True on the wire.
     """
+    import pytest as _pytest
+
+    from agent_mcp.core.authorize import AuthRejected
     from agent_mcp.tools.agent_communication_tools import (
         get_agent_messages_tool_impl,
     )
@@ -236,11 +244,8 @@ async def test_get_agent_messages_no_principal_denies(tmp_path) -> None:
         # operator_session_active=True — so the contextvar bridge
         # returns an operator_session Principal with agent_id=None.
         # Without an agent_id we cannot scope messages → denied.
-        result = await get_agent_messages_tool_impl({}, principal=None)
-
-    assert isinstance(result, PermissionDenied), (
-        f"expected PermissionDenied, got {result!r}"
-    )
+        with _pytest.raises(AuthRejected):
+            await get_agent_messages_tool_impl({}, principal=None)
 
 
 # ── broadcast_admin_message ─────────────────────────────────────

@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from .registry import register_tool
+from .registry import Cap, register_tool
 # R8-F1: explicit maxLength bound for the identifier-shaped agent_id
 # field. See core/schema_limits.py; `profile` is free-form prose and
 # inherits DEFAULT_STRING_MAX_LEN from the dispatcher's generic
@@ -253,6 +253,7 @@ def register_agent_profile_tools() -> None:
             "additionalProperties": False,
         },
         implementation=update_agent_profile_tool_impl,
+        requires=Cap("agents.use"),
     )
 
 

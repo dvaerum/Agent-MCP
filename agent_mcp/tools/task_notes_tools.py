@@ -53,7 +53,7 @@ from ..db.actions import task_notes_db
 from ..db.terminal_task_guard import TerminalTaskWriteBlocked
 from ..features.task_queries import TERMINAL_TASK_STATUSES
 from ..repositories.task_repository import get_task_by_id
-from .registry import register_tool
+from .registry import Predicate, register_tool
 # R8-F1: explicit maxLength bound for the identifier-shaped task_id
 # field. See core/schema_limits.py; `text` is free-form note content
 # and inherits DEFAULT_STRING_MAX_LEN from the dispatcher's generic
@@ -144,10 +144,21 @@ def _is_agent_or_operator_caller(principal: Optional[Principal]) -> bool:
     )
 
 
-@requires_predicate(
-    _is_agent_or_operator_caller,
-    "Unauthorized: agent or operator token required to add a task note",
+#: One home per verb: the decorator enforces the text, the
+#: ``register_tool(requires=Predicate(...))`` declaration pins it, and
+#: ``register_tool`` fails the import if the two ever disagree.
+_ADD_DENIED = (
+    "Unauthorized: agent or operator token required to add a task note"
 )
+_EDIT_DENIED = (
+    "Unauthorized: agent or operator token required to edit a task note"
+)
+_DELETE_DENIED = (
+    "Unauthorized: agent or operator token required to delete a task note"
+)
+
+
+@requires_predicate(_is_agent_or_operator_caller, _ADD_DENIED)
 async def add_task_note_tool_impl(
     arguments: Dict[str, Any],
     *,
@@ -262,10 +273,7 @@ async def add_task_note_tool_impl(
     )
 
 
-@requires_predicate(
-    _is_agent_or_operator_caller,
-    "Unauthorized: agent or operator token required to edit a task note",
-)
+@requires_predicate(_is_agent_or_operator_caller, _EDIT_DENIED)
 async def edit_task_note_tool_impl(
     arguments: Dict[str, Any],
     *,
@@ -331,10 +339,7 @@ async def edit_task_note_tool_impl(
     )
 
 
-@requires_predicate(
-    _is_agent_or_operator_caller,
-    "Unauthorized: agent or operator token required to delete a task note",
-)
+@requires_predicate(_is_agent_or_operator_caller, _DELETE_DENIED)
 async def delete_task_note_tool_impl(
     arguments: Dict[str, Any],
     *,
@@ -407,6 +412,7 @@ def register_task_notes_tools() -> None:
             "additionalProperties": False,
         },
         implementation=add_task_note_tool_impl,
+        requires=Predicate(_ADD_DENIED),
     )
     register_tool(
         name="edit_task_note",
@@ -438,6 +444,7 @@ def register_task_notes_tools() -> None:
             "additionalProperties": False,
         },
         implementation=edit_task_note_tool_impl,
+        requires=Predicate(_EDIT_DENIED),
     )
     register_tool(
         name="delete_task_note",
@@ -463,6 +470,7 @@ def register_task_notes_tools() -> None:
             "additionalProperties": False,
         },
         implementation=delete_task_note_tool_impl,
+        requires=Predicate(_DELETE_DENIED),
     )
 
 

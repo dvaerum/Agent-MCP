@@ -139,6 +139,7 @@ async def test_malformed_call_to_policy_gated_tool_by_disallowed_worker_is_denie
     from agent_mcp.core.authorize import AuthRejected, requires_policy
     from agent_mcp.core.tool_result import Ok, ToolResult
     from agent_mcp.tools.registry import (
+        Policy,
         ToolInputValidationError,
         dispatch_tool_call,
         register_tool,
@@ -162,7 +163,9 @@ async def test_malformed_call_to_policy_gated_tool_by_disallowed_worker_is_denie
             "additionalProperties": False,
         },
         implementation=_r20f4_stub_impl,
-        visibility=f"worker-if-toggled:{toggle_key}",
+        # Phase 2 (Finding A): `requires=` is a required registration
+        # argument, verified against the impl's live stamp.
+        requires=Policy(toggle_key, default=False),
     )
 
     with pytest.raises(AuthRejected) as excinfo:

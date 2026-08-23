@@ -5,7 +5,7 @@ import os
 import sqlite3
 from typing import Dict, Any, Optional
 
-from .registry import register_tool
+from .registry import Cap, register_tool
 from ..core.config import logger, AGENT_COLORS  # AGENT_COLORS for register_agent
 # R8-F1: explicit maxLength bounds for identifier/path-shaped schema
 # properties (agent_id, name, color, working_directory, ...). See
@@ -2191,7 +2191,7 @@ def register_admin_tools():
             "additionalProperties": False,
         },
         implementation=register_agent_tool_impl,
-        visibility="operator",
+        requires=Cap("agents.register"),
     )
 
     register_tool(
@@ -2205,7 +2205,7 @@ def register_admin_tools():
             "additionalProperties": False,
         },
         implementation=view_status_tool_impl,
-        visibility="operator",
+        requires=Cap("system.config.write"),
     )
 
     register_tool(
@@ -2224,7 +2224,7 @@ def register_admin_tools():
             "additionalProperties": False,
         },
         implementation=terminate_agent_tool_impl,
-        visibility="operator",
+        requires=Cap("agents.terminate"),
     )
 
     # E2 (arch-deepening): the real tools behind the agent-lifecycle REST
@@ -2252,7 +2252,7 @@ def register_admin_tools():
             "additionalProperties": False,
         },
         implementation=restore_agent_tool_impl,
-        visibility="operator",
+        requires=Cap("agents.terminate"),
     )
 
     register_tool(
@@ -2299,7 +2299,7 @@ def register_admin_tools():
             "additionalProperties": False,
         },
         implementation=edit_agent_tool_impl,
-        visibility="operator",
+        requires=Cap("agents.terminate"),
     )
 
     register_tool(
@@ -2322,7 +2322,7 @@ def register_admin_tools():
             "additionalProperties": False,
         },
         implementation=purge_agent_tool_impl,
-        visibility="operator",
+        requires=Cap("agents.terminate"),
     )
 
     register_tool(
@@ -2351,7 +2351,7 @@ def register_admin_tools():
             "additionalProperties": False,
         },
         implementation=view_audit_log_tool_impl,
-        visibility="operator",
+        requires=Cap("system.config.write"),
     )
 
     register_tool(
@@ -2426,7 +2426,7 @@ def register_admin_tools():
             "additionalProperties": False,
         },
         implementation=get_agent_tokens_tool_impl,
-        visibility="operator",
+        requires=Cap("agents.register"),
     )
 
     # There is no ``relaunch_agent`` tool: agent-mcp doesn't own the
