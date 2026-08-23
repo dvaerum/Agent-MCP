@@ -41,7 +41,7 @@ through `wait_for_events`.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Callable, Optional
 
 from mcp.shared.exceptions import McpError
@@ -51,6 +51,7 @@ from ..core.auth import get_agent_id
 from ..core.registry import Registry, RegistryEntry
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
+    from ..core.access import Decision
     from ..core.principal import Principal
 
 
@@ -175,10 +176,21 @@ def resolve_agent_id_for_uri(
     ``agent_id=None`` — that's the whole point of admin cross-agent
     access, the caller doesn't need an agent_id of their own, they're
     reading someone else's by design. Requiring a truthy
-    ``bearer_agent_id`` first made the admin branch below unreachable
-    for any of them.
+    ``bearer_agent_id`` first made the admin branch unreachable for any
+    of them.
+
+    Phase 4 (Finding E): both of those rules now live in the shared
+    :func:`agent_mcp.core.access.decide` seam, which additionally
+    re-checks ``entry.visibility`` — the declaration ``resources/list``
+    already filters on. Before, the read path consulted only the
+    agent_id scoping, so an ``"admin"``-visibility resource would be
+    hidden from a worker's ``resources/list`` and then served to that
+    same worker by ``resources/read`` if they guessed the URI. This
+    function keeps its signature and its exception contract; only WHERE
+    the decision is made moved.
     """
-    from ..core.principal_builder import build_agent_bearer_principal, catalog_role
+    from ..core.access import Request, decide
+    from ..core.principal_builder import build_agent_bearer_principal
 
     if principal is None and caller_token:
         principal = build_agent_bearer_principal(caller_token)
@@ -186,44 +198,71 @@ def resolve_agent_id_for_uri(
     # Match the URI against any registered resource's prefix to extract
     # the agent_id segment. Walking the registry keeps the helper open
     # to additional resource types without re-touching this function.
-    # Resolved before either branch below: an unknown URI must fail the
-    # same way regardless of caller tier.
-    uri_agent_id: Optional[str] = None
-    for entry in resource_registry._entries.values():  # type: ignore[attr-defined]
-        prefix = entry.meta.uri_prefix
-        if uri.startswith(prefix):
-            uri_agent_id = uri[len(prefix):].rstrip("/")
-            break
-    if uri_agent_id is None:
+    # Resolved first: an unknown URI must fail the same way regardless
+    # of caller tier.
+    entry = resource_registry.find_by_uri(uri)
+    if entry is None:
         raise ResourceReadError(
             f"Unknown resource URI: {uri}", code=INVALID_PARAMS
         )
+    uri_agent_id = uri[len(entry.meta.uri_prefix):].rstrip("/")
 
-    # Admin (per the shared catalog_role) can read any agent's resource
-    # (operational visibility) — checked BEFORE requiring the caller's
-    # own bearer_agent_id, since admin cross-agent access is exactly the
-    # case where the caller legitimately has no agent_id of their own.
-    if catalog_role(principal) == "admin":
+    request = Request(
+        principal=principal,
+        surface="resources",
+        verb="read",
+        entry=entry,
+        target_scope=uri_agent_id,
+        # The Principal's own agent_id is the caller's scope. The
+        # bearer→agent_id DB fallback below is deliberately NOT resolved
+        # up front: `decide` is pure, and an admin caller must not pay a
+        # lookup it doesn't need (the pre-seam code skipped it too, by
+        # returning from the admin branch first).
+        caller_scope=None,
+    )
+    decision = decide(request)
+
+    if decision.denial == "unauthenticated" and caller_token:
+        # Last-resort resolution, unchanged from the pre-seam code: the
+        # Principal carried no agent_id but a bearer did come in, so ask
+        # the token resolver and re-put the question. Only reachable on
+        # the non-admin path, which is exactly where it ran before.
+        resolved = get_agent_id(caller_token)
+        if resolved:
+            decision = decide(replace(request, caller_scope=resolved))
+
+    if decision.allowed:
         return uri_agent_id
+    raise _read_denial(entry, decision)
 
-    # Non-admin: the bearer's own agent_id scopes "read your own"; fall
-    # back to the token resolver when the Principal carries no agent_id
-    # (it's the same lookup get_agent_id would do).
-    bearer_agent_id = principal.agent_id if principal is not None else None
-    if not bearer_agent_id and caller_token:
-        bearer_agent_id = get_agent_id(caller_token)
-    if not bearer_agent_id:
-        raise ResourceReadError(
+
+def _read_denial(
+    entry: RegistryEntry[ResourceReader], decision: "Decision"
+) -> ResourceReadError:
+    """Map a :class:`~agent_mcp.core.access.Decision` denial onto this
+    surface's error type + JSON-RPC code.
+
+    The seam classifies (``not_visible`` / ``unauthenticated`` /
+    ``out_of_scope``); the wording and the wire code stay here, so the
+    two pre-existing messages survive the Phase 4 migration verbatim and
+    FLAG-R17-1's "never emit ``code: 0``" contract keeps holding.
+    """
+    if decision.denial == "not_visible":
+        return ResourceReadError(
+            f"Unauthorized: resource {entry.name!r} is not visible to "
+            "this caller",
+            code=INTERNAL_ERROR,
+        )
+    if decision.denial == "unauthenticated":
+        return ResourceReadError(
             "Unauthorized: token does not resolve to an agent",
             code=INTERNAL_ERROR,
         )
-    if uri_agent_id != bearer_agent_id:
-        raise ResourceReadError(
-            "Unauthorized: callers may only read their own inbox / "
-            "status resources",
-            code=INTERNAL_ERROR,
-        )
-    return uri_agent_id
+    return ResourceReadError(
+        "Unauthorized: callers may only read their own inbox / "
+        "status resources",
+        code=INTERNAL_ERROR,
+    )
 
 
 #: Singleton ResourceRegistry consumed by the MCP handlers in
