@@ -434,6 +434,85 @@ def _oidc_subject(iss: str | None, sub: object | None) -> str | None:
     return f"{_OIDC_SUBJECT_PREFIX}{iss}:{type(sub).__name__}:{sub}"
 
 
+def _looks_like_canonical_int(s: str) -> bool:
+    """True iff ``s`` is EXACTLY what ``str(int(s))`` would produce.
+
+    Used by ``_legacy_subject_is_ambiguous`` -- e.g. ``"1"`` qualifies
+    (``str(int("1")) == "1"``) but ``"007"`` or ``"1.0"`` don't (a real
+    ``int`` sub can never stringify to either).
+    """
+    try:
+        return str(int(s)) == s
+    except ValueError:
+        return False
+
+
+def _looks_like_canonical_float(s: str) -> bool:
+    """True iff ``s`` is EXACTLY what ``str(float(s))`` would produce."""
+    try:
+        return str(float(s)) == s
+    except ValueError:
+        return False
+
+
+def _legacy_subject_is_ambiguous(sub: object) -> bool:
+    """True iff the bare, untagged ``str(sub)`` legacy key content could
+    have been produced by MORE THAN ONE of ``_OIDC_SUBJECT_SCALAR_TYPES``.
+
+    R20-F1: R19-F1's legacy fallback matches on the pre-R18-F1 UNTAGGED
+    key (``oidc:<iss>:<sub>``), which by construction can't record which
+    scalar TYPE originally produced it -- that's exactly the collision
+    R16-F1/R17-F1/R18-F1 fixed for the tagged key
+    (``str(1) == str("1")``, ``str(True) == str("True")``). Reopening a
+    lookup on the untagged shape reopens that same collision: a legacy
+    row minted from one type's ``sub`` can be matched -- and self-healed
+    into -- by a DIFFERENT type's same-content login.
+
+    Git-history verified (R17-F1 #705 / R18-F1 #708): a "legacy rows are
+    provably str-only" premise does NOT hold -- ``_oidc_subject``
+    started accepting int/float/bool at R17-F1 while STILL emitting the
+    untagged format; the type tag wasn't added until the LATER, separate
+    R18-F1 commit. So a real deployment that ran R17-F1 before upgrading
+    to R18-F1 could have persisted an untagged row from a non-str
+    ``sub``. A fix that only checks the CURRENT caller's type (e.g.
+    "only match if the caller's sub is str") is one-directional and
+    leaves the mirror case open (a str claimant hijacking a legacy row
+    that was actually minted from a same-content int/float/bool sub).
+
+    This checks BOTH directions by asking: could some scalar type OTHER
+    than ``type(sub)`` have produced the identical ``str(sub)`` content?
+
+      * A non-``str`` ``sub`` is unconditionally ambiguous: a
+        hypothetical ``str`` sub with that exact content always
+        stringifies to itself, so ``str`` is always an alternate
+        producer.
+      * A ``str`` ``sub`` is ambiguous iff its content also happens to
+        be a canonical ``int``/``float`` repr, or is exactly
+        ``"True"``/``"False"`` -- the only collision family R18-F1
+        documented (int/float/bool never collide with each other via
+        ``str()``, only with a same-content ``str``).
+
+    An ambiguous sub therefore gets NO legacy fallback key at all (see
+    ``_oidc_subject_legacy``): the login falls through to step 2/3
+    rather than risk matching -- and self-healing into -- a row whose
+    true originating type can't be verified. The cost is a real but
+    narrow one: a genuine legacy user whose original ``sub`` happens to
+    be a numeric/bool-like string can never self-heal via this fallback
+    and gets a fresh JIT-created row instead -- an acceptable trade for
+    closing an account-takeover vector, and out of scope of R19-F1's
+    demonstrated target population (non-numeric string subs).
+    """
+    if not isinstance(sub, str):
+        return True
+    if sub in ("True", "False"):
+        return True
+    if _looks_like_canonical_int(sub):
+        return True
+    if _looks_like_canonical_float(sub):
+        return True
+    return False
+
+
 def _oidc_subject_legacy(iss: str | None, sub: object | None) -> str | None:
     """Build the PRE-R18-F1 (untagged) subject key from ``(iss, sub)``.
 
@@ -454,15 +533,23 @@ def _oidc_subject_legacy(iss: str | None, sub: object | None) -> str | None:
     Deliberately reproduces the OLD, non-type-discriminating shape
     verbatim -- it exists solely to match whatever an old row already
     has stored, not a "corrected" version of it. It is used only to
-    LOOK UP a pre-existing row; it is never written for a new one, so
-    it cannot reopen the R18-F1 collision (see
-    ``find_or_create_sso_user`` for why the two different types would
-    still upgrade to their own, now-distinguished, tagged keys rather
-    than merging).
+    LOOK UP a pre-existing row; it is never written for a new one.
+
+    R20-F1: unlike R19-F1's original version of this function, a HIT
+    here is not automatically safe to self-heal into -- the untagged
+    shape is exactly the non-type-discriminating format R16-F1/R17-F1/
+    R18-F1 fixed, so offering it as a lookup key for an AMBIGUOUS sub
+    (see ``_legacy_subject_is_ambiguous``) would reopen that collision.
+    Returning None here for an ambiguous sub means
+    ``find_or_create_sso_user`` never attempts the fallback lookup for
+    it at all, closing the hole at the source rather than trusting the
+    caller to re-check.
     """
     if not iss or sub is None:
         return None
     if not isinstance(sub, _OIDC_SUBJECT_SCALAR_TYPES):
+        return None
+    if _legacy_subject_is_ambiguous(sub):
         return None
     return f"{_OIDC_SUBJECT_PREFIX}{iss}:{sub}"
 
@@ -526,6 +613,17 @@ def find_or_create_sso_user(
          non-privileged account every login. On a hit the row is
          re-stamped to the current tagged format (self-heal), so it
          only ever takes the fallback path once per user.
+
+         R20-F1: ``legacy_subject`` is None whenever the current sub is
+         "ambiguous" (see ``_legacy_subject_is_ambiguous`` /
+         ``_oidc_subject_legacy``) -- i.e. its untagged string form
+         could have been produced by more than one accepted scalar
+         type. This function trusts that None-means-don't-try contract
+         from the caller rather than re-deriving it, so an ambiguous
+         sub simply never reaches this branch at all: the fallback
+         lookup (and the self-heal it triggers) is skipped entirely
+         rather than risk matching -- and retagging -- a row whose true
+         originating type can't be verified from the untagged key alone.
 
       2. **Verified-email link.** If ``email`` is present AND the IdP
          asserted ``email_verified is True``, link to a PRE-EXISTING

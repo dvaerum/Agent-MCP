@@ -269,7 +269,17 @@ async def test_scalar_type_collision_protection_unaffected(
     types whose ``str()`` forms collide (``sub=True`` / ``sub="True"``)
     must still produce DIFFERENT rows -- the legacy fallback must not
     reopen the R18-F1 collision by matching one claimant's login
-    against the untagged form of a DIFFERENT type's key."""
+    against the untagged form of a DIFFERENT type's key.
+
+    R20-F1 extension: the original version of this test only exercised
+    two brand-new JIT-created logins (neither hits the legacy-fallback
+    lookup at all, since there's no pre-existing row for either to
+    match) -- it did NOT cover the actual R20-F1 exploit shape, which
+    requires a PRE-EXISTING legacy row plus a *second*, differently-
+    typed claimant whose legacy-key computation collides with it. Added
+    below: a pre-existing sysadmin row keyed on the untagged legacy
+    format, then a differently-typed second login that must NOT
+    reconcile into (or self-heal/retag) that row."""
     from agent_mcp.router import identity
 
     client = await aiohttp_client(router_app)
@@ -294,6 +304,44 @@ async def test_scalar_type_collision_protection_unaffected(
     assert row_str is not None
     assert row_bool["user_id"] != row_str["user_id"]
     assert row_bool["sso_subject"] != row_str["sso_subject"]
+
+    # R20-F1: a PRE-EXISTING legacy (untagged) row must not be hijacked
+    # by a differently-typed second claimant whose legacy key collides.
+    identity.run_router_migrations_upgrade()
+    legacy_subject = f"oidc:{_FAKE_ISSUER}:1"
+    pre_existing_id = identity.create_user(
+        username="preexisting-sysadmin",
+        password=None,
+        email="pre-existing@example.test",
+        password_hash=None,
+        is_sysadmin=True,
+        sso_subject=legacy_subject,
+    )
+
+    cb3 = await _drive_callback(client, monkeypatch, claims={
+        "sub": 1,  # JSON int -- same str() content as the legacy key
+        "preferred_username": "secondclaimant",
+        "groups": [],
+    })
+    assert cb3.status in (302, 303), await cb3.text()
+
+    second_claimant = identity.get_user_by_username("secondclaimant")
+    assert second_claimant is not None
+    assert second_claimant["user_id"] != pre_existing_id, (
+        "the second, differently-typed claimant must NOT have been "
+        "reconciled into the pre-existing legacy row"
+    )
+    assert not (
+        second_claimant["is_sysadmin"] == 1
+        or second_claimant["is_sysadmin"] is True
+    ), "the second claimant must not inherit the pre-existing row's sysadmin bit"
+
+    pre_existing_after = identity.get_user_by_id(pre_existing_id)
+    assert pre_existing_after is not None
+    assert pre_existing_after["sso_subject"] == legacy_subject, (
+        "the pre-existing row must not have been retagged/self-healed "
+        "by the differently-typed claimant's login"
+    )
 
 
 async def test_oidc_subject_legacy_matches_pre_r18f1_format() -> None:
