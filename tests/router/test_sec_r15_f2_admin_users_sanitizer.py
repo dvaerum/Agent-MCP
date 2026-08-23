@@ -265,7 +265,7 @@ async def test_sso_find_or_create_rejects_unpaired_surrogate_email(
     user = sso.find_or_create_sso_user(
         email="abc\ud800def@example.test",
         preferred_username="idpuser",
-        subject=sso._oidc_subject("https://idp.example.test", "sub-1"),
+        subject=sso.SsoSubject("https://idp.example.test", "sub-1").encode(),
         email_verified=False,
     )
     row = identity.get_user_by_username("idpuser")

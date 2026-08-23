@@ -304,7 +304,7 @@ def _find_or_create(*, sub, email, bootstrap_sysadmin=None):
     """
     import sys
     sso = sys.modules["agent_mcp.router.sso"]
-    subject = sso._oidc_subject(_FAKE_ISSUER, sub)
+    subject = sso.SsoSubject(_FAKE_ISSUER, sub).encode()
     kwargs = {}
     if bootstrap_sysadmin is not None:
         kwargs["bootstrap_sysadmin"] = bootstrap_sysadmin

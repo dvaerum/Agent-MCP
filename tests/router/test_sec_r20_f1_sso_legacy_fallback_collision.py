@@ -3,7 +3,7 @@ reopens the exact scalar-type collision it claims can't reopen.
 
 FINDING: R19-F1 (#709) added a legacy-format fallback to
 ``find_or_create_sso_user``: when the current tagged-key lookup misses,
-it tries ``_oidc_subject_legacy(iss, sub)`` -- the pre-R18-F1 UNTAGGED
+it tries the legacy lookup key for ``(iss, sub)`` -- the pre-R18-F1 UNTAGGED
 key format, which is, by construction, the exact non-type-discriminating
 shape R16-F1/R17-F1/R18-F1 fixed (``str(1) == str("1")``,
 ``str(True) == str("True")``). On a legacy-key HIT, the row is
@@ -14,7 +14,7 @@ minted from (the legacy string can't record that, by definition).
 
 Historical note (verified against git history for R16-F1/#704,
 R17-F1/#705, R18-F1/#708): the reporting lane's "legacy rows can only
-ever have been str-minted" premise does NOT hold. ``_oidc_subject`` only
+ever have been str-minted" premise does NOT hold. the key builder only
 ever received a str-coerced ``sub`` through R16-F1, but R17-F1 (#705)
 widened it to accept int/float/bool WHILE STILL using the untagged
 format -- R18-F1 (#708) is what added the type tag. So during the
@@ -24,15 +24,15 @@ current sub is str" fix would therefore be UNSOUND (it would still let
 a str claimant hijack a legacy row that was genuinely minted from a
 same-string-content int/float/bool sub, and vice versa) -- hence this
 fix takes the "refuse on ambiguity" direction instead: the fallback
-lookup key is only offered (``_oidc_subject_legacy`` returns non-None)
+lookup key is only offered (``SsoSubject.legacy_lookup_key`` returns non-None)
 when the current sub's string form could NOT also have been produced by
-a DIFFERENT accepted scalar type. See ``sso._legacy_subject_is_ambiguous``.
+a DIFFERENT accepted scalar type. See ``sso.SsoSubject.is_ambiguous``.
 
 Live-confirmed exploit (this file's primary RED test): a genuine
 pre-existing sysadmin row ``alice`` has legacy key ``oidc:<iss>:1``
 (as if minted from ``sub="1"`` pre-R18-F1). A brand-new, unrelated
 identity ``mallory`` logs in for the first time with ``sub=1`` as a
-JSON INT -- ``_oidc_subject_legacy(iss, 1)`` produces the IDENTICAL
+JSON INT -- the legacy lookup key for ``(iss, 1)`` is the IDENTICAL
 string ``oidc:<iss>:1``. Pre-fix, the fallback matches and ``mallory``
 is returned ``alice``'s ``user_id`` (and her ``is_sysadmin`` bit).
 Post-fix, the ambiguous legacy key must never be offered as a fallback
@@ -77,6 +77,20 @@ _FAKE_DISCOVERY = {
     "jwks_uri": f"{_FAKE_ISSUER}/protocol/openid-connect/certs",
     "id_token_signing_alg_values_supported": ["RS256"],
 }
+
+
+def _legacy_key(iss: object | None, sub: object | None) -> str | None:
+    """The pre-R18-F1 UNTAGGED fallback key for ``(iss, sub)``, or None.
+
+    ADR-0024: ``sso._oidc_subject_legacy`` is now
+    ``SsoSubject.legacy_lookup_key()``, which still returns None for an
+    unusable claim AND for an ambiguous sub (R20-F1). Assertions below
+    are unchanged.
+    """
+    from agent_mcp.router.sso import SsoSubject
+
+    subject = SsoSubject.from_claims(iss, sub)
+    return subject.legacy_lookup_key() if subject is not None else None
 
 
 @pytest.fixture
@@ -151,7 +165,7 @@ async def test_differently_typed_claimant_does_not_hijack_legacy_row(
     """RED (pre-fix): the live exploit. A pre-existing sysadmin row
     ``alice`` carries the legacy key ``oidc:<iss>:1``. A brand-new
     claimant ``mallory`` logs in with ``sub=1`` as a JSON INT --
-    ``_oidc_subject_legacy`` produces the IDENTICAL string. Pre-fix,
+    the legacy lookup key is the IDENTICAL string. Pre-fix,
     the fallback matches and mallory is reconciled into (and inherits
     the sysadmin bit of) alice's account. Post-fix, mallory must get
     her OWN, non-privileged row and alice's row must be untouched."""
@@ -277,41 +291,40 @@ async def test_str_claimant_does_not_hijack_numeric_legacy_row(
 
 
 def test_legacy_subject_ambiguity_discriminator() -> None:
-    from agent_mcp.router import sso
+    from agent_mcp.router.sso import SsoSubject
 
     # Non-str scalars are always ambiguous against a hypothetical str
     # of the same content.
-    assert sso._legacy_subject_is_ambiguous(1) is True
-    assert sso._legacy_subject_is_ambiguous(1.5) is True
-    assert sso._legacy_subject_is_ambiguous(True) is True
-    assert sso._legacy_subject_is_ambiguous(False) is True
+    assert SsoSubject(_FAKE_ISSUER, 1).is_ambiguous() is True
+    assert SsoSubject(_FAKE_ISSUER, 1.5).is_ambiguous() is True
+    assert SsoSubject(_FAKE_ISSUER, True).is_ambiguous() is True
+    assert SsoSubject(_FAKE_ISSUER, False).is_ambiguous() is True
 
     # str content that LOOKS like a canonical int/float/bool repr is
     # ambiguous.
-    assert sso._legacy_subject_is_ambiguous("1") is True
-    assert sso._legacy_subject_is_ambiguous("-42") is True
-    assert sso._legacy_subject_is_ambiguous("1.5") is True
-    assert sso._legacy_subject_is_ambiguous("0") is True
-    assert sso._legacy_subject_is_ambiguous("True") is True
-    assert sso._legacy_subject_is_ambiguous("False") is True
+    assert SsoSubject(_FAKE_ISSUER, "1").is_ambiguous() is True
+    assert SsoSubject(_FAKE_ISSUER, "-42").is_ambiguous() is True
+    assert SsoSubject(_FAKE_ISSUER, "1.5").is_ambiguous() is True
+    assert SsoSubject(_FAKE_ISSUER, "0").is_ambiguous() is True
+    assert SsoSubject(_FAKE_ISSUER, "True").is_ambiguous() is True
+    assert SsoSubject(_FAKE_ISSUER, "False").is_ambiguous() is True
 
     # Genuine, non-numeric str subs (the real-world common case) are
     # unambiguous -- no other scalar type's str() can reproduce them.
-    assert sso._legacy_subject_is_ambiguous("alice-sub-1") is False
-    assert sso._legacy_subject_is_ambiguous("abc-123") is False
-    assert sso._legacy_subject_is_ambiguous("007") is False  # not canonical int
+    assert SsoSubject(_FAKE_ISSUER, "alice-sub-1").is_ambiguous() is False
+    assert SsoSubject(_FAKE_ISSUER, "abc-123").is_ambiguous() is False
+    assert SsoSubject(_FAKE_ISSUER, "007").is_ambiguous() is False  # not canonical int
 
 
 def test_oidc_subject_legacy_withholds_ambiguous_keys() -> None:
-    """``_oidc_subject_legacy`` must return None (no fallback offered)
-    for an ambiguous sub, and the normal untagged key for a safe one."""
-    from agent_mcp.router import sso
-
-    assert sso._oidc_subject_legacy(_FAKE_ISSUER, 1) is None
-    assert sso._oidc_subject_legacy(_FAKE_ISSUER, "1") is None
-    assert sso._oidc_subject_legacy(_FAKE_ISSUER, True) is None
-    assert sso._oidc_subject_legacy(_FAKE_ISSUER, "True") is None
+    """``SsoSubject.legacy_lookup_key`` must return None (no fallback
+    offered) for an ambiguous sub, and the normal untagged key for a
+    safe one."""
+    assert _legacy_key(_FAKE_ISSUER, 1) is None
+    assert _legacy_key(_FAKE_ISSUER, "1") is None
+    assert _legacy_key(_FAKE_ISSUER, True) is None
+    assert _legacy_key(_FAKE_ISSUER, "True") is None
     assert (
-        sso._oidc_subject_legacy(_FAKE_ISSUER, "alice-sub-1")
+        _legacy_key(_FAKE_ISSUER, "alice-sub-1")
         == f"oidc:{_FAKE_ISSUER}:alice-sub-1"
     )

@@ -59,6 +59,20 @@ _FAKE_DISCOVERY = {
 }
 
 
+def _legacy_key(iss: object | None, sub: object | None) -> str | None:
+    """The pre-R18-F1 UNTAGGED fallback key for ``(iss, sub)``, or None.
+
+    ADR-0024: ``sso._oidc_subject_legacy`` is now
+    ``SsoSubject.legacy_lookup_key()``, which still returns None for an
+    unusable claim AND for an ambiguous sub (R20-F1). Assertions below
+    are unchanged.
+    """
+    from agent_mcp.router.sso import SsoSubject
+
+    subject = SsoSubject.from_claims(iss, sub)
+    return subject.legacy_lookup_key() if subject is not None else None
+
+
 @pytest.fixture
 def sso_oidc_env(router_env, monkeypatch: pytest.MonkeyPatch, tmp_path):
     """Mirrors ``test_sso_oidc.py``'s fixture of the same name -- kept
@@ -348,11 +362,9 @@ async def test_oidc_subject_legacy_matches_pre_r18f1_format() -> None:
     """Unit-level: the legacy-key builder must reproduce the EXACT
     pre-R18-F1 untagged format, since it exists solely to match
     whatever an old row already has stored."""
-    from agent_mcp.router import sso
-
     assert (
-        sso._oidc_subject_legacy("https://idp.example.test", "abc-123")
+        _legacy_key("https://idp.example.test", "abc-123")
         == "oidc:https://idp.example.test:abc-123"
     )
-    assert sso._oidc_subject_legacy("https://idp.example.test", None) is None
-    assert sso._oidc_subject_legacy(None, "abc-123") is None
+    assert _legacy_key("https://idp.example.test", None) is None
+    assert _legacy_key(None, "abc-123") is None
