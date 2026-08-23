@@ -326,25 +326,34 @@ files carry the full reasoning rather than repeating it here:
   easy to break with one added `await`. `wait_for_events`' indefinite
   hold is a stream lifetime, which is **N5**'s subject, not this one's.
 
-### Phase 4 — after Phase 2 lands (needs its adapter shape)
+### Phase 4 — **done** (this PR): E, Resources only
 
-- **E — shared `decide()` seam for Tools/Resources/Prompts/Router.** Depends
-  on Phase 2 existing so the Tools adapter has a concrete shape to mirror.
-  Scope this phase narrowly at first: build `core/access.py`'s `decide()` +
-  `Request`/`Decision`, migrate the Resources surface only (closing R21-F4's
-  bug class structurally instead of the two-line reorder pentest-all already
-  shipped), and leave Prompts/Router as a documented follow-up rather than
-  doing all four surfaces in one PR.
-  - TDD: RED tests are the R21-F4 repro (admin cross-agent resource read) plus
-    the existing non-admin-denied regression test, both now going through
-    `decide()`.
-  - **Per N4**: `decide()` must consult `entry.visibility` on the Resources
-    **read** path, not just derive from listing — today `resources/read`
-    uses a parallel `catalog_role` check that never looks at
-    `entry.visibility`, benign only because both live resources are
-    `visibility="any"`. MCP resource *subscriptions* are confirmed out of
-    scope — `main_app.py` never registers them, so the vendored SDK never
-    advertises the capability.
+- **E — shared `decide()` seam.** Delivered as `core/access.py`'s
+  `decide(Request) -> Decision`; the module docstring carries the design
+  (why the role always comes from `catalog_role`, why denials are
+  *classified* rather than phrased, and the shape a later Prompts / Tools
+  migration would use). `resources/__init__.py::resolve_agent_id_for_uri`
+  is wired through it and keeps its signature + `ResourceReadError`
+  contract — only *where* the decision is made moved.
+  - **Per N4, the gap actually closed**: the read path now re-checks
+    `entry.visibility` (the declaration `resources/list` filters on), so an
+    `"admin"`-visibility resource can no longer be hidden from a worker's
+    `resources/list` and then served to that same worker by
+    `resources/read` if they guess the URI. Both shipped resources are
+    `visibility="any"`, so the RED test registers a synthetic admin-only
+    one — see `tests/test_phase4_decide_seam.py`.
+  - **No policy change**: `catalog_role` and `resolve_visibility` needed no
+    reconciling because `decide()` *delegates* to the former and feeds its
+    result to the latter, rather than re-deriving admin-ness. That
+    equivalence (LIST-visibility == READ-visibility, per Principal shape) is
+    pinned parametrically over every shape reachable in production.
+  - MCP resource *subscriptions* stay out of scope — `main_app.py` never
+    registers them, so the vendored SDK never advertises the capability.
+- **Follow-up, deliberately NOT in this pass** (the scope cut, restated so
+  it doesn't read as an omission): Prompts and Router admin are not
+  migrated onto `decide()`. Prompts already re-checks `visibility` at verb
+  time (`PromptRegistry.render`), so its migration is a consolidation, not
+  a fix; Router admin needs Phase 5's typed `Principal` first.
 
 ### N3 Tier 2 + N5 — after Phase 4, or explicitly deferred
 
