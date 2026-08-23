@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import pytest
 
+from agent_mcp.core.authorize import AuthRejected
 from agent_mcp.core.principal import Principal
 from agent_mcp.core.tool_result import Invalid, Ok, PermissionDenied
 from agent_mcp.tools.project_context_tools import (
@@ -93,45 +94,56 @@ def _row(key: str) -> dict | None:
 
 
 # ── (1) viewer-tier operator DENIED on all three write tools ──────
+#
+# Phase 2 (Finding A): the two in-body gates
+# (``_requires_authenticated_caller`` + ``_deny_viewer_tier_write``) are
+# now composed into the ``@requires_predicate`` stamped on each impl —
+# the SAME two helpers, called in the same order, so the admission
+# decision is byte-identical. The denial therefore arrives as a raised
+# ``AuthRejected`` instead of a returned ``PermissionDenied`` (same 403
+# / isError=True on every wire seam), and it now fires BEFORE jsonschema
+# validation, closing the pre-auth schema-shape oracle (R20-F4/R21-F1).
 
 
 async def test_viewer_operator_session_denied_update() -> None:
     """A viewer-tier ``operator_session`` cannot upsert project context."""
     viewer = _operator(project_role="viewer")
-    result = await update_project_context_tool_impl(
-        {"context_key": "pt_probe", "context_value": "owned"},
-        principal=viewer,
-    )
-    assert isinstance(result, PermissionDenied), result
+    with pytest.raises(AuthRejected):
+        await update_project_context_tool_impl(
+            {"context_key": "pt_probe", "context_value": "owned"},
+            principal=viewer,
+        )
 
 
 async def test_viewer_forwarding_header_denied_update() -> None:
     """Same denial via the signed forwarding-header viewer path — this
     is the exact MCP-wire shape the live repro used."""
     viewer = _operator(project_role="viewer", kind="forwarding_header")
-    result = await update_project_context_tool_impl(
-        {"context_key": "pt_probe", "context_value": "owned"},
-        principal=viewer,
-    )
-    assert isinstance(result, PermissionDenied), result
+    with pytest.raises(AuthRejected):
+        await update_project_context_tool_impl(
+            {"context_key": "pt_probe", "context_value": "owned"},
+            principal=viewer,
+        )
 
 
 async def test_viewer_denied_bulk_update() -> None:
     viewer = _operator(project_role="viewer")
-    result = await bulk_update_project_context_tool_impl(
-        {"updates": [{"context_key": "pt_probe", "context_value": "owned"}]},
-        principal=viewer,
-    )
-    assert isinstance(result, PermissionDenied), result
+    with pytest.raises(AuthRejected):
+        await bulk_update_project_context_tool_impl(
+            {"updates": [
+                {"context_key": "pt_probe", "context_value": "owned"}
+            ]},
+            principal=viewer,
+        )
 
 
 async def test_viewer_denied_delete() -> None:
     viewer = _operator(project_role="viewer")
-    result = await delete_project_context_tool_impl(
-        {"context_key": "pt_probe"},
-        principal=viewer,
-    )
-    assert isinstance(result, PermissionDenied), result
+    with pytest.raises(AuthRejected):
+        await delete_project_context_tool_impl(
+            {"context_key": "pt_probe"},
+            principal=viewer,
+        )
 
 
 # ── (2) operator-tier caller still succeeds (no regression) ───────
