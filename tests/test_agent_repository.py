@@ -278,9 +278,9 @@ def test_query_offset_pagination_survives_concurrent_status_change(
     the ENTIRE time (pg-a3) must not be silently skipped.
     """
     with _make_client(project_dir):
-        from agent_mcp.repositories import agent_repo
         from agent_mcp.db.engine import get_session
         from agent_mcp.db.models import Agent
+        from agent_mcp.repositories import agent_repo
 
         base = datetime.datetime(2025, 6, 1)
         for i in range(1, 6):

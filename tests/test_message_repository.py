@@ -417,9 +417,9 @@ def test_query_offset_pagination_survives_concurrent_read_flag_change(
     (m2) must not be silently skipped.
     """
     with _make_client(project_dir):
-        from agent_mcp.repositories import message_repo
         from agent_mcp.db.engine import get_session
         from agent_mcp.db.models import AgentMessage
+        from agent_mcp.repositories import message_repo
 
         _seed_agent("alice")
         _seed_agent("bob")
@@ -461,9 +461,9 @@ def test_count_query_offset_pagination_survives_concurrent_read_flag_change(
     fresh unconditional COUNT.
     """
     with _make_client(project_dir):
-        from agent_mcp.repositories import message_repo
         from agent_mcp.db.engine import get_session
         from agent_mcp.db.models import AgentMessage
+        from agent_mcp.repositories import message_repo
 
         _seed_agent("carol")
         _seed_agent("dave")

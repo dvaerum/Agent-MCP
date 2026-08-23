@@ -244,14 +244,12 @@ async def test_dispatcher_translates_authrejected_to_iserror(
     from agent_mcp.tools.registry import dispatch_tool_call
 
     app = create_app(project_dir=str(project_dir))
-    with TestClient(app):
-        # view_status is operator-tier. Calling with garbage must be rejected.
-        with with_bearer("deadbeef" * 4):
-            with pytest.raises(AuthRejected):
-                await dispatch_tool_call(
-                    "view_status",
-                    {"token": "deadbeef" * 4},
-                )
+    # view_status is operator-tier. Calling with garbage must be rejected.
+    with TestClient(app), with_bearer("deadbeef" * 4), pytest.raises(AuthRejected):
+        await dispatch_tool_call(
+            "view_status",
+            {"token": "deadbeef" * 4},
+        )
 
 
 @pytest.mark.asyncio
