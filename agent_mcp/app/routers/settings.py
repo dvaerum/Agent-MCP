@@ -45,8 +45,10 @@ from ...core.tool_result import (
 from ...tools.registry import ToolInputValidationError, dispatch_tool_call
 from ...utils.json_utils import get_sanitized_json_body
 from ...utils.string_utils import (
+    SETTING_KEY_ERROR,
     UNSAFE_KEY_ERROR,
     has_unsafe_unicode_for_identifier,
+    is_valid_memory_key,
 )
 
 
@@ -292,6 +294,16 @@ async def _dispatch_settings_write(
     if has_unsafe_unicode_for_identifier(context_key):
         return JSONResponse(UNSAFE_KEY_ERROR, status_code=400)
 
+    # R20-F2: positive ASCII allowlist, matching memories.py's pattern.
+    # The denylist above misses Unicode categories Lo/So (invisible
+    # "filler"/blank glyphs like U+115F, U+2800) that widening the
+    # denylist would also strip legitimate non-Latin letters (Lo covers
+    # CJK/Hangul/Arabic base letters). config_* keys are internal
+    # identifiers, not user-facing text, so an ASCII allowlist is the
+    # strictly correct fit -- see string_utils.SETTING_KEY_ERROR.
+    if not is_valid_memory_key(context_key):
+        return JSONResponse(SETTING_KEY_ERROR, status_code=400)
+
     principal = _build_route_principal(
         bearer_token=None,
         operator_session=True,
@@ -381,6 +393,10 @@ async def delete_setting_api_route(
     gate lives in the tool; the post-delete wake set fires there too)."""
     if has_unsafe_unicode_for_identifier(context_key):
         return JSONResponse(UNSAFE_KEY_ERROR, status_code=400)
+
+    # R20-F2: same ASCII allowlist gate as the write path above.
+    if not is_valid_memory_key(context_key):
+        return JSONResponse(SETTING_KEY_ERROR, status_code=400)
 
     principal = _build_route_principal(
         bearer_token=None,

@@ -364,9 +364,26 @@ async def get_sanitized_json_body(request: Any) -> Dict: # 'request: Request' if
     except ValueError as ve: # Catch ValueError from sanitize_json_input or body decoding
         logger.error(f"Failed to get/sanitize request body: {ve}")
         raise ValueError(f"Invalid request body: {ve}") # Re-raise with context
+    except RecursionError as re_exc:
+        # R20-F3: a deeply-nested body (~3000+ levels) trips CPython's
+        # own recursion guard inside json.loads() / the dict-list walk
+        # in sanitize_json_input -- not a crash (the guard is caught
+        # cleanly here), just an interpreter-internal exception whose
+        # default str() ("maximum recursion depth exceeded") has no
+        # business reaching the client. Mirrors
+        # admin_users_api._json_body's ``except (ValueError,
+        # RecursionError)`` handling (PF-R20-1); this helper is the ONE
+        # chokepoint 8 routers share (settings/memories/tasks/agents/
+        # composition/delivery/messages/schedules), so it needed the
+        # same guard. The real message stays server-side only.
+        logger.error(f"Request body too deeply nested to parse: {re_exc}")
+        raise ValueError("request body is too deeply nested")
     except Exception as e:
-        # Catching other potential exceptions from request.body() or unexpected issues
+        # Catching other potential exceptions from request.body() or unexpected issues.
+        # R20-F3: the client-visible message stays static -- str(e) can
+        # carry interpreter/library-internal detail; the real detail is
+        # already logged above with exc_info for debugging.
         logger.error(f"Unexpected error processing request body: {e}", exc_info=True)
-        raise ValueError(f"Error processing request body: {e}")
+        raise ValueError("Error processing request body")
 
 # --- End JSON Sanitization Utility ---
