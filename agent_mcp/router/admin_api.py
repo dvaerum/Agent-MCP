@@ -8,8 +8,9 @@ to live at ``/agent-mcp/__*`` lives here now as a REST resource.
 Auth: every handler in this module is gated by
 ``require_operator_session_middleware`` (PR D) because the paths fall
 under ``/agent-mcp/api/...``. The one exception is
-``GET /api/router/health``, which is allow-listed by
-``_UNAUTH_PREFIXES`` so callers can probe liveness without a session.
+``GET /api/router/health``, which declares itself public at its
+registration site via ``path_policy.public_route`` so callers can probe
+liveness without a session.
 
 URL map (legacy → new) is documented at:
 ``docs/adr/0014-rest-admin-api.md``.
@@ -91,8 +92,10 @@ async def health_handler(req: web.Request) -> web.Response:
     """``GET /agent-mcp/api/router/health`` — public service descriptor.
 
     The one admin endpoint that bypasses the operator-session gate
-    (allow-listed in ``_UNAUTH_PREFIXES``). Lets external monitors
-    probe liveness without minting an operator session.
+    (marked ``path_policy.public_route`` where it is registered, and
+    matched EXACTLY — a sibling route whose path merely starts with
+    this one does NOT inherit the bypass). Lets external monitors probe
+    liveness without minting an operator session.
     """
     from . import app as _app
 
@@ -1707,8 +1710,21 @@ def register_admin_routes(app: web.Application) -> None:
     gated = _app._rest_gated
     project_lifecycle_gate = require_capability("system.projects.manage")
 
+    # ADR 0014 public service descriptor: external monitors probe
+    # liveness without minting an operator session. N3 Tier 2: the
+    # bypass is declared HERE, at the registration site, and the
+    # operator-session gate derives its exact-path allowlist by walking
+    # for this mark — replacing a hand-written
+    # ``/agent-mcp/api/router/health`` entry that was matched with
+    # ``startswith`` (so a future ``…/health-details`` route would have
+    # silently inherited the bypass). Marking the HANDLER means the
+    # trailing-slash alias ``_add_admin_trailing_slash_aliases``
+    # re-registers is covered for free.
+    from .path_policy import public_route
+
     app.router.add_get(
-        "/agent-mcp/api/router/health", gated(health_handler),
+        "/agent-mcp/api/router/health",
+        public_route(gated(health_handler)),
     )
     app.router.add_get(
         "/agent-mcp/api/router/projects", gated(list_projects_handler),

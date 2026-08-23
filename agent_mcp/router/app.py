@@ -117,6 +117,7 @@ from aiohttp import (
 from ..utils.json_utils import UntrustedBodyError, decode_untrusted_body
 from . import project_registry  # sibling module — see ./project_registry.py
 from . import mount  # ADR-0020: per-request external prefix/origin
+from . import path_policy  # N3 Tier 2: shared request classification
 from . import asset_prefix as _asset_prefix  # Phase 4: runtime sentinel sub
 from . import project_orchestrator as _po  # PR-C: lifecycle state machine
 from .client_disconnect import client_gone_response as _client_gone_response
@@ -1616,6 +1617,7 @@ async def backend_api_handler(req: web.Request) -> web.StreamResponse:
     header.
     """
     rest = req.match_info.get("rest", "")
+    name = req.match_info["name"]
     # The live-update SSE stream (`/api/<project>/events`) negotiates via
     # `Accept: text/event-stream`, not the versioned JSON media type — the
     # version gate governs JSON REST responses, not event streams. Exempt
@@ -1628,12 +1630,16 @@ async def backend_api_handler(req: web.Request) -> web.StreamResponse:
     # media type. Exempt both routes like the events stream — otherwise the
     # bridge's `POST .../delivery/status` (no versioned Accept header) is 406'd
     # and ALL transport-status reporting silently fails.
-    _is_delivery = rest in ("delivery/stream", "delivery/status")
+    #
+    # N3 Tier 2 (question 3): classified by the SHARED policy, not a local
+    # tuple. The local tuple disagreed with the operator-session gate's
+    # regex on the trailing-slash form (which skipped the session gate here
+    # but then tripped this one) and on the reserved ``router`` segment.
+    _is_delivery = path_policy.is_delivery(name, rest)
     if req.method != "OPTIONS" and not _is_event_stream and not _is_delivery:
         if not _accept_includes_strict_api_media(req.headers.get("Accept", "")):
             return _api_version_required_response()
 
-    name = req.match_info["name"]
     redirect = _maybe_single_tenant_redirect(req, name)
     if redirect is not None:
         return redirect
@@ -2954,6 +2960,14 @@ def make_app(
     # keys off mount.canonical_path (which normalises a root request back
     # to /agent-mcp — no auth bypass).
     _add_root_aliases(app)
+
+    # N3 Tier 2 (question 1): derive the auth-bypass allowlist's
+    # EXACT-path half from the routing table now that every route —
+    # including both mechanical alias passes above — is registered.
+    # Must run last: a public route aliased after this point would not
+    # be seen. See ``path_policy.public_route`` for why the marking is
+    # carried by the handler object rather than a path string.
+    path_policy.freeze_public_paths(app)
 
     return app
 

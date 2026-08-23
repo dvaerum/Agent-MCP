@@ -15,7 +15,15 @@ entirely. retire-system-token Wave 1 (PR #208) removed the
 
 Project-scoped paths (``/agent-mcp/api/<project>/...`` and
 ``/agent-mcp/app/<project>/...``) additionally verify the resolved
-operator has a row in ``project_membership`` for that project.
+operator has a row in ``project_membership`` for the project the URL
+names — resolved through the same ADR-0010 alias-aware resolver the
+proxy uses, so a grace-window alias gates identically to the real name
+(N3 Tier 2).
+
+Every path-classification fact this middleware consults ("is this path
+public?", "is this a delivery route?", "is this project-scoped?") comes
+from ``path_policy``, the ONE home shared with ``setup_wizard`` and
+``app.backend_api_handler`` — see that module's docstring.
 
 Why a single middleware (rather than per-route deps the way FastAPI
 sets it up): the router is aiohttp, and aiohttp's idiomatic
@@ -28,7 +36,6 @@ and risks drift.
 from __future__ import annotations
 
 import logging
-import re
 import sqlite3
 from typing import Awaitable, Callable
 from urllib.parse import quote
@@ -36,6 +43,7 @@ from urllib.parse import quote
 from aiohttp import web
 
 from . import mount
+from . import path_policy
 from .login import resolve_current_user
 from .single_tenant import bypasses_operator_gate
 
@@ -56,150 +64,106 @@ _MUTATION_METHODS = frozenset({"POST", "PATCH", "DELETE", "PUT"})
 
 
 # ── Path policy ────────────────────────────────────────────────────
-
-
-# Prefixes that bypass operator-session gating entirely. Every entry
-# here is INTENTIONAL — adding a new one should come with a written
-# justification in the PR body.
 #
-#   * ``/agent-mcp/login`` + ``/agent-mcp/logout``: the auth handshake
-#     itself MUST be reachable without a cookie, or an operator who
-#     has logged out has no way back in.
-#   * ``/agent-mcp/setup``: the first-boot wizard runs before any
-#     user exists (PR C); the empty-users middleware bounces
-#     dashboard traffic to it.
-#   * ``/agent-mcp/assets/``: Next.js static bundle. Public by design.
-#   * ``/agent-mcp/mcp/``: MCP transport. Agent-side bearer auth lives
-#     in ``backend_mcp_handler``; cookies don't apply.
-#   * ``/agent-mcp/api/router/health``: public service descriptor
-#     (ADR 0014). External monitors probe liveness without minting
-#     an operator session. The path is exact-prefixed because every
-#     other ``/api/router/...`` route falls into the session gate.
-_UNAUTH_PREFIXES = (
-    "/agent-mcp/login",
-    "/agent-mcp/logout",
-    "/agent-mcp/setup",
-    "/agent-mcp/assets/",
-    "/agent-mcp/mcp/",
-    "/agent-mcp/api/router/health",
-    # Phase 3 Wave 3 (prancy-napping-pie): the SSO handshake itself
-    # MUST be reachable without a session cookie, or an operator
-    # mid-flow can't complete the redirect dance with the IdP.
-    "/agent-mcp/sso/",
-)
+# N3 Tier 2: the literal tuples/regexes that used to live here moved to
+# ``path_policy`` — the ONE home for "is this path public / a delivery
+# route / project-scoped?", shared with ``setup_wizard`` (the
+# fresh-install redirect gate) and ``app.backend_api_handler`` (the
+# Accept-version gate). The names below are re-exports so existing
+# call sites and tests keep resolving; the policy itself has exactly
+# one definition. See ``path_policy``'s module docstring for why the
+# auth-bypass and setup-redirect prefix sets stay two NAMED policies
+# rather than one merged list.
 
-
-# Exact paths that bypass auth — service descriptor + the bare
-# /agent-mcp landing redirect. We don't list `/agent-mcp/` itself
-# here because we DO want the redirect handler to fire (which
-# 303s to /login or the dashboard depending on auth state).
-_UNAUTH_EXACT = frozenset({
-    # The HEAD `/agent-mcp` (no trailing slash) is the 301 to
-    # `/agent-mcp/`; let it through so we don't double-301.
-    "/agent-mcp",
-})
-
-
-# Project-scoped prefixes that REQUIRE project_membership for the
-# resolved operator. Captured as (regex, group_name) so the project
-# slug can be extracted in O(1) match.
-_PROJECT_SCOPED_PATTERNS = (
-    re.compile(r"^/agent-mcp/api/(?P<project>[^/]+)(?:/|$)"),
-    re.compile(r"^/agent-mcp/app/(?P<project>[^/]+)(?:/|$)"),
-)
-
-
-# Project-segment values under /api/ that are NOT projects (they're
-# router-level admin endpoints). Membership-check skipped for these;
-# the global operator-session gate still applies. ADR 0014: the
-# single ``router`` segment replaces the prior per-route ``projects``
-# entry — every admin endpoint lives at ``/api/router/...`` so this
-# is the only top-level segment we have to exempt.
-_NON_PROJECT_API_SEGMENTS = frozenset({"router"})
-
-
-# ADR-0021 delivery transport: the per-agent fallback channel. These two
-# project-scoped routes are authenticated by the AGENT BEARER at the backend
-# (``require_agent_bearer``), exactly like the ``/agent-mcp/mcp/`` transport —
-# NOT by an operator session. So they must skip the operator-session gate (the
-# backend does the real auth), while every OTHER ``/api/<project>/...`` route
-# stays operator-gated. The match is deliberately tight (only ``stream`` and
-# ``status``) so it can't be used to reach any other project route unauthed.
-_DELIVERY_RE = re.compile(
-    r"^/agent-mcp/api/[^/]+/delivery/(?:stream|status)/?$"
-)
+_UNAUTH_PREFIXES = path_policy.UNAUTH_PREFIXES
+_UNAUTH_EXACT = path_policy.UNAUTH_EXACT
+_PROJECT_SCOPED_PATTERNS = path_policy.PROJECT_SCOPED_PATTERNS
+_NON_PROJECT_API_SEGMENTS = path_policy.NON_PROJECT_API_SEGMENTS
 
 
 # ── Helpers ────────────────────────────────────────────────────────
 
 
-def _path_is_unauth(path: str) -> bool:
-    """Return True iff ``path`` skips the operator-session gate."""
-    if path in _UNAUTH_EXACT:
-        return True
-    return any(path.startswith(p) for p in _UNAUTH_PREFIXES)
+def _path_is_unauth(path: str, app: web.Application | None = None) -> bool:
+    """Return True iff ``path`` skips the operator-session gate.
+
+    ``app`` supplies the DERIVED half of the allowlist: the exact
+    canonical paths of routes whose handler carries ``path_policy.
+    public_route`` (today just the ADR-0014 service descriptor and the
+    trailing-slash alias ``_add_admin_trailing_slash_aliases`` derives
+    from it). Passing ``None`` yields prefix-only matching, which is
+    strictly more restrictive — the safe direction for a caller with no
+    Application in hand.
+    """
+    return path_policy.is_unauth_path(path, app)
 
 
 def _path_is_delivery(path: str) -> bool:
     """Return True iff ``path`` is an ADR-0021 delivery route
     (``/agent-mcp/api/<project>/delivery/{stream,status}``), which the backend
     authenticates by agent bearer, so it skips the operator-session gate."""
-    return _DELIVERY_RE.match(path) is not None
+    return path_policy.is_delivery_path(path)
 
 
-def _project_exists(project_name: str) -> bool:
-    """Return True iff ``project_name`` is registered in the project
-    registry (or is a known alias).
+def _resolved_project_from_path(path: str) -> tuple[str | None, str | None]:
+    """Return ``(url_segment, real_project_name)`` for a project-scoped
+    ``path``; ``(None, None)`` when the path isn't project-scoped.
 
-    Membership is only meaningful for projects the router actually
-    serves. A request to ``/agent-mcp/app/typo-project/`` from a
-    logged-in operator should fall through to the handler — which
-    will emit 404 — rather than be rejected with a 401 that
-    discloses "this project exists but you can't see it".
+    ``real_project_name`` is None when the router doesn't serve that
+    project at all — membership is only meaningful for projects that
+    exist, and a request to ``/agent-mcp/app/typo-project/`` from a
+    logged-in operator should fall through to the handler (which emits
+    its own 404) rather than be rejected with a 401 that discloses
+    "this project exists but you can't see it".
 
-    The import is lazy so this module stays free of router.app
-    import-time circular hazards. Failures are treated as "project
-    does not exist" so a deploy with no registry file still works.
+    N3 Tier 2 (question 4): resolution goes through the SAME
+    ``app._resolve_project_or_alias`` the proxy uses, so the auth layer
+    and the proxy layer agree on which project a URL names. They used to
+    disagree during an ADR-0010 rename-with-grace window: the proxy
+    resolved ``/api/<old-alias>/...`` to the real project while this
+    layer looked ``project_membership`` up against the raw alias
+    segment, found nothing, and handed a genuine member the
+    unknown-project response. The ``/mcp`` transport already resolved
+    first and gated second (``_forwarding_header_from_cookie(req,
+    real_project_name)``); this brings the REST/dashboard surface into
+    line with it.
+
+    The imports are lazy so this module stays free of router.app
+    import-time circular hazards. Failures are treated as "project does
+    not exist" so a deploy with no registry file still works.
     """
+    segment = path_policy.project_segment_from_path(path)
+    if segment is None:
+        return None, None
     try:
-        from .app import _projects_dict
-        from .project_registry import ProjectRegistry  # noqa: F401
+        from .app import _projects_dict, _resolve_project_or_alias
     except Exception:  # pragma: no cover - defensive
-        return False
+        return segment, None
     try:
         projects = _projects_dict()
     except Exception:  # pragma: no cover - defensive
-        return False
-    if project_name in projects:
-        return True
-    # Aliased projects appear in the alias map; treat them as
-    # existing so the alias's project_membership check fires against
-    # the resolved (real) project. The current handler resolves
-    # aliases itself, but the operator-level gate is "can you see
-    # this URL at all?" — aliases count for that.
+        return segment, None
+    if segment in projects:
+        return segment, segment
+    # Not a real project name — it may still be a live ADR-0010 grace
+    # alias. ``_resolve_project_or_alias`` raises HTTPNotFound when it
+    # is neither; that (and any registry failure) means "no project".
     try:
-        from .app import _resolve_project_or_alias
-        real_name, alias_entry = _resolve_project_or_alias(project_name)
-        return alias_entry is not None or real_name in projects
-    except Exception:  # pragma: no cover - defensive
-        return False
+        real_name, _alias_entry = _resolve_project_or_alias(segment)
+    except Exception:
+        return segment, None
+    return segment, (real_name if real_name in projects else None)
 
 
 def _project_from_path(path: str) -> str | None:
-    """Return the project slug if ``path`` is project-scoped, else None.
+    """Return the raw project URL segment if ``path`` is project-scoped,
+    else None. Reserved non-project segments (``router``) yield None.
 
-    Filters out ``/api/projects`` (which is the project-lifecycle
-    REST collection, not a project member-checked route).
+    The SYNTACTIC half of "which project is this?" — callers that need
+    the real (alias-resolved) project want
+    ``_resolved_project_from_path``.
     """
-    for pat in _PROJECT_SCOPED_PATTERNS:
-        m = pat.match(path)
-        if m is None:
-            continue
-        project = m.group("project")
-        if project in _NON_PROJECT_API_SEGMENTS:
-            return None
-        return project
-    return None
+    return path_policy.project_segment_from_path(path)
 
 
 def _try_proxy_header_identity(
@@ -373,7 +337,7 @@ async def require_operator_session_middleware(
     path = mount.canonical_path(request)
     if not path.startswith("/agent-mcp"):
         return await handler(request)
-    if _path_is_unauth(path):
+    if _path_is_unauth(path, request.app):
         return await handler(request)
     # ADR-0021 delivery routes are agent-bearer-authed at the backend (like
     # /mcp/), so they skip the operator-session gate here — otherwise an agent's
@@ -468,9 +432,17 @@ async def require_operator_session_middleware(
         )
         is_sysadmin = False
 
-    project = _project_from_path(path)
+    # N3 Tier 2 (question 4): ONE alias-aware resolution per request.
+    # ``url_segment`` is what the caller typed (used only for the
+    # syntactic /app/ vs /api/ branch); ``project`` is the REAL project
+    # name the proxy will serve, so membership, the mutation gate and
+    # the Principal are all keyed off the same identity the backend
+    # sees. This replaced three separate ``_project_exists`` calls that
+    # each re-read the registry AND resolved aliases only for the
+    # existence question, never for the membership lookup.
+    url_segment, project = _resolved_project_from_path(path)
     role: str | None = None
-    if project is not None and _project_exists(project):
+    if project is not None:
         if not is_sysadmin:
             # Phase 3 Wave 2: per-project role gating. Reads (GET /
             # HEAD / OPTIONS) admit on either tier; mutations
@@ -528,7 +500,7 @@ async def require_operator_session_middleware(
                         "error": "forbidden",
                         "message": (
                             f"viewer-tier operator {user['username']!r} "
-                            f"cannot mutate project {project!r}"
+                            f"cannot mutate project {url_segment!r}"
                         ),
                     },
                     status=403,
@@ -567,11 +539,12 @@ async def require_operator_session_middleware(
             if user.get("user_id") is not None
             else None
         )
-        principal_project_name = (
-            project
-            if project is not None and _project_exists(project)
-            else None
-        )
+        # N3 Tier 2: ``project`` is already the alias-resolved REAL
+        # project name (or None when the router doesn't serve it), so
+        # the Principal is scoped to the same project the proxy routes
+        # to. Previously an alias URL stamped the Principal with the
+        # ALIAS, which no per-project capability grant is keyed on.
+        principal_project_name = project
         # arch-r4 #3: ``role`` is the SAME value the mutation gate
         # above already resolved (or ``None`` if that block never
         # ran, in which case the conditions below are ``None`` too) —
@@ -581,9 +554,7 @@ async def require_operator_session_middleware(
         # gate's result was never stashed; deleted along with this
         # call site.
         principal_project_role = (
-            None
-            if is_sysadmin or project is None or not _project_exists(project)
-            else role
+            None if is_sysadmin or project is None else role
         )
         # arch-B: capabilities resolved once via the shared builder (Wave
         # 9 PR 0 resolved them at this seam; the builder is now the single

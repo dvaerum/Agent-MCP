@@ -75,7 +75,7 @@ for full file:line detail on each):
 |---|---|---|---|
 | N1 | Sanitization is a helper you must remember to call, not a seam — 11 ledger findings across 9 rounds, 5 live bypasses | Strong | Medium |
 | N2 | The one structurally-enforced revalidation invariant covers 1 of 3 request surfaces (router admin; backend REST relies on an undocumented proxy-buffering side effect, FLAG-R7-1) — **done**: both remaining surfaces investigated and their real invariants pinned instead of adapters built, see N2 below | Strong | Medium |
-| N3 | "What kind of request is this?" answered 11 times by 5 modules — Tier 1 (pure-copy subtractions) done in Phase 1; the SSO-vs-rate_limit trusted-proxy disagreement was investigated and deliberately NOT force-fit (see Phase 1 below); Tier 2 (derived classification) deferred | Strong | Medium |
+| N3 | "What kind of request is this?" answered 11 times by 5 modules — Tier 1 (pure-copy subtractions) done in Phase 1; the SSO-vs-rate_limit trusted-proxy disagreement was investigated and deliberately NOT force-fit (see Phase 1 below); Tier 2 (derived classification) **done** — and it was not the "nothing broken today" item it was filed as: three live bugs fell out of it, see N3 Tier 2 below | Strong | Medium |
 | N4 | `Registry.visibility` is a listing filter wearing an authorization name for 2 of 3 catalogs — informational input to Phase 2 and Phase 4, no PR of its own | Strong | Low to surface |
 | N5 | Long-lived stream re-validation is a convention (4 copies, 1 pattern, 0 seams), not a seam — nothing broken today, pure future-proofing — **done**: `core/stream_gates.RevalidatingStream` + an AST discovery test, all 4 streams migrated keeping their own predicate and cadence, see N5 below | Worth exploring | Low-medium |
 | N6 | Credential lifecycle has no owning module — mint/compare consolidated, redact/rotate scattered; includes 2 fix-now items (Step 0) plus a structural half deferred to Phase 5 | Worth exploring | Medium |
@@ -357,16 +357,14 @@ files carry the full reasoning rather than repeating it here:
 
 ### N3 Tier 2 + N5 — after Phase 4, or explicitly deferred
 
-Lower urgency, both "generalize an idiom that already works," nothing
-broken today. **N3 Tier 2**: derive request classification (public-path?
-delivery route? which project?) from route-registration metadata instead
-of hand-maintained literal tuples, mirroring `app.py`'s existing
-`_add_admin_trailing_slash_aliases` idiom — this is also where the
-Phase-1-deferred SSO-trusted-proxy question belongs, designed properly
-rather than delegated wholesale. Fine to defer past this plan's initial
-pass if time-boxed — flag explicitly rather than silently dropping.
+Both were filed as "generalize an idiom that already works, nothing
+broken today." That held for N5. It did **not** hold for N3 Tier 2 —
+building the shared source of truth is what surfaced the three live bugs
+listed under N3 Tier 2 below, which is itself the finding: two
+independently-maintained classifiers do not stay in agreement, and you
+only see the disagreements when you force them through one function.
 
-**N5 — done (this PR).** `core/stream_gates.RevalidatingStream` is the
+**N5 — done.** `core/stream_gates.RevalidatingStream` is the
 streaming-lifecycle analogue of `perm_gates.read_body_and_revalidate`:
 `await gate.next_slice()` IS the bounded wait AND the liveness re-check,
 so the next event cannot be obtained without a fresh verdict. All four
@@ -413,6 +411,49 @@ streams (`events.py`, `delivery.py`, `main_app.py`'s GET /mcp pump,
   it strictly widens coverage, because the old shape left the *idle*
   branch unchecked — which matters for `wait_for_events`, whose idle
   branch can itself return scheduled-fire and idle-reminder content.
+
+**N3 Tier 2 — done.** `agent_mcp/router/path_policy.py` is now the one
+home for the three remaining classification questions, consumed by
+`auth_middleware`, `setup_wizard` and `app.backend_api_handler`. Tests:
+`tests/router/test_arch_n3_tier2_classification.py`.
+
+- *Is this path public?* The auth-bypass allowlist's exact-path half is
+  now **derived** from the routing table: `path_policy.public_route`
+  marks a *handler* at its registration site and `public_paths()` walks
+  the registered routes for that mark — the
+  `_add_admin_trailing_slash_aliases` idiom, so every mechanically-
+  derived re-registration (trailing-slash alias, ADR-0020 root mirror)
+  inherits the marking for free. **Live bug fixed**: the old
+  `/agent-mcp/api/router/health` entry claimed in its own comment to be
+  "exact-prefixed" but was matched with `path.startswith`, so a future
+  `/api/router/health-details` route would have silently bypassed the
+  session gate — the R5-F6 unbounded-prefix class, fixed in the ROUTING
+  table but never in this AUTH-BYPASS allowlist.
+- *Auth-bypass vs setup-redirect prefixes* were **deliberately not
+  merged**: `/login` + `/logout` must bypass auth but must NOT bypass
+  the fresh-install redirect (there is no account to log into yet), and
+  `/api/` is the exact inverse. They share a home and a matcher; a test
+  pins the exact symmetric difference so a future edit has to state its
+  case.
+- *Is this a delivery route?* One `path_policy.is_delivery(project,
+  rest)`, called by both the path-shaped gate and the (name, rest)-shaped
+  version gate. **Live bugs fixed**: the trailing-slash form skipped the
+  operator gate but tripped the version gate (406); and the regex's
+  `[^/]+` project group matched the reserved `router` admin segment, so
+  `/api/router/delivery/stream` skipped the operator gate entirely.
+- *Which project is this?* The auth layer now resolves ADR-0010 aliases
+  through the same `app._resolve_project_or_alias` the proxy uses.
+  **Live bug fixed**: during a rename-with-grace window a genuine member
+  hitting the OLD alias got the unknown-project response, because
+  membership was looked up against the raw alias segment. The `/mcp`
+  transport already resolved-then-gated; REST/dashboard now matches. The
+  Principal is stamped with the real project name too, so per-project
+  capability grants resolve on alias URLs.
+- *Still deliberately out of scope*: the Phase-1-deferred
+  SSO-vs-`rate_limit` trusted-proxy question. It is a trust-model
+  decision (should SSO's proxy-header trust gain a loopback carve-out?),
+  not a classification-derivation one, and nothing in this tier makes it
+  cheaper to answer — it stays flagged for the operator.
 
 ### Phase 5 — largest effort, do last
 
