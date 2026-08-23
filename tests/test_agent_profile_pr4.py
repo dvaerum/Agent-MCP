@@ -135,12 +135,23 @@ def test_view_agents_worker_sees_peer_profile(project_dir, reset_globals):
 
 
 def test_view_agents_denies_anonymous(project_dir, reset_globals):
-    from agent_mcp.core.tool_result import PermissionDenied
+    """A cap-less principal is denied the roster.
+
+    Phase 2 (Finding A): the gate moved from an in-body
+    ``return PermissionDenied`` to ``@requires_predicate`` on the impl,
+    so the denial now arrives as a raised ``AuthRejected``. Identical
+    admission decision (``_principal_can_view_roster`` is the same
+    predicate, unchanged) and identical wire shape (REST 403 / MCP
+    isError=True); only the carrier moved.
+    """
+    import pytest
+
+    from agent_mcp.core.authorize import AuthRejected
 
     with _make_client(project_dir):
         _seed_agent("alice")
-        res = _call(_anon_principal())
-        assert isinstance(res, PermissionDenied)
+        with pytest.raises(AuthRejected):
+            _call(_anon_principal())
 
 
 def test_view_agents_admits_operator(project_dir, reset_globals):

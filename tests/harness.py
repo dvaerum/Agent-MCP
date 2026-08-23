@@ -277,6 +277,52 @@ def seed_agent_rows(*agent_ids: str) -> None:
         conn.close()
 
 
+async def dispatch_expecting_denial(
+    tool_name: str,
+    arguments: dict[str, Any],
+    *,
+    principal: Any = None,
+) -> str:
+    """Dispatch ``tool_name`` and assert the caller was DENIED; return
+    the denial reason text.
+
+    Two denial SHAPES are equivalent at every wire seam and this helper
+    accepts both:
+
+    * a returned :class:`~agent_mcp.core.tool_result.PermissionDenied`
+      variant (an in-body gate) — REST 403, MCP ``isError=True`` with
+      ``"Unauthorized: <reason>"``;
+    * a raised :class:`~agent_mcp.core.authorize.AuthRejected` (a
+      registration-time ``@requires_*`` gate, which ``dispatch_tool_call``
+      evaluates BEFORE jsonschema validation per R20-F4/R21-F1) — REST
+      403, MCP ``isError=True`` with the reason verbatim.
+
+    Security-hardening Phase 2 (Finding A) moves per-tool gates from the
+    first shape to the second; tests assert "this caller is denied (and
+    why)", not which internal representation carried the denial. Same
+    rationale as :meth:`WorkerSession.assert_unauthorized`, which has
+    always asserted on the wire shape rather than the exception type.
+    """
+    from agent_mcp.core.authorize import AuthRejected
+    from agent_mcp.core.tool_result import PermissionDenied
+    from agent_mcp.tools.registry import dispatch_tool_call
+
+    try:
+        result = await dispatch_tool_call(
+            tool_name, arguments, principal=principal
+        )
+    except AuthRejected as exc:
+        return exc.reason
+
+    if isinstance(result, PermissionDenied):
+        return result.reason
+
+    pytest.fail(
+        f"{tool_name}({arguments!r}) was expected to be denied; "
+        f"got {result!r}"
+    )
+
+
 def _is_unauthorized(text: str) -> bool:
     if not text:
         return False

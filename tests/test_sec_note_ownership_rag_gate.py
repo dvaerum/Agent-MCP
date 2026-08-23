@@ -32,8 +32,9 @@ import datetime as _dt
 
 import pytest
 
+from agent_mcp.core.authorize import AuthRejected
 from agent_mcp.core.principal import Principal
-from agent_mcp.core.tool_result import NotFound, Ok, PermissionDenied
+from agent_mcp.core.tool_result import NotFound, Ok
 from agent_mcp.tools.rag_tools import ask_project_rag_tool_impl
 from agent_mcp.tools.task_notes_tools import add_task_note_tool_impl
 from tests.harness import make_principal, mcp_session
@@ -198,14 +199,21 @@ async def test_note_to_nonexistent_task_rejected(tmp_path) -> None:
 
 async def test_empty_cap_bearer_denied_rag(tmp_path) -> None:
     """A bearer with ``agent_role=None`` (empty capability bundle) is
-    denied — the bare ``kind`` check no longer admits it."""
+    denied — the bare ``kind`` check no longer admits it.
+
+    Phase 2 (Finding A): the gate is now ``@requires_predicate`` on the
+    impl, so the denial arrives as a raised ``AuthRejected`` rather than
+    a returned ``PermissionDenied``. Same decision, same reason text —
+    only the carrier changed (both are REST 403 / MCP isError=True).
+    """
     async with mcp_session(tmp_path):
         nobody = _agent(agent_id="nobody", role=None)
-        result = await ask_project_rag_tool_impl(
-            {"query": "leak the corpus"},
-            principal=nobody,
-        )
-        assert isinstance(result, PermissionDenied), result
+        with pytest.raises(AuthRejected) as excinfo:
+            await ask_project_rag_tool_impl(
+                {"query": "leak the corpus"},
+                principal=nobody,
+            )
+        assert "rag.query" in excinfo.value.reason
 
 
 async def test_worker_with_rag_query_allowed(tmp_path) -> None:
@@ -225,8 +233,8 @@ async def test_operator_still_denied_rag(tmp_path) -> None:
     ``rag.query`` in their bundle — the ``kind`` check is preserved."""
     async with mcp_session(tmp_path):
         op = _operator()
-        result = await ask_project_rag_tool_impl(
-            {"query": "hi"},
-            principal=op,
-        )
-        assert isinstance(result, PermissionDenied), result
+        with pytest.raises(AuthRejected):
+            await ask_project_rag_tool_impl(
+                {"query": "hi"},
+                principal=op,
+            )
