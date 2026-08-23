@@ -491,6 +491,57 @@ def test_count_query_offset_pagination_survives_concurrent_read_flag_change(
         )
 
 
+def test_count_query_total_excludes_message_deleted_mid_sweep(
+    project_dir, reset_globals,
+):
+    """R21-F3: ``count_query`` must subtract anchored ids that no
+    longer resolve to a live row by read time -- not just report the
+    raw anchor length.
+
+    7 messages anchored at offset=0 -> total 7. One NOT-yet-fetched
+    anchored message is hard-deleted (``message_repo.delete``). Paging
+    through offset=2,4,6 (limit=2 each, same filter) must report
+    total=6 on every remaining page -- ``query``'s window already
+    correctly omits the deleted row -- and the rows actually
+    delivered across the whole sweep must sum to 6.
+    """
+    with _make_client(project_dir):
+        from agent_mcp.repositories import message_repo
+
+        _seed_agent("erin")
+        _seed_agent("frank")
+        for i in range(7):
+            _seed_message(
+                f"tcm{i}", sender_id="erin", recipient_id="frank",
+                timestamp=f"2026-08-0{i + 1}T00:00:00", read=False,
+            )
+
+        filters = {"to": "frank", "read": False, "limit": 2}
+        page1 = message_repo.query({**filters, "offset": 0})
+        total1 = message_repo.count_query({**filters, "offset": 0})
+        assert total1 == 7
+        delivered = list(page1)
+
+        # tcm4 (anchored, third-ranked -- DESC by timestamp -- not yet
+        # fetched) is deleted outright.
+        assert message_repo.delete("tcm4") is True
+
+        for offset in (2, 4, 6):
+            page = message_repo.query({**filters, "offset": offset})
+            total = message_repo.count_query({**filters, "offset": offset})
+            assert total == 6, (
+                f"total must exclude the anchored-but-deleted message; "
+                f"offset={offset} reported {total}"
+            )
+            delivered.extend(page)
+
+        assert len(delivered) == 6, (
+            f"rows actually delivered across the full sweep must equal "
+            f"the reported total; delivered="
+            f"{[m['message_id'] for m in delivered]!r}"
+        )
+
+
 def test_count_query_does_not_clobber_query_anchor_with_unordered_ids(
     project_dir, reset_globals,
 ):

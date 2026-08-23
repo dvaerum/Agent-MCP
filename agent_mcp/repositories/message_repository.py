@@ -71,7 +71,7 @@ After the flip:
 from __future__ import annotations
 
 import contextlib
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 from sqlalchemy import (
     delete as sa_delete,
@@ -1014,7 +1014,20 @@ class MessageRepository:
                 ordered_ids = self._pagination_cache.get_or_anchor(
                     cache_key, offset=offset, compute=compute_ordered_ids,
                 )
-                return len(ordered_ids)
+                # R21-F3: ``ordered_ids`` is the anchor frozen at
+                # sweep-start — some of those messages may have been
+                # hard-deleted since. ``query()`` already omits a dead
+                # anchored id from its window (via its own ``rows_by_id``
+                # membership check); this method previously trusted the
+                # raw anchor length instead of running the equivalent
+                # existence check, over-counting a since-deleted row.
+                # Route through the same shared existence-check helper
+                # ``query`` effectively performs, applied to the FULL
+                # anchored set, so the two can't independently diverge
+                # (the R18-F2 drift class).
+                return len(
+                    self._existing_message_ids(session, ordered_ids)
+                )
         except SQLAlchemyError as e:
             logger.error(
                 f"Database error counting message query: {e}",
@@ -1090,6 +1103,29 @@ class MessageRepository:
         )
         id_stmt = id_stmt.order_by(order_col, AgentMessage.message_id.asc())
         return [row[0] for row in session.execute(id_stmt).all()]
+
+    @staticmethod
+    def _existing_message_ids(session: Any, ids: List[str]) -> Set[str]:
+        """Return the subset of ``ids`` that still correspond to a live
+        ``AgentMessage`` row (R21-F3).
+
+        Shared by :meth:`query` (which filters its window through this
+        same existence check via its own ``rows_by_id`` lookup) and
+        :meth:`count_query` (which needs it over the FULL anchored id
+        list, not just the window, to report an accurate ``total``) —
+        one existence-check implementation so the window and the total
+        structurally cannot diverge (the R18-F2 drift class).
+        """
+        if not ids:
+            return set()
+        return {
+            row[0]
+            for row in session.execute(
+                select(AgentMessage.message_id).where(
+                    AgentMessage.message_id.in_(ids)
+                )
+            ).all()
+        }
 
     @staticmethod
     def _apply_query_filters(

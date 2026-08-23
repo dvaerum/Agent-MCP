@@ -239,6 +239,56 @@ async def test_offset_pagination_survives_concurrent_status_change(
         )
 
 
+# --- 7. R21-F3: reported total excludes a row deleted mid-sweep ------
+
+
+async def test_total_excludes_task_deleted_mid_sweep(tmp_path) -> None:
+    """R21-F3: the ``Total:`` line must subtract anchored ids that no
+    longer resolve to a live row by read time -- not just report the
+    raw anchor length.
+
+    7 tasks anchored at offset=0 -> Total: 7. One NOT-yet-fetched
+    anchored task is deleted outright. Paging through offset=2,4,6
+    (limit=2 each) must report Total: 6 on every remaining page -- the
+    window already correctly omits the deleted row -- and the task
+    blocks actually delivered across the whole sweep must sum to 6.
+    """
+    from agent_mcp.core import globals as g
+
+    async with mcp_session(tmp_path) as admin:
+        ids = _seed_tasks("admin", count=7)
+        # _seed_tasks creates ids in ascending created_at order; sorted
+        # DESC (the default), ids[-3] is third-ranked (not yet fetched
+        # by a limit=2 page 1).
+        victim_id = ids[-3]
+
+        def _ids(text: str) -> set[str]:
+            return {
+                line.removeprefix("ID: ").strip()
+                for line in text.splitlines()
+                if line.startswith("ID: task_")
+            }
+
+        page1 = await _view(admin, {"limit": 2, "offset": 0})
+        assert "Total: 7" in page1
+        delivered = set(_ids(page1))
+
+        del g.tasks[victim_id]
+
+        for offset in (2, 4, 6):
+            page = await _view(admin, {"limit": 2, "offset": offset})
+            assert "Total: 6" in page, (
+                f"Total must exclude the deleted anchored task; "
+                f"offset={offset}:\n{page}"
+            )
+            delivered |= _ids(page)
+
+        assert len(delivered) == 6, (
+            f"task blocks actually delivered across the full sweep must "
+            f"equal the reported total; delivered={delivered!r}"
+        )
+
+
 # --- 5. Backward-compat regression: no new params -> existing shape ---
 
 

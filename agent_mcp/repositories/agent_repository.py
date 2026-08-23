@@ -814,7 +814,26 @@ class AgentRepository:
                 ordered_ids = self._pagination_cache.get_or_anchor(
                     cache_key, offset=offset, compute=compute_ordered_ids,
                 )
-                total = len(ordered_ids)
+
+                # R21-F3: ``ordered_ids`` is the anchor frozen at
+                # sweep-start — some of those agents may have been
+                # hard-deleted since. Resolve existence against the
+                # FULL anchored set (same ``.in_()`` existence check
+                # the window query below runs against just its
+                # subset) so ``total`` reflects ids that will actually
+                # be deliverable across the whole sweep, not the raw
+                # anchor length.
+                existing_ids = (
+                    {
+                        row[0]
+                        for row in session.query(Agent.agent_id)
+                        .filter(Agent.agent_id.in_(ordered_ids))
+                        .all()
+                    }
+                    if ordered_ids
+                    else set()
+                )
+                total = len(existing_ids)
                 window_ids = ordered_ids[offset:] if offset else ordered_ids
                 window_ids = window_ids[:limit]
 

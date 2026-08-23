@@ -3629,7 +3629,17 @@ async def view_tasks_tool_impl(
     # legacy: total reflects the list AFTER start_after but BEFORE
     # offset+limit (now the anchored count on an offset>0 cache hit,
     # consistent with the anchored window it describes).
-    total_matching = len(ordered_ids)
+    #
+    # R21-F3: ``ordered_ids`` is the anchor frozen at sweep-start —
+    # some of those ids may have been deleted outright since. Run the
+    # SAME ``tid in tasks_by_id`` liveness check the window below
+    # already applies, once, up front, and derive ``total_matching``
+    # from its length — reusing the raw anchor length would
+    # over-count a since-deleted row, and computing the window's
+    # liveness check independently from the total's is exactly the
+    # twin-computation drift the ``StableOrderCache`` class was
+    # already bitten by once (R18-F2).
+    total_matching = sum(1 for tid in ordered_ids if tid in tasks_by_id)
     window_ids = ordered_ids[offset:] if offset else ordered_ids
     if limit is not None:
         window_ids = window_ids[:limit]

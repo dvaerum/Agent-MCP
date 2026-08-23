@@ -484,3 +484,56 @@ def test_offset_pagination_omits_row_deleted_from_anchored_window() -> None:
     # t3 (anchored at this position) was deleted outright -- omitted,
     # not backfilled from t1. No crash, no reintroducing the shift bug.
     assert [t["task_id"] for t in page2.tasks] == ["t2"]
+
+
+def _seven_pending_tasks() -> dict[str, dict[str, Any]]:
+    """7 pending tasks, newest-first by created_at — the R21-F3 repro
+    shape."""
+    base = _dt.datetime(2025, 6, 1)
+    return {
+        f"t{n}": _task(
+            f"t{n}",
+            status="pending",
+            created_at=(base + _dt.timedelta(minutes=n)).isoformat(),
+        )
+        for n in range(1, 8)
+    }
+
+
+def test_total_count_excludes_anchored_row_deleted_mid_sweep() -> None:
+    """R21-F3: ``total_count`` must subtract anchored ids that no
+    longer resolve to a live row by read time -- not just report the
+    raw anchor length.
+
+    Live-reproduced: 7 pending tasks anchored at offset=0 -> Total: 7.
+    One NOT-yet-fetched anchored task is deleted outright. Paging
+    through offset=2,4,6 (limit=2 each) must report Total: 6 on every
+    remaining page (the window already correctly omits the deleted
+    row per R17-F2/R18-F2 -- only the total was stale), and the rows
+    actually delivered across the whole sweep must sum to 6, matching
+    the corrected total.
+    """
+    tasks = _seven_pending_tasks()
+    engine = TaskQueryEngine(task_source=lambda: tasks)
+    filters = TaskFilterSpec(status="pending")
+    sort = TaskSortSpec(by="created_at")
+
+    page1 = engine.query(filters=filters, sort=sort, offset=0, limit=2)
+    assert page1.total_count == 7
+    delivered = list(page1.tasks)
+
+    # t3 (anchored, third-ranked, not yet fetched) is deleted outright.
+    del tasks["t3"]
+
+    for offset in (2, 4, 6):
+        page = engine.query(filters=filters, sort=sort, offset=offset, limit=2)
+        assert page.total_count == 6, (
+            f"total_count must exclude the anchored-but-deleted row; "
+            f"offset={offset} reported {page.total_count}"
+        )
+        delivered.extend(page.tasks)
+
+    assert len(delivered) == 6, (
+        f"rows actually delivered across the full sweep must equal the "
+        f"reported total; delivered={[t['task_id'] for t in delivered]!r}"
+    )
