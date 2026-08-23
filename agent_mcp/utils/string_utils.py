@@ -166,6 +166,25 @@ MEMORY_KEY_ERROR = {
     ),
 }
 
+# R20-F2: settings.py's ``context_key`` sibling of MEMORY_KEY_ERROR.
+# Same allowlist (MEMORY_KEY_RE / is_valid_memory_key) applied to
+# project_settings' context_key -- the denylist in
+# has_unsafe_unicode_for_identifier misses Unicode categories Lo/So
+# (e.g. U+115F HANGUL CHOSEONG FILLER, U+2800 BRAILLE PATTERN BLANK),
+# which render as blank/invisible glyphs but were never in the
+# hand-enumerated range table above. config_* keys are internal toggle
+# identifiers, not user-facing text, so the same ASCII-only positive
+# allowlist memories.py already enforces is the right fit here too --
+# just a settings-flavoured message so the surface a caller hits
+# (memories vs settings) always names itself correctly.
+SETTING_KEY_ERROR = {
+    "error": "invalid_key_character",
+    "message": (
+        "Setting key may contain only letters, digits, and . _ / - "
+        "(A-Z a-z 0-9 . _ / -)."
+    ),
+}
+
 
 def camel_to_snake_case(camel_string: str) -> str:
     """
