@@ -114,6 +114,7 @@ from aiohttp import (
     web,
 )
 
+from ..utils.json_utils import UntrustedBodyError, decode_untrusted_body
 from . import project_registry  # sibling module — see ./project_registry.py
 from . import mount  # ADR-0020: per-request external prefix/origin
 from . import asset_prefix as _asset_prefix  # Phase 4: runtime sentinel sub
@@ -2222,41 +2223,49 @@ def _success_envelope(payload: dict, *, status: int = 200) -> web.Response:
 
 async def _parse_json_body(req: web.Request) -> dict:
     """Tolerant JSON body parser. Empty body → empty dict (some POSTs
-    take no fields). Non-JSON body raises 400 via the envelope."""
+    take no fields). Non-JSON body raises 400 via the envelope.
+
+    N1 (security-arch hardening pass 2): this used to call a bare
+    ``json.loads(raw)``. It backs the /api/projects lifecycle handlers
+    in ``admin_api.py`` — ``create_project_handler`` and
+    ``rename_project_handler`` — so the project ``name``, which becomes
+    the on-disk project slug AND the label rendered in the dashboard
+    project list, was the one operator-supplied JSON field in this
+    codebase that never met ``utils.json_utils``'s hidden-Unicode
+    strip. A zero-width space or an RTL override round-tripped into the
+    registry verbatim, giving two projects visually-identical names.
+
+    It is now a thin call-through to ``json_utils.decode_untrusted_body``
+    — the single decode seam shared with ``get_sanitized_json_body``
+    (FastAPI tier) and ``admin_users_api._json_body``. Everything the
+    inline body used to do (PF-R21-1 invalid-UTF8, PF-R20-1
+    recursion-depth, PF-R12-1 top-level-object guard) lives there now;
+    only the ``invalid_json`` error code below is this endpoint family's
+    own API contract, so it stays here.
+    """
     raw = await req.read()
     if not raw:
+        # Kept at the call site rather than folded into the seam: a few
+        # aiohttp POSTs legitimately take no fields, whereas the FastAPI
+        # tier has always 400'd an empty body. See the "empty body"
+        # bullet in ``decode_untrusted_body``'s docstring.
         return {}
     try:
-        parsed = json.loads(raw)
-    except (ValueError, RecursionError) as exc:
-        # Broaden to ValueError (was JSONDecodeError): an invalid-UTF8
-        # body makes ``json.loads(bytes)`` raise ``UnicodeDecodeError``
-        # — a ``ValueError`` subclass but NOT a ``JSONDecodeError`` — so
-        # the narrower guard let it propagate to an uncaught 500
-        # (PF-R21-1). ``ValueError`` covers BOTH JSONDecodeError and
-        # UnicodeDecodeError; ``RecursionError`` (a ``RuntimeError``, so
-        # not a ValueError subclass) stays explicit for the deeply-nested
-        # body case (PF-R20-1). All are a malformed body → clean 400.
-        # Raise via aiohttp so the per-endpoint handler can catch and
-        # surface through the envelope (sticking the message into the
-        # exception keeps the call sites simple).
-        msg = exc.msg if isinstance(exc, json.JSONDecodeError) else str(exc)
+        return decode_untrusted_body(raw)
+    except UntrustedBodyError as exc:
+        # ``str(exc)`` is already the client-safe message the seam chose
+        # ("request body is not valid JSON: …" / "… must be a JSON
+        # object" / "… is too deeply nested"). Raise via aiohttp so the
+        # per-endpoint handler can catch and surface through the
+        # envelope (sticking the message into the exception keeps the
+        # call sites simple).
         raise web.HTTPBadRequest(
             text=json.dumps({
                 "success": False, "error": "invalid_json",
-                "message": f"request body is not valid JSON: {msg}",
+                "message": str(exc),
             }),
             content_type="application/json",
         )
-    if not isinstance(parsed, dict):
-        raise web.HTTPBadRequest(
-            text=json.dumps({
-                "success": False, "error": "invalid_json",
-                "message": "request body must be a JSON object",
-            }),
-            content_type="application/json",
-        )
-    return parsed
 
 
 def _rest_gated(handler):

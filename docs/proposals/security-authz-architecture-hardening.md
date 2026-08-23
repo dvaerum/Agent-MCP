@@ -160,6 +160,23 @@ live bypasses (project create/rename, `identity.create_user`'s `username`,
 `main_app.py` clientInfo, `sso.py`'s flow cookie, form-encoded credential
 paths), and add `test_arch_enforced_sanitization.py`.
 
+**Delivered** as `json_utils.decode_untrusted_body` plus the AST
+discovery test. Scope moved in two places, both recorded where a reader
+will hit them rather than restated here:
+
+- `sso._decode_flow_cookie` is **deferred to Phase 3**, not fixed — it
+  lives in the file Finding C is reworking, so fixing it here would
+  collide. It carries a declared exemption in
+  `tests/router/test_arch_enforced_sanitization.py` naming Phase 3 as
+  its owner; Phase 3 must route it through the seam and delete that
+  entry.
+- the form-encoded credential paths took the **declared-exemption**
+  branch of the "join the seam or declare out of scope" question.
+  Identity fields are sanitized at the write instead
+  (`identity.create_user`, which now strips `username` as well as
+  `email`); the reasoning and its tests are in
+  `tests/router/test_arch_n1_form_credentials.py`.
+
 ### Phase 2 — the structural lever
 
 - **A — capability as a registration argument.** This is the big one:

@@ -62,7 +62,7 @@ from typing import Any, Iterable
 
 from aiohttp import web
 
-from ..utils.json_utils import sanitize_json_input
+from ..utils.json_utils import UntrustedBodyError, decode_untrusted_body
 from . import group_resolver, identity
 from .router_store import store
 from .single_tenant import bypasses_operator_gate
@@ -260,10 +260,10 @@ def _error(
 
 async def _json_body(req: web.Request) -> dict:
     """Read + parse the request body — routed through the shared
-    ``sanitize_json_input`` chokepoint (R15-F2).
+    ``json_utils.decode_untrusted_body`` seam (R15-F2, N1).
 
-    Pre-fix this called a bare ``json.loads(raw)``, the ONE JSON-body
-    surface in the codebase that never went through
+    Pre-R15-F2 this called a bare ``json.loads(raw)``, the ONE JSON-body
+    surface at the time that never went through
     ``utils.json_utils.sanitize_json_input`` — every sibling (MCP
     ``tools/call`` via ``dispatch_tool_call``, the FastAPI
     ``app/routers/*`` tier via ``get_sanitized_json_body``) strips C0/C1/
@@ -272,15 +272,13 @@ async def _json_body(req: web.Request) -> dict:
     spoofing characters (zero-width space, RTLO, …) survive unstripped
     into ``email`` and get echoed back verbatim by ``GET /users``.
 
-    ``sanitize_json_input`` decodes bytes itself (UTF-8 with a latin-1
-    fallback) and raises ``ValueError`` on any parse failure — it never
-    raises ``json.JSONDecodeError`` directly, so the ``exc.msg`` special
-    case below is dead for this call site but kept for defensiveness (a
-    future ``sanitize_json_input`` change that raises a JSONDecodeError
-    subclass would still get the more precise message). ``RecursionError``
-    stays an explicit sibling: it can still surface from CPython's C
-    JSON decoder on a deeply nested body (PF-R20-1), and from the walk in
-    ``_strip_control_bytes`` on a deeply nested already-parsed structure.
+    N1 turned that per-wrapper fix into a seam: the parse, the
+    PF-R21-1 invalid-UTF8 handling, the PF-R20-1 recursion-depth
+    handling and the PF-R12-1 top-level-object guard all live in
+    ``decode_untrusted_body`` now, shared with ``get_sanitized_json_body``
+    and ``router.app._parse_json_body``, so the three cannot drift apart
+    on any of them again. Only the error CODE below is this tier's own
+    contract.
 
     NOTE (R16-F3 update): at the time R15-F2 wrote this, ``Cs``
     (Surrogate) was NOT one of the hidden-format categories the
@@ -297,35 +295,24 @@ async def _json_body(req: web.Request) -> dict:
     """
     raw = await req.read()
     if not raw:
+        # Kept at the call site rather than folded into the seam: a few
+        # aiohttp POSTs legitimately take no fields, whereas the FastAPI
+        # tier has always 400'd an empty body. See the "empty body"
+        # bullet in ``decode_untrusted_body``'s docstring.
         return {}
     try:
-        parsed = sanitize_json_input(raw)
-    except (ValueError, RecursionError) as exc:
-        # Broaden to ValueError (was JSONDecodeError): an invalid-UTF8
-        # body makes ``json.loads(bytes)`` raise ``UnicodeDecodeError``
-        # — a ``ValueError`` subclass but NOT a ``JSONDecodeError`` — so
-        # the narrower guard let it propagate to an uncaught 500
-        # (PF-R21-1). ``ValueError`` covers BOTH JSONDecodeError and
-        # UnicodeDecodeError; ``RecursionError`` (a ``RuntimeError``, not
-        # a ValueError subclass) stays explicit for the deeply-nested
-        # body case (PF-R20-1). All are a malformed body → clean 400.
-        msg = exc.msg if isinstance(exc, json.JSONDecodeError) else str(exc)
+        return decode_untrusted_body(raw)
+    except UntrustedBodyError as exc:
+        # ``str(exc)`` is already the client-safe message the seam chose
+        # ("request body is not valid JSON: …" / "… must be a JSON
+        # object" / "… is too deeply nested"). All are a bad body → 400.
         raise web.HTTPBadRequest(
             text=json.dumps({
                 "success": False, "error": _ERROR_VALIDATION,
-                "message": f"request body is not valid JSON: {msg}",
+                "message": str(exc),
             }),
             content_type="application/json",
         )
-    if not isinstance(parsed, dict):
-        raise web.HTTPBadRequest(
-            text=json.dumps({
-                "success": False, "error": _ERROR_VALIDATION,
-                "message": "request body must be a JSON object",
-            }),
-            content_type="application/json",
-        )
-    return parsed
 
 
 def _now_iso() -> str:
