@@ -749,8 +749,14 @@ async def terminate_agent_tool_impl(
                 row = cursor.fetchone()
                 if row:
                     # Agent exists in DB but not active memory. Proceed to terminate in DB.
+                    # Log only a token suffix, never the full bearer -- same
+                    # discipline agent_actions_db.py's audit trail already
+                    # applies (source_token_suffix, last 4 chars).
+                    token_suffix = (
+                        row["token"][-4:] if row["token"] else "????"
+                    )
                     logger.warning(
-                        f"Agent {agent_id_to_terminate} found in DB (token: {row['token']}) but not in active memory. Proceeding with DB termination."
+                        f"Agent {agent_id_to_terminate} found in DB (token ends in: ...{token_suffix}) but not in active memory. Proceeding with DB termination."
                     )
                     # We don't have its token to remove from g.active_agents if it's not there.
                 else:

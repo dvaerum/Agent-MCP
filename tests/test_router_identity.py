@@ -264,7 +264,7 @@ def test_env_var_bootstrap(
     init_router_db() creates the first operator AND clears the env
     vars so they don't leak to subprocess spawns."""
     monkeypatch.setenv("AGENT_MCP_BOOTSTRAP_USERNAME", "boot_op")
-    monkeypatch.setenv("AGENT_MCP_BOOTSTRAP_PASSWORD", "boot_pw")
+    monkeypatch.setenv("AGENT_MCP_BOOTSTRAP_PASSWORD", "boot_pw_12chars")
 
     import agent_mcp.router.identity as identity
 
@@ -273,7 +273,7 @@ def test_env_var_bootstrap(
 
     row = identity.get_user_by_username("boot_op")
     assert row is not None
-    assert identity.verify_password(row["password_hash"], "boot_pw")
+    assert identity.verify_password(row["password_hash"], "boot_pw_12chars")
 
     # Env vars must be gone — they're a secret and we don't want them
     # to flow into any agent subprocess spawned later.
@@ -335,7 +335,7 @@ def test_env_var_bootstrap_grants_existing_projects(
     )
 
     monkeypatch.setenv("AGENT_MCP_BOOTSTRAP_USERNAME", "ops")
-    monkeypatch.setenv("AGENT_MCP_BOOTSTRAP_PASSWORD", "ops_pw")
+    monkeypatch.setenv("AGENT_MCP_BOOTSTRAP_PASSWORD", "ops_pw_12chars")
 
     import agent_mcp.router.identity as identity
 
@@ -379,7 +379,7 @@ def test_cli_create_operator(
             "cli_op",
             "--password-stdin",
         ],
-        input="cli_pw\n",
+        input="cli_pw_12chars\n",
         capture_output=True,
         text=True,
         env=env,
@@ -404,7 +404,7 @@ def test_cli_create_operator(
     importlib.reload(identity)
     row = identity.get_user_by_username("cli_op")
     assert row is not None
-    assert identity.verify_password(row["password_hash"], "cli_pw")
+    assert identity.verify_password(row["password_hash"], "cli_pw_12chars")
 
 
 def test_cli_create_operator_duplicate_username(
@@ -432,11 +432,11 @@ def test_cli_create_operator_duplicate_username(
         "--password-stdin",
     ]
     first = subprocess.run(
-        cmd, input="x\n", capture_output=True, text=True, env=env, timeout=30, check=False
+        cmd, input="first_pw_12ch\n", capture_output=True, text=True, env=env, timeout=30, check=False
     )
     assert first.returncode == 0
     second = subprocess.run(
-        cmd, input="y\n", capture_output=True, text=True, env=env, timeout=30, check=False
+        cmd, input="second_pw_12ch\n", capture_output=True, text=True, env=env, timeout=30, check=False
     )
     assert second.returncode != 0
     combined = (second.stdout + second.stderr).lower()
