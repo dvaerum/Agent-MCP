@@ -491,6 +491,114 @@ def test_count_query_offset_pagination_survives_concurrent_read_flag_change(
         )
 
 
+def test_count_query_does_not_clobber_query_anchor_with_unordered_ids(
+    project_dir, reset_globals,
+):
+    """R18-F2: ``list_messages_api_route`` calls ``query()`` then
+    ``count_query()`` back-to-back with IDENTICAL filters on every
+    request (see ``agent_mcp/app/routers/messages.py``). Both share
+    ONE ``StableOrderCache`` entry (keyed by filter shape), and
+    ``get_or_anchor`` always recomputes + OVERWRITES that entry on
+    ``offset == 0``. If ``count_query``'s ``compute_ordered_ids``
+    closure sorts differently than ``query``'s (or not at all), calling
+    it right after ``query()`` on the SAME page-1 request clobbers the
+    correct anchor with the wrong one -- corrupting every subsequent
+    ``offset > 0`` page of the sweep, with no concurrency or mutation
+    needed at all.
+
+    6 messages, page1 (offset=0, limit=10, mirroring the route calling
+    query() then count_query()) must anchor the DESC ordering; page2
+    (offset=2, same filters, no writes in between) must then replay
+    that SAME DESC ordering, not an unordered/ASC one.
+
+    Filters deliberately carry no ``to``/``from`` (the dashboard's
+    default, unfiltered "all messages" Messages-tab view) so
+    ``compute_ordered_ids`` falls back to a plain unindexed table
+    scan -- rowid/insertion order -- rather than an index seek on
+    ``recipient_id``/``sender_id`` that can incidentally happen to
+    come back in descending order and mask the missing ``ORDER BY``.
+    """
+    with _make_client(project_dir):
+        from agent_mcp.repositories import message_repo
+
+        _seed_agent("eve")
+        _seed_agent("frank")
+        for i in range(1, 7):
+            _seed_message(
+                f"m{i}", sender_id="eve", recipient_id="frank",
+                timestamp=f"2026-08-0{i}T00:00:00",
+            )
+
+        filters = {"limit": 10}
+
+        # Mirrors list_messages_api_route: query() then count_query(),
+        # identical filters, both at offset=0.
+        page1 = message_repo.query({**filters, "offset": 0})
+        assert [m["message_id"] for m in page1] == [
+            "m6", "m5", "m4", "m3", "m2", "m1",
+        ], page1
+        total = message_repo.count_query({**filters, "offset": 0})
+        assert total == 6, total
+
+        # No writes in between -- a second page must replay the exact
+        # same anchored DESC ordering, sliced by offset.
+        page2 = message_repo.query({**filters, "offset": 2})
+        assert [m["message_id"] for m in page2] == [
+            "m4", "m3", "m2", "m1",
+        ], (
+            "count_query() must not clobber query()'s DESC-ordered "
+            f"anchor with an unordered list; got {page2!r}"
+        )
+
+
+def test_query_and_count_query_anchor_the_identical_ordered_ids(
+    project_dir, reset_globals,
+):
+    """Class-of-bug regression guard (not just this one instance):
+    ``query()`` and ``count_query()`` must compute the SAME ordered id
+    sequence for the identical filter shape, so their shared
+    ``StableOrderCache`` entry can never drift depending on which one
+    last wrote it. Asserts full-sweep equality directly rather than
+    re-deriving the R18-F2 scenario, so any FUTURE drift between the
+    two closures (not just an ordering difference) fails loudly here.
+
+    No ``to``/``from`` filter, for the same reason as the sibling test
+    above: an unindexed table scan is what actually exposes a missing
+    ``ORDER BY`` deterministically (an index seek on a `to`/`from`
+    equality filter can incidentally come back sorted either way).
+    """
+    with _make_client(project_dir):
+        from agent_mcp.repositories import message_repo
+
+        _seed_agent("gina")
+        _seed_agent("hank")
+        for i in range(1, 6):
+            _seed_message(
+                f"n{i}", sender_id="gina", recipient_id="hank",
+                timestamp=f"2026-08-1{i}T00:00:00",
+            )
+
+        filters = {"limit": 100}
+
+        message_repo.query({**filters, "offset": 0})
+        anchor_after_query = list(
+            next(iter(message_repo._pagination_cache._store.values()))[1]
+        )
+
+        message_repo.count_query({**filters, "offset": 0})
+        anchor_after_count = list(
+            next(iter(message_repo._pagination_cache._store.values()))[1]
+        )
+
+        assert anchor_after_query == ["n5", "n4", "n3", "n2", "n1"]
+        assert anchor_after_count == anchor_after_query, (
+            "query() and count_query() must compute the IDENTICAL "
+            "ordered id sequence for the same filter shape -- "
+            f"query()={anchor_after_query!r} "
+            f"count_query()={anchor_after_count!r}"
+        )
+
+
 # --- Write interface: send ----------------------------------------------
 
 
