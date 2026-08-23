@@ -2,7 +2,9 @@
 
 * Status: Accepted
 * Date: 2026-07-15
-* Plan: `prancy-napping-pie.md` — "Settings page — best-long-term redesign"
+* Plan: "prancy-napping-pie" — "Settings page — best-long-term
+  redesign" section; ephemeral plan file, never committed, no longer
+  available; this ADR is the durable record
 * Supersedes: nothing
 * Builds on: ADR-0016 (separate project config from project memory)
 

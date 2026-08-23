@@ -106,8 +106,10 @@ deploys upgrade without losing access.
 
 ## References
 
-- Plan: `prancy-napping-pie` Phase 1 (operator login + framework
-  migration).
+- Plan: originally Phase 1 (operator login + framework migration) of
+  the "prancy-napping-pie" working plan — an ephemeral Claude Code
+  plan-mode file, never committed to this repo, no longer available.
+  This ADR is the durable record.
 - Supersedes: ADR-0009 (dashboard owns the ops surface) — the "owns
   the ops surface" half stands; the "implicit admin" half is
   retired.

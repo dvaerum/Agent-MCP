@@ -206,7 +206,9 @@ cover all spec behaviours in-process.
 
 ## Links
 
-- Plan: `/home/dennis/.claude/plans/prancy-napping-pie.md`
+- Plan: the "prancy-napping-pie" working plan — an ephemeral Claude
+  Code plan-mode file, never committed to this repo, no longer
+  available. This ADR is the durable record.
 - PR #126 — schema + capability routing groundwork (v5.0.9)
 - PR #127 — required_capabilities dashboard chip fix (v5.0.10)
 - PR #128 — `wait_for_events` hardening + capability-routed wake + cursor (v5.0.11)

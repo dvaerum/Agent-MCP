@@ -73,7 +73,9 @@ The URL surface is identical in both modes.
 
 ## Links
 
-- Plan: `/home/dennis/.claude/plans/prancy-napping-pie.md` decision #1.
+- Plan: originally decision #1 of the "prancy-napping-pie" working
+  plan — an ephemeral Claude Code plan-mode file, never committed to
+  this repo, no longer available. This ADR is the durable record.
 - Phase 3 PR (when it ships) for the `multiTenant` toggle implementation.
 - Commit `c1d85d9` (router SPA fallback fix) and commit `ffd1c4a` (router
   aiohttp trailing-slash fix) — concrete examples of the bug class this

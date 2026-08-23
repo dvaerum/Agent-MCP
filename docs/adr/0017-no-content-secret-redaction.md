@@ -2,7 +2,8 @@
 
 * Status: Accepted
 * Date: 2026-07-15
-* Plan: `prancy-napping-pie.md` Wave 12
+* Plan: "prancy-napping-pie" Wave 12 — ephemeral plan file, never
+  committed, no longer available; this ADR is the durable record
 * Supersedes: the content-scanning approach of the pentest R2-F3 /
   R2-F3b / R3-F2 / R4 / R5 / pentest-R1 secret-in-content findings
 * Builds on: ADR-0016 (separate project config from project memory)

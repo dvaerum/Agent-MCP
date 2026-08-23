@@ -2,7 +2,8 @@
 
 * Status: Accepted
 * Date: 2026-06-18
-* Plan: `prancy-napping-pie.md` Phase 3 Wave 3 (v5.0.70)
+* Plan: "prancy-napping-pie" Phase 3 Wave 3 (v5.0.70) — ephemeral plan
+  file, never committed, no longer available; this ADR is the record
 * Supersedes: nothing
 * Builds on: ADR-0013 (operator login), ADR-0014 (REST admin API)
 
