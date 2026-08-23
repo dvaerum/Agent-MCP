@@ -142,6 +142,27 @@ def _synthesize_principal_from_arguments(
     return build_agent_bearer_principal(raw_token)
 
 
+def check_capability_gate(principal: Optional[Principal], cap: str) -> None:
+    """Raise :class:`AuthRejected` iff ``principal`` lacks ``cap``.
+
+    R20-F4: the single evaluation of "does this principal carry this
+    capability", shared by the :func:`requires_capability` wrapper AND
+    ``dispatch_tool_call``'s pre-schema-validation gate
+    (``agent_mcp.tools.registry``). Extracted so the dispatcher can
+    run the SAME check the decorator would have run — before
+    ``jsonschema.validate`` — without a second, potentially-drifting
+    copy of the capability-resolution logic. Reads the tool's
+    ``_required_capability`` attribute that ``requires_capability``
+    stamps on its wrapper (the same attribute
+    ``agent_mcp.tools.access._derive_access_level`` already consults
+    for ``tools/list`` visibility).
+    """
+    if principal is None:
+        raise AuthRejected("Unauthorized: Valid token required")
+    if not principal.has_capability(cap):
+        raise AuthRejected(f"Unauthorized: capability {cap!r} required")
+
+
 def requires_capability(cap: str) -> Callable[[ToolImpl], ToolImpl]:
     """Authorise a tool entry point against a single capability.
 
@@ -181,12 +202,7 @@ def requires_capability(cap: str) -> Callable[[ToolImpl], ToolImpl]:
         ) -> Any:
             if principal is None:
                 principal = _synthesize_principal_from_arguments(arguments)
-            if principal is None:
-                raise AuthRejected("Unauthorized: Valid token required")
-            if not principal.has_capability(cap):
-                raise AuthRejected(
-                    f"Unauthorized: capability {cap!r} required"
-                )
+            check_capability_gate(principal, cap)
             if forward_principal:
                 return await func(arguments, principal=principal, **kwargs)
             return await func(arguments, **kwargs)
@@ -198,6 +214,50 @@ def requires_capability(cap: str) -> Callable[[ToolImpl], ToolImpl]:
         return wrapper
 
     return decorator
+
+
+def check_policy_gate(
+    principal: Optional[Principal],
+    config_keys: tuple,
+    default: Optional[bool],
+) -> None:
+    """Raise :class:`AuthRejected` iff ``principal`` fails the
+    toggle-gated worker-access policy for ``config_keys``.
+
+    R20-F4: the single evaluation of the ``@requires_policy`` policy,
+    shared by the decorator's wrapper AND ``dispatch_tool_call``'s
+    pre-schema-validation gate — see :func:`check_capability_gate` for
+    the same rationale on the capability side. Reads the tool's
+    ``_required_policy_keys`` / ``_required_policy_default`` attributes
+    that :func:`requires_policy` stamps on its wrapper.
+    """
+    if principal is None:
+        raise AuthRejected("Unauthorized: Valid token required")
+    # Operator-tier callers (and the harness's ``agent_id == "admin"``
+    # label that historically stood in for "operator at the dashboard")
+    # bypass the toggle check.
+    if _is_operator_tier(principal):
+        return
+
+    # Agent path: a worker / manager bearer is required.
+    if principal.kind != "agent_bearer" or not principal.agent_id:
+        raise AuthRejected("Unauthorized: Valid token required")
+
+    # Lazy import: the access module pulls in DB helpers we don't want
+    # to load at module-import time (keeps decorator import cheap for
+    # code paths that never run a real tool — e.g. some unit tests).
+    from ..tools.access import _get_config_bool
+
+    for key in config_keys:
+        if _get_config_bool(key, default):
+            return
+
+    joined = ", ".join(config_keys)
+    raise AuthRejected(
+        f"Unauthorized: worker access denied by project policy "
+        f"(all of: {joined} are off). Ask admin to enable "
+        "one in dashboard Settings."
+    )
 
 
 def requires_policy(
@@ -250,34 +310,8 @@ def requires_policy(
             # ContextVar (token-retirement PR 2).
             if principal is None:
                 principal = _synthesize_principal_from_arguments(arguments)
-            if principal is None:
-                raise AuthRejected("Unauthorized: Valid token required")
-            # Operator-tier callers (and the harness's
-            # ``agent_id == "admin"`` label that historically stood in
-            # for "operator at the dashboard") bypass the toggle check.
-            if _is_operator_tier(principal):
-                return await _call(arguments, principal, kwargs)
-
-            # Agent path: a worker / manager bearer is required.
-            if principal.kind != "agent_bearer" or not principal.agent_id:
-                raise AuthRejected("Unauthorized: Valid token required")
-
-            # Lazy import: the access module pulls in DB helpers we
-            # don't want to load at module-import time (keeps
-            # decorator import cheap for code paths that never run a
-            # real tool — e.g. some unit tests).
-            from ..tools.access import _get_config_bool
-
-            for key in config_keys:
-                if _get_config_bool(key, default):
-                    return await _call(arguments, principal, kwargs)
-
-            joined = ", ".join(config_keys)
-            raise AuthRejected(
-                f"Unauthorized: worker access denied by project policy "
-                f"(all of: {joined} are off). Ask admin to enable "
-                "one in dashboard Settings."
-            )
+            check_policy_gate(principal, config_keys, default)
+            return await _call(arguments, principal, kwargs)
 
         # PR-W1c (2026-06-05): expose the toggle keys + default on the
         # wrapper so the derived TOOL_ACCESS map can rebuild the

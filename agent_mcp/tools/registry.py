@@ -722,6 +722,55 @@ async def dispatch_tool_call(
             #   return await create_agent_tool_impl(sanitized_arguments)
             # This is handled by the dict lookup now.
 
+            # Direct-call fallback (tests / in-process scripts that
+            # didn't thread a Principal through): synthesize one from
+            # the ``request_auth_token`` ContextVar. Production seams
+            # always pass an explicit ``principal=`` so this path is
+            # dead weight in the deployed router.
+            effective_principal = principal
+            if effective_principal is None:
+                from ..core.authorize import _synthesize_principal_from_arguments
+                effective_principal = _synthesize_principal_from_arguments(
+                    sanitized_arguments,
+                )
+
+            # R20-F4: authorize BEFORE schema-validating. `tools/list`
+            # hides an operator/policy-gated tool's existence from a
+            # role lacking its capability (`tools/access.py`), but
+            # until this check existed, a MALFORMED call to that
+            # hidden tool still reached `jsonschema.validate` first —
+            # leaking the tool's exact required-field/type/
+            # additionalProperties shape via `ToolInputValidationError`
+            # to a caller who was never going to be allowed to invoke
+            # it. Only a WELL-FORMED unauthorized call reached the
+            # (correct) capability denial below. Consulting the same
+            # `_required_capability` / `_required_policy_keys`
+            # attributes `tools/access.py` already reads off the
+            # wrapper — via the exact gate-check helpers the
+            # `@requires_capability` / `@requires_policy` decorators
+            # themselves call — closes that pre-auth oracle: the same
+            # AuthRejected a well-formed call would raise now fires
+            # first, regardless of whether the arguments would also
+            # have failed schema validation. Tools with no stamped
+            # attribute (the cap check lives in-body, e.g.
+            # `terminate_agent`) are unaffected — their own in-body
+            # check still runs after schema validation, unchanged.
+            required_cap = getattr(implementation_func, "_required_capability", None)
+            required_policy_keys = getattr(
+                implementation_func, "_required_policy_keys", None
+            )
+            if required_cap is not None:
+                from ..core.authorize import check_capability_gate
+                check_capability_gate(effective_principal, required_cap)
+            elif required_policy_keys:
+                from ..core.authorize import check_policy_gate
+                required_policy_default = getattr(
+                    implementation_func, "_required_policy_default", None
+                )
+                check_policy_gate(
+                    effective_principal, required_policy_keys, required_policy_default
+                )
+
             # -32602 regression fix: clean arguments before schema
             # validation so real client shapes don't get rejected:
             #
@@ -777,18 +826,10 @@ async def dispatch_tool_call(
                         f"{_DEFAULT_STRING_MAX_LEN} characters"
                     )
 
-            # Direct-call fallback (tests / in-process scripts that
-            # didn't thread a Principal through): synthesize one from
-            # the ``request_auth_token`` ContextVar. Production seams
-            # always pass an explicit ``principal=`` so this path is
-            # dead weight in the deployed router.
-            effective_principal = principal
-            if effective_principal is None:
-                from ..core.authorize import _synthesize_principal_from_arguments
-                effective_principal = _synthesize_principal_from_arguments(
-                    sanitized_arguments,
-                )
-
+            # ``effective_principal`` was already resolved above (ahead
+            # of the R20-F4 pre-schema authorization gate) — reused
+            # here for the actual dispatch call.
+            #
             # Issue H is now handled by the @requires / @requires_policy
             # decorators in agent_mcp/core/authorize.py: they raise
             # AuthRejected directly, which the `except AuthRejected`
