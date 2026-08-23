@@ -463,5 +463,15 @@ async def get_sanitized_json_body(request: Any) -> Dict: # 'request: Request' if
     except UntrustedBodyError as ube:
         logger.error(f"Failed to get/sanitize request body: {ube}")
         raise
+    except Exception as e:
+        # Defensive, and non-regressive: pre-N1 this helper wrapped the
+        # whole parse in ``except Exception`` → a 400. The seam converts
+        # every failure mode it knows about (ValueError incl.
+        # JSONDecodeError/UnicodeDecodeError, RecursionError) into
+        # UntrustedBodyError, so nothing should reach here — but letting
+        # a surprise escape would turn a 400 into a 500 for the ~26
+        # FastAPI call sites, which is a regression, not a fix.
+        logger.error(f"Unexpected error processing request body: {e}", exc_info=True)
+        raise ValueError("Error processing request body")
 
 # --- End JSON Sanitization Utility ---
