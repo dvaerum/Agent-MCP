@@ -15,9 +15,10 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 from .registry import register_tool
+from ..core.authorize import requires_predicate
 from ..core.config import logger
 from ..core.principal import Principal
-from ..core.tool_result import Ok, PermissionDenied, ToolResult
+from ..core.tool_result import Ok, ToolResult
 from ..utils.audit_utils import log_audit
 
 
@@ -35,6 +36,11 @@ def _principal_can_view_roster(principal: Optional[Principal]) -> bool:
     admits via the wildcard). Anonymous callers carry no caps and are
     rejected. Kept as an OR of the two agent/operator read caps because
     no single cap spans both the agent bundles and the operator bundles.
+
+    Phase 2 (Finding A): declared via ``@requires_predicate`` rather
+    than ``@requires_capability`` precisely because it is an OR of two
+    caps — collapsing it to either one alone would narrow the admitted
+    set (a policy change).
     """
     if principal is None:
         return False
@@ -43,6 +49,11 @@ def _principal_can_view_roster(principal: Optional[Principal]) -> bool:
     )
 
 
+@requires_predicate(
+    _principal_can_view_roster,
+    "Unauthorized: An authenticated agent or operator is required to view "
+    "the agent roster.",
+)
 async def view_agents_tool_impl(
     arguments: Dict[str, Any],
     *,
@@ -54,12 +65,6 @@ async def view_agents_tool_impl(
     profile_updated_at}, ...]}`` sorted by ``agent_id``. Excludes
     terminated / tombstone / system rows. No token or secret fields.
     """
-    if not _principal_can_view_roster(principal):
-        return PermissionDenied(
-            reason="An authenticated agent or operator is required to view "
-            "the agent roster."
-        )
-
     from ..repositories import agent_repo
 
     roster = []

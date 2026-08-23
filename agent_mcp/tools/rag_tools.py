@@ -2,47 +2,67 @@
 """RAG-query MCP tool surface.
 
 Wave 6 PR 1 migrated the lone tool here (`ask_project_rag`) to the
-Principal + ToolResult signature. The legacy ``@requires("any")``
-decorator is gone — the tool itself rejects non-agent principals via
-``principal.kind == "agent_bearer"``, matching the pre-migration
-admission ("active agent token required"). Operator-session callers
-(dashboard) are still rejected because no current call site needs the
-widening; PR 6 (or a later UX-driven PR) can broaden if needed.
+Principal + ToolResult signature. Operator-session callers (dashboard)
+are rejected because no current call site needs the widening; a later
+UX-driven PR can broaden if needed.
+
+Phase 2 / Finding A (security-architecture hardening): the admission
+rule moved from an in-body ``if`` to ``@requires_predicate`` on the
+impl (:func:`_is_rag_capable_agent`). Same decision, same principals
+admitted — only WHEN it runs moves earlier, so
+``dispatch_tool_call``'s pre-schema gate can deny an unauthorized
+caller before ``jsonschema.validate`` leaks the tool's schema shape
+(the R20-F4 / R21-F1 class), and the registry can introspect the
+requirement instead of it being invisible inside the body.
 """
 
 from typing import Any, Dict, Optional
 
 from .registry import register_tool
+from ..core.authorize import requires_predicate
 from ..core.config import logger
 from ..core.principal import Principal
-from ..core.tool_result import Failed, Invalid, Ok, PermissionDenied, ToolResult
+from ..core.tool_result import Failed, Invalid, Ok, ToolResult
 from ..utils.audit_utils import log_audit
 # Import the core RAG querying logic
 from ..features.rag.query import RAG_ERROR_SENTINELS, query_rag_system
 
 
+def _is_rag_capable_agent(principal: Optional[Principal]) -> bool:
+    """True iff ``principal`` may query the project RAG corpus.
+
+    SEC Wave-B (Finding 2): gates on the ``rag.query`` capability, not
+    the bare ``kind``. The pre-Wave-B ``kind == "agent_bearer"`` check
+    admitted a bearer whose ``agent_role`` is None (empty capability
+    bundle) — a token that carries no caps could still read the RAG
+    corpus. The ``kind`` check is retained so operators (who DO carry
+    ``rag.query`` in their project bundle) stay rejected — this tool is
+    agent-only by design; a later UX PR can widen if needed.
+
+    Phase 2 (Finding A): this is a genuine compound predicate (a ``kind``
+    discriminator AND a capability), NOT a single capability test, so it
+    is declared via ``@requires_predicate`` rather than
+    ``@requires_capability`` — flattening it to ``Cap("rag.query")``
+    would widen the tool to operator-session callers, a policy change.
+    """
+    return (
+        principal is not None
+        and principal.kind == "agent_bearer"
+        and principal.has_capability("rag.query")
+    )
+
+
 # --- ask_project_rag tool ---
+@requires_predicate(
+    _is_rag_capable_agent,
+    "Unauthorized: agent token with rag.query capability required to "
+    "query project RAG",
+)
 async def ask_project_rag_tool_impl(
     arguments: Dict[str, Any],
     *,
     principal: Optional[Principal] = None,
 ) -> ToolResult:
-    # SEC Wave-B (Finding 2): gate on the ``rag.query`` capability, not
-    # the bare ``kind``. The prior ``kind == "agent_bearer"`` check
-    # admitted a bearer whose ``agent_role`` is None (empty capability
-    # bundle) — a token that carries no caps could still read the RAG
-    # corpus. The ``kind`` check is retained so operators (who DO carry
-    # ``rag.query`` in their project bundle) stay rejected — this tool
-    # is agent-only by design; a later UX PR can widen if needed.
-    if (
-        principal is None
-        or principal.kind != "agent_bearer"
-        or not principal.has_capability("rag.query")
-    ):
-        return PermissionDenied(
-            reason="agent token with rag.query capability required to query project RAG"
-        )
-
     query_text = arguments.get("query")
     if not query_text or not isinstance(query_text, str):
         return Invalid(

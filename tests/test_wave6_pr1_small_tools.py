@@ -41,7 +41,7 @@ from agent_mcp.core.tool_result import (
     Ok,
     PermissionDenied,
 )
-from tests.harness import make_principal, mcp_session
+from tests.harness import dispatch_expecting_denial, make_principal, mcp_session
 
 pytestmark = pytest.mark.asyncio
 
@@ -323,18 +323,11 @@ async def test_ask_project_rag_rejects_operator(tmp_path) -> None:
     PR can widen to admit operators; PR 1's job is signature
     migration, not behaviour change.
     """
-    from agent_mcp.tools.registry import dispatch_tool_call
-
     async with mcp_session(tmp_path):
-        p = _operator_principal()
-        result = await dispatch_tool_call(
+        await dispatch_expecting_denial(
             "ask_project_rag",
             {"query": "hello"},
-            principal=p,
-        )
-
-        assert isinstance(result, PermissionDenied), (
-            f"expected PermissionDenied, got {result!r}"
+            principal=_operator_principal(),
         )
 
 
@@ -657,20 +650,17 @@ async def test_migrated_tools_reject_anonymous_principal(
     ``arguments["token"]`` when no explicit Principal is supplied; we
     omit the token here so the fallback also returns None and the
     tool's policy gate is what we observe.
+    Phase 2 (Finding A): these gates moved from an in-body
+    ``return PermissionDenied`` to a registration-time ``@requires_*``
+    decorator, which ``dispatch_tool_call`` evaluates as a raised
+    ``AuthRejected`` before schema validation. ``dispatch_expecting_denial``
+    accepts either carrier — what is pinned is that an anonymous caller
+    is DENIED (never reaches the tool body), which is the security
+    property. Without it ``ask_project_rag``'s query_rag_system on the
+    no-OpenAI mock would return error prose inside an ``Ok``, masking a
+    missing auth check.
     """
-    from agent_mcp.tools.registry import dispatch_tool_call
-
     async with mcp_session(tmp_path):
-        result = await dispatch_tool_call(tool_name, arguments)
-
-        # Most tools surface PermissionDenied; ``ask_project_rag``'s
-        # query_rag_system on the no-OpenAI mock returns an error
-        # prose answer rather than raising, so the Ok-with-text path
-        # would mask a missing auth check — assert PermissionDenied
-        # uniformly to pin the explicit principal-is-None gate.
-        assert isinstance(result, PermissionDenied), (
-            f"{tool_name}: expected PermissionDenied for anonymous caller, "
-            f"got {result!r}"
-        )
+        await dispatch_expecting_denial(tool_name, arguments)
 
 
