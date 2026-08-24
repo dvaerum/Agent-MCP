@@ -1138,23 +1138,33 @@ def _users_table_is_empty() -> bool:
 def is_trusted_proxy_source(
     request: web.Request, settings: ProxyHeaderSettings,
 ) -> bool:
-    """Return True iff this request originates from a trusted source IP.
+    """Return True iff this request originates from a trusted source.
 
-    The peer IP comes from aiohttp's ``request.remote`` (which honours
-    the transport's reported peername; we deliberately do NOT consult
-    ``X-Forwarded-For`` for trust decisions — the forwarded chain is
-    operator-supplied and the trusted-IP check IS the gatekeeper that
-    prevents header spoofing).
+    Delegates to the single shared implementation,
+    ``rate_limit.is_trusted_peer`` — this used to be a second, hand-
+    maintained copy of the same peer check, and the two had drifted apart
+    on the Unix-socket case (an empty ``request.remote``: the limiter
+    trusted it unconditionally, this returned False).
+
+    ``settings.trusted_ips`` is passed through EXPLICITLY rather than
+    letting the shared helper source an allowlist itself. That keeps
+    proxy-header trust on exactly the operator-configured IPs and nothing
+    else — in particular it does NOT pick up the rate limiter's
+    loopback-by-default set, which would let any loopback-originating
+    request forge the trust header. The TCP behaviour here is therefore
+    unchanged; only the UDS peer's verdict moves, and it moves from an
+    unparseable-address accident to a deliberate ``SO_PEERCRED`` same-UID
+    check.
+
+    We deliberately do NOT consult ``X-Forwarded-For`` for trust
+    decisions — the forwarded chain is client-supplied and this peer
+    check IS the gatekeeper that prevents header spoofing.
     """
-    peer = request.remote or ""
-    if not peer:
-        return False
-    try:
-        parsed = ipaddress.ip_address(peer)
-    except ValueError:
-        return False
-    canonical = str(parsed)
-    return canonical in settings.trusted_ips
+    from . import rate_limit
+
+    return rate_limit.is_trusted_peer(
+        request, trusted_ips=settings.trusted_ips,
+    )
 
 
 def extract_proxy_header_user(

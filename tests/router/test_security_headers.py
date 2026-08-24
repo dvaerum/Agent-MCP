@@ -246,21 +246,28 @@ async def test_server_banner_stripped_on_401(
 def _mocked_request(remote: str | None, headers: dict[str, str]):
     """A GET request with a chosen peer IP and headers.
 
-    ``remote=None`` models a UDS / in-process peer (empty
-    ``request.remote``) which the trusted-proxy check treats as
-    trusted loopback. A dotted-quad models a direct (untrusted) client
-    hit. The mocked request's own scheme is plain HTTP (no TLS
-    metadata attached), matching the underlying connection whose
-    apparent scheme an untrusted peer must not be able to override.
+    ``remote=None`` models a UDS peer (empty ``request.remote``) that the
+    trusted-proxy check accepts, and carries a REAL ``socketpair``
+    endpoint: UDS trust is decided by ``SO_PEERCRED`` (the peer runs as
+    the router's own uid), not by the absence of a peer address — see
+    ``tests/router/uds_peer.py``. A dotted-quad models a direct
+    (untrusted) client hit. The mocked request's own scheme is plain
+    HTTP (no TLS metadata attached), matching the underlying connection
+    whose apparent scheme an untrusted peer must not be able to override.
     """
     from unittest import mock
 
     from aiohttp.test_utils import make_mocked_request
 
+    from tests.router.uds_peer import uds_peer_socket
+
     transport = mock.Mock()
     peername = (remote, 40000) if remote else None
+    sock = None if remote else uds_peer_socket()
     transport.get_extra_info = lambda key, default=None: (
-        peername if key == "peername" else default
+        peername if key == "peername"
+        else sock if key == "socket"
+        else default
     )
     return make_mocked_request(
         "GET", "/agent-mcp/login", headers=headers, transport=transport,
