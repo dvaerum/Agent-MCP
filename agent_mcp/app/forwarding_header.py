@@ -74,6 +74,14 @@ router and backend are co-located (same machine, Unix-domain socket),
 the request lifetime is < 1 s, and a stolen header from a
 co-located process means the attacker already owns the host. The
 30-second window is the right trade-off.
+
+Note the SCOPE of that argument: it bounds REPLAY risk, not disclosure
+trust. A signed, replay-resistant role proves the claim is untampered in
+transit — it does NOT make this door equivalent to a browser session the
+backend authenticated itself. Hence a forwarding caller is never
+confirmed-operator-tier for secrets disclosure, regardless of the role
+it signs: see
+``docs/adr/0025-forwarding-tier-excluded-from-confirmed-operator-tier.md``.
 """
 
 from __future__ import annotations

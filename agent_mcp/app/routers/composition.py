@@ -174,7 +174,12 @@ def is_confirmed_operator_tier(auth: RestPrincipal) -> bool:
     ``GET /api/all-data``. The hardening plan this refactor belongs to
     is explicitly mechanism-only, so the inputs stay exactly as they
     were and the widening is left as an operator decision. Do not
-    "finish the job" here without one.
+    "finish the job" here without one. That decision is now recorded in
+    ``docs/adr/0025-forwarding-tier-excluded-from-confirmed-operator-tier.md``,
+    which names the sanctioned way to widen it (an off-by-default
+    ``AGENT_MCP_FORWARDING_CONFIRMS_OPERATOR_TIER`` flag, NOT an edit
+    here) and is pinned by
+    ``tests/test_arch_forwarding_never_confirmed_tier.py``.
     """
     # Only the fields the PREVIOUS auth dict carried per door, so the
     # answer is bit-identical to pre-Finding-D. See the scope note above
