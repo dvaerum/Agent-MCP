@@ -30,11 +30,12 @@ with identical information — the per-agent bearer.
 
 from __future__ import annotations
 
+from agent_mcp.app.rest_principal import RestPrincipal
 from agent_mcp.core.principal import Principal
 from tests.harness import make_principal
 
 
-def _rest_answer(auth: dict) -> bool:
+def _rest_answer(auth) -> bool:
     from agent_mcp.app.routers.composition import is_confirmed_operator_tier
 
     return is_confirmed_operator_tier(auth)
@@ -86,7 +87,7 @@ def test_manager_bearer_same_answer_on_rest_and_mcp() -> None:
 
     Pre-fix: REST returns True, MCP returns False → drift → RED.
     """
-    rest = _rest_answer({"kind": "operator_bearer", "user": None})
+    rest = _rest_answer(RestPrincipal(kind="operator_bearer"))
     mcp = _mcp_answer(_manager_bearer_principal())
 
     assert rest == mcp, (

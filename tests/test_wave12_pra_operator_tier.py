@@ -38,6 +38,8 @@ import pytest
 from fastapi import HTTPException
 from starlette.requests import Request
 
+from agent_mcp.app.rest_principal import RestPrincipal
+
 pytestmark = pytest.mark.asyncio
 
 
@@ -161,9 +163,9 @@ async def test_cookie_operator_dep_carries_role_and_confirms(authz_env):
     cookie = authz_env.session_for(project="beta", role="operator")
     auth = await require_operator_session(_make_request("GET", session_cookie=cookie))
 
-    assert auth["kind"] == "session"
-    assert auth["project_role"] == "operator"
-    assert auth["sysadmin"] is False
+    assert auth.kind == "session"
+    assert auth.project_role == "operator"
+    assert auth.sysadmin is False
     assert is_confirmed_operator_tier(auth) is True
 
 
@@ -176,8 +178,8 @@ async def test_cookie_viewer_stays_unconfirmed(authz_env):
     cookie = authz_env.session_for(project="beta", role="viewer")
     auth = await require_operator_session(_make_request("GET", session_cookie=cookie))
 
-    assert auth["kind"] == "session"
-    assert auth["project_role"] == "viewer"
+    assert auth.kind == "session"
+    assert auth.project_role == "viewer"
     assert is_confirmed_operator_tier(auth) is False
 
 
@@ -189,8 +191,8 @@ async def test_sysadmin_session_confirms(authz_env):
     cookie = authz_env.session_for(project=None, sysadmin=True)
     auth = await require_operator_session(_make_request("GET", session_cookie=cookie))
 
-    assert auth["kind"] == "session"
-    assert auth["sysadmin"] is True
+    assert auth.kind == "session"
+    assert auth.sysadmin is True
     assert is_confirmed_operator_tier(auth) is True
 
 
@@ -209,8 +211,8 @@ async def test_harness_path_no_project_role_is_unconfirmed(authz_env, monkeypatc
         _make_request("GET", session_cookie=cookie)
     )
 
-    assert auth["project_role"] is None
-    assert auth["sysadmin"] is False
+    assert auth.project_role is None
+    assert auth.sysadmin is False
     assert is_confirmed_operator_tier(auth) is False
 
 
@@ -224,14 +226,14 @@ async def test_predicate_invariants_unchanged():
     from agent_mcp.app.routers.composition import is_confirmed_operator_tier
 
     # operator-tier bearer stays confirmed
-    assert is_confirmed_operator_tier({"kind": "operator_bearer"}) is True
+    assert is_confirmed_operator_tier(RestPrincipal(kind="operator_bearer")) is True
     # signed-forwarding stays NON-confirmed at this REST seam
-    assert is_confirmed_operator_tier({"kind": "forwarding"}) is False
+    assert is_confirmed_operator_tier(RestPrincipal(kind="forwarding")) is False
     # a session missing the new keys defaults to least-privilege
-    assert is_confirmed_operator_tier({"kind": "session"}) is False
+    assert is_confirmed_operator_tier(RestPrincipal(kind="session")) is False
     assert (
         is_confirmed_operator_tier(
-            {"kind": "session", "project_role": None, "sysadmin": False}
+            RestPrincipal(kind="session", project_role=None, sysadmin=False)
         )
         is False
     )

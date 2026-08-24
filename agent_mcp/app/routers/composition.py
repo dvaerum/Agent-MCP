@@ -46,6 +46,7 @@ from .._dispatch_helpers import (
 )
 from ._wire_validation import require_str as _require_str
 from ..deps import caller_identity, require_operator_session
+from ..rest_principal import RestPrincipal
 from ...core.authorize import AuthRejected
 from ...core.config import logger
 from ...core import globals as g
@@ -122,8 +123,8 @@ router = APIRouter(
 # control on real credentials, not content-guessing).
 
 
-def is_confirmed_operator_tier(auth: Dict[str, Any]) -> bool:
-    """Return True iff ``auth`` came via a CONFIRMED operator-tier path.
+def is_confirmed_operator_tier(auth: RestPrincipal) -> bool:
+    """Return True iff ``auth`` came via a CONFIRMED operator-tier door.
 
     ``require_operator_session`` admits three kinds:
 
@@ -134,15 +135,15 @@ def is_confirmed_operator_tier(auth: Dict[str, Any]) -> bool:
         per-project backend DOES resolve the caller's ``project_role``
         and ``sysadmin`` flag against router.db (in
         ``app/deps._authorize_session_for_project``); Wave 12 PR A stops
-        discarding them and carries them in the auth dict. So a genuine
-        cookie OPERATOR (or sysadmin) is now CONFIRMED and reads their
-        own project's secrets, while a cookie VIEWER (``project_role ==
-        "viewer"``) stays NOT confirmed → still redacted.
-      * ``"forwarding"`` — signed-header operator identity. The REST auth
-        dict carries no role for this path (the forwarding role rides the
-        task-local ``_forwarding_route_role`` carrier consumed by the
-        dispatch seam, not this dict), so it passes only ``kind`` and a
-        forwarding caller is conservatively NOT confirmed here.
+        discarding them and carries them on the REST principal. So a
+        genuine cookie OPERATOR (or sysadmin) is now CONFIRMED and reads
+        their own project's secrets, while a cookie VIEWER
+        (``project_role == "viewer"``) stays NOT confirmed → still
+        redacted.
+      * ``"forwarding"`` — signed-header operator identity. Conservatively
+        NOT confirmed: only ``kind`` is fed to the predicate, so this
+        door never reaches the ``project_role == "operator"`` clause.
+        See the deliberate-scope note below.
 
     Endpoints that return agent bearer tokens use this to withhold them
     from the unverifiable-tier paths, closing the viewer→agent token
@@ -153,16 +154,34 @@ def is_confirmed_operator_tier(auth: Dict[str, Any]) -> bool:
     The policy itself lives in
     ``core/operator_tier.is_confirmed_operator_tier`` so this REST surface
     and the MCP ``tools/admin_tools`` surface cannot drift (they did — see
-    that module). This thin adapter maps the auth dict onto the shared
-    predicate's keyword fields. Absent keys (forwarding, or a harness path
-    that couldn't resolve a role) default to least-privilege in the
-    predicate, so a session with ``project_role=None`` stays unconfirmed.
+    that module). This thin adapter maps the REST principal onto the
+    shared predicate's keyword fields. Unresolvable fields (a harness
+    path that couldn't name its own project) stay ``None`` and default
+    to least-privilege in the predicate, so a session with
+    ``project_role=None`` remains unconfirmed.
+
+    DELIBERATE SCOPE (Finding D, Phase 5) — the forwarding door now
+    HAS a real ``project_role`` / ``sysadmin`` on its
+    :class:`RestPrincipal` (Phase 5 moved them off the task-local
+    ContextVar they used to ride). Feeding them here would be a
+    one-line change and would make a forwarding OPERATOR confirmed —
+    but that is a POLICY change, not a mechanism change: it widens who
+    receives plaintext agent bearer tokens from ``GET /api/tokens`` and
+    ``GET /api/all-data``. The hardening plan this refactor belongs to
+    is explicitly mechanism-only, so the inputs stay exactly as they
+    were and the widening is left as an operator decision. Do not
+    "finish the job" here without one.
     """
-    return _shared_is_confirmed_operator_tier(
-        kind=auth.get("kind"),
-        sysadmin=auth.get("sysadmin", False),
-        project_role=auth.get("project_role"),
-    )
+    # Only the fields the PREVIOUS auth dict carried per door, so the
+    # answer is bit-identical to pre-Finding-D. See the scope note above
+    # before widening this.
+    if auth.kind == "session":
+        return _shared_is_confirmed_operator_tier(
+            kind=auth.kind,
+            sysadmin=auth.sysadmin,
+            project_role=auth.project_role,
+        )
+    return _shared_is_confirmed_operator_tier(kind=auth.kind)
 
 
 # --- Composition reads (cross-resource) ---

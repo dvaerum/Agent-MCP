@@ -265,7 +265,7 @@ async def settings_schema_api_route(
         {
             "schema": _schema_as_json(),
             "caller": {
-                "sysadmin": auth.get("sysadmin", False),
+                "sysadmin": auth.sysadmin,
                 "confirmed_operator": is_confirmed_operator_tier(auth),
             },
         }

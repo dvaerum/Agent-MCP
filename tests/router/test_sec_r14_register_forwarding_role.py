@@ -32,6 +32,7 @@ import pytest
 
 from agent_mcp.app import deps
 from agent_mcp.app.deps import forwarding_route_role, require_operator_session
+from agent_mcp.app.rest_principal import RestPrincipal
 from agent_mcp.app.routers import agents as agents_router
 from agent_mcp.core.principal import Principal
 from agent_mcp.core.tool_result import Ok
@@ -114,7 +115,7 @@ async def test_register_forwarding_viewer_principal_is_viewer_role(monkeypatch):
     auth = await require_operator_session(
         _FakeAuthRequest(_forwarding_principal("viewer"))
     )
-    assert auth["kind"] == "forwarding"
+    assert auth.kind == "forwarding"
     assert forwarding_route_role() == ("viewer", False)
 
     captured: dict[str, Any] = {}
@@ -214,7 +215,7 @@ async def test_register_no_forwarding_role_defaults_operator_tier(monkeypatch):
 
     resp = await agents_router.register_agent_dashboard_api_route(
         _FakeRouteRequest({"name": "worker-1", "role": "worker"}),
-        auth={"kind": "operator_bearer", "user": None},
+        auth=RestPrincipal(kind="operator_bearer"),
     )
 
     built = captured["principal"]

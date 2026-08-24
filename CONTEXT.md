@@ -37,28 +37,43 @@ object" — all four names appear informally in comments/docstrings
 across the codebase referring to this same concept on the MCP side.
 Use `Principal`.
 
-**Known deviation — the REST "auth dict" is NOT a Principal.**
-`agent_mcp/app/deps.py:310` (`require_operator_session`) returns a
-plain `dict[str, Any]` with one of three shapes
-(`{"kind": "session", "user": ..., "project_role": ..., "sysadmin":
-...}`, `{"kind": "forwarding", "operator_id": ...}`, `{"kind":
-"operator_bearer", "user": None}`) — not a `Principal`. This is a
-real, currently-shipping type split between the MCP surface
-(`Principal`) and the backend REST surface (this untyped dict), not a
-naming inconsistency to fix here. It is tracked as Finding D in
-`docs/proposals/security-authz-architecture-hardening.md` (typed
-`Principal` for backend REST, Phase 5 — the highest-effort phase,
-blocked on updating a test that pins the dict shape verbatim). Do not
-attempt to unify it in this phase; do use the term **"REST auth
-dict"** (not "Principal") when referring to this shape, so the two are
-never conflated in conversation or comments.
+### RestPrincipal
+
+**Canonical term for "which backend-REST door admitted this caller, and
+what did that door prove about them?"** An immutable dataclass:
+`agent_mcp/app/rest_principal.py` (`RestPrincipal`). Fields: `kind`,
+`user`, `operator_id`, `project_role`, `sysadmin`. Returned by
+`agent_mcp/app/deps.py` (`require_operator_session`) and threaded into
+the ~40 backend REST handlers.
+
+Finding D (`docs/proposals/security-authz-architecture-hardening.md`,
+Phase 5) replaced what this glossary previously described as the "REST
+auth dict" — a plain `dict[str, Any]` with three undeclared shapes plus
+a `contextvars.ContextVar` side-channel (`_forwarding_route_role`)
+carrying the forwarding caller's signed `(project_role, sysadmin)` out
+of band. **Both are gone**; do not reintroduce either term or shape.
+
+`RestPrincipal` and `Principal` are **deliberately distinct types**, not
+a naming inconsistency to collapse:
+
+* `RestPrincipal` is an **admission record** — its `kind` values
+  (`session` / `forwarding` / `operator_bearer`) name REST doors, and
+  `operator_bearer` has no `Principal` analogue meaning the same thing
+  (see `PrincipalKind` below).
+* `Principal` is an **authorization subject** — it carries a resolved
+  `capabilities` frozenset and answers `has_capability`.
+
+There is exactly one conversion between them:
+`agent_mcp/app/_dispatch_helpers.py` (`_build_route_principal`). Say
+**"REST principal"** for the former and **"Principal"** for the latter;
+never "auth dict".
 
 ### PrincipalKind — the four authentication MODES
 
 `agent_mcp/core/principal.py:54`: `Literal["operator_session",
 "agent_bearer", "forwarding_header"]` — three MCP-side values, plus a
 fourth REST-only mode below. These are the distinct ways a `Principal`
-(or the REST auth dict) can be constructed; a request is authenticated
+(or a `RestPrincipal`) can be constructed; a request is authenticated
 through exactly one of them.
 
 * **`agent_bearer`** — a per-agent token on `Authorization: Bearer`,
@@ -77,17 +92,20 @@ through exactly one of them.
   is mount-agnostic, so the backend can't see the original cookie).
   Also built by `build_operator_principal`, with `kind="forwarding_header"`.
 * **`operator_bearer`** (REST-only, not a `PrincipalKind` value — a
-  REST auth-dict `"kind"` discriminator) — a per-agent
+  `RestPrincipal.kind` / `RestAuthKind` discriminator) — a per-agent
   manager/admin-role bearer token presented directly to a backend REST
   endpoint instead of a cookie. See
-  `agent_mcp/app/deps.py:310-436`. Named `"admin_token"` before
-  retire-system-token Wave 5; renamed because it never carried a
-  god-key admin token post-Wave-1, only per-agent manager-tier tokens.
-  Do not confuse this REST-only discriminator with the MCP
-  `agent_bearer` `PrincipalKind` — they overlap in meaning (a bearer
-  token identifying an agent) but live in different type systems (REST
-  dict vs. typed `Principal`) and currently have different name
-  spellings for historical reasons.
+  `agent_mcp/app/deps.py` (`require_operator_session`). Named
+  `"admin_token"` before retire-system-token Wave 5; renamed because it
+  never carried a god-key admin token post-Wave-1, only per-agent
+  manager-tier tokens. Do not confuse this REST-only discriminator with
+  the MCP `agent_bearer` `PrincipalKind` — they overlap in meaning (a
+  bearer token identifying an agent) but they are **not
+  interchangeable**: `operator_bearer` is pre-filtered to manager/admin
+  by `deps._is_operator_tier_bearer`, whereas `agent_bearer` also covers
+  workers and therefore needs a separate `agent_role` check before it
+  counts as operator tier (`core/operator_tier.py`). Collapsing the two
+  spellings would change who is confirmed operator tier.
 
 **Do not call these** "auth modes", "login types", or "identity
 sources" interchangeably with `PrincipalKind` values — use the exact
@@ -217,7 +235,7 @@ This module exists because the policy was implemented twice
 module docstring in `agent_mcp/core/operator_tier.py:10-25` for the
 exact before/after disagreement. Do not reimplement this check inline
 anywhere; both surfaces now call the one function, adapting their
-native identity representation (REST auth dict vs. `Principal`) into
+native identity representation (`RestPrincipal` vs. `Principal`) into
 its keyword arguments.
 
 ## Capability vocabulary — three distinct layers
@@ -316,11 +334,11 @@ maps onto them as:
 * **"forwarding header"** = `PrincipalKind == "forwarding_header"`:
   the router's signed `X-Agent-MCP-Forwarded-Operator` header, built
   by `app/main_app.py`'s `AuthHeaderMiddleware`
-  and consulted by `app/deps.py:394-417`.
+  and consulted by `app/deps.py` (`require_operator_session`).
 * **"cookie session"** = `PrincipalKind == "operator_session"` (MCP
-  side) / REST auth-dict `kind == "session"` (`app/deps.py:370-375`):
+  side) / `RestPrincipal.kind == "session"` (`app/deps.py`):
   the dashboard's `agent_mcp_session` cookie (ADR-0013).
-* **"operator_bearer"** = the REST-only auth-dict discriminator (see
+* **"operator_bearer"** = the REST-only `RestPrincipal.kind` value (see
   above) — not a `PrincipalKind` value, a per-agent manager/admin
   bearer presented straight to a REST endpoint.
 
@@ -329,7 +347,7 @@ maps onto them as:
 | Term | What it answers | Type | Defined at |
 |---|---|---|---|
 | `Principal` | who is calling (MCP side) | frozen dataclass | `core/principal.py:58` |
-| REST auth dict | who is calling (backend REST side) | untyped `dict` (3 shapes) | `app/deps.py:310` |
+| `RestPrincipal` | which REST door admitted the caller | frozen dataclass | `app/rest_principal.py` |
 | `PrincipalKind` | which auth mode built this Principal | `Literal[...]` | `core/principal.py:54` |
 | capability | one authorization atom | `str`, member of `KNOWN_CAPABILITIES` | `core/capabilities.py:81` |
 | role bundle | caps granted by a role | `frozenset[str]` | `core/capabilities.py:127,165` |

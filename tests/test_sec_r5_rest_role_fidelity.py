@@ -118,7 +118,7 @@ async def test_forwarding_viewer_yields_viewer_role_not_operator():
 
     auth = await require_operator_session(req)
 
-    assert auth["kind"] == "forwarding"
+    assert auth.kind == "forwarding"
     # The dep now threads the real role via the task-local carrier
     # instead of dropping it (the return dict's shape is pinned by
     # test_sec_r4_operator_identity_race, so the role rides the carrier).
@@ -127,7 +127,7 @@ async def test_forwarding_viewer_yields_viewer_role_not_operator():
     built = _build_route_principal(
         bearer_token=None,
         operator_session=True,
-        operator_user_id=auth["operator_id"],
+        operator_user_id=auth.operator_id,
     )
 
     assert built is not None
@@ -147,13 +147,13 @@ async def test_forwarding_operator_yields_operator_role_unaffected():
 
     auth = await require_operator_session(req)
 
-    assert auth["kind"] == "forwarding"
+    assert auth.kind == "forwarding"
     assert forwarding_route_role() == ("operator", False)
 
     built = _build_route_principal(
         bearer_token=None,
         operator_session=True,
-        operator_user_id=auth["operator_id"],
+        operator_user_id=auth.operator_id,
     )
 
     assert built.project_role == "operator"
@@ -207,7 +207,7 @@ async def test_cookie_admit_resets_stale_forwarding_role(monkeypatch):
 
     auth: dict[str, Any] = await require_operator_session(cookie_req)
 
-    assert auth["kind"] == "session"
+    assert auth.kind == "session"
     assert forwarding_route_role() is None
 
     built = _build_route_principal(

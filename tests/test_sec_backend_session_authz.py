@@ -191,8 +191,8 @@ async def test_operator_member_is_admitted(authz_env):
     req = _make_request("GET", session_cookie=cookie)
 
     auth = await require_operator_session(req)
-    assert auth["kind"] == "session"
-    assert auth["user"]["username"] == "user1"
+    assert auth.kind == "session"
+    assert auth.username == "user1"
 
 
 async def test_viewer_member_can_read(authz_env):
@@ -203,7 +203,7 @@ async def test_viewer_member_can_read(authz_env):
     req = _make_request("GET", session_cookie=cookie)
 
     auth = await require_operator_session(req)
-    assert auth["kind"] == "session"
+    assert auth.kind == "session"
 
 
 async def test_viewer_member_cannot_mutate(authz_env):
@@ -228,4 +228,4 @@ async def test_sysadmin_bypasses_membership(authz_env):
     req = _make_request("POST", session_cookie=cookie)
 
     auth = await require_operator_session(req)
-    assert auth["kind"] == "session"
+    assert auth.kind == "session"
