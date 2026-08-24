@@ -27,9 +27,9 @@ admin surface to a running Agent-MCP project.
 Numbered ADRs (0008+). Each captures a decision, its context,
 and the alternatives weighed. Most recent decisions:
 
-- [ADR-0013](./adr/0013-operator-login.md) — operator login on the dashboard surface.
-- [ADR-0014](./adr/0014-rest-admin-api.md) — REST admin API; retire the `__` URL namespace.
-- [ADR-0015](./adr/0015-sso-oidc-and-proxy-header.md) — SSO via OIDC + proxy-header trust.
+- [ADR-0023](./adr/0023-dashboard-data-layer-tanstack-query.md) — dashboard data layer on TanStack Query, replacing the hand-rolled Zustand store + bespoke fetch hooks.
+- [ADR-0024](./adr/0024-sso-subject-value-type.md) — the OIDC subject key is a value type, not an f-string.
+- [ADR-0025](./adr/0025-forwarding-tier-excluded-from-confirmed-operator-tier.md) — forwarding-tier identity is excluded from confirmed-operator-tier by design.
 
 ### [`proposals/`](./proposals/) — parked future improvements
 
