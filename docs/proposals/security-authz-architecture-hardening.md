@@ -124,7 +124,7 @@ skipped at 2 of 4 mint sites (env bootstrap + CLI `create-operator`), and an
 SSO fresh-install lockout (`setup_wizard._REDIRECT_EXEMPT_PREFIXES` missing
 the SSO callback path).
 
-### Phase 1 — quick wins (in flight)
+### Phase 1 — quick wins — **done** (PR #722)
 
 - **B — thread `project_name` through `_build_route_principal`.** One
   optional parameter + delete the 20-line inline duplicate in
@@ -154,7 +154,7 @@ the SSO callback path).
   N3 Tier 2 (below) is where this should be revisited with a real design,
   not a copy-paste delegation.
 
-### N1 — parallel with Phase 2 (pass 2's top recommendation)
+### N1 — parallel with Phase 2 — **done** (PRs #725, #727)
 
 **Sanitization is a helper you must remember to call, not a seam.** File-
 disjoint from Phase 2 (`tools/` vs `router/` + `app/main_app.py`), and the
@@ -183,7 +183,7 @@ will hit them rather than restated here:
   `email`); the reasoning and its tests are in
   `tests/router/test_arch_n1_form_credentials.py`.
 
-### Phase 2 — the structural lever — **done** (PRs #723, #726, #728, #729, this PR)
+### Phase 2 — the structural lever — **done** (PRs #723, #726, #728, #729, #730)
 
 - **A — capability as a registration argument.** `register_tool(...,
   requires=Cap("agents.terminate"))` is now a REQUIRED keyword argument
@@ -262,7 +262,7 @@ parallel mechanism. Two consequences already folded into Phase 2 (above)
 and Phase 4 (below); this entry exists so a future reader doesn't
 rediscover the asymmetry mid-implementation.
 
-### Phase 3 — parallel with Phase 2, independent files
+### Phase 3 — parallel with Phase 2, independent files — **done** (PR #724)
 
 - **C — `SsoSubject` value type.** Self-contained to `router/sso.py` (plus
   its own new test file); doesn't touch any file Phase 2 touches, so this can
@@ -283,7 +283,7 @@ rediscover the asymmetry mid-implementation.
     admitted duplicate of `login.cookie_secure_flag` that already produced
     R6-F3) — same file, already checked out, cheap to add.
 
-### N2 — after Phase 2 — **done**
+### N2 — after Phase 2 — **done** (PR #731)
 
 **Widen the arch-enforcement invariant to all 3 request surfaces.**
 `test_arch_enforced_revalidation.py` (post-Phase-0) discovers targets
@@ -332,7 +332,7 @@ files carry the full reasoning rather than repeating it here:
   easy to break with one added `await`. `wait_for_events`' indefinite
   hold is a stream lifetime, which is **N5**'s subject, not this one's.
 
-### Phase 4 — **done** (this PR): E, Resources only
+### Phase 4 — **done** (PR #732): E, Resources only
 
 - **E — shared `decide()` seam.** Delivered as `core/access.py`'s
   `decide(Request) -> Decision`; the module docstring carries the design
@@ -361,7 +361,7 @@ files carry the full reasoning rather than repeating it here:
   time (`PromptRegistry.render`), so its migration is a consolidation, not
   a fix; Router admin needs Phase 5's typed `Principal` first.
 
-### N3 Tier 2 + N5 — after Phase 4, or explicitly deferred
+### N3 Tier 2 + N5 — after Phase 4 — **done** (PRs #733, #734)
 
 Both were filed as "generalize an idiom that already works, nothing
 broken today." That held for N5. It did **not** hold for N3 Tier 2 —
@@ -461,7 +461,7 @@ home for the three remaining classification questions, consumed by
   not a classification-derivation one, and nothing in this tier makes it
   cheaper to answer — it stays flagged for the operator.
 
-### Phase 5 — largest effort, do last
+### Phase 5 — largest effort, do last — **done** (PRs #735, #736, #737)
 
 **D — done** (PRs #735, #736). `agent_mcp/app/rest_principal.py`'s
 `RestPrincipal` replaced the three-shape `dict[str, Any]`, and
