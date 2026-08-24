@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import pytest
 
+from agent_mcp.app.rest_principal import RestPrincipal
 from agent_mcp.core.principal import Principal
 from agent_mcp.core.tool_result import (
     Conflict,
@@ -493,8 +494,7 @@ async def test_dispatch_create_agent_via_rest_adapter_returns_ok_with_data(
             "register_agent",
             {"agent_id": "rest-adapter-target"},
             bearer_token=None,
-            operator_session=True,
-            operator_user_id="test-operator",
+            auth=RestPrincipal(kind="session", user={"username": "test-operator"}),
         )
 
     assert response.status_code in (200, 201), response.body

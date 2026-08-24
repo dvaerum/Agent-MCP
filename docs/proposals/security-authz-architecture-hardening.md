@@ -457,19 +457,56 @@ home for the three remaining classification questions, consumed by
 
 ### Phase 5 — largest effort, do last
 
-- **D — typed `Principal` for backend REST, replacing the 3-shape dict.**
-  Blocked today by `tests/test_sec_r4_operator_identity_race.py` pinning the
-  dict literal verbatim. This phase's first step is updating that test to
-  assert on `Principal` fields instead of dict shape (a deliberate,
-  reviewed test change — not a silent loosening: the pinned invariant
-  itself must survive, just expressed against the new type).
-  - TDD: keep the race-condition property that test protects; add a RED test
-    proving the ContextVar (`_forwarding_route_role`) is no longer read
-    anywhere once the dict is gone.
-  - This is the highest-effort phase and the one most likely to surface
-    unexpected callers relying on the dict shape (40+ handlers) — budget the
-    most review time here, and consider doing it as several smaller PRs
-    (one subsystem of routers at a time) rather than one big-bang migration.
+**D — done** (PRs #735, #736). `agent_mcp/app/rest_principal.py`'s
+`RestPrincipal` replaced the three-shape `dict[str, Any]`, and
+`deps._forwarding_route_role` — the module-level `ContextVar` that carried
+the forwarding caller's signed `(project_role, sysadmin)` out of band — is
+deleted.
+
+- **Two types, deliberately.** `RestPrincipal` is an *admission record*
+  ("which REST door let this caller in, and what did it prove?");
+  `core.principal.Principal` is an *authorization subject* (carries a
+  resolved capability frozenset). They are not unified because the REST
+  `operator_bearer` door is pre-filtered to manager/admin upstream while
+  the MCP `agent_bearer` kind also covers workers — collapsing the two
+  spellings would change who `core/operator_tier` calls confirmed operator
+  tier. One conversion exists, `_build_route_principal`; `CONTEXT.md`'s
+  former "REST auth dict — known deviation" entry is now a `RestPrincipal`
+  entry saying so.
+- **The blocking test.** `tests/test_sec_r4_operator_identity_race.py`
+  pinned the dict literal verbatim, which is what made D expensive. Its
+  assertions now target `RestPrincipal` and are **no weaker**: a frozen
+  dataclass's `==` still compares every field (so no field can appear
+  unnoticed), plus the race property is now stated directly
+  (`auth.operator_id == "realop"`, `!= "intruder"`; the interleaved
+  two-task case asserts `["alice", "bob"]`) instead of implied by a dict
+  comparison.
+- **Why the ContextVar had to go, beyond tidiness.** Its consumer's
+  fallback is `("operator", False)`, so an edit that dropped the `.set()`
+  would have silently restored AC-R5-1's viewer→operator escalation with
+  every test green. Passing the admission value itself makes that omission
+  unrepresentable — the same "fuse the two halves so one can't be
+  forgotten" move as `perm_gates` and N5's `RevalidatingStream`.
+  `tests/test_arch_d_rest_principal.py` AST-scans the whole package for the
+  retired identifiers and bans any `ContextVar` declaration in `deps.py`,
+  with the detector itself run against a synthetic offender so the rule
+  can't decay into a no-op.
+- **The 40+ handlers were a paper tiger, and that is the finding.** Only
+  three call sites ever read a key off the dict
+  (`composition.is_confirmed_operator_tier`, `settings.py`'s caller block,
+  and `caller_identity`); the rest took `auth: dict` purely to forward it.
+  The cost was never the handler count — it was that an undeclared shape
+  gives no way to *know* that without grepping, which is also why the one
+  field that didn't fit ended up on a ContextVar instead of in the shape.
+- **No policy change, and one deliberate stop.** The forwarding door's
+  `RestPrincipal` now carries a real signed `project_role`/`sysadmin`, so
+  feeding them to `is_confirmed_operator_tier` is a one-liner — and would
+  make a forwarding OPERATOR confirmed, widening who receives plaintext
+  agent bearer tokens from `GET /api/tokens` and `GET /api/all-data`. That
+  is a policy change, so the adapter keeps feeding exactly the inputs each
+  door fed before, with a scope note saying why. **Open question for the
+  operator:** should the forwarding door's signed role now count toward
+  confirmed-operator-tier?
 - **N6 structural half — do alongside D** (every response builder gets
   touched anyway): consolidate the four independent agent-bearer redaction
   mechanics (`admin_tools.py:2093` string-overwrite, `composition.py:443`+

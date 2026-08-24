@@ -32,7 +32,8 @@ from .._dispatch_helpers import (
 )
 from ._read_limits import _clamp_section_limit
 from ._wire_validation import require_str as _require_str
-from ..deps import caller_identity, require_operator_session
+from ..deps import require_operator_session
+from ..rest_principal import RestPrincipal
 from ...core.authorize import AuthRejected
 from ...core.config import logger
 from ...core.tool_result import (
@@ -171,7 +172,7 @@ async def all_tasks_api_route(request: Request) -> JSONResponse:
 @router.post("")
 async def create_task_api_route(
     request: Request,
-    auth: dict = Depends(require_operator_session),
+    auth: RestPrincipal = Depends(require_operator_session),
 ) -> JSONResponse:
     """Create a new task — thin adapter over the ``create_task`` MCP tool.
 
@@ -257,11 +258,7 @@ async def create_task_api_route(
     # Operator-session Principal (forwarding VIEWER gets a viewer-role
     # Principal the tool's capability gate denies — AC-R5-1). Mirrors
     # ``delete_task_api_route`` / the other thin adapters.
-    principal = _build_route_principal(
-        bearer_token=None,
-        operator_session=True,
-        operator_user_id=caller_identity(auth),
-    )
+    principal = _build_route_principal(auth=auth)
 
     try:
         result = await dispatch_tool_call(
@@ -322,7 +319,7 @@ async def create_task_api_route(
 @router.get("/{task_id}/delete-preview")
 async def delete_task_preview_api_route(
     task_id: str,
-    auth: dict = Depends(require_operator_session),
+    auth: RestPrincipal = Depends(require_operator_session),
 ) -> JSONResponse:
     """GET /api/tasks/<id>/delete-preview — blast radius of a delete.
 
@@ -418,7 +415,7 @@ async def delete_task_preview_api_route(
 async def delete_task_api_route(
     task_id: str,
     request: Request,
-    auth: dict = Depends(require_operator_session),
+    auth: RestPrincipal = Depends(require_operator_session),
 ) -> JSONResponse:
     """DELETE /api/tasks/<task_id> — admin deletes a task.
 
@@ -462,7 +459,6 @@ async def delete_task_api_route(
         "delete_task",
         {"task_id": task_id, "force_delete": force_delete},
         bearer_token=None,
-        operator_session=True,
-        operator_user_id=caller_identity(auth),
+        auth=auth,
         success_message=f"Task '{task_id}' deleted successfully",
     )

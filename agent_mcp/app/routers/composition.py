@@ -45,7 +45,7 @@ from .._dispatch_helpers import (
     handle_options,
 )
 from ._wire_validation import require_str as _require_str
-from ..deps import caller_identity, require_operator_session
+from ..deps import require_operator_session
 from ..rest_principal import RestPrincipal
 from ...core.authorize import AuthRejected
 from ...core.config import logger
@@ -189,7 +189,7 @@ def is_confirmed_operator_tier(auth: RestPrincipal) -> bool:
 
 @router.get("/status")
 async def simple_status_api_route(
-    auth: dict = Depends(require_operator_session),
+    auth: RestPrincipal = Depends(require_operator_session),
 ) -> JSONResponse:
     # SECURITY (AZ-R28-1): gated to match the composition router's other
     # reads (node-details / all-data / context-data). AuthHeaderMiddleware
@@ -230,7 +230,7 @@ async def simple_status_api_route(
 @router.get("/graph-data")
 async def graph_data_api_route(
     request: Request,
-    auth: dict = Depends(require_operator_session),
+    auth: RestPrincipal = Depends(require_operator_session),
 ) -> JSONResponse:
     # SECURITY (AZ-R28-1): gated to match the sibling composition reads —
     # see simple_status_api_route.
@@ -258,7 +258,7 @@ async def graph_data_api_route(
 @router.get("/task-tree-data")
 async def task_tree_data_api_route(
     request: Request,
-    auth: dict = Depends(require_operator_session),
+    auth: RestPrincipal = Depends(require_operator_session),
 ) -> JSONResponse:
     # SECURITY (AZ-R28-1): gated to match the sibling composition reads —
     # see simple_status_api_route.
@@ -300,7 +300,7 @@ _AGENT_NODE_SAFE_COLUMNS = (
 @router.get("/node-details")
 async def node_details_api_route(
     request: Request,
-    auth: dict = Depends(require_operator_session),
+    auth: RestPrincipal = Depends(require_operator_session),
 ) -> JSONResponse:
     # SECURITY: this endpoint previously had NO auth dependency and, for
     # an ``agent_<id>`` node, returned ``SELECT * FROM agents`` verbatim
@@ -390,7 +390,7 @@ from ._read_limits import (  # noqa: E402
 @router.get("/all-data")
 async def all_data_api_route(
     request: Request,
-    auth: dict = Depends(require_operator_session),
+    auth: RestPrincipal = Depends(require_operator_session),
 ) -> JSONResponse:
     """Get all data in one call for caching on frontend.
 
@@ -614,7 +614,7 @@ async def all_data_api_route(
 @router.get("/context-data")
 async def context_data_api_route(
     request: Request,
-    auth: dict = Depends(require_operator_session),
+    auth: RestPrincipal = Depends(require_operator_session),
 ) -> JSONResponse:
     """Get only context data.
 
@@ -675,7 +675,7 @@ async def context_data_api_route(
 @router.post("/terminate-agent")
 async def terminate_agent_dashboard_api_route(
     request: Request,
-    auth: dict = Depends(require_operator_session),
+    auth: RestPrincipal = Depends(require_operator_session),
 ) -> JSONResponse:
     """POST /api/terminate-agent — operator terminates an agent.
 
@@ -686,10 +686,11 @@ async def terminate_agent_dashboard_api_route(
     PR D (prancy-napping-pie): auth via ``require_operator_session``.
     Wave 3 (prancy-napping-pie): the inner tool call no longer
     synthesises ``g.admin_token`` as a bearer to satisfy the gate.
-    Instead, ``_dispatch_through_tool`` stamps ``operator_session=True``
-    on the dispatch — the decorator admits via the operator-session
-    ContextVar (the route's outer dep has already validated the
-    cookie / legacy bearer / body-token before we get here).
+    Instead, ``_dispatch_through_tool`` is handed the route's
+    ``RestPrincipal`` and converts it to an operator-session
+    ``Principal`` for the dispatch (the route's outer dep has already
+    validated the cookie / forwarding header / operator bearer before we
+    get here).
 
     Wave 8 PR 1 placement: lives on the composition router (not the
     agents router) because the URL is ``/api/terminate-agent`` and
@@ -708,8 +709,7 @@ async def terminate_agent_dashboard_api_route(
         "terminate_agent",
         {"agent_id": agent_id} if agent_id else {},
         bearer_token=None,
-        operator_session=True,
-        operator_user_id=caller_identity(auth),
+        auth=auth,
         success_message=(
             f"Agent '{agent_id}' terminated successfully via dashboard API."
             if agent_id else None
@@ -737,7 +737,7 @@ def _update_task_error_detail(result: ToolResult) -> str:
 @router.api_route("/update-task-dashboard", methods=["POST", "OPTIONS"])
 async def update_task_details_api_route(
     request: Request,
-    auth: dict = Depends(require_operator_session),
+    auth: RestPrincipal = Depends(require_operator_session),
 ) -> JSONResponse:
     """Dashboard task edit endpoint — thin adapter over the ``update_task``
     MCP tool.
@@ -837,11 +837,7 @@ async def update_task_details_api_route(
         "notes": data.get("notes"),
     }
 
-    principal = _build_route_principal(
-        bearer_token=None,
-        operator_session=True,
-        operator_user_id=caller_identity(auth),
-    )
+    principal = _build_route_principal(auth=auth)
 
     try:
         result = await dispatch_tool_call(
@@ -879,7 +875,7 @@ async def update_task_details_api_route(
 # --- Test/Demo Data Endpoint ---
 @router.post("/create-sample-memories")
 async def create_sample_memories_route(
-    auth: dict = Depends(require_operator_session),
+    auth: RestPrincipal = Depends(require_operator_session),
 ) -> JSONResponse:
     """Create sample memory entries for testing.
 
@@ -930,11 +926,7 @@ async def create_sample_memories_route(
         },
     ]
 
-    principal = _build_route_principal(
-        bearer_token=None,
-        operator_session=True,
-        operator_user_id=caller_identity(auth),
-    )
+    principal = _build_route_principal(auth=auth)
 
     try:
         result = await dispatch_tool_call(

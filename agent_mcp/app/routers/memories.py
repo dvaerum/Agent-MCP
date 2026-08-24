@@ -27,7 +27,8 @@ from starlette.requests import Request
 
 from .._dispatch_helpers import _build_route_principal
 from ._wire_validation import require_str as _require_str
-from ..deps import caller_identity, require_operator_session
+from ..deps import require_operator_session
+from ..rest_principal import RestPrincipal
 from ...core.authorize import AuthRejected
 from ...core.config import logger
 from ...core.tool_result import (
@@ -73,7 +74,7 @@ router = APIRouter(
 @router.post("")
 async def create_memory_api_route(
     request: Request,
-    auth: dict = Depends(require_operator_session),
+    auth: RestPrincipal = Depends(require_operator_session),
 ) -> JSONResponse:
     """Create a new memory entry — thin adapter over ``create_project_context``.
 
@@ -134,11 +135,7 @@ async def create_memory_api_route(
     # Operator-session Principal (a forwarding VIEWER gets a viewer-role
     # Principal the tool's capability gate denies — AC-R5-1). Mirrors the
     # task / agent thin adapters.
-    principal = _build_route_principal(
-        bearer_token=None,
-        operator_session=True,
-        operator_user_id=caller_identity(auth),
-    )
+    principal = _build_route_principal(auth=auth)
 
     try:
         result = await dispatch_tool_call(
@@ -198,7 +195,7 @@ async def create_memory_api_route(
 async def update_memory_api_route(
     context_key: str,
     request: Request,
-    auth: dict = Depends(require_operator_session),
+    auth: RestPrincipal = Depends(require_operator_session),
 ) -> JSONResponse:
     """Update a memory entry — thin adapter over ``update_project_context``.
 
@@ -254,11 +251,7 @@ async def update_memory_api_route(
     # Operator-session Principal (a forwarding VIEWER gets a viewer-role
     # Principal the tool's capability gate denies — SEC1). Mirrors the
     # CREATE handler above.
-    principal = _build_route_principal(
-        bearer_token=None,
-        operator_session=True,
-        operator_user_id=caller_identity(auth),
-    )
+    principal = _build_route_principal(auth=auth)
 
     # Only thread ``description`` when the caller supplied it so the tool's
     # partial-update semantics preserve an existing description (BL-R22-1).
@@ -309,7 +302,7 @@ async def update_memory_api_route(
 async def delete_memory_api_route(
     context_key: str,
     request: Request,
-    auth: dict = Depends(require_operator_session),
+    auth: RestPrincipal = Depends(require_operator_session),
 ) -> JSONResponse:
     """DELETE /api/memories/<context_key> — thin adapter over
     ``delete_project_context``.
@@ -347,11 +340,7 @@ async def delete_memory_api_route(
     # Operator-session Principal (a forwarding VIEWER gets a viewer-role
     # Principal the tool's capability gate denies — SEC1). Mirrors the
     # CREATE / UPDATE handlers.
-    principal = _build_route_principal(
-        bearer_token=None,
-        operator_session=True,
-        operator_user_id=caller_identity(auth),
-    )
+    principal = _build_route_principal(auth=auth)
 
     try:
         result = await dispatch_tool_call(

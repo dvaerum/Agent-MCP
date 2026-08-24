@@ -26,6 +26,7 @@ from __future__ import annotations
 import agent_mcp.core.authorize as authorize
 import agent_mcp.core.principal_builder as principal_builder
 import agent_mcp.tools.agent_communication_tools as agent_comm
+from agent_mcp.app.rest_principal import RestPrincipal
 from agent_mcp.core.capabilities import resolve_capabilities
 from agent_mcp.core.principal import Principal
 from agent_mcp.core.principal_builder import (
@@ -126,9 +127,7 @@ def test_agent_bearer_caps_identical_across_construction_sites(
     with with_bearer("tok"):
         synth = authorize._synthesize_principal_from_arguments({})
         comm = agent_comm._resolve_principal({}, None)
-    rest = _build_route_principal(
-        bearer_token="tok", operator_session=False, operator_user_id=None,
-    )
+    rest = _build_route_principal(bearer_token="tok")
 
     caps = built.capabilities
     assert caps  # manager bundle is non-empty
@@ -151,9 +150,7 @@ def test_route_principal_threads_project_name_for_operator_session() -> None:
     from agent_mcp.app._dispatch_helpers import _build_route_principal
 
     built = _build_route_principal(
-        bearer_token=None,
-        operator_session=True,
-        operator_user_id="op-1",
+        auth=RestPrincipal(kind="session", user={"username": "op-1"}),
         project_name="demo-project",
     )
     assert built is not None
@@ -167,7 +164,7 @@ def test_route_principal_project_name_defaults_to_none() -> None:
     from agent_mcp.app._dispatch_helpers import _build_route_principal
 
     built = _build_route_principal(
-        bearer_token=None, operator_session=True, operator_user_id="op-1",
+        auth=RestPrincipal(kind="session", user={"username": "op-1"}),
     )
     assert built is not None
     assert built.project_name is None

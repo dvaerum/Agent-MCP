@@ -33,7 +33,8 @@ from starlette.requests import Request
 
 from .._dispatch_helpers import _build_route_principal, handle_options
 from ._wire_validation import require_str as _require_str
-from ..deps import caller_identity, require_operator_session
+from ..deps import require_operator_session
+from ..rest_principal import RestPrincipal
 from .composition import is_confirmed_operator_tier
 from ...core.authorize import AuthRejected
 from ...core.config import logger
@@ -62,7 +63,7 @@ router = APIRouter(
 @router.api_route("/tokens", methods=["GET", "OPTIONS"])
 async def tokens_api_route(
     request: Request,
-    auth: dict = Depends(require_operator_session),
+    auth: RestPrincipal = Depends(require_operator_session),
 ) -> JSONResponse:
     """GET /api/tokens — dashboard's source of agent bearer tokens.
 
@@ -162,7 +163,7 @@ async def prompts_catalog_api_route(request: Request) -> JSONResponse:
 @router.api_route("/settings-data", methods=["GET", "OPTIONS"])
 async def settings_data_api_route(
     request: Request,
-    auth: dict = Depends(require_operator_session),
+    auth: RestPrincipal = Depends(require_operator_session),
 ) -> JSONResponse:
     """GET /api/settings-data — every ``project_settings`` row.
 
@@ -226,7 +227,7 @@ def _schema_as_json() -> list[dict]:
 @router.api_route("/settings-schema", methods=["GET", "OPTIONS"])
 async def settings_schema_api_route(
     request: Request,
-    auth: dict = Depends(require_operator_session),
+    auth: RestPrincipal = Depends(require_operator_session),
 ) -> JSONResponse:
     """GET /api/settings-schema — the single-source settings schema.
 
@@ -274,7 +275,7 @@ async def settings_schema_api_route(
 
 async def _dispatch_settings_write(
     request: Request,
-    auth: dict,
+    auth: RestPrincipal,
     context_key: str,
     data: dict,
 ) -> JSONResponse:
@@ -305,11 +306,7 @@ async def _dispatch_settings_write(
     if not is_valid_memory_key(context_key):
         return JSONResponse(SETTING_KEY_ERROR, status_code=400)
 
-    principal = _build_route_principal(
-        bearer_token=None,
-        operator_session=True,
-        operator_user_id=caller_identity(auth),
-    )
+    principal = _build_route_principal(auth=auth)
 
     arguments: dict = {
         "context_key": context_key,
@@ -360,7 +357,7 @@ async def _dispatch_settings_write(
 @router.post("/settings")
 async def create_setting_api_route(
     request: Request,
-    auth: dict = Depends(require_operator_session),
+    auth: RestPrincipal = Depends(require_operator_session),
 ) -> JSONResponse:
     """POST /api/settings — upsert a setting (body carries the key)."""
     try:
@@ -380,7 +377,7 @@ async def create_setting_api_route(
 async def update_setting_api_route(
     context_key: str,
     request: Request,
-    auth: dict = Depends(require_operator_session),
+    auth: RestPrincipal = Depends(require_operator_session),
 ) -> JSONResponse:
     """PUT /api/settings/<context_key> — upsert a setting."""
     try:
@@ -394,7 +391,7 @@ async def update_setting_api_route(
 async def delete_setting_api_route(
     context_key: str,
     request: Request,
-    auth: dict = Depends(require_operator_session),
+    auth: RestPrincipal = Depends(require_operator_session),
 ) -> JSONResponse:
     """DELETE /api/settings/<context_key> — thin adapter over the gated
     ``delete_project_settings`` tool (the ``system.config.write`` cap
@@ -406,11 +403,7 @@ async def delete_setting_api_route(
     if not is_valid_memory_key(context_key):
         return JSONResponse(SETTING_KEY_ERROR, status_code=400)
 
-    principal = _build_route_principal(
-        bearer_token=None,
-        operator_session=True,
-        operator_user_id=caller_identity(auth),
-    )
+    principal = _build_route_principal(auth=auth)
 
     try:
         result = await dispatch_tool_call(

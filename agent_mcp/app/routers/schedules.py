@@ -24,7 +24,8 @@ from fastapi.responses import JSONResponse
 from starlette.requests import Request
 
 from .._dispatch_helpers import _build_route_principal
-from ..deps import caller_identity, require_operator_session
+from ..deps import require_operator_session
+from ..rest_principal import RestPrincipal
 from ...core.authorize import AuthRejected
 from ...core.config import logger
 from ...core.tool_result import Ok, tool_result_to_http
@@ -42,12 +43,8 @@ from ...utils.json_utils import get_sanitized_json_body
 router = APIRouter(prefix="/api/schedules", tags=["schedules"])
 
 
-def _operator_principal(auth: dict):
-    return _build_route_principal(
-        bearer_token=None,
-        operator_session=True,
-        operator_user_id=caller_identity(auth),
-    )
+def _operator_principal(auth: RestPrincipal):
+    return _build_route_principal(auth=auth)
 
 
 def _tool_result_to_response(result) -> JSONResponse:
@@ -69,7 +66,7 @@ def _tool_result_to_response(result) -> JSONResponse:
 @router.get("")
 async def list_schedules_api_route(
     request: Request,
-    auth: dict = Depends(require_operator_session),
+    auth: RestPrincipal = Depends(require_operator_session),
 ) -> JSONResponse:
     """GET /api/schedules — every schedule across the project's agents.
 
@@ -95,7 +92,7 @@ async def list_schedules_api_route(
 @router.post("")
 async def create_schedule_api_route(
     request: Request,
-    auth: dict = Depends(require_operator_session),
+    auth: RestPrincipal = Depends(require_operator_session),
 ) -> JSONResponse:
     """POST /api/schedules — operator creates a schedule for any agent.
 
@@ -132,7 +129,7 @@ async def create_schedule_api_route(
 async def update_schedule_api_route(
     directive_id: str,
     request: Request,
-    auth: dict = Depends(require_operator_session),
+    auth: RestPrincipal = Depends(require_operator_session),
 ) -> JSONResponse:
     """PUT /api/schedules/{id} — edit / pause / resume.
 
@@ -168,7 +165,7 @@ async def update_schedule_api_route(
 async def delete_schedule_api_route(
     directive_id: str,
     request: Request,
-    auth: dict = Depends(require_operator_session),
+    auth: RestPrincipal = Depends(require_operator_session),
 ) -> JSONResponse:
     """DELETE /api/schedules/{id} — remove a schedule permanently."""
     try:

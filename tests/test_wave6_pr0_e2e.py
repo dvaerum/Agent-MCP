@@ -33,6 +33,7 @@ import datetime as _dt
 
 import pytest
 
+from agent_mcp.app.rest_principal import RestPrincipal
 from agent_mcp.core.tool_result import Ok
 from tests.harness import make_principal, mcp_session, with_principal
 
@@ -136,8 +137,7 @@ async def test_rest_adapter_maps_ok_with_data_to_200(tmp_path) -> None:
             "add_task_note",
             {"task_id": "wave6-demo-rest-1", "text": "rest path"},
             bearer_token=None,
-            operator_session=True,
-            operator_user_id="alice",
+            auth=RestPrincipal(kind="session", user={"username": "alice"}),
         )
 
     assert response.status_code == 200, response.body
@@ -167,8 +167,7 @@ async def test_rest_adapter_maps_invalid_to_400(tmp_path) -> None:
             "add_task_note",
             {"task_id": "wave6-demo-rest-invalid", "text": ""},
             bearer_token=None,
-            operator_session=True,
-            operator_user_id="alice",
+            auth=RestPrincipal(kind="session", user={"username": "alice"}),
         )
 
     assert response.status_code == 400, response.body

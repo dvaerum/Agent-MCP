@@ -37,6 +37,7 @@ from ..deps import (
     caller_identity,
     require_operator_session,
 )
+from ..rest_principal import RestPrincipal
 from ...core.authorize import AuthRejected
 from ...core.config import logger
 from ...core import session_registry
@@ -337,7 +338,7 @@ async def agents_list_api_route(request: Request) -> JSONResponse:
 @router.post("/register")
 async def register_agent_dashboard_api_route(
     request: Request,
-    auth: dict = Depends(require_operator_session),
+    auth: RestPrincipal = Depends(require_operator_session),
 ) -> JSONResponse:
     """POST /api/agents/register — operator mints an agent identity.
 
@@ -377,7 +378,6 @@ async def register_agent_dashboard_api_route(
             status_code=422,
         )
 
-    operator_id = caller_identity(auth)
     # AZ-R14-1 (round 14) / Finding B (security-arch-hardening-
     # consolidated.md Phase 1): thread the forwarding caller's REAL
     # signed ``(project_role, sysadmin)`` instead of a hard-coded
@@ -391,9 +391,7 @@ async def register_agent_dashboard_api_route(
     # the Principal field is best-effort plumbing (the tool's snippet
     # builder reads ``arguments["project_name"]`` first either way).
     principal = _build_route_principal(
-        bearer_token=None,
-        operator_session=True,
-        operator_user_id=operator_id,
+        auth=auth,
         project_name=project_name if isinstance(project_name, str) else None,
     )
 
@@ -481,7 +479,7 @@ async def register_agent_dashboard_api_route(
 async def _dispatch_agent_lifecycle_tool(
     tool_name: str,
     arguments: Dict[str, Any],
-    auth: dict,
+    auth: RestPrincipal,
 ) -> ToolResult | JSONResponse:
     """Dispatch an agent-lifecycle tool from a REST handler.
 
@@ -492,11 +490,7 @@ async def _dispatch_agent_lifecycle_tool(
     (input-validation / unexpected exception) returns a ready
     :class:`JSONResponse` instead — the caller returns it verbatim.
     """
-    principal = _build_route_principal(
-        bearer_token=None,
-        operator_session=True,
-        operator_user_id=caller_identity(auth),
-    )
+    principal = _build_route_principal(auth=auth)
     try:
         return await dispatch_tool_call(
             tool_name, arguments, principal=principal,
@@ -559,13 +553,9 @@ def _agent_tool_error(result: ToolResult, failed_message: str) -> JSONResponse:
 
 
 async def _dispatch_presence_impl(
-    impl, arguments: Dict[str, Any], auth: dict,
+    impl, arguments: Dict[str, Any], auth: RestPrincipal,
 ) -> "ToolResult | JSONResponse":
-    principal = _build_route_principal(
-        bearer_token=None,
-        operator_session=True,
-        operator_user_id=caller_identity(auth),
-    )
+    principal = _build_route_principal(auth=auth)
     try:
         return await impl(arguments, principal=principal)
     except Exception as e:  # pragma: no cover - defensive
@@ -581,7 +571,7 @@ async def _dispatch_presence_impl(
 @router.post("/disconnect-all")
 async def disconnect_all_agents_api_route(
     request: Request,
-    auth: dict = Depends(require_operator_session),
+    auth: RestPrincipal = Depends(require_operator_session),
 ) -> JSONResponse:
     """POST /api/agents/disconnect-all — pause the whole fleet.
 
@@ -614,7 +604,7 @@ async def disconnect_all_agents_api_route(
 @router.post("/reconnect-all")
 async def reconnect_all_agents_api_route(
     request: Request,
-    auth: dict = Depends(require_operator_session),
+    auth: RestPrincipal = Depends(require_operator_session),
 ) -> JSONResponse:
     """POST /api/agents/reconnect-all — re-enable the global loop."""
     try:
@@ -641,7 +631,7 @@ async def reconnect_all_agents_api_route(
 async def disconnect_agent_api_route(
     agent_id: str,
     request: Request,
-    auth: dict = Depends(require_operator_session),
+    auth: RestPrincipal = Depends(require_operator_session),
 ) -> JSONResponse:
     """POST /api/agents/<id>/disconnect — pause one agent's monitoring.
 
@@ -679,7 +669,7 @@ async def disconnect_agent_api_route(
 async def reconnect_agent_api_route(
     agent_id: str,
     request: Request,
-    auth: dict = Depends(require_operator_session),
+    auth: RestPrincipal = Depends(require_operator_session),
 ) -> JSONResponse:
     """POST /api/agents/<id>/reconnect — re-enable one agent's loop."""
     if not agent_id:
@@ -709,7 +699,7 @@ async def reconnect_agent_api_route(
 async def restore_agent_api_route(
     agent_id: str,
     request: Request,
-    auth: dict = Depends(require_operator_session),
+    auth: RestPrincipal = Depends(require_operator_session),
 ) -> JSONResponse:
     """POST /api/agents/<id>/restore — thin adapter over ``restore_agent``.
 
@@ -756,7 +746,7 @@ async def restore_agent_api_route(
 async def edit_agent_api_route(
     agent_id: str,
     request: Request,
-    auth: dict = Depends(require_operator_session),
+    auth: RestPrincipal = Depends(require_operator_session),
 ) -> JSONResponse:
     """POST /api/agents/<id>/edit — thin adapter over ``edit_agent``.
 
@@ -930,7 +920,7 @@ _POKE_PRIORITIES = ("low", "normal", "high", "urgent")
 async def poke_agent_directive_api_route(
     agent_id: str,
     request: Request,
-    auth: dict = Depends(require_operator_session),
+    auth: RestPrincipal = Depends(require_operator_session),
 ) -> JSONResponse:
     """POST /api/agents/<id>/directive — operator/admin ad-hoc poke.
 
@@ -1037,7 +1027,7 @@ async def poke_agent_directive_api_route(
 @router.get("/{agent_id}/purge-preview")
 async def purge_preview_api_route(
     agent_id: str,
-    auth: dict = Depends(require_operator_session),
+    auth: RestPrincipal = Depends(require_operator_session),
 ) -> JSONResponse:
     """GET /api/agents/<id>/purge-preview — blast-radius counts + samples.
 
@@ -1088,7 +1078,7 @@ async def purge_preview_api_route(
 async def purge_agent_api_route(
     agent_id: str,
     request: Request,
-    auth: dict = Depends(require_operator_session),
+    auth: RestPrincipal = Depends(require_operator_session),
 ) -> JSONResponse:
     """DELETE /api/agents/<id>?cascade=true — thin adapter over ``purge_agent``.
 

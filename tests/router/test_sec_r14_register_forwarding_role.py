@@ -14,13 +14,16 @@ route (should the router method-gate or cookie-authorize ever be bypassed)
 would receive the full operator bundle — including ``agents.register`` —
 regardless of true authority.
 
-The fix threads the real signed ``(project_role, sysadmin)`` via
-``deps.forwarding_route_role()`` (the task-local carrier
-``require_operator_session`` arms on the forwarding branch), mirroring
+The fix threads the real signed ``(project_role, sysadmin)`` through
 ``_build_route_principal``. A forwarding VIEWER now yields a viewer-role
 Principal whose capability set the tool's own gate denies; a genuine
 forwarding operator (and the cookie / operator-tier bearer paths, which
 report ``None``) keep the historical operator-tier bundle.
+
+Finding D (Phase 5) changed only WHERE the role travels: it rode
+``deps._forwarding_route_role``, a module-level ContextVar the dep armed
+on the forwarding branch, and is now a field on the ``RestPrincipal``
+the dep returns.
 """
 
 from __future__ import annotations
@@ -30,8 +33,7 @@ from typing import Any
 
 import pytest
 
-from agent_mcp.app import deps
-from agent_mcp.app.deps import forwarding_route_role, require_operator_session
+from agent_mcp.app.deps import require_operator_session
 from agent_mcp.app.rest_principal import RestPrincipal
 from agent_mcp.app.routers import agents as agents_router
 from agent_mcp.core.principal import Principal
@@ -92,16 +94,6 @@ def _forwarding_principal(role: str | None, *, user_id: str = "op-1") -> Princip
     )
 
 
-@pytest.fixture(autouse=True)
-def _reset_forwarding_carrier():
-    """Isolate the module-level ContextVar across tests."""
-    token = deps._forwarding_route_role.set(None)
-    try:
-        yield
-    finally:
-        deps._forwarding_route_role.reset(token)
-
-
 # ── Tests ──────────────────────────────────────────────────────────
 
 
@@ -116,7 +108,7 @@ async def test_register_forwarding_viewer_principal_is_viewer_role(monkeypatch):
         _FakeAuthRequest(_forwarding_principal("viewer"))
     )
     assert auth.kind == "forwarding"
-    assert forwarding_route_role() == ("viewer", False)
+    assert auth.route_role() == ("viewer", False)
 
     captured: dict[str, Any] = {}
 
@@ -158,7 +150,7 @@ async def test_register_forwarding_viewer_denied_end_to_end():
     auth = await require_operator_session(
         _FakeAuthRequest(_forwarding_principal("viewer"))
     )
-    assert forwarding_route_role() == ("viewer", False)
+    assert auth.route_role() == ("viewer", False)
 
     resp = await agents_router.register_agent_dashboard_api_route(
         _FakeRouteRequest({"name": "worker-1", "role": "worker"}),
@@ -175,7 +167,7 @@ async def test_register_forwarding_operator_principal_unaffected(monkeypatch):
     auth = await require_operator_session(
         _FakeAuthRequest(_forwarding_principal("operator"))
     )
-    assert forwarding_route_role() == ("operator", False)
+    assert auth.route_role() == ("operator", False)
 
     captured: dict[str, Any] = {}
 
@@ -200,10 +192,10 @@ async def test_register_forwarding_operator_principal_unaffected(monkeypatch):
 
 
 async def test_register_no_forwarding_role_defaults_operator_tier(monkeypatch):
-    """Cookie / operator-tier bearer admits leave the carrier unset, so the
+    """Cookie / operator-tier bearer admits report no route role, so the
     route keeps its historical operator-tier default (those paths are
-    genuinely operator). Simulates the ``operator_bearer`` auth dict."""
-    assert forwarding_route_role() is None
+    genuinely operator)."""
+    assert RestPrincipal(kind="operator_bearer").route_role() is None
 
     captured: dict[str, Any] = {}
 

@@ -9,7 +9,7 @@ loop on the backend: the API responses no longer surface
 ``admin_token``, the self-RPC handlers no longer synthesise a system
 bearer to satisfy a downstream ``@requires("admin")`` gate (they now
 rely on the operator-session-active ContextVar that
-``_dispatch_through_tool`` stamps when ``operator_session=True``), and
+``_dispatch_through_tool`` derives from the route's ``RestPrincipal``), and
 the ``task_notes`` privilege check moves from the raw
 ``token == g.admin_token`` comparison to ``verify_token(..., "manager")``.
 
