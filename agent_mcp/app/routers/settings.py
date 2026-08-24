@@ -100,6 +100,13 @@ async def tokens_api_route(
     # and replay it to escalate to write. Only a CONFIRMED operator-tier
     # bearer may read the list; everything else gets 403. See
     # ``is_confirmed_operator_tier``.
+    #
+    # N6: this is the one agent-secret surface that GATES rather than
+    # redacts, and deliberately stays that way. Serving plaintext bearers
+    # is the endpoint's entire contract — there is no non-secret residue
+    # to return, so a masked row would be a 200 that answers nothing.
+    # It shares the *who* predicate with the three redaction sites in
+    # ``core.agent_secrets``; it has no *what* to share.
     if not is_confirmed_operator_tier(auth):
         return JSONResponse(
             {

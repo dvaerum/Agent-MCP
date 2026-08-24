@@ -50,6 +50,10 @@ from ..rest_principal import RestPrincipal
 from ...core.authorize import AuthRejected
 from ...core.config import logger
 from ...core import globals as g
+from ...core.agent_secrets import (
+    strip_agent_secrets,
+    without_secret_columns,
+)
 from ...core.operator_tier import (
     is_confirmed_operator_tier as _shared_is_confirmed_operator_tier,
 )
@@ -276,13 +280,20 @@ async def task_tree_data_api_route(
         return JSONResponse({'nodes': [], 'edges': [], 'error': 'Failed to serve task tree data.'}, status_code=500)
 
 
-#: Safe, non-secret columns to project from ``agents`` for the
-#: node-details panel. Excludes ``token`` (the bearer secret — leaking
-#: it lets a viewer replay as the agent) and ``aoe_session_id`` (the
-#: AoE side-channel session credential). The previous ``SELECT *`` +
-#: ``dict(row)`` returned both verbatim. Keep this in sync with the
-#: agents model (``agent_mcp/db/models/agent.py``) when columns change.
-_AGENT_NODE_SAFE_COLUMNS = (
+#: Columns the node-details panel DISPLAYS for an ``agent_<id>`` node.
+#: A presentation choice, deliberately narrower than the agents model
+#: (it omits the profile bookkeeping and ``last_activity_at``) — the
+#: previous ``SELECT *`` + ``dict(row)`` returned everything verbatim,
+#: including the bearer.
+#:
+#: N6: the SECURITY half is no longer this list's job. It is filtered
+#: through ``without_secret_columns``, so a credential column added to
+#: the display list — or a new column marked ``info={"secret": True}``
+#: on the model — is dropped structurally instead of relying on the
+#: "keep this in sync with the agents model" comment that used to sit
+#: here. This panel withholds bearers from EVERY tier, confirmed
+#: operators included: it is a display surface, not a credential one.
+_AGENT_NODE_DISPLAY_COLUMNS = (
     "agent_id",
     "status",
     "agent_role",
@@ -295,6 +306,8 @@ _AGENT_NODE_SAFE_COLUMNS = (
     "auto_event_loop",
     "last_event_seen_at",
 )
+
+_AGENT_NODE_SAFE_COLUMNS = without_secret_columns(_AGENT_NODE_DISPLAY_COLUMNS)
 
 
 @router.get("/node-details")
@@ -322,9 +335,10 @@ async def node_details_api_route(
         details['type'] = node_type_from_id
         if node_type_from_id == 'agent':
             # Explicit safe-column projection — NEVER ``SELECT *`` here:
-            # the agents table holds the secret bearer ``token`` (and the
-            # ``aoe_session_id`` side-channel credential) which must not
-            # reach any dashboard client. See ``_AGENT_NODE_SAFE_COLUMNS``.
+            # the agents table holds credential columns which must not
+            # reach any dashboard client. See ``_AGENT_NODE_SAFE_COLUMNS``,
+            # which is the display list minus whatever
+            # ``core.agent_secrets`` says is secret.
             _cols = ", ".join(_AGENT_NODE_SAFE_COLUMNS)
             cursor.execute(
                 f"SELECT {_cols} FROM agents WHERE agent_id = ?",
@@ -452,22 +466,20 @@ async def all_data_api_route(
         )
         agents_data = []
         for row in cursor.fetchall():
-            agent_dict = dict(row)
-            # SECURITY: the ``SELECT *`` above pulls the secret bearer
-            # ``token`` column. Drop it unconditionally — the canonical
-            # (operator-gated) token field is ``auth_token`` below.
-            # Leaving the raw column in ``dict(row)`` re-opened the
-            # viewer→agent bearer disclosure that ``auth_token`` gating
-            # otherwise closes.
-            agent_dict.pop('token', None)
-            # SECURITY: aoe_session_id is the AoE side-channel session
-            # credential. /api/all-data is served to the viewer tier
-            # (the router admits viewers on GET), and node-details
-            # already strips it via _AGENT_NODE_SAFE_COLUMNS — strip it
-            # here too so the two agent-exposing surfaces agree and a
-            # viewer can't harvest it. (Operators edit AoE via the
-            # operator-gated POST /api/agents/<id>/edit path.)
-            agent_dict.pop('aoe_session_id', None)
+            # SECURITY: the ``SELECT *`` above pulls every credential
+            # column the agents table holds — the bearer ``token`` and
+            # the ``aoe_session_id`` AoE side-channel session id. Drop
+            # them unconditionally; this endpoint's only bearer field is
+            # the operator-gated ``auth_token`` set below. Leaving a raw
+            # column in ``dict(row)`` re-opened the viewer→agent bearer
+            # disclosure that ``auth_token`` gating otherwise closes, and
+            # /api/all-data IS served to the viewer tier (the router
+            # admits viewers on GET). N6: the column NAMES come from
+            # ``core.agent_secrets`` — the same declaration node-details
+            # projects against — so the two agent-exposing surfaces
+            # cannot disagree about what a credential is. (Operators edit
+            # AoE via the operator-gated POST /api/agents/<id>/edit path.)
+            agent_dict = strip_agent_secrets(dict(row))
             # Defensive skip for the legacy 'admin' pseudo-agent row.
             # Wave 4 (migration 0014) deletes it; this filter remains
             # so a partially-upgraded DB (or one with the

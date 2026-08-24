@@ -41,6 +41,7 @@ from ..core.auth import generate_token  # For register_agent, terminate_agent
 from ..core.principal import Principal
 from ..core.authorize import requires_capability
 from ..core.agent_profile_defaults import MANAGER_DEFAULT_PROFILE
+from ..core.agent_secrets import redact_agent_row
 from ..core.operator_tier import (
     is_confirmed_operator_tier as _shared_is_confirmed_operator_tier,
 )
@@ -2046,21 +2047,23 @@ async def get_agent_tokens_tool_impl(
         expose_tokens = include_sensitive_data and _is_confirmed_operator_tier(
             principal
         )
-        agents_data = []
-        for row in rows:
-            agent_data = dict(row)
-            if not expose_tokens:
-                # SECURITY (viewer-read-gating finding 3, 2026-07-08):
-                # FULL-mask the bearer for the non-confirmed-operator
-                # path. The prior ``token[:4] + "..." + token[-4:]`` form
-                # disclosed 8 characters of a secret bearer to any
-                # non-operator caller — enough to narrow a brute-force or
-                # confirm a guessed token. Confirmed operators still get
-                # the real token via the ``expose_tokens`` branch (the
-                # SEC2 contract, unchanged).
-                if "token" in agent_data:
-                    agent_data["token"] = "***"
-            agents_data.append(agent_data)
+        # SECURITY (viewer-read-gating finding 3, 2026-07-08): FULL-mask
+        # the bearer for the non-confirmed-operator path. The prior
+        # ``token[:4] + "..." + token[-4:]`` form disclosed 8 characters
+        # of a secret bearer to any non-operator caller — enough to
+        # narrow a brute-force or confirm a guessed token. Confirmed
+        # operators (who also opted in) still get the real token.
+        #
+        # N6: masking goes through the shared ``redact_agent_row``, so
+        # WHICH columns count as credentials is the model's declaration
+        # (``core.agent_secrets``) rather than this function's memory of
+        # them. Today ``AgentRepository.query`` projects only ``token``
+        # of the secret set; if that projection ever widens, this masks
+        # the new column without an edit here.
+        agents_data = [
+            redact_agent_row(row, confirmed_operator_tier=expose_tokens)
+            for row in rows
+        ]
 
         # Log this access against the REAL caller (FINDING 2 audit bug:
         # the actor was hard-coded "admin", so a viewer's dump was
