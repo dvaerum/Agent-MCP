@@ -34,6 +34,7 @@ from starlette.requests import Request
 from ..core.authorize import AuthRejected
 from ..core.config import logger
 from ..core.principal import Principal
+from .rest_principal import RestPrincipal
 from ..core.tool_result import (
     Failed as _Failed,
     Ok as _Ok,
@@ -67,8 +68,7 @@ async def _dispatch_through_tool(
     bearer_token: Optional[str],
     success_message: Optional[str] = None,
     extra_response: Optional[Dict[str, Any]] = None,
-    operator_session: bool = False,
-    operator_user_id: Optional[str] = None,
+    auth: Optional[RestPrincipal] = None,
 ) -> JSONResponse:
     """Run an MCP tool from a REST handler and translate the typed
     :data:`ToolResult` back into a dashboard-friendly JSON response.
@@ -79,11 +79,12 @@ async def _dispatch_through_tool(
     ``arguments.token`` if not already there — same path an HTTP
     middleware would take.
 
-    Callers pass ``operator_session=True`` + ``operator_user_id=<username>``
-    to admit operator-tier dispatches without a bearer token. We build
-    a ``Principal`` from those values and thread it to the dispatcher;
-    when neither is set, the bearer is expected to carry an
-    ``agent_bearer`` Principal (built locally from the row).
+    Callers pass ``auth=<RestPrincipal>`` (the value
+    ``require_operator_session`` handed their handler) to admit an
+    operator-tier dispatch without a bearer token; we convert it to a
+    ``Principal`` via :func:`_build_route_principal` and thread that to
+    the dispatcher. When ``auth`` is absent, the bearer is expected to
+    carry an ``agent_bearer`` Principal (built locally from the row).
 
     Wave 6 PR 6: the legacy ContextVar stamp block (which set the
     deleted ``operator_session_active`` / ``operator_user_id`` vars
@@ -109,9 +110,8 @@ async def _dispatch_through_tool(
         cv_token = request_auth_token.set(bearer_token)
 
     dispatch_principal = _build_route_principal(
+        auth=auth,
         bearer_token=bearer_token,
-        operator_session=operator_session,
-        operator_user_id=operator_user_id,
     )
     try:
         result = await dispatch_tool_call(
@@ -190,51 +190,63 @@ async def _dispatch_through_tool(
 
 def _build_route_principal(
     *,
-    bearer_token: Optional[str],
-    operator_session: bool,
-    operator_user_id: Optional[str],
+    auth: Optional[RestPrincipal] = None,
+    bearer_token: Optional[str] = None,
     project_name: Optional[str] = None,
 ) -> Optional[Principal]:
-    """Construct the Principal the REST seam threads into the dispatcher.
+    """Convert a REST admission into the authorization Principal the
+    dispatcher runs a tool under.
+
+    This is the ONE place
+    :class:`~agent_mcp.app.rest_principal.RestPrincipal` ("which door
+    admitted this caller") becomes
+    :class:`~agent_mcp.core.principal.Principal` ("what may they do") —
+    see ``CONTEXT.md`` for why those are two types.
 
     Three shapes:
 
-    * ``operator_session=True`` → ``operator_session`` Principal
-      naming the operator (the dashboard / forwarding-header path).
-    * Bearer present, no operator session → ``agent_bearer`` Principal
-      sourced from the row in ``agents``.
+    * ``auth`` present → ``operator_session`` Principal naming the
+      operator (the dashboard / forwarding-header / operator-bearer
+      doors all dispatch as operator-session).
+    * No ``auth``, bearer present → ``agent_bearer`` Principal sourced
+      from the row in ``agents``.
     * Neither → None (the dispatcher will reject downstream).
 
-    AC-R5-1 (round 5): for the ``operator_session`` shape, use the
-    forwarding caller's REAL HMAC-signed ``project_role`` + ``sysadmin``
-    when :func:`agent_mcp.app.deps.forwarding_route_role` reports them
-    (set by ``require_operator_session``'s forwarding branch for THIS
-    request task). A forwarding VIEWER thus gets a viewer-role Principal
-    whose capability set the tool's own gate denies — closing the latent
-    viewer→operator escalation the hard-coded ``"operator"`` left open.
-    The cookie / operator-tier bearer paths report ``None`` here and keep
-    the historical operator-tier default: those paths are genuinely
-    operator (the cookie mutation admit is authorized as operator
-    upstream; the bearer resolves an operator-tier agent row).
+    AC-R5-1 (round 5): the ``operator_session`` shape takes its
+    ``project_role`` + ``sysadmin`` from ``auth.route_role()`` — the
+    forwarding caller's REAL HMAC-signed role when the forwarding door
+    admitted them, ``None`` (→ the historical operator-tier default) for
+    the cookie and operator-bearer doors, which are genuinely
+    operator-tier. A forwarding VIEWER thus gets a viewer-role Principal
+    whose capability set the tool's own gate denies, closing the latent
+    viewer→operator escalation a hard-coded ``"operator"`` left open.
 
-    Finding B (security-arch-hardening-consolidated.md Phase 1):
-    ``project_name`` is best-effort plumbing for routes whose tool call
-    needs it explicitly (e.g. ``agents.register`` — the per-project
-    backend doesn't yet derive its own project name from the request).
-    Every other call site omits it and keeps the historical ``None``.
+    Finding D (Phase 5) is why this takes the whole ``auth`` value rather
+    than a pre-extracted ``operator_user_id`` + a role tuple: those two
+    facts used to arrive by different routes (an argument and a
+    module-level ``ContextVar``), so a call site could supply the first
+    and silently forget the second — and forgetting it re-opened AC-R5-1
+    with every test still green, because the fallback is "operator".
+    Passing the admission itself makes that omission unrepresentable.
+
+    Finding B (Phase 1): ``project_name`` is best-effort plumbing for
+    routes whose tool call needs it explicitly (e.g. ``agents.register``
+    — the per-project backend doesn't yet derive its own project name
+    from the request). Every other call site omits it and keeps the
+    historical ``None``.
     """
     from ..core.principal_builder import (
         build_agent_bearer_principal,
         build_operator_principal,
     )
 
-    if operator_session:
+    if auth is not None:
         # Local import: deps.py imports nothing from this module, so a
         # module-level import is cycle-free — but keeping it local also
         # sidesteps any app-construction import-ordering surprise.
-        from .deps import forwarding_route_role
+        from .deps import caller_identity
 
-        threaded = forwarding_route_role()
+        threaded = auth.route_role()
         if threaded is not None:
             project_role, sysadmin = threaded
         else:
@@ -243,7 +255,7 @@ def _build_route_principal(
         # one code path (this used to lean on Principal.__post_init__'s
         # back-fill; the builder now resolves explicitly, identically).
         return build_operator_principal(
-            user_id=operator_user_id,
+            user_id=caller_identity(auth),
             kind="operator_session",
             project_role=project_role,
             sysadmin=sysadmin,

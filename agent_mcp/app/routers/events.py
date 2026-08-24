@@ -43,6 +43,7 @@ from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
 from ..deps import caller_identity, require_operator_session
+from ..rest_principal import RestPrincipal
 from ...core.stream_gates import RevalidatingStream, StreamRevoked
 from ...features import operator_events
 
@@ -95,7 +96,7 @@ async def _still_authorized(request: Request) -> bool:
 @router.get("/events")
 async def operator_events_stream(
     request: Request,
-    auth: dict = Depends(require_operator_session),
+    auth: RestPrincipal = Depends(require_operator_session),
 ) -> EventSourceResponse:
     """Stream ``notifications/resources/updated`` envelopes to an
     authenticated operator as Server-Sent Events."""
@@ -136,7 +137,7 @@ async def operator_events_stream(
 @router.get("/events/status")
 async def operator_events_status(
     request: Request,
-    auth: dict = Depends(require_operator_session),
+    auth: RestPrincipal = Depends(require_operator_session),
 ) -> JSONResponse:
     """Operator observability for the live-update channel: the count of
     live dashboard SSE streams plus a per-stream snapshot

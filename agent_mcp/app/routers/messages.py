@@ -31,6 +31,7 @@ from starlette.requests import Request
 
 from .._dispatch_helpers import _build_route_principal
 from ..deps import caller_identity, require_operator_session
+from ..rest_principal import RestPrincipal
 from ...core.config import logger
 from ...core.tool_result import tool_result_to_http
 from ...db.actions.agent_actions_db import log_agent_action_to_db
@@ -76,7 +77,7 @@ _MESSAGE_PRIORITIES = ("low", "normal", "high", "urgent")
 @router.post("/query")
 async def list_messages_api_route(
     request: Request,
-    auth: dict = Depends(require_operator_session),
+    auth: RestPrincipal = Depends(require_operator_session),
 ) -> JSONResponse:
     """POST /api/messages/query with rich filters.
 
@@ -173,7 +174,7 @@ async def list_messages_api_route(
 @router.post("/participants")
 async def list_participants_api_route(
     request: Request,
-    auth: dict = Depends(require_operator_session),
+    auth: RestPrincipal = Depends(require_operator_session),
 ) -> JSONResponse:
     """POST /api/messages/participants — agents available as filter values.
 
@@ -239,7 +240,7 @@ async def list_participants_api_route(
 @router.post("/suggest-subject")
 async def suggest_subject_api_route(
     request: Request,
-    auth: dict = Depends(require_operator_session),
+    auth: RestPrincipal = Depends(require_operator_session),
 ) -> JSONResponse:
     """POST /api/messages/suggest-subject — Ollama-backed subject helper.
 
@@ -291,7 +292,7 @@ async def suggest_subject_api_route(
 @router.post("")
 async def create_message_api_route(
     request: Request,
-    auth: dict = Depends(require_operator_session),
+    auth: RestPrincipal = Depends(require_operator_session),
 ) -> JSONResponse:
     """POST /api/messages — admin composes a message to a recipient.
 
@@ -403,11 +404,7 @@ async def create_message_api_route(
         # silently reopen the gap (mirrors the memories #483 fix). The
         # gate runs before both the broadcast ("*") and single-recipient
         # branches so the cap + stop-command rules apply to each.
-        principal = _build_route_principal(
-            bearer_token=None,
-            operator_session=True,
-            operator_user_id=caller_identity(auth),
-        )
+        principal = _build_route_principal(auth=auth)
         denial = check_send_message_permission(
             principal,
             recipient_id=recipient_id,
@@ -667,7 +664,7 @@ async def create_message_api_route(
 async def get_message_thread_api_route(
     message_id: str,
     request: Request,
-    auth: dict = Depends(require_operator_session),
+    auth: RestPrincipal = Depends(require_operator_session),
 ) -> JSONResponse:
     """GET /api/messages/{message_id}/thread — the whole conversation.
 
@@ -709,7 +706,7 @@ async def get_message_thread_api_route(
 async def patch_message_api_route(
     message_id: str,
     request: Request,
-    auth: dict = Depends(require_operator_session),
+    auth: RestPrincipal = Depends(require_operator_session),
 ) -> JSONResponse:
     """PATCH/DELETE /api/messages/{message_id}.
 

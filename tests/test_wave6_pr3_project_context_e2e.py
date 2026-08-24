@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import pytest
 
+from agent_mcp.app.rest_principal import RestPrincipal
 from agent_mcp.core.principal import Principal
 from agent_mcp.core.tool_result import (
     Invalid,
@@ -659,8 +660,7 @@ async def test_rest_adapter_maps_not_found_to_404(tmp_path) -> None:
             "delete_project_context",
             {"context_key": "pr3.rest.missing"},
             bearer_token=None,
-            operator_session=True,
-            operator_user_id="alice",
+            auth=RestPrincipal(kind="session", user={"username": "alice"}),
         )
 
     assert response.status_code == 404, response.body
@@ -682,8 +682,7 @@ async def test_rest_adapter_maps_invalid_to_400_with_field(tmp_path) -> None:
             "delete_project_context",
             {},
             bearer_token=None,
-            operator_session=True,
-            operator_user_id="alice",
+            auth=RestPrincipal(kind="session", user={"username": "alice"}),
         )
 
     assert response.status_code == 400, response.body
@@ -709,8 +708,7 @@ async def test_rest_adapter_maps_ok_data_to_200_with_payload(
                 "context_value": "via-rest",
             },
             bearer_token=None,
-            operator_session=True,
-            operator_user_id="alice",
+            auth=RestPrincipal(kind="session", user={"username": "alice"}),
         )
 
     assert response.status_code == 200, response.body

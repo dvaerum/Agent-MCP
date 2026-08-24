@@ -23,11 +23,16 @@ escalation for any future GET route that dispatches a privileged
 now yields a viewer-role Principal whose capability set the tool's own
 gate denies, while a forwarding operator (and the cookie / bearer
 paths) are unaffected.
+
+Finding D (Phase 5) changed only WHERE the role travels: it rode a
+module-level ``ContextVar`` (``deps._forwarding_route_role``) between
+the dep and the dispatch helper, and is now a field on the
+``RestPrincipal`` the dep returns, which the helper is handed directly.
+The property under test is identical; the assertions read the field
+instead of the carrier.
 """
 
 from __future__ import annotations
-
-from typing import Any
 
 import pytest
 
@@ -35,9 +40,9 @@ from agent_mcp.app import deps
 from agent_mcp.app._dispatch_helpers import _build_route_principal
 from agent_mcp.app.deps import (
     SESSION_COOKIE_NAME,
-    forwarding_route_role,
     require_operator_session,
 )
+from agent_mcp.app.rest_principal import RestPrincipal
 from agent_mcp.core.principal import Principal
 from tests.harness import make_principal
 
@@ -94,18 +99,6 @@ def _forwarding_principal(role: str | None, *, user_id: str = "op-1") -> Princip
     )
 
 
-@pytest.fixture(autouse=True)
-def _reset_forwarding_carrier():
-    """Isolate the module-level ContextVar across tests — ContextVar
-    values set via ``.set()`` in one test persist into the next in the
-    same task otherwise."""
-    token = deps._forwarding_route_role.set(None)
-    try:
-        yield
-    finally:
-        deps._forwarding_route_role.reset(token)
-
-
 # ── Tests ──────────────────────────────────────────────────────────
 
 
@@ -119,16 +112,11 @@ async def test_forwarding_viewer_yields_viewer_role_not_operator():
     auth = await require_operator_session(req)
 
     assert auth.kind == "forwarding"
-    # The dep now threads the real role via the task-local carrier
-    # instead of dropping it (the return dict's shape is pinned by
-    # test_sec_r4_operator_identity_race, so the role rides the carrier).
-    assert forwarding_route_role() == ("viewer", False)
+    # The dep threads the real role on the value it returns; the
+    # dispatch seam reads it off that value, not off a module global.
+    assert auth.route_role() == ("viewer", False)
 
-    built = _build_route_principal(
-        bearer_token=None,
-        operator_session=True,
-        operator_user_id=auth.operator_id,
-    )
+    built = _build_route_principal(auth=auth)
 
     assert built is not None
     assert built.kind == "operator_session"
@@ -148,13 +136,9 @@ async def test_forwarding_operator_yields_operator_role_unaffected():
     auth = await require_operator_session(req)
 
     assert auth.kind == "forwarding"
-    assert forwarding_route_role() == ("operator", False)
+    assert auth.route_role() == ("operator", False)
 
-    built = _build_route_principal(
-        bearer_token=None,
-        operator_session=True,
-        operator_user_id=auth.operator_id,
-    )
+    built = _build_route_principal(auth=auth)
 
     assert built.project_role == "operator"
     assert built.has_capability("tasks.delete")
@@ -162,39 +146,42 @@ async def test_forwarding_operator_yields_operator_role_unaffected():
 
 
 async def test_no_forwarding_role_defaults_to_operator_tier():
-    """Cookie / operator-tier bearer admits leave the carrier unset, so
+    """Cookie / operator-tier bearer admits report no route role, so
     ``_build_route_principal`` keeps its historical operator-tier default
     (those paths are genuinely operator)."""
-    assert forwarding_route_role() is None
+    cookie_auth = RestPrincipal(kind="session", user={"username": "op-cookie"})
+    assert cookie_auth.route_role() is None
 
-    built = _build_route_principal(
-        bearer_token=None,
-        operator_session=True,
-        operator_user_id="op-cookie",
-    )
+    built = _build_route_principal(auth=cookie_auth)
 
     assert built.project_role == "operator"
     assert built.sysadmin is False
     assert built.has_capability("tasks.delete")
 
 
-async def test_cookie_admit_resets_stale_forwarding_role(monkeypatch):
-    """The dep resets the carrier at entry: a forwarding-viewer admit
-    followed by a cookie admit in the same task must NOT leak the viewer
-    role into the cookie caller's dispatch (cookie regression)."""
-    # First a forwarding-viewer admit arms the carrier.
-    await require_operator_session(_FakeRequest(_forwarding_principal("viewer")))
-    assert forwarding_route_role() == ("viewer", False)
+async def test_cookie_admit_cannot_inherit_a_prior_forwarding_role(monkeypatch):
+    """A forwarding-viewer admit followed by a cookie admit in the SAME
+    task must not leak the viewer role into the cookie caller's dispatch.
 
-    # Then a cookie admit in the same task must clear it.
+    Pre-Finding-D this needed the dep to explicitly reset a task-local
+    ContextVar at entry — an easy thing to drop. Now each admit returns
+    its own value and the dispatch seam reads only the value it was
+    handed, so staleness is unrepresentable rather than defended
+    against. The regression is pinned all the same."""
+    fwd_auth = await require_operator_session(
+        _FakeRequest(_forwarding_principal("viewer"))
+    )
+    assert fwd_auth.route_role() == ("viewer", False)
+
     monkeypatch.setattr(
         deps,
         "_resolve_session_user",
         lambda sid: {"user_id": "u1", "username": "alice"},
     )
-    # Wave 12 PR A: the authorize helper now RETURNS the resolved
-    # ``(project_role, sysadmin)`` instead of ``None``. This test only
-    # cares about the carrier reset, so a benign admit tuple suffices.
+    # Wave 12 PR A: the authorize helper RETURNS the resolved
+    # ``(project_role, sysadmin)``. This test only cares that the cookie
+    # admit is independent of the forwarding one, so a benign admit
+    # tuple suffices.
     monkeypatch.setattr(
         deps,
         "_authorize_session_for_project",
@@ -205,15 +192,13 @@ async def test_cookie_admit_resets_stale_forwarding_role(monkeypatch):
         cookies={SESSION_COOKIE_NAME: "sess-1"},
     )
 
-    auth: dict[str, Any] = await require_operator_session(cookie_req)
+    auth = await require_operator_session(cookie_req)
 
     assert auth.kind == "session"
-    assert forwarding_route_role() is None
+    assert auth.route_role() is None
+    # ... and the earlier forwarding admit is untouched by it.
+    assert fwd_auth.route_role() == ("viewer", False)
 
-    built = _build_route_principal(
-        bearer_token=None,
-        operator_session=True,
-        operator_user_id="alice",
-    )
+    built = _build_route_principal(auth=auth)
     assert built.project_role == "operator"
     assert built.has_capability("tasks.delete")

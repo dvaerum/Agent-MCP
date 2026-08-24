@@ -39,6 +39,7 @@ import pytest
 
 import agent_mcp.app._dispatch_helpers as dispatch_helpers
 import agent_mcp.app.main_app as main_app
+from agent_mcp.app.rest_principal import RestPrincipal
 from agent_mcp.core.authorize import AuthRejected
 from agent_mcp.core.tool_result import Ok
 
@@ -191,8 +192,7 @@ async def test_rest_uncaught_exception_is_generic(monkeypatch) -> None:
         "some_tool",
         {},
         bearer_token=None,
-        operator_session=True,
-        operator_user_id="admin",
+        auth=RestPrincipal(kind="operator_bearer"),
     )
     assert resp.status_code == 500
     blob = resp.body.decode("utf-8")
@@ -215,8 +215,7 @@ async def test_rest_authrejected_reason_preserved(monkeypatch) -> None:
         "some_tool",
         {},
         bearer_token=None,
-        operator_session=True,
-        operator_user_id="admin",
+        auth=RestPrincipal(kind="operator_bearer"),
     )
     assert resp.status_code == 403
     body = _json.loads(resp.body.decode("utf-8"))

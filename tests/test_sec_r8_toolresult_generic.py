@@ -22,6 +22,7 @@ from unittest.mock import patch
 
 import pytest
 
+from agent_mcp.app.rest_principal import RestPrincipal
 from agent_mcp.core.tool_result import (
     Conflict,
     Failed,
@@ -92,8 +93,7 @@ async def test_rest_failed_render_is_generic_not_raw():
             "some_tool",
             {},
             bearer_token=None,
-            operator_session=True,
-            operator_user_id="admin",
+            auth=RestPrincipal(kind="session", user={"username": "admin"}),
         )
 
     assert resp.status_code == 500
@@ -168,8 +168,7 @@ async def test_rest_other_variants_unchanged():
                 "some_tool",
                 {},
                 bearer_token=None,
-                operator_session=True,
-                operator_user_id="admin",
+                auth=RestPrincipal(kind="session", user={"username": "admin"}),
             )
         assert resp.status_code == status
         body = _json.loads(bytes(resp.body))
@@ -182,8 +181,7 @@ async def test_rest_other_variants_unchanged():
         await _ret(Invalid(message="must be positive", field="count")),
     ):
         resp = await dh._dispatch_through_tool(
-            "some_tool", {}, bearer_token=None, operator_session=True,
-            operator_user_id="admin",
+            "some_tool", {}, bearer_token=None, auth=RestPrincipal(kind="session", user={"username": "admin"}),
         )
     body = _json.loads(bytes(resp.body))
     assert body["message"] == "must be positive"
