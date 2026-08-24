@@ -48,6 +48,7 @@ from typing import Any, Optional
 from fastapi import HTTPException, Request
 
 from ..router.auth_middleware import _MUTATION_METHODS
+from .rest_principal import RestPrincipal
 
 
 logger = logging.getLogger(__name__)
@@ -311,14 +312,15 @@ def _authorize_session_for_project(
 # ── The dep ───────────────────────────────────────────────────────
 
 
-async def require_operator_session(request: Request) -> dict[str, Any]:
+async def require_operator_session(request: Request) -> RestPrincipal:
     """FastAPI dep — admit cookie OR forwarding-header OR operator-bearer.
 
-    On success returns a dict shaped like::
-
-        {"kind": "session", "user": <user-row>}             # cookie path
-        {"kind": "forwarding", "operator_id": <str>}        # signed-header
-        {"kind": "operator_bearer", "user": None}           # bearer path
+    On success returns a :class:`~agent_mcp.app.rest_principal.RestPrincipal`
+    naming the door that admitted the caller and whatever that door could
+    prove about them. Finding D (Phase 5) replaced the previous
+    three-shape ``dict[str, Any]`` with this type; read that module's
+    docstring for why it is deliberately NOT
+    :class:`agent_mcp.core.principal.Principal`.
 
     On failure raises HTTPException(401).
 
@@ -364,19 +366,15 @@ async def require_operator_session(request: Request) -> dict[str, Any]:
             # and carry them in the auth dict so
             # ``is_confirmed_operator_tier`` can confirm a genuine cookie
             # operator instead of redacting them from their own project.
-            # Additive keys — no handler unpacks a fixed session-dict
-            # shape (the verbatim-shape assertion in
-            # tests/test_sec_r4_operator_identity_race.py pins the
-            # FORWARDING dict, not this one).
             project_role, sysadmin = _authorize_session_for_project(
                 user, request
             )
-            return {
-                "kind": "session",
-                "user": user,
-                "project_role": project_role,
-                "sysadmin": sysadmin,
-            }
+            return RestPrincipal(
+                kind="session",
+                user=user,
+                project_role=project_role,
+                sysadmin=sysadmin,
+            )
 
     # 2. Forwarding-header path — retire-system-token Wave 1. The
     #    ``AuthHeaderMiddleware`` already verified the header and built
@@ -409,16 +407,22 @@ async def require_operator_session(request: Request) -> dict[str, Any]:
         # ``project_role="operator"`` — handing a forwarding VIEWER the
         # full operator bundle for any ``operator_session`` dispatch.
         #
-        # We thread the real role via the task-local carrier rather than
-        # the returned dict: the dispatch helper has no Request/auth-dict
-        # handle, and the dict's shape is contract-pinned elsewhere
-        # (``tests/test_sec_r4_operator_identity_race.py`` asserts it
-        # verbatim). The carrier is the single value the dispatch seam
-        # actually consumes.
+        # Finding D (Phase 5): the real role now rides the returned
+        # RestPrincipal (``.route_role()``) as an ordinary field. It used
+        # to travel out of band on the ``_forwarding_route_role``
+        # ContextVar because "the dispatch helper has no
+        # Request/auth-dict handle, and the dict's shape is
+        # contract-pinned elsewhere" — the shape is a declared type now,
+        # so both halves of that excuse are gone.
         project_role = getattr(principal, "project_role", None)
         sysadmin = bool(getattr(principal, "sysadmin", False))
         _forwarding_route_role.set((project_role, sysadmin))
-        return {"kind": "forwarding", "operator_id": principal.user_id}
+        return RestPrincipal(
+            kind="forwarding",
+            operator_id=principal.user_id,
+            project_role=project_role,
+            sysadmin=sysadmin,
+        )
 
     # 3. Authorization-bearer path — admits per-agent manager-role
     #    (or legacy admin-role) tokens. Worker tokens fall through.
@@ -426,7 +430,7 @@ async def require_operator_session(request: Request) -> dict[str, Any]:
     if auth.lower().startswith("bearer "):
         bearer = auth[7:].strip()
         if bearer and _is_operator_tier_bearer(bearer):
-            return {"kind": "operator_bearer", "user": None}
+            return RestPrincipal(kind="operator_bearer")
 
     raise HTTPException(
         status_code=401,
@@ -440,19 +444,21 @@ async def require_operator_session(request: Request) -> dict[str, Any]:
     )
 
 
-def caller_identity(auth: dict[str, Any]) -> str:
-    """Map an auth context to an audit-log identifier.
+def caller_identity(auth: RestPrincipal) -> str:
+    """Map an admitted REST principal to an audit-log identifier.
 
     Cookie-path callers surface as their username; forwarding-header
     callers surface as the operator_id the router carried in. Falls
-    back to ``"admin"`` only when none of the above is present
-    (defensive — ``require_operator_session`` would have 401'd before
-    reaching a handler in that case).
+    back to ``"admin"`` only when none of the above is present (the
+    operator-bearer door, which identifies an agent rather than a
+    person, plus defensive cases —
+    ``require_operator_session`` would have 401'd before reaching a
+    handler otherwise).
     """
-    user = auth.get("user")
-    if isinstance(user, dict) and user.get("username"):
-        return str(user["username"])
-    op_id = auth.get("operator_id")
+    username = auth.username
+    if username:
+        return username
+    op_id = auth.operator_id
     if isinstance(op_id, str) and op_id:
         return op_id
     return "admin"
@@ -462,5 +468,6 @@ __all__ = [
     "caller_identity",
     "forwarding_route_role",
     "require_operator_session",
+    "RestPrincipal",
     "SESSION_COOKIE_NAME",
 ]

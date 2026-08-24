@@ -20,6 +20,7 @@ from typing import Any
 
 import pytest
 
+from agent_mcp.app.rest_principal import RestPrincipal
 from agent_mcp.app.routers import agents as agents_router
 from agent_mcp.core.tool_result import (
     Conflict,
@@ -113,7 +114,7 @@ async def test_register_agent_permission_denied_maps_to_403(monkeypatch):
         _FakeRouteRequest({"name": "worker-1", "role": "worker"}),
         # operator-tier admit (no forwarding carrier) — mirrors the
         # r14 default-operator-tier fixture.
-        auth={"kind": "operator_bearer", "user": None},
+        auth=RestPrincipal(kind="operator_bearer"),
     )
 
     assert resp.status_code == 403

@@ -28,6 +28,7 @@ from typing import Any
 import pytest
 
 from agent_mcp.app.deps import require_operator_session
+from agent_mcp.app.rest_principal import RestPrincipal
 from agent_mcp.features import delivery_transport as dt
 from agent_mcp.features import operator_events
 from tests.harness import mcp_session
@@ -83,9 +84,9 @@ async def test_operator_events_peer_disconnect_unsubscribes_quietly(
     normally and release its subscriber slot."""
     async with mcp_session(tmp_path) as admin:
         app = admin.client.app
-        app.dependency_overrides[require_operator_session] = lambda: {
-            "operator_id": "op-under-test",
-        }
+        app.dependency_overrides[require_operator_session] = lambda: (
+            RestPrincipal(kind="forwarding", operator_id="op-under-test")
+        )
         try:
             before = operator_events.subscriber_count()
             sent = await _stream_then_disconnect(

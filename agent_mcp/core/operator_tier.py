@@ -11,7 +11,7 @@ Why this module exists
 The policy was implemented TWICE and the two copies DRIFTED:
 
   * REST ``app/routers/composition.py::is_confirmed_operator_tier`` keyed
-    on the ``require_operator_session`` auth-dict ``kind`` — only a
+    on the ``require_operator_session`` REST principal's ``kind`` — only a
     per-agent operator-tier bearer (``"operator_bearer"``) was confirmed;
     cookie session / signed forwarding were unverifiable → denied.
   * MCP ``tools/admin_tools.py::_is_confirmed_operator_tier`` keyed on
@@ -22,7 +22,8 @@ The policy was implemented TWICE and the two copies DRIFTED:
 So the SAME per-agent manager bearer was confirmed on REST yet masked on
 MCP — opposite answers on a secret surface. This module is the one
 predicate both surfaces call; each adapts its native identity
-representation (auth dict / ``Principal``) into these keyword fields.
+representation (``RestPrincipal`` / ``Principal``) into these keyword
+fields.
 
 The policy, stated once
 -----------------------
@@ -40,13 +41,15 @@ clause 2, and ONLY when the seam actually supplies the role. Since PR #280
 the per-project backend DOES have a router.db role handle: its
 ``app/deps._authorize_session_for_project`` resolves the cookie caller's
 ``project_role`` + ``sysadmin`` before admitting, and Wave 12 PR A carries
-them in the ``require_operator_session`` auth dict. So the REST composition
-seam now feeds a real role for the COOKIE (``kind == "session"``) path — a
-genuine operator/sysadmin is confirmed and reads their own project's data,
-a viewer stays unconfirmed. The signed-FORWARDING path still passes only
-``kind`` here (its role rides a task-local carrier consumed by the dispatch
-seam, not this auth dict), so a forwarding caller is conservatively not
-confirmed at this predicate. The MCP ``Principal`` carries a signed role,
+them on the ``require_operator_session`` REST principal. So the REST
+composition seam feeds a real role for the COOKIE (``kind == "session"``)
+path — a genuine operator/sysadmin is confirmed and reads their own
+project's data, a viewer stays unconfirmed. The signed-FORWARDING path
+deliberately passes only ``kind`` here, so a forwarding caller is
+conservatively not confirmed at this predicate. Finding D (Phase 5) put
+that path's signed role on the REST principal too, but feeding it here
+would WIDEN who receives plaintext agent bearers — a policy change, left
+as an operator decision; see the scope note on the REST adapter. The MCP ``Principal`` carries a signed role,
 so a genuine operator over the wire is confirmed. Any remaining asymmetry
 is input availability, not policy drift: one predicate, fed what each seam
 can prove.

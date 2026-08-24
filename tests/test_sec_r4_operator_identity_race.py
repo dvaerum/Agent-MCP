@@ -21,6 +21,18 @@ The fix resolves the forwarding operator from the per-request
 ``request.state.principal`` (built once per request by the middleware,
 copy-per-task and race-safe) instead of the shared global.
 
+Finding D (security-arch-hardening-consolidated.md Phase 5): these
+assertions used to pin the dep's return value as a *dict literal*
+(``auth == {"kind": "forwarding", "operator_id": "realop"}``), which is
+what blocked giving the backend REST surface a real type. They now pin
+the same contract against
+:class:`agent_mcp.app.rest_principal.RestPrincipal` — a frozen
+dataclass, so ``==`` is still a VERBATIM whole-shape assertion (every
+field compared, no extra field can slip in unnoticed), and the
+race-condition property is unchanged: the operator id must come from
+*this request's* ``request.state.principal``, never from a process-wide
+global that a concurrent request can clobber.
+
 These tests pin that contract:
 
 * ``test_dep_reads_principal_not_process_global`` — deterministic: the
@@ -48,6 +60,7 @@ from starlette.requests import Request
 from agent_mcp.app import forwarding_header as _fh
 from agent_mcp.app.deps import require_operator_session
 from agent_mcp.app.main_app import AuthHeaderMiddleware
+from agent_mcp.app.rest_principal import RestPrincipal
 from agent_mcp.core import globals as g
 from agent_mcp.core.principal import Principal
 from tests.harness import make_principal
@@ -135,7 +148,20 @@ async def test_dep_reads_principal_not_process_global():
 
     auth = await require_operator_session(req)
 
-    assert auth == {"kind": "forwarding", "operator_id": "realop"}
+    # Whole-shape assertion (frozen dataclass ``__eq__`` compares every
+    # field), the typed successor to the old dict-literal pin.
+    assert auth == RestPrincipal(
+        kind="forwarding",
+        user=None,
+        operator_id="realop",
+        project_role="operator",
+        sysadmin=False,
+    )
+    # The race property, stated field-by-field: the operator id is the
+    # one on THIS request's principal, not the poisoned global.
+    assert auth.kind == "forwarding"
+    assert auth.operator_id == "realop"
+    assert auth.operator_id != "intruder"
     # And the audit identifier derived from it is the request's own.
     from agent_mcp.app.deps import caller_identity
 
@@ -172,8 +198,24 @@ async def test_concurrent_forwarding_requests_no_cross_attribution(hmac_key):
 
     results = await asyncio.gather(_run("alice"), _run("bob"))
 
-    assert results[0] == {"kind": "forwarding", "operator_id": "alice"}
-    assert results[1] == {"kind": "forwarding", "operator_id": "bob"}
+    assert [r.kind for r in results] == ["forwarding", "forwarding"]
+    # THE property: each task's principal names its OWN operator. A
+    # process-global carrier would give both tasks the last writer's id.
+    assert [r.operator_id for r in results] == ["alice", "bob"]
+    assert results[0] == RestPrincipal(
+        kind="forwarding",
+        user=None,
+        operator_id="alice",
+        project_role="operator",
+        sysadmin=False,
+    )
+    assert results[1] == RestPrincipal(
+        kind="forwarding",
+        user=None,
+        operator_id="bob",
+        project_role="operator",
+        sysadmin=False,
+    )
 
 
 # ---------- regressions ----------------------------------------------
@@ -192,7 +234,13 @@ async def test_single_forwarding_request_resolves_own_operator(hmac_key):
     req = _make_request(header_value=header)
     result = await mw.dispatch(req, _call_next)
 
-    assert result == {"kind": "forwarding", "operator_id": "carol"}
+    assert result == RestPrincipal(
+        kind="forwarding",
+        user=None,
+        operator_id="carol",
+        project_role="operator",
+        sysadmin=False,
+    )
 
 
 async def test_missing_principal_falls_through_forwarding_branch():

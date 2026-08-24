@@ -19,6 +19,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from agent_mcp.app.rest_principal import RestPrincipal
 from agent_mcp.core.settings_schema import (
     KNOWN_SETTING_KEYS,
     SECRET_SETTING_KEYS,
@@ -203,11 +204,11 @@ async def test_settings_schema_caller_sysadmin_true_for_sysadmin() -> None:
     construction against a genuine sysadmin auth dict."""
     from agent_mcp.app.routers.settings import settings_schema_api_route
 
-    auth = {
-        "kind": "session",
-        "project_role": "operator",
-        "sysadmin": True,
-    }
+    auth = RestPrincipal(
+        kind="session",
+        project_role="operator",
+        sysadmin=True,
+    )
     resp = await settings_schema_api_route(
         SimpleNamespace(method="GET"), auth=auth,
     )
