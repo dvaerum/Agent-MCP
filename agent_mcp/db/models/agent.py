@@ -17,7 +17,9 @@ migrate them.
 Column rationale:
 
 * `token`: TEXT PRIMARY KEY — the bearer token. NOT exposed to clients;
-  used internally for authentication.
+  used internally for authentication. Marked ``info={"secret": True}``
+  (N6): that marking is the single source of truth every redaction
+  surface derives from — see ``core/agent_secrets.py``.
 * `agent_id`: TEXT UNIQUE NOT NULL — the display id (e.g. "alice").
   Referenced by the four FK constraints landed in PR #96 and the
   three deferred FKs landed in PR-G1.
@@ -28,7 +30,9 @@ Column rationale:
   'tombstone' (the synthetic `[deleted-<id>]` row created by the
   purge cascade in routes.py).
 * `aoe_session_id`: 16-hex side-channel session id for the AoE
-  notification stream. Added by migration 0003.
+  notification stream. Added by migration 0003. Also
+  ``info={"secret": True}`` — it is a session credential, not a display
+  field.
 """
 
 from __future__ import annotations
@@ -44,7 +48,9 @@ from ..engine import Base
 class Agent(Base):
     __tablename__ = "agents"
 
-    token: Mapped[str] = mapped_column(Text, primary_key=True)
+    token: Mapped[str] = mapped_column(
+        Text, primary_key=True, info={"secret": True},
+    )
     agent_id: Mapped[str] = mapped_column(Text, unique=True, nullable=False)
     created_at: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(Text, nullable=False)
@@ -53,7 +59,9 @@ class Agent(Base):
     color: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     terminated_at: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     updated_at: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    aoe_session_id: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    aoe_session_id: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True, info={"secret": True},
+    )
     # Event-coord PR-1: per-agent wake-loop toggle (default TRUE; FALSE
     # disables the wake-loop bootstrap shipped in PR-2). NOT NULL with
     # DEFAULT 1 in DDL.

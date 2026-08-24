@@ -1,8 +1,14 @@
 # Proposal: Security-architecture hardening (authorization seam + SSO identity type)
 
-* Status: **Proposed** (Phase 0 — Findings H, G — landed: PRs #717, #718.
-  Step 0's 3 fix-now bugs — landed: PR #721. Phase 1 — Findings B, F, N3
-  Tier 1 — in flight.)
+* Status: **Delivered.** Every phase below has landed: Phase 0 (H, G —
+  PRs #717/#718), Step 0's 3 fix-now bugs (#721), Phase 1 (B, F, N3 Tier 1),
+  N1, Phase 2 (A), Phase 3 (C), N2, Phase 4 (E), N5, N3 Tier 2, and Phase 5
+  (D + N6's structural half — PRs #735/#736/#737). Two questions are
+  deliberately left open for the operator rather than decided in a refactor:
+  whether the forwarding door's signed role should count toward
+  confirmed-operator-tier (Phase 5), and whether `rotate_token()` gets a
+  caller or gets deleted (N6). The SSO-vs-`rate_limit` trusted-proxy
+  trust-model question stays flagged from Phase 1.
 * Date: 2026-08-23
 * Source: two security-focused `/improve-codebase-architecture` passes.
   Pass 1 ran parallel with pentest-all round 21 (see
@@ -61,7 +67,7 @@ Pass 1 (Findings A–H):
 | A | Capability is a decorator, not a registration argument — 20/49 MCP tools bypass the pre-schema authz gate (re-verified counts, pass 2; was stale 37/53 pre-R21-F1) — **done**, see Phase 2 | `tools/registry.py`, `tools/access.py`, all `tools/*.py` | Strong | Medium |
 | B | `_build_route_principal` hardcodes `project_name=None` → one route duplicates identity construction | `app/_dispatch_helpers.py`, `app/routers/agents.py` | Strong | Trivial |
 | C | SSO subject key is an unescaped f-string carrying 4 responsibilities | `router/sso.py` | Strong | Medium |
-| D | Backend REST identity is an untyped 3-shape dict + a ContextVar side-channel | `app/deps.py`, `core/operator_tier.py` | Worth exploring | High |
+| D | Backend REST identity is an untyped 3-shape dict + a ContextVar side-channel — **done**: `app/rest_principal.py::RestPrincipal` replaced the dict and the ContextVar is deleted, see Phase 5 below | `app/deps.py`, `app/rest_principal.py`, `app/_dispatch_helpers.py`, `core/operator_tier.py` | Worth exploring | High |
 | E | MCP Resources authz is a disconnected 4th mechanism, no capability consulted | `resources/__init__.py`, `core/auth.py` | Worth exploring | Medium |
 | F | Agent liveness checked 6 ways, one hand-duplicated constant | `repositories/agent_repository.py`, `tools/scheduled_directive_tools.py` | Speculative | Trivial |
 | G | Arch-enforcement test scans a hardcoded 2-module allowlist | `tests/router/test_arch_enforced_revalidation.py` | Speculative | Trivial |
@@ -78,7 +84,7 @@ for full file:line detail on each):
 | N3 | "What kind of request is this?" answered 11 times by 5 modules — Tier 1 (pure-copy subtractions) done in Phase 1; the SSO-vs-rate_limit trusted-proxy disagreement was investigated and deliberately NOT force-fit (see Phase 1 below); Tier 2 (derived classification) **done** — and it was not the "nothing broken today" item it was filed as: three live bugs fell out of it, see N3 Tier 2 below | Strong | Medium |
 | N4 | `Registry.visibility` is a listing filter wearing an authorization name for 2 of 3 catalogs — informational input to Phase 2 and Phase 4, no PR of its own | Strong | Low to surface |
 | N5 | Long-lived stream re-validation is a convention (4 copies, 1 pattern, 0 seams), not a seam — nothing broken today, pure future-proofing — **done**: `core/stream_gates.RevalidatingStream` + an AST discovery test, all 4 streams migrated keeping their own predicate and cadence, see N5 below | Worth exploring | Low-medium |
-| N6 | Credential lifecycle has no owning module — mint/compare consolidated, redact/rotate scattered; includes 2 fix-now items (Step 0) plus a structural half deferred to Phase 5 | Worth exploring | Medium |
+| N6 | Credential lifecycle has no owning module — mint/compare consolidated, redact/rotate scattered; 2 fix-now items **done** (Step 0) and the structural half **done** (Phase 5): `core/agent_secrets.py` owns the secret-column vocabulary, derived from the ORM model; the four *mechanics* stay distinct on purpose, see Phase 5 below. `rotate_token()`'s zero-caller question is still **open for the operator**. | Worth exploring | Medium |
 
 ## Sequencing
 
@@ -507,18 +513,53 @@ deleted.
   door fed before, with a scope note saying why. **Open question for the
   operator:** should the forwarding door's signed role now count toward
   confirmed-operator-tier?
-- **N6 structural half — do alongside D** (every response builder gets
-  touched anyway): consolidate the four independent agent-bearer redaction
-  mechanics (`admin_tools.py:2093` string-overwrite, `composition.py:443`+
-  `:410-418` pop+rename, `composition.py:266-277` SQL column allowlist,
-  `settings.py:101-112` binary 403-or-plaintext) into one redactor — all
-  four already agree on the *who* (`is_confirmed_operator_tier`), only the
-  *what* differs. Surface (don't unilaterally decide in this PR) the
-  `rotate_token()` question: it exists, fully implements
-  rotate-with-cache-rekey, has zero callers — either give it a caller or
-  delete it; that's a product decision for the operator, not a refactor
-  call. (N6's two fix-now items — the plaintext-bearer log line and the
-  password-policy gap — are already done, Step 0/PR #721.)
+**N6 structural half — done** (PR #737). `agent_mcp/core/agent_secrets.py`
+is the one owner of "which columns on an `agents` row are credentials".
+(N6's two fix-now items — the plaintext-bearer log line and the
+password-policy gap — landed earlier, Step 0/PR #721.)
+
+- **What actually drifted was the vocabulary, not the mechanic.** The
+  four sites agreed on the *who* (`is_confirmed_operator_tier`, already
+  one definition) and each restated *what is secret* separately:
+  `admin_tools.get_agent_tokens` knew about `token` only,
+  `composition./all-data` popped two names, `composition./node-details`
+  kept a safe-column allowlist whose own comment read "Keep this in sync
+  with the agents model when columns change". So the secret set is now
+  **derived from `mapped_column(..., info={"secret": True})` on
+  `db/models/agent.py`** — a future credential column is secret where it
+  is declared, or it is secret nowhere. A list inside `agent_secrets.py`
+  would have been the fifth hand-maintained copy.
+- **The four *mechanics* were NOT collapsed, and that is the finding.**
+  Verified per site before touching anything, and each difference is real:
+  - *mask* (`get_agent_tokens` → `redact_agent_row`, keys stay, values
+    become `"***"`) vs *drop* (`/all-data` → `strip_agent_secrets`; the
+    raw columns are `SELECT *` artefacts and its bearer field is the
+    separately-gated `auth_token`, so adding a `token: "***"` key would
+    be a wire-shape change);
+  - *tier-conditional* vs *unconditional*: `/node-details` withholds the
+    bearer from **every** tier, confirmed operators included — it is a
+    display panel. Running it through a tier-conditional redactor would
+    start serving operators a bearer they do not get today. Its allowlist
+    stays hand-chosen (a presentation decision, deliberately narrower
+    than the model) but is filtered through `without_secret_columns`, so
+    the *security* half became structural even though the projection did
+    not;
+  - `/api/tokens` is **not a redaction site at all** — serving plaintext
+    bearers is its whole contract, so it gates (403). A masked row there
+    would be a 200 that answers nothing. It shares the *who* predicate
+    and has no *what* to share.
+- `tests/test_arch_n6_agent_secret_redaction.py` pins every per-tier
+  outcome at all four sites against the exact wire shape. Those
+  assertions were written against the OLD mechanics, seen green there,
+  and pass unmodified after the consolidation — that is the evidence
+  nothing changed for any caller.
+- **`rotate_token()` — needs an operator decision, still open.**
+  `repositories/agent_repository.py::AgentRepository.rotate_token` fully
+  implements rotate-with-cache-rekey and has **zero production callers**
+  (re-verified at this HEAD: the only references are its own tests and
+  comments). Either give it a caller — an admin-relaunch flow is the
+  obvious one — or delete it. That is a product decision, deliberately
+  not made in a refactor PR.
 
 ## Delivery mechanics (same discipline as pentest-all's fix agents)
 
