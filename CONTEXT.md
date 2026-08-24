@@ -244,7 +244,7 @@ its keyword arguments.
 
 A single authorization atom, e.g. `"agents.terminate"`,
 `"tasks.assign"`, `"system.config.write"`. The complete vocabulary is
-the frozen 28-element set `KNOWN_CAPABILITIES`
+the frozen 29-element set `KNOWN_CAPABILITIES`
 (`agent_mcp/core/capabilities.py:81`). Format: AWS-IAM-style,
 per-resource × verb, matching `^[a-z]+(\.[a-z_]+)+$`. `system.*` caps
 are project-membership-ungated (deployment-wide router-admin verbs);

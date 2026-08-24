@@ -907,6 +907,58 @@ async def edit_agent_api_route(
     })
 
 
+@router.post("/{agent_id}/rotate-token")
+async def rotate_agent_token_api_route(
+    agent_id: str,
+    request: Request,
+    auth: RestPrincipal = Depends(require_operator_session),
+) -> JSONResponse:
+    """POST /api/agents/<id>/rotate-token — thin adapter over
+    ``rotate_agent_token``.
+
+    Credential-only replacement: unlike ``DELETE /api/agents/<id>``
+    (purge) or ``/api/terminate-agent``, the identity survives — task
+    assignments, message attribution and audit trail are untouched. The
+    old bearer is revoked the instant the rotation commits; there is no
+    grace window by design (see the tool's own docstring).
+
+    The new token is returned ONCE as ``agent_token`` — the same field
+    name and shown-once contract ``POST /api/agents/register`` uses.
+    Nothing re-displays it afterwards.
+
+    Auth: ``require_operator_session`` admits any operator-tier session;
+    the tool's ``agents.rotate_token`` gate is what actually decides
+    (a forwarding VIEWER passes the dep and is denied 403 by the gate).
+    """
+    # Body is read for shape-compat / wire hygiene; no field is required.
+    try:
+        _ = await get_sanitized_json_body(request)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+    result = await _dispatch_agent_lifecycle_tool(
+        "rotate_agent_token", {"agent_id": agent_id}, auth,
+    )
+    if isinstance(result, JSONResponse):
+        return result
+    if isinstance(result, _Ok):
+        # Read through a named ``payload`` (not ``result.data[...]``)
+        # to match ``register_agent_dashboard_api_route``'s idiom for
+        # the same shown-once-token shape — and to stay clear of the
+        # ``data["token"]`` body-auth pattern
+        # ``tests/test_dashboard_migration.py`` scans these routers for.
+        payload = result.data if isinstance(result.data, dict) else {}
+        return JSONResponse({
+            "success": True,
+            "agent_id": payload.get("agent_id"),
+            "agent_token": payload.get("token"),
+            "message": (
+                result.message or f"Agent '{agent_id}' token rotated"
+            ),
+        })
+    return _agent_tool_error(result, "Failed to rotate agent token")
+
+
 # --- Ad-hoc poke (event-loop scheduler PR2) -----------------------------
 # Operator/admin ONLY (decision 11): push a one-shot directive to an agent.
 # Delivered immediately if the agent is listening (waiter-wake) else queued

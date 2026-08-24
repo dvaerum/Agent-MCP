@@ -10,10 +10,10 @@ design context (locked 2026-06-30 via ``/grill-me``).
 What lives here
 ---------------
 
-* :data:`KNOWN_CAPABILITIES` — the exact 28-element frozenset of
+* :data:`KNOWN_CAPABILITIES` — the exact 29-element frozenset of
   capability strings the system recognises. Any cap string used in
   decorators, in-body checks, or DB rows MUST be drawn from this set.
-  Adding the 28th cap is a design change that re-opens the Wave 9
+  Adding a cap is a design change that re-opens the Wave 9
   bundle table.
 * :data:`PROJECT_ROLE_BUNDLES` — caps granted to operator-tier callers
   by virtue of their ``project_membership.role`` (``"viewer"`` /
@@ -63,9 +63,17 @@ logger = logging.getLogger(__name__)
 # ── Capability vocabulary ───────────────────────────────────────────
 
 
-#: The exact 28-element frozenset of capability strings the system
-#: recognises. Locked by Wave 9 grilling (2026-06-30); adding /
+#: The exact 29-element frozenset of capability strings the system
+#: recognises. Locked by Wave 9 grilling (2026-06-30) at 28; adding /
 #: removing entries is a design change that needs a new wave.
+#:
+#: AMENDED (three-flagged-decisions Fix 2, 2026-08-24): +1 —
+#: ``agents.rotate_token``. Deliberate, narrow addition, not a
+#: mechanism-only refactor: replacing an agent's bearer while it KEEPS
+#: every existing grant (tasks, message attribution, audit trail) is a
+#: different — arguably more sensitive — operation than destroying the
+#: identity outright, so terminate-authority must not silently imply
+#: rotate-authority. See ``tools/admin_tools.rotate_agent_token_tool_impl``.
 #:
 #: NOTE (arch round-2 #6, 2026-07-11): a review flagged 8 of these
 #: (agents.view, agents.use, memories.view, messages.view,
@@ -84,6 +92,7 @@ KNOWN_CAPABILITIES: frozenset[str] = frozenset({
     "agents.view",
     "agents.register",
     "agents.terminate",
+    "agents.rotate_token",
     "agents.use",
     # Tasks
     "tasks.view",
@@ -142,6 +151,12 @@ PROJECT_ROLE_BUNDLES: dict[str, frozenset[str]] = {
         # write surfaces inside the project
         "agents.register",
         "agents.terminate",
+        # Fix 2 (2026-08-24): operator tier, same bundle as
+        # ``agents.terminate`` — an operator who can destroy an agent
+        # identity can also re-credential it. Deliberately NOT in
+        # ``viewer`` (read-only) and NOT in either agent bundle: an
+        # agent must never rotate a peer's — or its own — bearer.
+        "agents.rotate_token",
         "tasks.create",
         "tasks.update",
         "tasks.delete",
@@ -200,7 +215,7 @@ AGENT_ROLE_BUNDLES: dict[str, frozenset[str]] = {
 
 #: Sentinel cap string that :meth:`Principal.has_capability`
 #: short-circuits on. A sysadmin Principal carries exactly
-#: ``frozenset({SYSADMIN_WILDCARD})`` rather than the full 27-cap set;
+#: ``frozenset({SYSADMIN_WILDCARD})`` rather than the full cap set;
 #: the wildcard semantics live in the method, not the resolver.
 SYSADMIN_WILDCARD: str = "*"
 
@@ -230,7 +245,7 @@ def resolve_capabilities(
 
     * ``sysadmin=True`` → ``frozenset({SYSADMIN_WILDCARD})``. The
       wildcard short-circuit in ``has_capability`` admits every cap;
-      we don't materialise the full 27-cap set onto every sysadmin
+      we don't materialise the full cap set onto every sysadmin
       Principal.
     * ``kind == "agent_bearer"`` → ``AGENT_ROLE_BUNDLES[agent_role]``
       verbatim (or empty when ``agent_role`` is absent / malformed).

@@ -63,6 +63,7 @@ export const CAPABILITY_DESCRIPTIONS: Readonly<Record<string, string>> = {
   "agents.view": "Read the agents roster and per-agent metadata.",
   "agents.register": "Register a new agent (mint token, claim slot).",
   "agents.terminate": "Terminate an agent (soft-delete; restorable until purge).",
+  "agents.rotate_token": "Replace an agent's bearer token, keeping its identity, tasks and history.",
   "agents.use": "Act as an agent on the MCP wire (worker-tier baseline).",
 
   // Tasks

@@ -937,6 +937,162 @@ async def terminate_agent_tool_impl(
         return Failed(message=f"Unexpected error terminating agent: {e}")
 
 
+# --- rotate_agent_token tool ---
+#
+# The credential-only counterpart to ``terminate_agent``. Before this
+# tool existed, ``AgentRepository.rotate_token`` (which mints nothing
+# itself — the caller supplies the new bearer — but re-keys the
+# token-keyed ``state.active_agents`` cache and writes the new row) had
+# ZERO callers, so the only response to a suspected leaked agent token
+# was ``terminate_agent``: it destroys the identity (task assignments,
+# message attribution, audit trail) rather than replacing its
+# credential.
+#
+# Gated on ``agents.rotate_token``, NOT ``agents.terminate``: minting a
+# fresh credential for an identity that KEEPS all its existing grants is
+# a different — arguably more sensitive — operation than destroying that
+# identity outright, so terminate-authority must not silently imply
+# rotate-authority. See core/capabilities.py for the bundle placement.
+#
+# NO overlap / grace-period window, deliberately. An agent bearer
+# authenticates one long-lived stateful connection (not many
+# independent stateless callers, where a dual-valid window earns its
+# keep); the agent process picks up the new token on its next connect,
+# exactly the operational shape a relaunch already has. The old token
+# stops working the instant the UPDATE commits.
+
+
+@requires_capability("agents.rotate_token")
+async def rotate_agent_token_tool_impl(
+    arguments: Dict[str, Any],
+    *,
+    principal: Optional[Principal] = None,
+) -> ToolResult:
+    """Replace an agent's bearer token, preserving the identity.
+
+    The CANONICAL rotate implementation, shared by the
+    ``rotate_agent_token`` MCP tool and
+    ``POST /api/agents/<id>/rotate-token``. On the unit-of-work: the
+    mint, the ``agents.token`` UPDATE (``agent_repo.rotate_token`` on
+    ``u.cursor``) and the ``rotated_agent_token`` DB-audit row commit in
+    ONE transaction; the cache re-key + stream teardown + publish
+    register post-commit via ``agent_repo.apply_rotation_effects``
+    (emit-iff-commit — a rollback leaves the old bearer live and the
+    cache untouched).
+
+    The new token is returned ONCE in ``Ok.data["token"]`` and is never
+    re-displayable afterwards — the same shown-once contract
+    :func:`register_agent_tool_impl` established.
+    """
+    agent_id = arguments.get("agent_id")
+    if not agent_id or not isinstance(agent_id, str):
+        return Invalid(field="agent_id", message="`agent_id` is required.")
+
+    actor_label = principal.actor_label() if principal else "operator"
+
+    try:
+        with unit_of_work() as u:
+            cursor = u.cursor
+
+            cursor.execute(
+                "SELECT token, status FROM agents WHERE agent_id = ?",
+                (agent_id,),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return NotFound(resource="agent", identifier=agent_id)
+
+            from ..repositories.agent_repository import (
+                TERMINAL_AGENT_STATUSES,
+            )
+
+            if row["status"] in TERMINAL_AGENT_STATUSES:
+                # A terminated / tombstoned agent's bearer is already
+                # revoked; minting a new one would silently resurrect a
+                # working credential for a dead identity. Restore first,
+                # then rotate — two explicit operator decisions.
+                return Conflict(
+                    reason=(
+                        f"Agent '{agent_id}' is {row['status']}; restore it "
+                        "before rotating its token"
+                    ),
+                )
+
+            old_token = row["token"]
+            new_token = generate_token()
+
+            from ..repositories import agent_repo
+
+            if not agent_repo.rotate_token(
+                agent_id, new_token, connection=cursor,
+            ):
+                return Failed(
+                    message=f"Failed to rotate token for agent '{agent_id}'.",
+                )
+
+            # SECURITY: suffixes only, never a plaintext bearer — same
+            # discipline ``agent_actions_db`` applies to
+            # ``source_token_suffix`` for the calling principal. The
+            # suffix is enough for an operator to correlate "which
+            # credential was replaced" without the audit table becoming
+            # a second place bearers live.
+            log_agent_action_to_db(
+                cursor,
+                actor_label,
+                "rotated_agent_token",
+                details={
+                    "agent_id": agent_id,
+                    "old_token_suffix": old_token[-4:] if old_token else None,
+                    "new_token_suffix": new_token[-4:],
+                },
+                principal=principal,
+            )
+
+            def _post_rotate_effects() -> None:
+                # ONE owner for the in-memory half of a rotation — the
+                # repo's own standalone path calls the same method.
+                agent_repo.apply_rotation_effects(
+                    agent_id, old_token=old_token, new_token=new_token,
+                )
+                log_audit(
+                    actor_label,
+                    "rotate_agent_token",
+                    {"agent_id": agent_id},
+                )
+                logger.info(
+                    "Rotated bearer token for agent %r (old ...%s -> new "
+                    "...%s).",
+                    agent_id,
+                    old_token[-4:] if old_token else "????",
+                    new_token[-4:],
+                )
+
+            u.on_commit(_post_rotate_effects)
+
+            return Ok(
+                data={"agent_id": agent_id, "token": new_token},
+                message=(
+                    f"Agent '{agent_id}' token rotated. The previous token "
+                    "is revoked immediately — hand the new one to the "
+                    "agent's claude session and relaunch it. This is the "
+                    "only time the new token is shown."
+                ),
+            )
+
+    except sqlite3.Error as e_sql:
+        logger.error(
+            "Database error rotating token for agent %s: %s",
+            agent_id, e_sql, exc_info=True,
+        )
+        return Failed(message=f"Database error rotating agent token: {e_sql}")
+    except Exception as e:
+        logger.error(
+            "Unexpected error rotating token for agent %s: %s",
+            agent_id, e, exc_info=True,
+        )
+        return Failed(message=f"Unexpected error rotating agent token: {e}")
+
+
 # --- agent lifecycle: restore / edit / purge tools (E2 arch-deepening) ---
 #
 # `terminate_agent` (above) is a soft-delete: it flips status='terminated'
@@ -2228,6 +2384,34 @@ def register_admin_tools():
         },
         implementation=terminate_agent_tool_impl,
         requires=Cap("agents.terminate"),
+    )
+
+    register_tool(
+        name="rotate_agent_token",
+        description=(
+            "Replace an agent's bearer token without destroying the "
+            "identity: task assignments, message attribution and audit "
+            "trail all survive. The old token is revoked the instant the "
+            "rotation commits (no grace window) and the new one is shown "
+            "exactly once. Operator-only."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "agent_id": {
+                    "type": "string",
+                    "description": (
+                        "Unique identifier for the agent whose token to "
+                        "rotate."
+                    ),
+                    "maxLength": IDENTIFIER_MAX_LEN,
+                },
+            },
+            "required": ["agent_id"],
+            "additionalProperties": False,
+        },
+        implementation=rotate_agent_token_tool_impl,
+        requires=Cap("agents.rotate_token"),
     )
 
     # E2 (arch-deepening): the real tools behind the agent-lifecycle REST

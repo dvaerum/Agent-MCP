@@ -1897,18 +1897,22 @@ class AgentRepository:
 
         ``token`` is deliberately OFF the ``update_field`` allowlist
         (the generic field-update API shouldn't be able to overwrite
-        the auth secret). This dedicated method exists for the
-        admin-relaunch flow that legitimately needs to rotate.
+        the auth secret). This dedicated method is the ONE write path
+        for the auth secret; its caller is
+        :func:`agent_mcp.tools.admin_tools.rotate_agent_token_tool_impl`
+        (the ``rotate_agent_token`` MCP tool +
+        ``POST /api/agents/<id>/rotate-token``).
 
         Re-keys ``state.active_agents``: the cache is keyed by token,
         so a token change requires popping the old key and inserting
         the new one. ``state.agent_working_dirs`` (keyed by agent_id)
         is unaffected.
 
-        ``connection`` is the transaction-aware seam — the
-        admin-relaunch flow wraps token rotation, status flip, and an
-        audit-log INSERT in one transaction. When ``None``, the call
-        opens its own session.
+        ``connection`` is the transaction-aware seam — the rotate tool
+        wraps the mint, this UPDATE, and an audit-log INSERT in one
+        transaction, then registers :meth:`apply_rotation_effects` on
+        its post-commit step. When ``None``, the call opens its own
+        session and applies those effects itself.
 
         Returns True on success, False if the agent didn't exist or
         the DB raised.
@@ -1989,47 +1993,88 @@ class AgentRepository:
 
         # Re-key the cache only on the standalone path. With a
         # ``connection=`` the caller's transaction is still open; the
-        # cache re-key + publish — and the stream teardown below — are
-        # deferred to the caller's post-commit step (they must also
-        # tear down the old bearer's live streams themselves).
+        # cache re-key + publish — and the stream teardown — are
+        # deferred to the caller's post-commit step, which registers
+        # :meth:`apply_rotation_effects` on its unit-of-work (see
+        # ``tools/admin_tools.rotate_agent_token_tool_impl``).
         if connection is None:
-            if not self._cache_disabled and old_token is not None:
-                cached = state.active_agents.pop(old_token, None)
-                # SECURITY (terminate-revocation): see get_by_id /
-                # get_by_token above. Don't carry a terminal row
-                # forward under the new token — that would re-warm the
-                # cache-only auth gate for a bearer that should stay
-                # revoked.
-                if (
-                    cached is not None
-                    and cached.get("status") not in TERMINAL_AGENT_STATUSES
-                ):
-                    cached["token"] = new_token
-                    state.active_agents[new_token] = cached
-
-            # AC-R29-1: the old bearer's already-open GET /mcp streams
-            # authenticated once at open and pump indefinitely; without
-            # an active nudge they'd survive the rotation until their
-            # next heartbeat self-validation tick. Signal them to
-            # re-validate now, same as ``terminate``.
-            try:
-                from ..core import session_registry
-
-                session_registry.close_streams_for_agent(agent_id)
-            except Exception:  # pragma: no cover - defensive
-                logger.warning(
-                    "Failed to signal stream close for agent '%s' "
-                    "after token rotation.",
-                    agent_id,
-                    exc_info=True,
-                )
-
-            _publish(
-                agent_id,
-                "agent.updated",
-                {"agent_id": agent_id, "field": "token", "value": new_token},
+            self.apply_rotation_effects(
+                agent_id, old_token=old_token, new_token=new_token,
             )
         return True
+
+    def apply_rotation_effects(
+        self,
+        agent_id: str,
+        *,
+        old_token: Optional[str],
+        new_token: str,
+    ) -> None:
+        """Post-commit half of a token rotation: cache re-key, stream
+        teardown, ``agent.updated`` publish.
+
+        Split out of :meth:`rotate_token` so a caller that supplies its
+        own ``connection=`` (i.e. rotates inside a wider transaction)
+        can register the SAME effects on its unit-of-work's
+        post-commit step instead of re-deriving them — one owner for
+        "what a rotation does to in-memory state", whether the write
+        opened its own session or joined someone else's.
+
+        Idempotent-ish and best-effort: safe to skip entirely if the
+        transaction rolled back (nothing here is registered until the
+        commit lands).
+        """
+        if not self._cache_disabled and old_token is not None:
+            cached = state.active_agents.pop(old_token, None)
+            # SECURITY (terminate-revocation): see get_by_id /
+            # get_by_token above. Don't carry a terminal row
+            # forward under the new token — that would re-warm the
+            # cache-only auth gate for a bearer that should stay
+            # revoked.
+            if (
+                cached is not None
+                and cached.get("status") not in TERMINAL_AGENT_STATUSES
+            ):
+                cached["token"] = new_token
+                state.active_agents[new_token] = cached
+
+        # AC-R29-1: the old bearer's already-open GET /mcp streams
+        # authenticated once at open and pump indefinitely; without
+        # an active nudge they'd survive the rotation until their
+        # next heartbeat self-validation tick. Signal them to
+        # re-validate now, same as ``terminate``.
+        try:
+            from ..core import session_registry
+
+            session_registry.close_streams_for_agent(agent_id)
+        except Exception:  # pragma: no cover - defensive
+            logger.warning(
+                "Failed to signal stream close for agent '%s' "
+                "after token rotation.",
+                agent_id,
+                exc_info=True,
+            )
+
+        # SECURITY: suffix, NEVER the bearer itself. The default
+        # ``event_bus.StreamingQueueAdapter`` fans this payload out to
+        # the agent's open ``GET /mcp`` streams — streams that were
+        # authenticated with the OLD bearer, the one this rotation
+        # revokes. ``close_streams_for_agent`` above only *signals* a
+        # re-validate, so the teardown is not ordered against this
+        # fan-out: shipping the plaintext here would hand the
+        # replacement credential to whoever was holding the leaked one.
+        # (Dead code until the rotate tool gave this method its first
+        # caller; live from that moment on.) Nothing consumes ``value``
+        # for the token field — subscribers only need the edge.
+        _publish(
+            agent_id,
+            "agent.updated",
+            {
+                "agent_id": agent_id,
+                "field": "token",
+                "token_suffix": new_token[-4:],
+            },
+        )
 
     # --- Write interface: delete ----------------------------------------
 
