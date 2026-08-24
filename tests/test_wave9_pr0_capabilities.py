@@ -2,7 +2,7 @@
 
 Wave 9 PR 0 of 7 in ``prancy-napping-pie.md``. Pins:
 
-* The :data:`KNOWN_CAPABILITIES` set is exactly the 28-element
+* The :data:`KNOWN_CAPABILITIES` set is exactly the 29-element
   vocabulary the plan locks; the per-resource × verb regex shape
   ``^[a-z]+(\\.[a-z_]+)+$`` holds for every cap.
 * :data:`PROJECT_ROLE_BUNDLES` and :data:`AGENT_ROLE_BUNDLES` are
@@ -37,14 +37,20 @@ from tests.harness import make_principal, with_capabilities
 
 
 #: Locked vocabulary per the Wave 9 design (2026-06-30 grilling
-#: locked these 27 strings). Re-stating the set here (instead of
+#: locked these strings). Re-stating the set here (instead of
 #: importing) so a typo in capabilities.py is caught by a direct
 #: equality check rather than the smoke tests passing trivially.
+#:
+#: AMENDED (three-flagged-decisions Fix 2, 2026-08-24): 28 -> 29 with
+#: ``agents.rotate_token``. A deliberate design addition, reviewed as
+#: such — see ``tests/test_rotate_agent_token.py`` for why it is a
+#: capability of its own rather than folded into ``agents.terminate``.
 _EXPECTED_KNOWN_CAPABILITIES: frozenset[str] = frozenset({
     "mcp.connect",
     "agents.view",
     "agents.register",
     "agents.terminate",
+    "agents.rotate_token",
     "agents.use",
     "tasks.view",
     "tasks.create",
@@ -84,9 +90,10 @@ def test_known_capabilities_matches_locked_vocabulary():
     explicit enumeration (both in the section header bundle list and
     in this PR's prompt) lists 28 cap strings. The explicit list is
     the authoritative content; the count in the prose is an off-by-
-    one in the design doc. The test pins the explicit set.
+    one in the design doc. The test pins the explicit set — now 29
+    after Fix 2 added ``agents.rotate_token``.
     """
-    assert len(_EXPECTED_KNOWN_CAPABILITIES) == 28
+    assert len(_EXPECTED_KNOWN_CAPABILITIES) == 29
     assert KNOWN_CAPABILITIES == _EXPECTED_KNOWN_CAPABILITIES
 
 

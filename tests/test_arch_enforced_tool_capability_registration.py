@@ -188,6 +188,9 @@ EXPECTED_ACCESS_LEVELS = {
     "register_agent": "operator",
     "request_assistance": "worker",
     "restore_agent": "operator",
+    # three-flagged-decisions Fix 2: derived (not kwarg-declared) from
+    # ``agents.rotate_token``, which is in neither agent bundle.
+    "rotate_agent_token": "operator",
     "search_tasks": "worker",
     "send_agent_message": "worker-if-toggled:config_allow_worker_to_worker",
     "terminate_agent": "operator",
