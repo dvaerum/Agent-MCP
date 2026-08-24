@@ -25,24 +25,36 @@ Two limiters wire in via ``attach``:
     isn't hampered; operators opt in for public exposure.
 
 Client-IP resolution honours ``X-Forwarded-For`` ONLY when the
-direct peer is a trusted proxy — reusing the same trust posture as
-``sso.is_trusted_proxy_source`` (the forwarded chain is
-attacker-controllable, so the peer-IP check is the gatekeeper). The
+direct peer is a trusted proxy (the forwarded chain is
+attacker-controllable, so the peer check is the gatekeeper). The
 chain is walked right-to-left past trusted-proxy hops to the first
 untrusted client, never the spoofable leftmost entry (see
 ``resolve_client_ip``).
+
+``is_trusted_peer`` is the single home for "is this direct peer a
+trusted proxy?" — ``sso.is_trusted_proxy_source`` calls it too, with
+its own allowlist. For a Unix-socket peer the answer comes from
+``SO_PEERCRED``, i.e. the kernel's record of who opened the
+connection, rather than from the empty ``request.remote`` a UDS
+connection happens to produce: the peer is trusted iff it runs as
+the router's own UID, or as a UID listed in the optional
+``AGENT_MCP_TRUSTED_PEER_UIDS`` (comma-separated integers) for the
+case where the fronting proxy legitimately runs as another user.
 """
 
 from __future__ import annotations
 
+import functools
 import ipaddress
 import logging
 import math
 import os
+import socket
+import struct
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Awaitable, Callable, Deque, Dict
+from typing import Awaitable, Callable, Collection, Deque, Dict
 
 from aiohttp import web
 
@@ -58,11 +70,17 @@ _AUTH_LIMITER_KEY = "rate_limit_auth"
 _GLOBAL_LIMITER_KEY = "rate_limit_global"
 
 
-# Loopback is the default trusted proxy source: production deploys
-# terminate TLS at nginx / tailscale and forward to the router over a
-# Unix socket or loopback, so the direct peer of a forwarded request
-# is 127.0.0.1 / ::1 (a UDS peer reports an empty ``request.remote``).
+# Loopback is the default trusted proxy source for the LIMITER: production
+# deploys terminate TLS at nginx / tailscale and forward to the router over
+# loopback. Deliberately the limiter's default only — ``sso``'s proxy-header
+# allowlist has no default at all, and ``is_trusted_peer`` keeps the two
+# separate (see that function's docstring).
 _DEFAULT_TRUSTED_PROXIES = "127.0.0.1,::1"
+
+# Env var naming the UIDs a Unix-socket peer may run as, over and above
+# the router's own. Comma-separated integers; empty/unset means "only our
+# own UID" (see ``_uds_peer_is_trusted``).
+_TRUSTED_PEER_UIDS_ENV = "AGENT_MCP_TRUSTED_PEER_UIDS"
 
 
 # ── Config ─────────────────────────────────────────────────────────
@@ -211,55 +229,196 @@ class SlidingWindowLimiter:
 # ── Client-IP resolution ───────────────────────────────────────────
 
 
-def _is_trusted_ip(ip: str, cfg: RateLimitConfig) -> bool:
-    """Return True iff ``ip`` (a raw string) is a configured trusted proxy.
+# ``struct ucred { pid_t pid; uid_t uid; gid_t gid; }`` — the payload
+# ``SO_PEERCRED`` returns. Three native ints on every Linux ABI.
+_UCRED_FORMAT = "3i"
 
-    Canonicalises the address first, then checks the limiter's own
-    ``trusted_proxies`` config unioned with the SSO proxy-header
-    trusted-IP set (so an operator who configured proxy-header SSO
-    doesn't have to re-declare the same proxy IPs for the limiter).
-    A non-parseable value is never trusted.
+
+@functools.lru_cache(maxsize=8)
+def _parse_trusted_peer_uids(raw: str) -> frozenset[int]:
+    """Comma-separated UID list → frozenset[int] (garbage dropped).
+
+    Cached on the raw string: this is consulted from the per-request
+    trust check, and caching also means a typo'd entry warns once rather
+    than once per request.
     """
+    if not raw:
+        return frozenset()
+    out: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.add(int(part))
+        except ValueError:
+            logger.warning(
+                "%s: %r is not an integer UID; dropping.",
+                _TRUSTED_PEER_UIDS_ENV, part,
+            )
+    return frozenset(out)
+
+
+def trusted_peer_uids() -> frozenset[int]:
+    """The operator-configured extra UIDs a UDS peer may run as."""
+    return _parse_trusted_peer_uids(
+        os.environ.get(_TRUSTED_PEER_UIDS_ENV, ""),
+    )
+
+
+def peer_uid(sock: socket.socket) -> int | None:
+    """The kernel-reported UID of the process on the other end of ``sock``.
+
+    ``SO_PEERCRED`` is the kernel's own answer to "who opened this
+    connection?" — recorded at ``connect()``/``socketpair()`` time from
+    the peer's real credentials, so it is not forgeable by the peer the
+    way any in-band claim would be.
+
+    Returns None — never a UID, never a default — whenever the fact
+    isn't available, so every caller fails closed:
+
+      * ``SO_PEERCRED`` is Linux-only (absent on macOS/BSD, which spell
+        the same idea ``LOCAL_PEERCRED``/``getpeereid`` with a different
+        payload). An unsupported platform must not silently degrade into
+        trusting the peer.
+      * A non-AF_UNIX or unconnected socket answers ``(0, -1, -1)``
+        rather than erroring on Linux, so the sentinel pid/uid are
+        rejected explicitly — otherwise a TCP socket would report UID -1
+        and, worse, a root-run router comparing against uid 0 would be
+        one kernel-quirk away from a false match.
+    """
+    if not hasattr(socket, "SO_PEERCRED"):
+        return None
     try:
-        canonical = str(ipaddress.ip_address(ip))
-    except ValueError:
+        raw = sock.getsockopt(
+            socket.SOL_SOCKET,
+            socket.SO_PEERCRED,
+            struct.calcsize(_UCRED_FORMAT),
+        )
+        pid, uid, _gid = struct.unpack(_UCRED_FORMAT, raw)
+    except (OSError, AttributeError, struct.error):
+        return None
+    if pid <= 0 or uid < 0:
+        # No peer credentials recorded — not a connected UDS endpoint.
+        return None
+    return uid
+
+
+def _uds_peer_is_trusted(request: web.Request) -> bool:
+    """Return True iff the Unix-socket peer's kernel UID is ours/allowed.
+
+    The property this answers is "the process on the other end is our own
+    co-located reverse proxy". Before this existed, that was approximated
+    by "``request.remote`` is empty" — but an empty peer address is not
+    evidence of anything; it is just what AF_UNIX sockets have instead of
+    an address. Same-user co-location is the real property, and
+    ``SO_PEERCRED`` reports it as an unspoofable kernel fact.
+    """
+    transport = request.transport
+    if transport is None:
         return False
-    if canonical in cfg.trusted_proxies:
+    sock = transport.get_extra_info("socket")
+    if sock is None:
+        return False
+    uid = peer_uid(sock)
+    if uid is None:
+        return False
+    if hasattr(os, "getuid") and uid == os.getuid():
         return True
+    return uid in trusted_peer_uids()
+
+
+def _trusted_ip_set(cfg: RateLimitConfig) -> frozenset[str]:
+    """The limiter's trusted-proxy IPs ∪ the SSO proxy-header trusted IPs.
+
+    The union is the LIMITER's allowlist, not a global one: an operator
+    who configured proxy-header SSO shouldn't have to re-declare the same
+    proxy IPs for rate limiting. ``sso.is_trusted_proxy_source``
+    deliberately does NOT use this set — see ``is_trusted_peer``.
+    """
     try:
         from . import sso
 
         settings = sso.get_sso_config()
         if settings.proxy is not None:
-            return canonical in settings.proxy.trusted_ips
+            return cfg.trusted_proxies | settings.proxy.trusted_ips
     except Exception:  # pragma: no cover - defensive
         pass
-    return False
+    return cfg.trusted_proxies
 
 
-def _is_trusted_proxy(request: web.Request, cfg: RateLimitConfig) -> bool:
-    """Return True iff the direct peer may set ``X-Forwarded-For``.
+def _ip_in_allowlist(ip: str, trusted_ips: Collection[str]) -> bool:
+    """True iff ``ip`` canonicalises into ``trusted_ips``.
 
-    A UDS peer reports an empty ``request.remote`` and is treated as
-    trusted loopback (the reverse proxy forwards over that socket).
-    Otherwise the peer IP is matched against the trusted-proxy set via
-    ``_is_trusted_ip``.
+    A non-parseable value is never trusted; ``trusted_ips`` holds
+    canonical ``str(ipaddress.ip_address(...))`` forms so that e.g.
+    ``::1`` and ``0:0:0:0:0:0:0:1`` compare equal.
+    """
+    try:
+        canonical = str(ipaddress.ip_address(ip))
+    except ValueError:
+        return False
+    return canonical in trusted_ips
+
+
+def _is_trusted_ip(ip: str, cfg: RateLimitConfig) -> bool:
+    """True iff ``ip`` is a trusted proxy for RATE-LIMITING purposes."""
+    return _ip_in_allowlist(ip, _trusted_ip_set(cfg))
+
+
+def is_trusted_peer(
+    request: web.Request, *, trusted_ips: Collection[str],
+) -> bool:
+    """Return True iff the request's DIRECT peer is a trusted proxy.
+
+    One mechanism, two callers (``_is_trusted_proxy`` here and
+    ``sso.is_trusted_proxy_source``), because the question — "may this
+    peer set ``X-Forwarded-*`` / the SSO trust header?" — is one question
+    and two independently-maintained answers had already drifted apart on
+    the UDS case.
+
+    Two peer kinds, resolved differently because they carry different
+    evidence:
+
+      * **TCP peer** — ``request.remote`` is a real address; trust is
+        membership in the caller-supplied ``trusted_ips`` allowlist and
+        nothing else. Explicit-allowlist-only, per OWASP's forwarded-
+        header guidance: there is no implicit trust here and no default.
+      * **UDS peer** — ``request.remote`` is the empty string, because
+        AF_UNIX sockets have no peer address. Trust comes from
+        ``SO_PEERCRED`` (see ``_uds_peer_is_trusted``), never from the
+        emptiness itself.
+
+    ``trusted_ips`` is a PARAMETER, not read from config here, and that
+    is load-bearing: the two callers legitimately have different
+    allowlists. The limiter's defaults to loopback; the SSO proxy-header
+    allowlist is operator-configured with no default whatsoever. Unioning
+    them — the obvious-looking "just share the canonical helper" refactor
+    — would let any loopback-originating request forge the SSO trust
+    header. That regression was proposed once (N3 Tier 1) and caught by
+    ``test_sso_proxy_header.test_trusted_header_from_untrusted_source_rejected``;
+    keep the allowlist per-caller so it stays caught.
     """
     peer = request.remote or ""
     if not peer:
-        # UDS / in-process transport — the reverse proxy forwards here.
-        return True
-    return _is_trusted_ip(peer, cfg)
+        return _uds_peer_is_trusted(request)
+    return _ip_in_allowlist(peer, trusted_ips)
+
+
+def _is_trusted_proxy(request: web.Request, cfg: RateLimitConfig) -> bool:
+    """Return True iff the direct peer may set ``X-Forwarded-For``."""
+    return is_trusted_peer(request, trusted_ips=_trusted_ip_set(cfg))
 
 
 def request_from_trusted_proxy(request: web.Request) -> bool:
     """True iff the direct peer is a trusted proxy that may set
     ``X-Forwarded-*`` headers.
 
-    Reuses the limiter's trusted-proxy determination — loopback + UDS
-    trusted by default (the ``nginx-on-loopback`` / Unix-socket posture),
-    unioned with ``AGENT_MCP_RATELIMIT_TRUSTED_PROXIES`` and the SSO
-    proxy-header trusted-IP set. This is the SAME trust boundary that
+    Reuses the limiter's trusted-proxy determination — loopback trusted
+    by default (the ``nginx-on-loopback`` posture) unioned with
+    ``AGENT_MCP_RATELIMIT_TRUSTED_PROXIES`` and the SSO proxy-header
+    trusted-IP set, plus the ``SO_PEERCRED`` same-UID check for a
+    Unix-socket peer. This is the SAME trust boundary that
     decides whether ``X-Forwarded-For`` may be honoured, so it is the
     correct gate for whether ``X-Forwarded-Host`` / ``X-Forwarded-Proto``
     may be trusted when deriving the router's own external origin
@@ -418,6 +577,10 @@ __all__ = [
     "RateLimitConfig",
     "SlidingWindowLimiter",
     "attach",
+    "is_trusted_peer",
+    "peer_uid",
     "rate_limit_middleware",
+    "request_from_trusted_proxy",
     "resolve_client_ip",
+    "trusted_peer_uids",
 ]

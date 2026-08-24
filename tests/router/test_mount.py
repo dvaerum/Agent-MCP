@@ -14,15 +14,25 @@ from unittest import mock
 from aiohttp.test_utils import make_mocked_request
 
 from agent_mcp.router import mount
+from tests.router.uds_peer import uds_peer_socket
 
 
 def _req(path: str, *, remote: str | None = None, headers=None):
-    """Mocked request with a chosen peer IP. remote=None → UDS/loopback
-    (trusted); a dotted-quad → untrusted direct client."""
+    """Mocked request with a chosen peer. remote=None → a real UDS peer
+    running as this process (trusted); a dotted-quad → untrusted direct
+    client.
+
+    The UDS case carries an actual ``socketpair`` endpoint because trust
+    for a Unix-socket peer is decided by ``SO_PEERCRED``, not by the
+    absence of a peer address — see ``tests/router/uds_peer.py``.
+    """
     transport = mock.Mock()
     peername = (remote, 40000) if remote else None
+    sock = None if remote else uds_peer_socket()
     transport.get_extra_info = lambda key, default=None: (
-        peername if key == "peername" else default
+        peername if key == "peername"
+        else sock if key == "socket"
+        else default
     )
     return make_mocked_request(
         "GET", path, headers=headers or {}, transport=transport,

@@ -16,6 +16,13 @@ That's a genuine architectural question (should SSO's proxy-header
 trust model gain a UDS-fronted carve-out, and if so, on whose terms?),
 not a mechanical dedup -- flagged back to the operator rather than
 force-fit.
+
+RESOLVED since, on the operator's terms: the two now share ONE
+``rate_limit.is_trusted_peer``, but the allowlist stays a per-caller
+PARAMETER (so sso still gets no implicit loopback trust), and the UDS
+carve-out is a kernel-verified ``SO_PEERCRED`` UID check rather than an
+"empty ``request.remote`` implies trust" heuristic. See
+``tests/router/test_so_peercred_peer_trust.py``.
 """
 
 from __future__ import annotations
