@@ -2,6 +2,13 @@
 # workers — the regression guard for the dashboard-cleanup-loop bug fixed
 # in this PR.
 #
+# Runs as a systemd-nspawn container (`containers.machine`), not a QEMU
+# VM (`nodes.machine`) — nixpkgs' native nspawn test-driver support
+# (nixos/lib/testing/nodes.nix). Migrated using the same 2-change
+# pattern as multi-tenant.nix (see
+# docs/learnings/nspawn-test-migration.md): no systemd-hardening-
+# directive assertions and no multi-node topology here either.
+#
 # Background
 # ----------
 # The dashboard previously ran a 2-minute setInterval that called
@@ -49,14 +56,8 @@ in
 pkgs.testers.nixosTest {
   name = "agent-mcp-no-auto-cleanup";
 
-  nodes.machine = { config, pkgs, ... }: {
+  containers.machine = { config, pkgs, ... }: {
     imports = [ ./fake-openai.nix ];
-
-    virtualisation = {
-      memorySize = 1536;
-      cores = 2;
-      diskSize = 2048;
-    };
 
     users.users.testuser = {
       isNormalUser = true;
