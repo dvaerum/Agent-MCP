@@ -240,9 +240,23 @@ jobs:
           # before giving up, rather than failing the job on the first
           # flaky download from cache.nixos.org. Pairs with --fallback
           # on the build step below.
+          #
+          # auto-allocate-uids/uid-range/cgroups: vm-multi-tenant runs as
+          # a systemd-nspawn container (nix/tests/multi-tenant.nix), not
+          # a QEMU node. The nixpkgs manual's nspawn "System Requirements"
+          # section documents these three daemon settings as mandatory —
+          # without them the container-test derivation fails eval with
+          # "feature 'uid-range' requires the setting 'auto-allocate-uids'
+          # to be enabled" before a single VM/container even boots.
+          # `extra-` prefixes append rather than clobber the installer's
+          # own experimental-features/system-features defaults. Harmless
+          # for the other 3 (QEMU) shards in this matrix.
           extra-conf: |
             download-attempts = 3
             connect-timeout = 10
+            auto-allocate-uids = true
+            extra-system-features = uid-range
+            extra-experimental-features = auto-allocate-uids cgroups
 
       # magic-nix-cache is sunset by Determinate Systems (it also spammed
       # an "Unable to authenticate to FlakeHub" annotation on every run)
