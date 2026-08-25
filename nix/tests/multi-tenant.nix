@@ -1,7 +1,13 @@
 # pkgs.nixosTest: end-to-end smoke for multi-tenant router mode.
 #
-# Boots a single-node VM with the router unit + a per-project backend
-# template, then drives the public HTTP surface:
+# Runs as a systemd-nspawn container (`containers.machine`), not a QEMU
+# VM (`nodes.machine`) — nixpkgs' native nspawn test-driver support
+# (nixos/lib/testing/nodes.nix). Picked as the pilot for this backend
+# swap because it has no systemd-hardening-directive assertions and no
+# multi-node topology (see docs/learnings/nspawn-test-migration.md for
+# why, and why single-tenant.nix stays on QEMU). Boots a single
+# container with the router unit + a per-project backend template,
+# then drives the public HTTP surface:
 #
 #   1. POST /api/router/projects twice (two projects, JSON body).
 #   2. GET  /api/router/projects lists both names.
@@ -33,17 +39,13 @@ in
 pkgs.testers.nixosTest {
   name = "agent-mcp-multi-tenant";
 
-  nodes.machine = { config, pkgs, ... }: {
+  containers.machine = { config, pkgs, ... }: {
     imports = [ ./fake-openai.nix ];
 
-    # Modest sizing — the router + a per-project backend are both
-    # python+aiohttp processes; 1.5 GB headroom catches OOM bugs
-    # without exploding the runner.
-    virtualisation = {
-      memorySize = 1536;
-      cores = 2;
-      diskSize = 2048;
-    };
+    # No `virtualisation.memorySize`/`cores`/`diskSize` here — those are
+    # QEMU-vm-only options (nixos/modules/virtualisation/qemu-vm.nix);
+    # a systemd-nspawn container shares the host kernel and its cgroup
+    # memory/CPU accounting instead, so there's nothing to size.
 
     users.users.testuser = {
       isNormalUser = true;
