@@ -34,6 +34,7 @@ class DeliveryPolicyConfig:
     on_unread_messages: bool
     on_unfinished_tasks: bool
     on_unassigned_tasks: bool
+    on_due_directives: bool
     backoff_initial_seconds: int
     backoff_max_seconds: int
     cooldown_seconds: int

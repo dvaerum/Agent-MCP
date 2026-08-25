@@ -24,6 +24,7 @@ def _cfg(**over) -> DeliveryPolicyConfig:
         "on_unread_messages": True,
         "on_unfinished_tasks": True,
         "on_unassigned_tasks": False,
+        "on_due_directives": True,
         "backoff_initial_seconds": 30,
         "backoff_max_seconds": 3600,
         "cooldown_seconds": 60,

@@ -3,10 +3,15 @@
 ``scheduled_directive`` store (event-loop scheduled directives).
 
 A **directive** is an agent's recurring imperative that fires *when the
-agent next checks in* at-or-after its interval. Firing is wait-loop-
-native: this store is pure state (``next_due_at``) and the
-``wait_for_events`` slice loop is the sole driver — there is no
-background sweeper (plan §2 decision 2).
+agent next checks in* at-or-after its interval. This store is pure state
+(``next_due_at``); firing is wait-loop-native by default via the
+``wait_for_events``/``fetch_events_since`` slice loop, which is always
+available and needs no extra infrastructure. Since ADR-0026, a second,
+additive path also fires due directives: the delivery-transport
+background tick (:mod:`agent_mcp.features.delivery_scheduler`) evaluates
+and fires due directives for any worker with a live delivery stream, so a
+delivery-connected worker that never calls ``wait_for_events`` still gets
+nudged. Both callers share :func:`collect_due_and_fire` unmodified.
 
 Shaped like ``project_settings_repository``: a **module of plain
 functions**, each taking a live ``connection`` (a ``sqlite3.Cursor``,
@@ -33,7 +38,9 @@ import datetime
 from typing import Any, Dict, List, Optional
 
 
-# The delivered ``directive`` event shape (plan §3), source="schedule".
+# The delivered ``directive`` event shape, source="schedule". Consumed by
+# both firing paths: the wait_for_events-native collector and, since
+# ADR-0026, the delivery-transport background tick.
 def _directive_event(
     *, directive_id: str, prompt: str, timestamp: str
 ) -> Dict[str, Any]:
@@ -287,9 +294,12 @@ def collect_due_and_fire(
 ) -> List[Dict[str, Any]]:
     """Fire every due directive for ``agent_id`` and return the events.
 
-    This is the wait-loop-native firing step (plan §4). For each enabled,
-    active directive that is due (``next_due_at <= now``) OR whose window
-    has closed (``until_at <= now``):
+    This is the firing step shared by both callers: the wait_for_events-
+    native collector (``_collect_scheduled_directive_events_for``) and, since
+    ADR-0026, the delivery-transport background tick
+    (``delivery_scheduler._fire_due_directives``). For each enabled, active
+    directive that is due (``next_due_at <= now``) OR whose window has
+    closed (``until_at <= now``):
 
     * a still-in-window due schedule emits a ``directive`` event, bumps
       ``run_count``, and resets ``next_due_at = now + interval``

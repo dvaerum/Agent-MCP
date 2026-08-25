@@ -30,6 +30,7 @@ and the alternatives weighed. Most recent decisions:
 - [ADR-0023](./adr/0023-dashboard-data-layer-tanstack-query.md) — dashboard data layer on TanStack Query, replacing the hand-rolled Zustand store + bespoke fetch hooks.
 - [ADR-0024](./adr/0024-sso-subject-value-type.md) — the OIDC subject key is a value type, not an f-string.
 - [ADR-0025](./adr/0025-forwarding-tier-excluded-from-confirmed-operator-tier.md) — forwarding-tier identity is excluded from confirmed-operator-tier by design.
+- [ADR-0026](./adr/0026-directive-due-delivery-trigger.md) — scheduled directives fire through the delivery-transport trigger set, closing the wait-loop-only firing gap.
 
 ### [`proposals/`](./proposals/) — parked future improvements
 
