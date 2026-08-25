@@ -14,6 +14,15 @@
 //!  "open_tasks":[{"task_id","title","status"}...],
 //!  "unassigned_count":N?}
 //! ```
+//!
+//! A fourth reason, `directive_due` (ADR-0026, from
+//! `delivery_scheduler.py::_render_directive_frame`), carries a nested
+//! `directive` event instead and is rendered separately — see
+//! `render_skinny`'s early-return branch:
+//! ```json
+//! {"type":"delivery","reason":"directive_due",
+//!  "directive":{"data":{"prompt":"..."}}}
+//! ```
 
 use serde::Deserialize;
 use unicode_general_category::{get_general_category, GeneralCategory};
@@ -43,6 +52,20 @@ pub struct OpenTask {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+pub struct DirectiveData {
+    #[serde(default)]
+    pub prompt: String,
+}
+
+/// The `directive` event nested in a `directive_due` frame
+/// (`scheduled_directive_repository.py::_directive_event`, ADR-0026).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DirectiveEvent {
+    #[serde(default)]
+    pub data: DirectiveData,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct Frame {
     #[serde(default, rename = "type")]
     pub kind: String,
@@ -58,6 +81,9 @@ pub struct Frame {
     pub open_tasks: Vec<OpenTask>,
     #[serde(default)]
     pub unassigned_count: Option<i64>,
+    /// Present only when `reason == "directive_due"` (ADR-0026).
+    #[serde(default)]
+    pub directive: Option<DirectiveEvent>,
 }
 
 /// Parse one SSE `data:` payload into a [`Frame`].
@@ -155,8 +181,26 @@ fn sanitize_for_pane(s: &str) -> String {
     out
 }
 
-/// Render a frame to a skinny pane nudge. Pure: ids/subjects/status only.
+/// Render a frame to a skinny pane nudge. Pure: ids/subjects/status only —
+/// EXCEPT `directive_due` (ADR-0026), which renders its prompt inline: a
+/// scheduled directive's prompt is first-party content the agent/operator
+/// itself authored, not a third party's message body, so ADR-0021's
+/// "never inline a body" rule doesn't apply the same way here. Handled as
+/// its own early return: the shape (no unread/open-task sections, no
+/// "marks nothing read or done" footer — a directive fire is a one-shot
+/// event, not a re-checkable backlog condition) diverges enough from the
+/// other three reasons that folding it into their shared accumulation
+/// logic below would be more confusing than a second, short branch.
 pub fn render_skinny(f: &Frame) -> String {
+    if f.reason == "directive_due" {
+        let prompt = f
+            .directive
+            .as_ref()
+            .map(|d| sanitize_for_pane(&d.data.prompt))
+            .unwrap_or_default();
+        return format!("[agent-mcp delivery] Scheduled directive due: {prompt}");
+    }
+
     let mut lines: Vec<String> = Vec::new();
 
     let headline = match f.reason.as_str() {
@@ -258,6 +302,31 @@ mod tests {
         );
         let out = render_skinny(&f);
         assert!(out.contains("4 unassigned open task(s)"));
+    }
+
+    #[test]
+    fn renders_directive_due_with_its_actual_prompt_text() {
+        // ADR-0026: unlike the other three reasons (which stay skinny —
+        // ids/subjects only, never a body), a directive's prompt is
+        // first-party content the agent/operator itself authored, not a
+        // third party's message body — so it's rendered inline, not
+        // pointed-at via a tool call.
+        let f = frame_json(
+            r#"{"type":"delivery","reason":"directive_due","unread_count":0,"task_count":0,
+                "unread_messages":[],"open_tasks":[],
+                "directive":{"ref_id":"sd_abc123","timestamp":"2026-08-25T00:00:00",
+                  "priority":"urgent","data":{"prompt":"check in with all workers",
+                  "source":"schedule","schedule_id":"sd_abc123"}}}"#,
+        );
+        let out = render_skinny(&f);
+        assert!(
+            out.contains("check in with all workers"),
+            "directive prompt text missing from rendered nudge; got: {out:?}"
+        );
+        // Must NOT fall through to the generic message/task wildcard text —
+        // that's the actual bug this test reproduces (silently renders
+        // "0 unread message(s), 0 open task(s)" and drops the prompt).
+        assert!(!out.contains("0 unread message(s)"));
     }
 
     #[test]
