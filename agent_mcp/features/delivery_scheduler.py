@@ -16,6 +16,7 @@ policy re-fires next tick (self-healing, ADR-0021).
 from __future__ import annotations
 
 import asyncio
+import datetime
 import logging
 import time
 from typing import Any, Dict, Optional
@@ -51,6 +52,9 @@ def load_config() -> dp.DeliveryPolicyConfig:
         ),
         on_unassigned_tasks=_get_config_bool(
             "config_delivery_on_unassigned_tasks", False
+        ),
+        on_due_directives=_get_config_bool(
+            "config_delivery_on_due_directives", True
         ),
         backoff_initial_seconds=_get_config_int(
             "config_delivery_backoff_initial_seconds", 30
@@ -121,6 +125,21 @@ def _render_frame(
     return frame
 
 
+def _render_directive_frame(event: Dict[str, Any]) -> Dict[str, Any]:
+    """A ``directive.due`` delivery frame (ADR-0026) — wraps the SAME event
+    shape :func:`~agent_mcp.repositories.scheduled_directive_repository
+    .collect_due_and_fire` already emits for the ``wait_for_events`` path
+    (``_directive_event``), so a downstream consumer sees identical
+    directive content regardless of which path delivered it.
+
+    No skinny-redaction here (unlike :func:`_render_frame`): a directive's
+    ``data.prompt`` is first-party content the agent/operator itself
+    authored, not a third party's message body — ADR-0021's "never ship
+    bodies" concern doesn't apply the same way (documented asymmetry,
+    ADR-0026)."""
+    return {"type": "delivery", "reason": "directive_due", "directive": event}
+
+
 def evaluate_and_push(
     agent_id: str,
     config: dp.DeliveryPolicyConfig,
@@ -140,6 +159,45 @@ def evaluate_and_push(
     return True
 
 
+def _fire_due_directives(agent_id: str, now_iso: str) -> bool:
+    """Fire every due scheduled directive for ``agent_id`` and push each as
+    a ``directive_due`` frame. Returns whether anything was pushed.
+
+    Only called from :func:`tick` for agents already in
+    :func:`delivery_transport.connected_agent_ids` — never for a
+    disconnected worker (preserves offline-fire-once-on-reconnect).
+    ``collect_due_and_fire`` mutates unconditionally regardless of
+    ``push()``'s outcome; see ADR-0026 for why that's an accepted,
+    rare-case tradeoff (the connectivity gate + no-``await`` chain closes
+    the disconnect race; only a genuinely full subscriber queue can still
+    drop a fire)."""
+    from ..db.connection import get_db_connection
+    from ..repositories import scheduled_directive_repository as sched_repo
+
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        events = sched_repo.collect_due_and_fire(
+            agent_id, now_iso, connection=cursor
+        )
+        conn.commit()
+    except Exception as e:  # pragma: no cover - defensive
+        logger.debug(
+            "delivery: due-directive fire failed for %s: %s", agent_id, e
+        )
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+    pushed = False
+    for event in events:
+        if delivery_transport.push(agent_id, _render_directive_frame(event)):
+            pushed = True
+    return pushed
+
+
 def tick(now: Optional[float] = None) -> int:
     """One scheduler pass over every connected worker. Returns the number
     of frames pushed. A no-op (no config read cost beyond the toggle) when
@@ -149,6 +207,7 @@ def tick(now: Optional[float] = None) -> int:
         return 0
     if now is None:
         now = time.monotonic()
+    now_iso = datetime.datetime.now().isoformat()
     pushed = 0
     for agent_id in delivery_transport.connected_agent_ids():
         try:
@@ -156,6 +215,14 @@ def tick(now: Optional[float] = None) -> int:
                 pushed += 1
         except Exception as e:  # pragma: no cover - defensive
             logger.debug("delivery: evaluate failed for %s: %s", agent_id, e)
+        if config.on_due_directives:
+            try:
+                if _fire_due_directives(agent_id, now_iso):
+                    pushed += 1
+            except Exception as e:  # pragma: no cover - defensive
+                logger.debug(
+                    "delivery: directive fire failed for %s: %s", agent_id, e
+                )
     return pushed
 
 

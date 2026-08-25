@@ -416,6 +416,20 @@ SETTINGS_SCHEMA: tuple[SettingSpec, ...] = (
         widget="switch",
     ),
     SettingSpec(
+        key="config_delivery_on_due_directives",
+        type="bool",
+        default=True,
+        tier="operator",
+        group="delivery",
+        title="Deliver on due scheduled directives",
+        description=(
+            "Arm the fallback while the agent has a scheduled directive "
+            "that is due now. On by default — a due directive is an "
+            "explicit, deliberate obligation, not an ambient signal."
+        ),
+        widget="switch",
+    ),
+    SettingSpec(
         key="config_delivery_backoff_initial_seconds",
         type="int",
         default=30,
