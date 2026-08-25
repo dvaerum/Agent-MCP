@@ -20,6 +20,13 @@
 #   10. Global toggle OFF → stop_listening for all agents.
 #
 # Test runtime target: ~2-3 minutes total once the VM is booted.
+#
+# Runs as a systemd-nspawn container (`containers.machine`), not a QEMU
+# VM (`nodes.machine`) — nixpkgs' native nspawn test-driver support
+# (nixos/lib/testing/nodes.nix). Migrated using the same 2-change
+# pattern as multi-tenant.nix and no-auto-cleanup.nix (see
+# docs/learnings/nspawn-test-migration.md): no systemd-hardening-
+# directive assertions and no multi-node topology here either.
 { pkgs, lib, self, ... }:
 
 let
@@ -32,14 +39,8 @@ in
 pkgs.testers.nixosTest {
   name = "agent-mcp-event-driven-coord";
 
-  nodes.machine = { config, pkgs, ... }: {
+  containers.machine = { config, pkgs, ... }: {
     imports = [ ./fake-openai.nix ];
-
-    virtualisation = {
-      memorySize = 1536;
-      cores = 2;
-      diskSize = 2048;
-    };
 
     users.users.testuser = {
       isNormalUser = true;
