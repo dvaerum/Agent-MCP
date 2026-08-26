@@ -159,15 +159,20 @@ export function ProjectMembershipsModal({
       {/* CC-14: `w-[calc(100vw-2rem)]` keeps a 1rem gutter each side at
           375px; without it the sm:max-w-3xl width applies below sm too
           and the dialog clips horizontally. */}
-      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-3xl">
-        <DialogHeader>
+      {/* max-h + flex-col caps the dialog to the viewport (dvh, not vh,
+          for mobile Safari/Chrome's collapsing address bar); the
+          membership table can grow arbitrarily long, so it needs its
+          own scroll region rather than pushing Close off-screen — see
+          docs/learnings/dashboard-dialog-mobile-clipping.md. */}
+      <DialogContent className="w-[calc(100vw-2rem)] flex max-h-[calc(100dvh-2rem)] flex-col overflow-hidden sm:!max-w-3xl">
+        <DialogHeader className="flex-shrink-0">
           <DialogTitle>Memberships for {projectName}</DialogTitle>
           <DialogDescription>
             Users and groups with access to this project. Roles:
             operator (full) or viewer (read-only).
           </DialogDescription>
         </DialogHeader>
-        <div className="space-y-4 py-2">
+        <div className="flex-1 min-h-0 space-y-4 overflow-y-auto py-2 pr-1">
           <div className="flex justify-end">
             <Button size="sm" onClick={() => setAddOpen(true)}>
               <Plus className="h-4 w-4 mr-1" /> Add
@@ -262,7 +267,7 @@ export function ProjectMembershipsModal({
             </Table>
           )}
         </div>
-        <DialogFooter>
+        <DialogFooter className="flex-shrink-0">
           <Button variant="ghost" onClick={() => onOpenChange(false)}>
             Close
           </Button>
@@ -343,12 +348,12 @@ function AddMembershipModal({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-lg">
-        <form onSubmit={handleSubmit}>
-          <DialogHeader>
+      <DialogContent className="w-[calc(100vw-2rem)] flex max-h-[calc(100dvh-2rem)] flex-col overflow-hidden sm:!max-w-lg">
+        <form onSubmit={handleSubmit} className="flex min-h-0 flex-1 flex-col">
+          <DialogHeader className="flex-shrink-0">
             <DialogTitle>Add membership to {projectName}</DialogTitle>
           </DialogHeader>
-          <div className="space-y-4 py-4">
+          <div className="flex-1 min-h-0 space-y-4 overflow-y-auto py-4 pr-1">
             <div className="space-y-2">
               <Label htmlFor="pm-kind">Kind</Label>
               <Select
@@ -411,7 +416,7 @@ function AddMembershipModal({
             </div>
             {error && <div className="text-sm text-destructive">{error}</div>}
           </div>
-          <DialogFooter>
+          <DialogFooter className="flex-shrink-0">
             <Button
               type="button"
               variant="ghost"

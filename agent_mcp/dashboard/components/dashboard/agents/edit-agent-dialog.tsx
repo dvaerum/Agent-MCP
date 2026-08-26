@@ -213,7 +213,7 @@ export function EditAgentDialog({
         the taller-than-viewport form clipped its own title and Save
         button with no way to scroll to them.
       */}
-      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-md bg-card border-border text-card-foreground p-0 gap-0 max-h-[90vh] flex flex-col">
+      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-md bg-card border-border text-card-foreground p-0 gap-0 max-h-[90dvh] flex flex-col">
         <DialogHeader className="px-6 pt-6 pb-4 border-b border-border flex-shrink-0">
           <DialogTitle className="text-lg">Edit agent {agent?.agent_id}</DialogTitle>
           <DialogDescription className="text-muted-foreground">

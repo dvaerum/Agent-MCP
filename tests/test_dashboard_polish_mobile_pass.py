@@ -296,6 +296,61 @@ def test_every_dialog_content_has_mobile_width_fallback() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Dialog mobile height-cap — every <DialogContent> needs `dvh`, not `vh`
+# ---------------------------------------------------------------------------
+#
+# Companion to CC-14 above, added after a real production bug: the
+# schedules create/edit dialog (and several siblings — DeleteConfirmModal,
+# project-memberships, users, add/remove/rename-project, send-directive)
+# had no height cap at all, so a tall form's bottom (fields + action
+# buttons) got clipped behind mobile Safari/Chrome's collapsing address
+# bar with no way to scroll to it. `vh` alone doesn't fix this — it's
+# computed against the LARGEST possible viewport, not the one visible
+# once the browser chrome collapses; `dvh` (dynamic viewport height)
+# tracks the real visible area. See
+# docs/learnings/dashboard-dialog-mobile-clipping.md.
+#
+# Reuses the same glob as CC-14 (`_dialog_content_files`) so a dialog
+# added tomorrow is covered automatically, and treats the `<form>`-wrapped
+# dialogs' outer DialogContent the same way as the plain ones — the cap
+# must be on DialogContent itself, not just somewhere in the file.
+
+
+def test_every_dialog_content_caps_height_for_mobile() -> None:
+    """Every <DialogContent> must include a `dvh`-based height cap
+    (`max-h-[...dvh...]`) so mobile Safari/Chrome's collapsing address
+    bar can't clip its bottom content with no way to scroll to it.
+
+    `vh` alone is NOT sufficient (see module docstring) — pin the
+    stronger unit explicitly rather than just "some height cap exists".
+    """
+    files = _dialog_content_files()
+    assert files, (
+        "no <DialogContent> sites found under "
+        f"{[str(r) for r in DIALOG_CONTENT_ROOTS]} — the glob is broken, "
+        "which would silently disable this audit"
+    )
+    dvh_re = re.compile(r"max-h-\[[^\]]*dvh[^\]]*\]")
+    failures: list[str] = []
+    for f in files:
+        src = _code_only(_read(f))
+        for m in DIALOG_CONTENT_RE.finditer(src):
+            classes = m.group(1)
+            if not dvh_re.search(classes):
+                line = src[: m.start()].count("\n") + 1
+                snippet = classes[:80] + ("…" if len(classes) > 80 else "")
+                failures.append(f"{f}:{line}  className={snippet!r}")
+    assert not failures, (
+        "DialogContent missing a dvh-based height cap "
+        "(`max-h-[calc(100dvh-2rem)]` or similar) at "
+        + str(len(failures))
+        + " sites — mobile Safari/Chrome's collapsing address bar will "
+        "clip the bottom of these dialogs with no way to scroll to it:\n  "
+        + "\n  ".join(failures)
+    )
+
+
+# ---------------------------------------------------------------------------
 # CC-7 — mobile card-list sibling for every data-table dashboard
 # ---------------------------------------------------------------------------
 

@@ -84,9 +84,9 @@ export function AddProjectModal({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-lg">
-        <form onSubmit={handleSubmit}>
-          <DialogHeader>
+      <DialogContent className="w-[calc(100vw-2rem)] flex max-h-[calc(100dvh-2rem)] flex-col overflow-hidden sm:!max-w-lg">
+        <form onSubmit={handleSubmit} className="flex min-h-0 flex-1 flex-col">
+          <DialogHeader className="flex-shrink-0">
             <DialogTitle className="flex items-center gap-2">
               <Plus className="h-4 w-4" />
               Add a new project
@@ -98,7 +98,7 @@ export function AddProjectModal({
             </DialogDescription>
           </DialogHeader>
 
-          <div className="space-y-4 py-4">
+          <div className="flex-1 min-h-0 space-y-4 overflow-y-auto py-4 pr-1">
             <div className="space-y-2">
               <Label htmlFor="add-project-name">Project name</Label>
               <Input
@@ -138,7 +138,7 @@ export function AddProjectModal({
             )}
           </div>
 
-          <DialogFooter>
+          <DialogFooter className="flex-shrink-0">
             <Button
               type="button"
               variant="ghost"

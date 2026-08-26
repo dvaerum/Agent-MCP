@@ -34,7 +34,10 @@ export function TaskDetailsDialog({ task, open, onOpenChange }: TaskDetailsDialo
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-2xl max-h-[80vh]">
+      {/* dvh, not vh — mobile Safari/Chrome's collapsing address bar
+          shrinks the visual viewport without firing a resize vh would
+          need to track; see docs/learnings/dashboard-dialog-mobile-clipping.md. */}
+      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-2xl max-h-[80dvh]">
         <DialogHeader>
           <DialogTitle className="flex items-center justify-between pr-8">
             <span className="text-lg font-semibold">{task.title}</span>
@@ -49,7 +52,7 @@ export function TaskDetailsDialog({ task, open, onOpenChange }: TaskDetailsDialo
           </DialogDescription>
         </DialogHeader>
 
-        <ScrollArea className="max-h-[60vh] pr-4">
+        <ScrollArea className="max-h-[60dvh] pr-4">
           <div className="space-y-4">
             {/* Task Info */}
             <div className="grid grid-cols-2 gap-4 text-sm">
