@@ -189,7 +189,7 @@ export function MemoryValueView({ value, className }: MemoryValueViewProps) {
       </div>
 
       {/* Body — no inner vertical scroll: the value block grows to its
-          natural height and the modal (DialogContent max-h-[90vh]
+          natural height and the modal (DialogContent max-h-[90dvh]
           overflow-y-auto) is the single vertical scroller, so large JSON
           no longer produces a nested "double scroll". The value <pre>s
           wrap long lines (whitespace-pre-wrap) rather than using

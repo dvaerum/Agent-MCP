@@ -208,12 +208,13 @@ def test_view_dialog_body_uses_max_h_overflow() -> None:
 
     Wave 5: the Edit dialog moved to the shared <FormDialog> (which owns
     an equivalent viewport cap + scroll body). The View dialog keeps its
-    own layout, so the guarantee is pinned there: `max-h-[90vh]` on the
+    own layout, so the guarantee is pinned there: `max-h-[90dvh]` on the
     DialogContent + a `flex-1 min-h-0 overflow-y-auto` scroll body.
+    `dvh`, not `vh` — see docs/learnings/dashboard-dialog-mobile-clipping.md.
     """
     src = _read_tasks()
-    assert "max-h-[90vh]" in src, (
-        "View dialog must cap height at 90vh so long tasks scroll inside "
+    assert "max-h-[90dvh]" in src, (
+        "View dialog must cap height at 90dvh so long tasks scroll inside "
         "the modal instead of stretching the page"
     )
     assert "flex-1 min-h-0 overflow-y-auto" in src, (

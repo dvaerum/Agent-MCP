@@ -207,7 +207,7 @@ export function EditAgentDialog({
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       {/*
-        Height capped at 90vh + a flex column so the long form body
+        Height capped at 90dvh + a flex column so the long form body
         scrolls instead of overflowing the viewport (header + footer stay
         pinned). Mirrors the AgentDetailDialog structure; without this
         the taller-than-viewport form clipped its own title and Save

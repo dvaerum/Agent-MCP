@@ -48,12 +48,17 @@ def test_view_dialog_uses_important_max_width_override() -> None:
 
 
 def test_view_dialog_caps_height_to_viewport() -> None:
-    """`max-h-[90vh]` on the dialog + scrollable body region prevents
+    """`max-h-[90dvh]` on the dialog + scrollable body region prevents
     the dialog from overflowing the viewport when the description is
-    huge (we have one task with a 65k-char body in the wild)."""
+    huge (we have one task with a 65k-char body in the wild).
+
+    `dvh`, not `vh`: `vh` is computed against the largest possible
+    viewport, not the one actually visible once a mobile browser's
+    chrome (address bar, bottom bar) collapses — see
+    docs/learnings/dashboard-dialog-mobile-clipping.md."""
     src = _src()
-    assert "max-h-[90vh]" in src, (
-        "expected `max-h-[90vh]` on the dialog content to cap dialog "
+    assert "max-h-[90dvh]" in src, (
+        "expected `max-h-[90dvh]` on the dialog content to cap dialog "
         "height. Without it, monster descriptions push the dialog "
         "past the viewport bottom."
     )
@@ -122,9 +127,9 @@ def test_view_dialog_description_no_inner_scroll() -> None:
     # (~400 chars after the label is plenty).
     region = src[description_block_idx:description_block_idx + 500]
     import re as _re
-    assert not _re.search(r"max-h-\[\d+vh\]", region), (
+    assert not _re.search(r"max-h-\[\d+d?vh\]", region), (
         "expected NO `max-h-[Nvh]` constraint on the description block — "
-        "the parent dialog body already scrolls (`max-h-[90vh]` + "
+        "the parent dialog body already scrolls (`max-h-[90dvh]` + "
         "`flex-1 min-h-0 overflow-y-auto`), and nesting another scroll "
         "region inside it forces users to scroll twice. Drop the cap."
     )

@@ -4,7 +4,7 @@ Several dashboard pages have been split from a single god-file into a
 page module plus a directory of satellites (the Agents page: PR
 ``feat/webui-migrate-agents``). The guards in ``test_dashboard_*.py``
 assert properties of the *page* — "the row action buttons stop
-propagation", "the detail dialog caps at 90vh" — not properties of a
+propagation", "the detail dialog caps at 90dvh" — not properties of a
 particular file, so they read the page **and its satellites** as one
 text blob.
 

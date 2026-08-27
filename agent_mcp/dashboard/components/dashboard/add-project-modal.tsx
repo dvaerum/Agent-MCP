@@ -14,19 +14,12 @@
 // success we refresh the overview store; on 4xx we surface the
 // router's envelope ``message``.
 
-import React, { useState } from "react"
-import { Loader2, Plus } from "lucide-react"
-import { Button } from "@/components/ui/button"
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog"
+import { useState } from "react"
+import type { ReactElement } from "react"
+import { Plus } from "lucide-react"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { FormDialog } from "@/components/dashboard/shared/form-dialog"
 import { useProjectsStore } from "@/lib/stores/projects-store"
 import { routerProjectsUrl } from "@/lib/urls"
 import { routerApi } from "@/lib/router-api"
@@ -38,122 +31,85 @@ export interface AddProjectModalProps {
   onOpenChange: (open: boolean) => void
 }
 
+/**
+ * Add project — adopts the shared <FormDialog> shell (mirrors
+ * EditTaskDialog/AddGroupModal): the shell owns the mobile dvh-cap +
+ * scroll body, the Cancel/Create footer, the in-flight spinner and the
+ * success/error toast. `onSubmit` builds the request, mutates, and
+ * THROWS on failure so the shell keeps the dialog open with the
+ * operator's input intact (was previously an inline error paragraph;
+ * now a toast, matching every other FormDialog adopter).
+ */
 export function AddProjectModal({
   open,
   onOpenChange,
-}: AddProjectModalProps): React.ReactElement {
+}: AddProjectModalProps): ReactElement {
   const [name, setName] = useState("")
   const [workspace, setWorkspace] = useState("")
-  const [submitting, setSubmitting] = useState(false)
-  const [error, setError] = useState<string | null>(null)
   const fetchOverview = useProjectsStore((s) => s.fetchOverview)
-
-  const resetAndClose = () => {
-    setName("")
-    setWorkspace("")
-    setError(null)
-    setSubmitting(false)
-    onOpenChange(false)
-  }
 
   const validName = SLUG_RE.test(name)
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault()
-    if (!validName) {
-      setError(
-        "Name must start with a lowercase letter and contain only " +
-          "lowercase letters, digits, and hyphens.",
-      )
-      return
-    }
-    setSubmitting(true)
-    setError(null)
-    try {
-      await routerApi.request(routerProjectsUrl(), {
-        method: "POST",
-        body: JSON.stringify({ name }),
-      })
-      await fetchOverview()
-      resetAndClose()
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
-      setSubmitting(false)
-    }
+  const handleSubmit = async () => {
+    await routerApi.request(routerProjectsUrl(), {
+      method: "POST",
+      body: JSON.stringify({ name }),
+    })
+    await fetchOverview()
+  }
+
+  const reset = () => {
+    setName("")
+    setWorkspace("")
   }
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="w-[calc(100vw-2rem)] flex max-h-[calc(100dvh-2rem)] flex-col overflow-hidden sm:!max-w-lg">
-        <form onSubmit={handleSubmit} className="flex min-h-0 flex-1 flex-col">
-          <DialogHeader className="flex-shrink-0">
-            <DialogTitle className="flex items-center gap-2">
-              <Plus className="h-4 w-4" />
-              Add a new project
-            </DialogTitle>
-            <DialogDescription>
-              Register a new agent-mcp project on this router. Leave the
-              workspace blank to let the router create one under the
-              default location.
-            </DialogDescription>
-          </DialogHeader>
+    <FormDialog
+      open={open}
+      onOpenChange={(o) => {
+        onOpenChange(o)
+        if (!o) reset()
+      }}
+      title="Add a new project"
+      description="Register a new agent-mcp project on this router. Leave the workspace blank to let the router create one under the default location."
+      icon={Plus}
+      onSubmit={handleSubmit}
+      submitLabel="Create"
+      submitDisabled={!validName}
+      successMessage="Project created."
+      errorMessage="Failed to add project"
+    >
+      <div className="space-y-2">
+        <Label htmlFor="add-project-name">Project name</Label>
+        <Input
+          id="add-project-name"
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          placeholder="my-project"
+          autoFocus
+          required
+        />
+        {name && !validName && (
+          <p className="text-xs text-destructive">
+            Lowercase slug only: ^[a-z][a-z0-9-]*[a-z0-9]?$
+          </p>
+        )}
+      </div>
 
-          <div className="flex-1 min-h-0 space-y-4 overflow-y-auto py-4 pr-1">
-            <div className="space-y-2">
-              <Label htmlFor="add-project-name">Project name</Label>
-              <Input
-                id="add-project-name"
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                placeholder="my-project"
-                autoFocus
-                required
-              />
-              {name && !validName && (
-                <p className="text-xs text-destructive">
-                  Lowercase slug only: ^[a-z][a-z0-9-]*[a-z0-9]?$
-                </p>
-              )}
-            </div>
-
-            <div className="space-y-2">
-              <Label htmlFor="add-project-workspace">
-                Workspace path <span className="text-muted-foreground">(optional)</span>
-              </Label>
-              <Input
-                id="add-project-workspace"
-                value={workspace}
-                onChange={(e) => setWorkspace(e.target.value)}
-                placeholder="/home/dennis/.local/share/agent-mcp/projects/<name>"
-              />
-              <p className="text-xs text-muted-foreground">
-                Editable for the &quot;restore from existing folder&quot; use case.
-              </p>
-            </div>
-
-            {error && (
-              <p className="text-sm text-destructive whitespace-pre-wrap">
-                {error}
-              </p>
-            )}
-          </div>
-
-          <DialogFooter className="flex-shrink-0">
-            <Button
-              type="button"
-              variant="ghost"
-              onClick={resetAndClose}
-              disabled={submitting}
-            >
-              Cancel
-            </Button>
-            <Button type="submit" disabled={submitting || !validName}>
-              {submitting && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
-              Create
-            </Button>
-          </DialogFooter>
-        </form>
-      </DialogContent>
-    </Dialog>
+      <div className="space-y-2">
+        <Label htmlFor="add-project-workspace">
+          Workspace path <span className="text-muted-foreground">(optional)</span>
+        </Label>
+        <Input
+          id="add-project-workspace"
+          value={workspace}
+          onChange={(e) => setWorkspace(e.target.value)}
+          placeholder="/home/dennis/.local/share/agent-mcp/projects/<name>"
+        />
+        <p className="text-xs text-muted-foreground">
+          Editable for the &quot;restore from existing folder&quot; use case.
+        </p>
+      </div>
+    </FormDialog>
   )
 }
