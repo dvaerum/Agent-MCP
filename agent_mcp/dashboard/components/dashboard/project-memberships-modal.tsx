@@ -39,6 +39,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table"
+import { EmptyState } from "@/components/dashboard/shared/empty-state"
 import {
   projectMembershipsUrl, projectMembershipUrl,
   routerUsersUrl, routerGroupsUrl,
@@ -202,70 +203,82 @@ export function ProjectMembershipsModal({
           {!loading && !forbidden && error && (
             <div className="text-destructive text-sm">{error}</div>
           )}
-          {!loading && !forbidden && (
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Kind</TableHead>
-                  <TableHead>Name</TableHead>
-                  <TableHead>Role</TableHead>
-                  <TableHead className="text-right">Actions</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {rows.length === 0 && (
+          {/* CC-20-style swap: this used to be a bare centered TableCell
+              string ("No memberships.") — the one hand-rolled empty-state
+              left in the dashboard once messages-dashboard adopted the
+              shared primitive. The table itself stays hand-rolled
+              (ResponsiveDataTable inside a dialog is an unproven pattern
+              with no existing precedent — out of scope here). */}
+          {!loading && !forbidden && rows.length === 0 && (
+            <EmptyState
+              icon={UsersIcon}
+              title="No memberships"
+              description="No users or groups have access to this project yet."
+            />
+          )}
+          {!loading && !forbidden && rows.length > 0 && (
+            // CC-14-capped dialog width means an unwrapped table clips
+            // silently rather than reflowing — wrap it so an overflow
+            // scrolls horizontally instead (pinned by
+            // test_dialog_hosted_tables_scroll_horizontally_not_clip).
+            <div className="overflow-x-auto">
+              <Table>
+                <TableHeader>
                   <TableRow>
-                    <TableCell colSpan={4} className="text-center text-muted-foreground">
-                      No memberships.
-                    </TableCell>
+                    <TableHead>Kind</TableHead>
+                    <TableHead>Name</TableHead>
+                    <TableHead>Role</TableHead>
+                    <TableHead className="text-right">Actions</TableHead>
                   </TableRow>
-                )}
-                {rows.map((r) => {
-                  const isUser = !!r.user_id
-                  return (
-                    <TableRow key={r.membership_id}>
-                      <TableCell>
-                        {isUser ? (
-                          <UserIcon className="h-4 w-4 text-muted-foreground" />
-                        ) : (
-                          <UsersIcon className="h-4 w-4 text-muted-foreground" />
-                        )}
-                      </TableCell>
-                      <TableCell className="font-medium">
-                        {r.username || r.group_name}
-                      </TableCell>
-                      <TableCell>
-                        <Select
-                          value={r.role}
-                          onValueChange={(v) =>
-                            handleChangeRole(r.membership_id, v as Role)
-                          }
-                        >
-                          <SelectTrigger className="h-7 w-32">
-                            <SelectValue />
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value="operator">operator</SelectItem>
-                            <SelectItem value="viewer">viewer</SelectItem>
-                          </SelectContent>
-                        </Select>
-                      </TableCell>
-                      <TableCell className="text-right">
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          aria-label={`Remove ${r.username || r.group_name}`}
-                          className="text-destructive"
-                          onClick={() => handleRemove(r)}
-                        >
-                          <Trash2 className="h-4 w-4" />
-                        </Button>
-                      </TableCell>
-                    </TableRow>
-                  )
-                })}
-              </TableBody>
-            </Table>
+                </TableHeader>
+                <TableBody>
+                  {rows.map((r) => {
+                    const isUser = !!r.user_id
+                    return (
+                      <TableRow key={r.membership_id}>
+                        <TableCell>
+                          {isUser ? (
+                            <UserIcon className="h-4 w-4 text-muted-foreground" />
+                          ) : (
+                            <UsersIcon className="h-4 w-4 text-muted-foreground" />
+                          )}
+                        </TableCell>
+                        <TableCell className="font-medium">
+                          {r.username || r.group_name}
+                        </TableCell>
+                        <TableCell>
+                          <Select
+                            value={r.role}
+                            onValueChange={(v) =>
+                              handleChangeRole(r.membership_id, v as Role)
+                            }
+                          >
+                            <SelectTrigger className="h-7 w-32">
+                              <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value="operator">operator</SelectItem>
+                              <SelectItem value="viewer">viewer</SelectItem>
+                            </SelectContent>
+                          </Select>
+                        </TableCell>
+                        <TableCell className="text-right">
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            aria-label={`Remove ${r.username || r.group_name}`}
+                            className="text-destructive"
+                            onClick={() => handleRemove(r)}
+                          >
+                            <Trash2 className="h-4 w-4" />
+                          </Button>
+                        </TableCell>
+                      </TableRow>
+                    )
+                  })}
+                </TableBody>
+              </Table>
+            </div>
           )}
         </div>
         <DialogFooter className="flex-shrink-0">
