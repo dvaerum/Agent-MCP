@@ -10,6 +10,7 @@ import json
 import pytest
 
 import agent_mcp.tools.agent_communication_tools as acm
+from agent_mcp.features import delivery_transport as dt
 from agent_mcp.repositories import pending_directive_repository as poke_repo
 from tests.harness import mcp_session
 
@@ -229,6 +230,33 @@ async def test_rest_poke_delivered_when_agent_listening(tmp_path):
             assert "delivered" in body["message"].lower(), body
         finally:
             g.unregister_waiter("alice", queue)
+
+
+async def test_rest_poke_pushes_via_delivery_transport_when_connected(tmp_path):
+    """The exact same gap ADR-0026 closed for scheduled directives applies
+    to ad-hoc pokes: a chat-style session connected via the delivery
+    transport (aoe-bridge) but not currently blocked in a
+    wait_for_events call never saw the pending_directive row — it just
+    sat there until (if ever) the agent happened to check in again.
+
+    RED before the fix: `create_poke` + the waiter-wake notify are the
+    ONLY things the REST route does; nothing reads
+    `delivery_transport.connected_agent_ids()`/`is_connected()` at all,
+    so a connected-but-not-polling agent's delivery subscription never
+    receives anything for a poke, unlike what already happens for a due
+    scheduled directive."""
+    async with mcp_session(tmp_path) as admin:
+        await admin.create_worker("alice")
+        sub = dt.subscribe("alice")  # connected, never polls
+        r = _post_poke(admin, "alice", {"prompt": "stop and report status"})
+        assert r.status_code == 200, r.text
+
+        frame = sub.queue.get_nowait()
+        assert frame["type"] == "delivery"
+        assert frame["reason"] == "poke_due"
+        directive = frame["directive"]
+        assert directive["data"]["prompt"] == "stop and report status"
+        assert directive["data"]["source"] == "poke"
 
 
 async def test_rest_poke_unknown_agent_404(tmp_path):

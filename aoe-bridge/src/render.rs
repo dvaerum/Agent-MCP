@@ -23,6 +23,13 @@
 //! {"type":"delivery","reason":"directive_due",
 //!  "directive":{"data":{"prompt":"..."}}}
 //! ```
+//!
+//! A fifth reason, `poke_due` (ad-hoc operator poke,
+//! `POST /api/agents/<id>/directive`), carries the identical nested
+//! `directive` shape and shares `directive_due`'s render branch — the
+//! same "push immediately when connected, don't rely solely on
+//! wait_for_events" fix, applied to one-shot pokes instead of
+//! recurring schedules.
 
 use serde::Deserialize;
 use unicode_general_category::{get_general_category, GeneralCategory};
@@ -192,13 +199,22 @@ fn sanitize_for_pane(s: &str) -> String {
 /// other three reasons that folding it into their shared accumulation
 /// logic below would be more confusing than a second, short branch.
 pub fn render_skinny(f: &Frame) -> String {
-    if f.reason == "directive_due" {
+    if f.reason == "directive_due" || f.reason == "poke_due" {
         let prompt = f
             .directive
             .as_ref()
             .map(|d| sanitize_for_pane(&d.data.prompt))
             .unwrap_or_default();
-        return format!("[agent-mcp delivery] Scheduled directive due: {prompt}");
+        // poke_due (ad-hoc operator poke, POST /api/agents/<id>/directive)
+        // mirrors directive_due's immediate-push fix for the exact same
+        // reason: a chat-style session not currently blocked in
+        // wait_for_events never sees the pending_directive row otherwise.
+        let headline = if f.reason == "poke_due" {
+            "Directive"
+        } else {
+            "Scheduled directive due"
+        };
+        return format!("[agent-mcp delivery] {headline}: {prompt}");
     }
 
     let mut lines: Vec<String> = Vec::new();
@@ -326,6 +342,33 @@ mod tests {
         // Must NOT fall through to the generic message/task wildcard text —
         // that's the actual bug this test reproduces (silently renders
         // "0 unread message(s), 0 open task(s)" and drops the prompt).
+        assert!(!out.contains("0 unread message(s)"));
+    }
+
+    #[test]
+    fn renders_poke_due_with_its_actual_prompt_text() {
+        // Ad-hoc operator pokes (POST /api/agents/<id>/directive) had the
+        // exact same gap ADR-0026 fixed for scheduled directives: a
+        // chat-style session not currently blocked in wait_for_events
+        // never sees the poke until (if ever) it happens to check in
+        // again — the pending_directive row just sits there. The fix
+        // mirrors directive_due: when the target is connected via this
+        // bridge, push a frame immediately instead of only relying on
+        // the wait_for_events queue.
+        let f = frame_json(
+            r#"{"type":"delivery","reason":"poke_due","unread_count":0,"task_count":0,
+                "unread_messages":[],"open_tasks":[],
+                "directive":{"ref_id":"poke_abc123","timestamp":"2026-08-27T00:00:00",
+                  "priority":"urgent","data":{"prompt":"stop and report your current status",
+                  "source":"poke"}}}"#,
+        );
+        let out = render_skinny(&f);
+        assert!(
+            out.contains("stop and report your current status"),
+            "poke prompt text missing from rendered nudge; got: {out:?}"
+        );
+        // Must NOT fall through to the generic message/task wildcard —
+        // same failure mode as the directive_due regression.
         assert!(!out.contains("0 unread message(s)"));
     }
 
