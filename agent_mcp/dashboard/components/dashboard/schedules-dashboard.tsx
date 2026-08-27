@@ -330,7 +330,7 @@ export function SchedulesDashboard() {
         <TooltipProvider>
           <Tooltip>
             <TooltipTrigger asChild>
-              <span>{formatNextFire(s.next_due_at, new Date())}</span>
+              <span>{formatNextFire(s.next_due_at, new Date(), s.status)}</span>
             </TooltipTrigger>
             <TooltipContent>
               {formatAbsolute(s.next_due_at)}

@@ -32,8 +32,22 @@ export function formatInterval(seconds: number): string {
  * few seconds), "in 4m", "in 2h", "in 3d", or "overdue" when the fire is
  * in the past (an offline agent will get it on reconnect). Deterministic —
  * pass `now` in tests.
+ *
+ * A non-"active" `status` short-circuits to a status-appropriate label
+ * instead of computing a countdown: `next_due_at` keeps its last
+ * interval-reset-from-delivery value even after a schedule is paused or
+ * completes (the backend never clears it), so without this check the
+ * cell showed a live "in Nm" countdown right next to a "paused"/
+ * "completed" badge in the Status column — implying the schedule would
+ * still fire when it can't. Surfaced live: an operator paused their own
+ * schedule and saw "paused" + "in 7m" side by side.
  */
-export function formatNextFire(nextDueAt: string, now: Date = new Date()): string {
+export function formatNextFire(
+  nextDueAt: string,
+  now: Date = new Date(),
+  status: string = "active",
+): string {
+  if (status !== "active") return status === "completed" ? "—" : "paused"
   const due = new Date(nextDueAt).getTime()
   if (Number.isNaN(due)) return "—"
   const deltaMs = due - now.getTime()
