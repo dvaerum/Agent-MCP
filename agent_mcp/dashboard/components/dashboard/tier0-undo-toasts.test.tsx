@@ -304,6 +304,7 @@ describe("alias remove", () => {
       </>,
     )
     await u.click(await screen.findByRole("button", { name: /Remove alias now/ }))
+    await u.click(await screen.findByRole("button", { name: "Remove alias" }))
     expect(await screen.findByText(/Removed alias old-name/i)).toBeTruthy()
   })
 
@@ -324,6 +325,7 @@ describe("alias remove", () => {
       </>,
     )
     await u.click(await screen.findByRole("button", { name: /Remove alias now/ }))
+    await u.click(await screen.findByRole("button", { name: "Remove alias" }))
     await screen.findByText(/Removed alias old-name/i)
     expect(screen.queryByRole("button", { name: "Undo" })).toBeNull()
   })

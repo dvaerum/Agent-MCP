@@ -42,6 +42,7 @@ import { DeleteConfirmModal } from "@/components/dashboard/modals/delete-confirm
 import { ConfirmActionModal } from "@/components/dashboard/modals/confirm-action-modal"
 import { TerminateAgentDialog } from "@/components/dashboard/agents/terminate-agent-dialog"
 import { RemoveProjectModal } from "@/components/dashboard/remove-project-modal"
+import { AliasChipPanel } from "@/components/dashboard/alias-chip-panel"
 
 afterEach(() => {
   cleanup()
@@ -155,6 +156,60 @@ describe("<RemoveProjectModal>", () => {
     renderModal()
     const remove = screen.getByRole("button", { name: "Remove" })
     await waitFor(() => expect(document.activeElement).not.toBe(remove))
+  })
+})
+
+// Bug: "Remove alias now" fired the DELETE on a single click with zero
+// confirmation — the panel had no dialog at all, unlike every other
+// destructive action in the dashboard. Tier 1 is the right gate (the
+// action is irreversible but recreatable via Rename, and its blast
+// radius is one alias row on one project).
+describe("<AliasChipPanel>'s remove-alias confirm", () => {
+  const renderPanel = () =>
+    render(
+      <AliasChipPanel
+        projectName="acme"
+        alias={{ name: "old-acme", expires_at: "2026-12-31T00:00:00Z" }}
+        open
+        onClose={() => {}}
+      />,
+    )
+
+  it("does not call DELETE on a single click — opens a confirm dialog first", async () => {
+    routerRequest.mockResolvedValueOnce({ agents: [] })
+    const { default: userEvent } = await import("@testing-library/user-event")
+    const user = userEvent.setup()
+    renderPanel()
+    await user.click(
+      await screen.findByRole("button", { name: "Remove alias now" }),
+    )
+    // Only the on-open usage GET has fired — no DELETE yet.
+    expect(routerRequest).toHaveBeenCalledTimes(1)
+    expect(screen.getByRole("alertdialog")).toBeTruthy()
+  })
+
+  it("announces as an alertdialog and names the alias", async () => {
+    routerRequest.mockResolvedValueOnce({ agents: [] })
+    const { default: userEvent } = await import("@testing-library/user-event")
+    const user = userEvent.setup()
+    renderPanel()
+    await user.click(
+      await screen.findByRole("button", { name: "Remove alias now" }),
+    )
+    const dialog = screen.getByRole("alertdialog")
+    expect(describedText(dialog)).toMatch(/old-acme/)
+  })
+
+  it("does not focus the destructive button on open", async () => {
+    routerRequest.mockResolvedValueOnce({ agents: [] })
+    const { default: userEvent } = await import("@testing-library/user-event")
+    const user = userEvent.setup()
+    renderPanel()
+    await user.click(
+      await screen.findByRole("button", { name: "Remove alias now" }),
+    )
+    const destructive = screen.getByRole("button", { name: "Remove alias" })
+    await waitFor(() => expect(document.activeElement).not.toBe(destructive))
   })
 })
 

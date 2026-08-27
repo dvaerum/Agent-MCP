@@ -422,6 +422,69 @@ def test_data_tables_have_mobile_card_list_sibling() -> None:
     )
 
 
+# `_table_dashboards()` above is deliberately scoped to full-page list
+# dashboards (`*-dashboard.tsx` + their `*-mobile-list.tsx` sibling
+# convention) — the CC-7 bar for those is a genuine mobile card-list
+# rewrite, which is real migration work, not something a raw-table file
+# should be silently held to.
+#
+# But that same filename-suffix gate means a raw `<Table>` hand-rolled
+# inside a MODAL (not a page) is invisible to the whole file — audited
+# nowhere. `project-memberships-modal.tsx` was exactly this: found
+# during the prancy-napping-pie sweep with a 4-column `<Table>` and no
+# horizontal-scroll safety net at all, sitting in a dialog capped to
+# `w-[calc(100vw-2rem)]`. The bar for a dialog-hosted table is lower
+# than CC-7's — it doesn't need its own card-list twin, it needs to not
+# clip: wrapped in `overflow-x-auto` so an overflowing row scrolls
+# instead of blowing out the dialog.
+def _dialog_hosted_table_files() -> list[Path]:
+    """Every `.tsx` under `components/dashboard/` with a raw `<Table>`
+    render, EXCLUDING the full-page dashboards already covered by
+    `_table_dashboards()`'s stricter CC-7 mobile-card-list bar.
+    """
+    found: list[Path] = []
+    for f in sorted(DASHBOARDS.rglob("*.tsx")):
+        if f.name.endswith(".test.tsx"):
+            continue
+        if f.name.endswith("-dashboard.tsx"):
+            continue
+        src = _read(f)
+        if "@/components/ui/table" in src and "<Table" in src:
+            found.append(f)
+    return found
+
+
+def test_dialog_hosted_tables_scroll_horizontally_not_clip() -> None:
+    """A raw `<Table>` rendered inside a modal must be wrapped in an
+    `overflow-x-auto` container. Unlike a full dashboard page, a dialog
+    has no room to grow — CC-14 already caps its width at
+    `w-[calc(100vw-2rem)]`, so an unwrapped table with more columns
+    than fit clips silently with no way to reach the rest of the row.
+    """
+    files = _dialog_hosted_table_files()
+    assert files, (
+        "dialog-hosted-table audit set derived empty — "
+        "the derivation is broken"
+    )
+    failures: list[str] = []
+    for f in files:
+        src = _code_only(_read(f))
+        m = re.search(r"<Table\b", src)
+        assert m, f  # found by the raw-source pass above
+        # The nearest wrapping `overflow-x-auto` div is expected
+        # immediately around the `<Table>` — a simple presence check
+        # in the same file is enough to catch the "no wrapper at all"
+        # case this test exists for, without needing a real JSX parse.
+        if "overflow-x-auto" not in src:
+            line = src[: m.start()].count("\n") + 1
+            failures.append(f"{f}:{line}")
+    assert not failures, (
+        "Raw <Table> in a dialog with no overflow-x-auto wrapper — "
+        "will clip columns with no way to scroll to them on a "
+        "CC-14-capped dialog width:\n  " + "\n  ".join(failures)
+    )
+
+
 def test_responsive_data_table_renders_mobile_twin_guard() -> None:
     """The scaffold half of CC-7: `<ResponsiveDataTable>` must itself
     render the desktop/mobile twin guard, because every page that

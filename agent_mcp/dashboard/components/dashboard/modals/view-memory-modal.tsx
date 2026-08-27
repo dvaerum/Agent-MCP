@@ -10,6 +10,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
+import { toastError, toastSuccess } from '@/components/ui/toast'
 import type { Memory } from '@/lib/api'
 import { MemoryValueView } from '@/components/dashboard/memory-value-view'
 import { decodeMemoryValue } from '@/lib/memory-value'
@@ -50,10 +51,9 @@ export function ViewMemoryModal({ memory, open, onOpenChange, onEdit, onDelete }
   const copyToClipboard = async (text: string, type: string) => {
     try {
       await navigator.clipboard.writeText(text)
-      // TODO: Add toast notification
-      console.log(`${type} copied to clipboard`)
+      toastSuccess(`${type} copied to clipboard.`)
     } catch (error) {
-      console.error('Failed to copy to clipboard:', error)
+      toastError(error, `Failed to copy ${type.toLowerCase()}`)
     }
   }
 

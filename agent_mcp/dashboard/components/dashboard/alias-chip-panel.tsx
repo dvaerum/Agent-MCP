@@ -20,6 +20,7 @@
 import React, { useEffect, useState } from "react"
 import { Loader2, Trash2, Users, AlertCircle } from "lucide-react"
 import { Button } from "@/components/ui/button"
+import { ConfirmActionModal } from "@/components/dashboard/modals/confirm-action-modal"
 import { useProjectsStore, type ProjectAlias } from "@/lib/stores/projects-store"
 import { projectAliasUrl, projectAliasesUrl } from "@/lib/urls"
 import { routerApi } from "@/lib/router-api"
@@ -48,7 +49,12 @@ export function AliasChipPanel({
   const [usage, setUsage] = useState<AliasUsage | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [removing, setRemoving] = useState(false)
+  // Tier 1 confirm (this action is irreversible — see the no-Undo note
+  // on handleRemove below — but recreatable via Rename, and its blast
+  // radius is one alias row, so a simple named confirm is the right
+  // gate, not a type-to-confirm one). Previously fired on a single
+  // click with zero confirmation.
+  const [confirmOpen, setConfirmOpen] = useState(false)
   const fetchOverview = useProjectsStore((s) => s.fetchOverview)
 
   useEffect(() => {
@@ -87,23 +93,19 @@ export function AliasChipPanel({
   // `expires_at` rather than the one the operator just expired. That is
   // a different alias wearing the same name, so offering "Undo" here
   // would be a lie. If a real inverse lands, this becomes `toastUndo`.
+  // Throws on failure so <ConfirmActionModal> keeps itself open and
+  // shows the reason inline next to the button that failed (Wave 5
+  // pattern — mirrors schedules-dashboard.tsx's confirmDelete).
   const handleRemove = async () => {
-    setRemoving(true)
-    setError(null)
-    try {
-      await routerApi.request(projectAliasUrl(projectName, alias.name), {
-        method: "DELETE",
-      })
-      await fetchOverview()
-      toastSuccess(
-        `Removed alias ${alias.name} from ${projectName}. ` +
-          `Re-issue it with Rename if you still need the old name.`,
-      )
-      onClose()
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-      setRemoving(false)
-    }
+    await routerApi.request(projectAliasUrl(projectName, alias.name), {
+      method: "DELETE",
+    })
+    await fetchOverview()
+    toastSuccess(
+      `Removed alias ${alias.name} from ${projectName}. ` +
+        `Re-issue it with Rename if you still need the old name.`,
+    )
+    onClose()
   }
 
   if (!open) return null
@@ -172,17 +174,39 @@ export function AliasChipPanel({
           variant="destructive"
           size="sm"
           className="h-7 text-xs"
-          disabled={removing}
-          onClick={handleRemove}
+          onClick={() => setConfirmOpen(true)}
         >
-          {removing ? (
-            <Loader2 className="h-3 w-3 mr-1 animate-spin" />
-          ) : (
-            <Trash2 className="h-3 w-3 mr-1" />
-          )}
+          <Trash2 className="h-3 w-3 mr-1" />
           Remove alias now
         </Button>
       </div>
+
+      {/* Tier 1 (see confirmOpen's comment above) — this used to fire on
+          a single click with no confirmation at all. */}
+      <ConfirmActionModal
+        open={confirmOpen}
+        onOpenChange={setConfirmOpen}
+        title="Remove alias"
+        description={
+          <>
+            Remove alias <code>{alias.name}</code> from{" "}
+            <code>{projectName}</code>? Re-issue it with Rename if you
+            still need the old name.
+          </>
+        }
+        details={
+          usage && (
+            <p className="text-xs text-muted-foreground">
+              {usage.agents.length === 0
+                ? "No recorded usage. Safe to remove."
+                : `Used by ${usage.agents.length} agent(s): ${usage.agents.join(", ")}`}
+            </p>
+          )
+        }
+        confirmLabel="Remove alias"
+        busyLabel="Removing…"
+        onConfirm={handleRemove}
+      />
     </div>
   )
 }
