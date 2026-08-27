@@ -51,6 +51,7 @@ will invalidate the cache automatically on next read.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 
@@ -59,6 +60,32 @@ from pathlib import Path
 # time by the router. See module docstring for the choice rationale.
 SENTINEL: str = "__AGENT_MCP_ASSET_PREFIX__"
 SENTINEL_BYTES: bytes = SENTINEL.encode("ascii")
+
+# Next.js's flight-streaming serializer can flush its output buffer
+# mid-string, closing one ``self.__next_f.push([N, "..."])`` call and
+# opening the next at a byte offset that depends on the surrounding
+# page content — not on anything to do with the sentinel itself. When
+# a flush happens to land inside the sentinel, the whole-string
+# byte-replace in ``substitute_asset_prefix`` never sees a contiguous
+# match, so the sentinel (or its unmatched remainder) survives
+# verbatim into the served bytes; the browser then requests it as a
+# relative URL and gets a MIME-type mismatch off the SPA-fallback
+# response. Confirmed live: an ``index.html`` containing
+# ``...:HL["__AGENT_MCP_ASSET_PREFIX_"])</script><script>self.__next_f.push([1,"_/_next/static/css/<hash>.css",...``
+# — the sentinel split one character before its end. Surfaced via
+# Firefox-MCP click-through against the Schedules page, 2026-08-27.
+#
+# Fixed by matching the sentinel with this exact flush boundary
+# allowed (optionally) between ANY two of its characters — the flush
+# offset is build/content-dependent, so a fix pinned to one specific
+# split position wouldn't generalize to a different page or a future
+# rebuild.
+_FLIGHT_FLUSH_BOUNDARY = rb'"\]\)</script><script>self\.__next_f\.push\(\[\d+,"'
+_SENTINEL_WITH_OPTIONAL_SPLIT = re.compile(
+    (b"(?:" + _FLIGHT_FLUSH_BOUNDARY + b")?").join(
+        re.escape(bytes([b])) for b in SENTINEL_BYTES
+    )
+)
 
 
 # Content-Type prefixes that need substitution. Anything else passes
@@ -93,19 +120,35 @@ def substitute_asset_prefix(body: bytes, prefix: str) -> bytes:
 
     Pure: takes bytes, returns bytes. No I/O, no caching.
 
-    The substitution is byte-level (not regex) so it's safe to call on
-    arbitrary text-shaped payloads regardless of encoding details, as
-    long as the encoding is ASCII-compatible (which UTF-8 / Latin-1 /
-    ASCII all are; the dashboard build emits UTF-8).
+    Matches the sentinel with the flight-flush boundary optionally
+    interposed between any two of its characters (see
+    ``_SENTINEL_WITH_OPTIONAL_SPLIT`` above), so both a normal
+    contiguous occurrence AND one split across a
+    ``self.__next_f.push(...)`` boundary get replaced. This subsumes a
+    plain substring match — when nothing splits the sentinel, every
+    optional group simply matches zero characters and the pattern
+    degenerates to the sentinel's literal bytes — so there is no
+    separate non-split code path to keep in sync.
+
+    Safe on arbitrary text-shaped payloads regardless of encoding
+    details, as long as the encoding is ASCII-compatible (which
+    UTF-8 / Latin-1 / ASCII all are; the dashboard build emits UTF-8).
 
     ``prefix`` is the configured runtime prefix (e.g.
     ``/agent-mcp/__dashboard``). It is encoded as UTF-8 for the
     replacement. An empty ``prefix`` is legal and produces site-root-
     relative URLs (useful for a single-tenant deploy at the host root).
     """
-    if SENTINEL_BYTES not in body:
+    if SENTINEL_BYTES not in body and b"__next_f.push" not in body:
+        # Neither a plain nor a split occurrence can be present: a
+        # split occurrence always straddles a self.__next_f.push(...)
+        # boundary (see module docstring), so its absence rules that
+        # case out too. Skips the regex on the common case (most
+        # served bodies carry neither).
         return body
-    return body.replace(SENTINEL_BYTES, prefix.encode("utf-8"))
+    return _SENTINEL_WITH_OPTIONAL_SPLIT.sub(
+        prefix.encode("utf-8"), body
+    )
 
 
 def content_type_needs_substitution(content_type: str | None) -> bool:

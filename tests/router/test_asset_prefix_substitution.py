@@ -78,6 +78,64 @@ def test_substitute_no_op_when_sentinel_absent() -> None:
     assert substitute_asset_prefix(body, "/anything") == body
 
 
+def test_substitute_handles_sentinel_split_across_flight_push_boundary() -> None:
+    """Next.js's streaming flight serializer can flush its buffer
+    mid-string, closing one ``self.__next_f.push(...)`` call and
+    opening the next at an ARBITRARY byte offset that depends on the
+    surrounding page content. When that flush lands inside the
+    sentinel, the whole-string byte-replace never sees a contiguous
+    match, so the sentinel (or its split remainder) survives verbatim
+    into the served HTML — the browser then requests it as a relative
+    URL and gets a MIME-type mismatch on the resulting 404-shaped
+    SPA-fallback response.
+
+    Confirmed live: a real deploy's ``index.html`` contained
+    ``...:HL["__AGENT_MCP_ASSET_PREFIX_"])</script><script>self.__next_f.push([1,"_/_next/static/css/<hash>.css",...``
+    — the sentinel split exactly between its second-to-last and last
+    underscore. Surfaced via Firefox-MCP click-through against the
+    Schedules page, 2026-08-27."""
+    from agent_mcp.router.asset_prefix import (
+        SENTINEL,
+        substitute_asset_prefix,
+    )
+
+    split_at = len(SENTINEL) - 1  # split one character before the end
+    head, tail = SENTINEL[:split_at], SENTINEL[split_at:]
+    payload = (
+        b'0:HL["' + head.encode() + b'"])'
+        b'</script><script>self.__next_f.push([1,"'
+        + tail.encode() + b'/_next/static/css/c916fe8822084f8b.css"])'
+    )
+
+    out = substitute_asset_prefix(payload, "/agent-mcp/assets")
+
+    assert SENTINEL.encode() not in out
+    assert head.encode() not in out
+    assert b"/agent-mcp/assets/_next/static/css/c916fe8822084f8b.css" in out
+
+
+def test_substitute_handles_sentinel_split_at_every_possible_offset() -> None:
+    """The flush point is content-dependent and can land anywhere
+    inside the sentinel, not just one specific offset — sweep every
+    split position to pin the general case, not just the one offset
+    observed live."""
+    from agent_mcp.router.asset_prefix import (
+        SENTINEL,
+        substitute_asset_prefix,
+    )
+
+    for split_at in range(1, len(SENTINEL)):
+        head, tail = SENTINEL[:split_at], SENTINEL[split_at:]
+        payload = (
+            b'x="' + head.encode() + b'"])'
+            b'</script><script>self.__next_f.push([2,"'
+            + tail.encode() + b'/_next/y.js"'
+        )
+        out = substitute_asset_prefix(payload, "/p")
+        assert SENTINEL.encode() not in out, f"split_at={split_at}"
+        assert b"/p/_next/y.js" in out, f"split_at={split_at}"
+
+
 def test_substitute_with_alternate_prefix_tools() -> None:
     """An operator deploying behind a reverse proxy mounted at ``/tools/``
     just changes the configured prefix; no rebuild needed."""
