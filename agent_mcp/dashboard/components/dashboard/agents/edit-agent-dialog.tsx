@@ -1,7 +1,7 @@
 "use client"
 
-import React, { useEffect, useState } from "react"
-import { Button } from "@/components/ui/button"
+import { useEffect, useMemo, useState } from "react"
+import type { ReactElement } from "react"
 import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
 import { Switch } from "@/components/ui/switch"
@@ -12,15 +12,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog"
-import { toastError } from "@/components/ui/toast"
+import { FormDialog } from "@/components/dashboard/shared/form-dialog"
 import { useAllData } from "@/lib/queries/all-data"
 import type { Agent } from "@/lib/api"
 
@@ -64,6 +56,19 @@ export const coerceAutoEventLoop = (raw: unknown): boolean => {
  * That is the same split the Memories page uses for `EditMemoryModal`
  * — and it is why this dialog no longer carries its own `setError`
  * banner: mutation errors are surfaced by the caller's shared toast.
+ *
+ * Adopts the shared <FormDialog> shell. `onSave` already toasts (the
+ * caller's shared toast), so FormDialog's own successMessage is
+ * omitted — a genuine change (updates present) still gets a real
+ * mutation + the caller's toast; a no-op diff (nothing changed) just
+ * closes silently, matching the pre-migration behavior exactly (no
+ * API call, no toast either way). Per-field disabling during submit
+ * (previously gated on a local `busy` flag) is dropped — FormDialog
+ * doesn't expose its `submitting` state to children, and no other
+ * migrated dialog in this codebase disables individual fields during
+ * submit either (they rely on the shell's own submit-button guard) —
+ * this keeps the migration consistent with that convention rather
+ * than growing FormDialog's API for one caller.
  */
 export function EditAgentDialog({
   agent,
@@ -75,7 +80,7 @@ export function EditAgentDialog({
   open: boolean
   onOpenChange: (open: boolean) => void
   onSave: (agentId: string, updates: AgentEditUpdates) => Promise<void>
-}): React.ReactElement {
+}): ReactElement {
   const [color, setColor] = useState('')
   const [workingDirectory, setWorkingDirectory] = useState('')
   const [aoeSessionId, setAoeSessionId] = useState('')
@@ -88,13 +93,12 @@ export function EditAgentDialog({
   // Agent self-description (migration 0018). Operator-curatable here;
   // the agent also edits its own via the update_agent_profile MCP tool.
   const [profile, setProfile] = useState('')
-  const [busy, setBusy] = useState(false)
 
   // Read the global event-loop flag from project_context so we can
   // disable + annotate the per-agent toggle when global is OFF (per
   // the locked-decisions table in the event-coord plan).
   const dataAll = useAllData()
-  const globalEventLoop = React.useMemo<boolean>(() => {
+  const globalEventLoop = useMemo<boolean>(() => {
     const row = dataAll?.context?.find(
       (c) => (c as { context_key?: unknown }).context_key === 'config_auto_event_loop_global'
     )
@@ -146,10 +150,8 @@ export function EditAgentDialog({
   const aoeTrimmedLive = aoeSessionId.trim().toLowerCase()
   const aoeValid = aoeTrimmedLive === '' || AOE_SESSION_ID_RE.test(aoeTrimmedLive)
 
-  const handleSave = async (e: React.FormEvent) => {
-    e.preventDefault()
+  const handleSubmit = async () => {
     if (!agent) return
-    setBusy(true)
     const updates: AgentEditUpdates = {}
     if (color !== (agent.color || '')) {
       updates.color = color
@@ -159,14 +161,12 @@ export function EditAgentDialog({
     }
     const aoeTrimmed = aoeSessionId.trim().toLowerCase()
     if (aoeTrimmed !== (agent.aoe_session_id || '')) {
-      // Client-side hint — the backend re-validates and 400s on bad input.
+      // Last-resort guard — submitDisabled (aoeValid) already keeps
+      // the UI from reaching this with malformed input.
       if (aoeTrimmed && !AOE_SESSION_ID_RE.test(aoeTrimmed)) {
-        toastError(
-          new Error('AoE session id must be 16 lowercase hex chars (or empty to clear).'),
-          'Invalid AoE session id',
+        throw new Error(
+          'AoE session id must be 16 lowercase hex chars (or empty to clear).',
         )
-        setBusy(false)
-        return
       }
       updates.aoe_session_id = aoeTrimmed
     }
@@ -189,210 +189,167 @@ export function EditAgentDialog({
       updates.profile = profile
     }
     if (Object.keys(updates).length === 0) {
-      onOpenChange(false)
-      setBusy(false)
+      // No-op diff: close silently (no API call, no toast) — same as
+      // pre-migration. Returning without throwing lets the shell close
+      // via its normal success path; successMessage is omitted so
+      // nothing toasts.
       return
     }
-    try {
-      await onSave(agent.agent_id, updates)
-      onOpenChange(false)
-    } catch {
-      // The caller surfaced the error via the shared toast; keep the
-      // dialog open so the operator's edits survive the retry.
-    } finally {
-      setBusy(false)
-    }
+    await onSave(agent.agent_id, updates)
   }
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <FormDialog
+      open={open}
+      onOpenChange={onOpenChange}
+      title={`Edit agent ${agent?.agent_id}`}
+      description="Update the agent's appearance, working directory, self-description, role, and event-loop settings. Status changes use Terminate / Restore / Purge."
+      onSubmit={handleSubmit}
+      submitLabel="Save changes"
+      submittingLabel="Saving…"
+      submitDisabled={!aoeValid}
+    >
+      <div>
+        <label className="text-xs font-medium text-muted-foreground uppercase tracking-wider block mb-2">
+          Color
+        </label>
+        <div className="flex items-center gap-2">
+          <Input
+            type="color"
+            value={color || '#888888'}
+            onChange={(e) => setColor(e.target.value)}
+            className="h-9 w-12 p-1"
+          />
+          <Input
+            value={color}
+            onChange={(e) => setColor(e.target.value)}
+            placeholder="#888888"
+            className="font-mono"
+          />
+        </div>
+      </div>
+      <div>
+        <label className="text-xs font-medium text-muted-foreground uppercase tracking-wider block mb-2">
+          Working Directory
+        </label>
+        <Input
+          value={workingDirectory}
+          onChange={(e) => setWorkingDirectory(e.target.value)}
+          placeholder="/workspace/agent"
+          className="font-mono text-sm"
+        />
+      </div>
+      <div>
+        <label
+          htmlFor="edit-agent-profile"
+          className="text-xs font-medium text-muted-foreground uppercase tracking-wider block mb-2"
+        >
+          Self-description
+        </label>
+        <Textarea
+          id="edit-agent-profile"
+          value={profile}
+          onChange={(e) => setProfile(e.target.value)}
+          placeholder="What this agent does, how it works, what to ask it…"
+          rows={4}
+          className="text-sm"
+        />
+        <p className="text-[10px] text-muted-foreground mt-1">
+          The agent&apos;s own profile — normally authored by the agent
+          via update_agent_profile, editable here for curation. Markdown
+          supported (rendered in the details view). Empty clears it.
+        </p>
+      </div>
+      <div>
+        <label className="text-xs font-medium text-muted-foreground uppercase tracking-wider block mb-2">
+          AoE Session ID
+        </label>
+        <Input
+          value={aoeSessionId}
+          onChange={(e) => setAoeSessionId(e.target.value)}
+          placeholder="16-char lowercase hex, e.g. 551e7a79d11f435b"
+          className="font-mono text-sm"
+          maxLength={16}
+          pattern="[0-9a-f]{16}"
+          aria-invalid={!aoeValid}
+        />
+        {!aoeValid && (
+          <p className="text-[10px] text-destructive mt-1">
+            Must be 16 lowercase hex chars (0-9, a-f), or empty to clear.
+          </p>
+        )}
+        <p className="text-[10px] text-muted-foreground mt-1">
+          Binds this agent to a specific Agents-of-Empires tmux session for the
+          notification side-channel. Leave empty to fall back to title-match.
+        </p>
+      </div>
       {/*
-        Height capped at 90dvh + a flex column so the long form body
-        scrolls instead of overflowing the viewport (header + footer stay
-        pinned). Mirrors the AgentDetailDialog structure; without this
-        the taller-than-viewport form clipped its own title and Save
-        button with no way to scroll to them.
+        Phase 2 Wave 2b (plan §2e): Role dropdown — promote a worker to
+        manager (or demote). The server-side check in
+        /api/agents/<id>/edit 422s anything outside {'worker', 'manager'};
+        the column CHECK constraint is the last-resort guard.
       */}
-      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-md bg-card border-border text-card-foreground p-0 gap-0 max-h-[90dvh] flex flex-col">
-        <DialogHeader className="px-6 pt-6 pb-4 border-b border-border flex-shrink-0">
-          <DialogTitle className="text-lg">Edit agent {agent?.agent_id}</DialogTitle>
-          <DialogDescription className="text-muted-foreground">
-            Update the agent&apos;s appearance, working directory,
-            self-description, role, and event-loop settings. Status
-            changes use Terminate / Restore / Purge.
-          </DialogDescription>
-        </DialogHeader>
-        <form onSubmit={handleSave} className="flex flex-col min-h-0 flex-1">
-          <div className="px-6 py-4 space-y-4 flex-1 min-h-0 overflow-y-auto">
-          <div>
-            <label className="text-xs font-medium text-muted-foreground uppercase tracking-wider block mb-2">
-              Color
-            </label>
-            <div className="flex items-center gap-2">
-              <Input
-                type="color"
-                value={color || '#888888'}
-                onChange={(e) => setColor(e.target.value)}
-                className="h-9 w-12 p-1 bg-background border-border"
-              />
-              <Input
-                value={color}
-                onChange={(e) => setColor(e.target.value)}
-                placeholder="#888888"
-                className="bg-background border-border text-foreground font-mono"
-              />
-            </div>
-          </div>
-          <div>
-            <label className="text-xs font-medium text-muted-foreground uppercase tracking-wider block mb-2">
-              Working Directory
-            </label>
-            <Input
-              value={workingDirectory}
-              onChange={(e) => setWorkingDirectory(e.target.value)}
-              placeholder="/workspace/agent"
-              className="bg-background border-border text-foreground font-mono text-sm"
-            />
-          </div>
-          <div>
+      <div>
+        <label
+          htmlFor="edit-agent-role"
+          className="text-xs font-medium text-muted-foreground uppercase tracking-wider block mb-2"
+        >
+          Role
+        </label>
+        <Select
+          value={agentRole}
+          onValueChange={(value) => setAgentRole(value as 'worker' | 'manager')}
+        >
+          <SelectTrigger id="edit-agent-role">
+            <SelectValue placeholder="Select role" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="worker">Worker</SelectItem>
+            <SelectItem value="manager">Manager</SelectItem>
+          </SelectContent>
+        </Select>
+        <p className="text-[10px] text-muted-foreground mt-1">
+          Workers run assigned tasks. Managers also supervise
+          subordinates (assign tasks, edit agent fields).
+        </p>
+      </div>
+      {/*
+        Event-coord PR-1: per-agent wake-loop toggle. Default TRUE.
+        Disabled (greyed) when the global flag is OFF — the wake-loop
+        bootstrap requires BOTH flags ON per the locked-decisions table
+        in the event-coord plan. Note text explicitly directs the
+        operator to Settings to flip the global flag.
+      */}
+      <div className="rounded-md border p-3 space-y-2">
+        <div className="flex items-center justify-between gap-3">
+          <div className="space-y-0.5">
             <label
-              htmlFor="edit-agent-profile"
-              className="text-xs font-medium text-muted-foreground uppercase tracking-wider block mb-2"
+              htmlFor="agent-edit-auto-event-loop"
+              className="text-xs font-medium text-foreground uppercase tracking-wider"
             >
-              Self-description
+              Auto event-loop
             </label>
-            <Textarea
-              id="edit-agent-profile"
-              value={profile}
-              onChange={(e) => setProfile(e.target.value)}
-              placeholder="What this agent does, how it works, what to ask it…"
-              rows={4}
-              className="bg-background border-border text-foreground text-sm"
-            />
-            <p className="text-[10px] text-muted-foreground mt-1">
-              The agent&apos;s own profile — normally authored by the agent
-              via update_agent_profile, editable here for curation. Markdown
-              supported (rendered in the details view). Empty clears it.
+            <p className="text-[11px] text-muted-foreground leading-snug">
+              When on (default), this agent receives the wake-loop
+              bootstrap and auto-calls wait_for_events on connect.
+              Both this toggle and the global Settings toggle must
+              be on.
             </p>
           </div>
-          <div>
-            <label className="text-xs font-medium text-muted-foreground uppercase tracking-wider block mb-2">
-              AoE Session ID
-            </label>
-            <Input
-              value={aoeSessionId}
-              onChange={(e) => setAoeSessionId(e.target.value)}
-              placeholder="16-char lowercase hex, e.g. 551e7a79d11f435b"
-              className="bg-background border-border text-foreground font-mono text-sm"
-              maxLength={16}
-              pattern="[0-9a-f]{16}"
-              aria-invalid={!aoeValid}
-            />
-            {!aoeValid && (
-              <p className="text-[10px] text-destructive mt-1">
-                Must be 16 lowercase hex chars (0-9, a-f), or empty to clear.
-              </p>
-            )}
-            <p className="text-[10px] text-muted-foreground mt-1">
-              Binds this agent to a specific Agents-of-Empires tmux session for the
-              notification side-channel. Leave empty to fall back to title-match.
-            </p>
-          </div>
-          {/*
-            Phase 2 Wave 2b (plan §2e): Role dropdown — promote a
-            worker to manager (or demote). The server-side check in
-            /api/agents/<id>/edit 422s anything outside
-            {'worker', 'manager'}; the column CHECK constraint is
-            the last-resort guard.
-          */}
-          <div>
-            <label
-              htmlFor="edit-agent-role"
-              className="text-xs font-medium text-muted-foreground uppercase tracking-wider block mb-2"
-            >
-              Role
-            </label>
-            <Select
-              value={agentRole}
-              onValueChange={(value) => setAgentRole(value as 'worker' | 'manager')}
-              disabled={busy}
-            >
-              <SelectTrigger
-                id="edit-agent-role"
-                className="bg-background border-border text-foreground"
-              >
-                <SelectValue placeholder="Select role" />
-              </SelectTrigger>
-              <SelectContent className="bg-background border-border">
-                <SelectItem value="worker">Worker</SelectItem>
-                <SelectItem value="manager">Manager</SelectItem>
-              </SelectContent>
-            </Select>
-            <p className="text-[10px] text-muted-foreground mt-1">
-              Workers run assigned tasks. Managers also supervise
-              subordinates (assign tasks, edit agent fields).
-            </p>
-          </div>
-          {/*
-            Event-coord PR-1: per-agent wake-loop toggle. Default TRUE.
-            Disabled (greyed) when the global flag is OFF — the
-            wake-loop bootstrap requires BOTH flags ON per the
-            locked-decisions table in the event-coord plan. Note text
-            explicitly directs the operator to Settings to flip the
-            global flag.
-          */}
-          <div className="rounded-md border border-border p-3 space-y-2">
-            <div className="flex items-center justify-between gap-3">
-              <div className="space-y-0.5">
-                <label
-                  htmlFor="agent-edit-auto-event-loop"
-                  className="text-xs font-medium text-foreground uppercase tracking-wider"
-                >
-                  Auto event-loop
-                </label>
-                <p className="text-[11px] text-muted-foreground leading-snug">
-                  When on (default), this agent receives the wake-loop
-                  bootstrap and auto-calls wait_for_events on connect.
-                  Both this toggle and the global Settings toggle must
-                  be on.
-                </p>
-              </div>
-              <Switch
-                id="agent-edit-auto-event-loop"
-                checked={autoEventLoop}
-                onCheckedChange={setAutoEventLoop}
-                disabled={!globalEventLoop || busy}
-              />
-            </div>
-            {!globalEventLoop && (
-              <p className="text-[11px] text-warning">
-                Global event-loop is disabled — toggle it on in
-                Settings to enable per-agent control.
-              </p>
-            )}
-          </div>
-          </div>
-          <DialogFooter className="gap-2 px-6 py-4 border-t border-border flex-shrink-0">
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              onClick={() => onOpenChange(false)}
-              disabled={busy}
-            >
-              Cancel
-            </Button>
-            <Button
-              type="submit"
-              size="sm"
-              disabled={busy || !aoeValid}
-              className="bg-primary hover:bg-primary/90"
-            >
-              {busy ? 'Saving...' : 'Save changes'}
-            </Button>
-          </DialogFooter>
-        </form>
-      </DialogContent>
-    </Dialog>
+          <Switch
+            id="agent-edit-auto-event-loop"
+            checked={autoEventLoop}
+            onCheckedChange={setAutoEventLoop}
+            disabled={!globalEventLoop}
+          />
+        </div>
+        {!globalEventLoop && (
+          <p className="text-[11px] text-warning">
+            Global event-loop is disabled — toggle it on in
+            Settings to enable per-agent control.
+          </p>
+        )}
+      </div>
+    </FormDialog>
   )
 }

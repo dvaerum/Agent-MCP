@@ -32,17 +32,14 @@
 // `wait_for_events_in_flight` field the store already polls) so the
 // operator knows what to expect before hitting Send.
 
-import * as React from "react"
-import { Radio, RadioTower } from "lucide-react"
+import { useEffect, useMemo, useState } from "react"
+import type { ReactElement } from "react"
+import { Radio, RadioTower, Send } from "lucide-react"
 
-import { Button } from "@/components/ui/button"
 import { Label } from "@/components/ui/label"
 import { Textarea } from "@/components/ui/textarea"
-import {
-  Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog"
-import { toastError, toastSuccess } from "@/components/ui/toast"
+import { toastSuccess } from "@/components/ui/toast"
+import { FormDialog } from "@/components/dashboard/shared/form-dialog"
 import { AgentSelect } from "@/components/dashboard/shared/agent-select"
 import { apiClient } from "@/lib/api"
 import { useAllData, useAllDataStatus } from "@/lib/queries/all-data"
@@ -59,15 +56,22 @@ export interface SendDirectiveModalProps {
   lockedAgentId?: string | null
 }
 
+/**
+ * Adopts the shared <FormDialog> shell. The delivered-vs-queued toast
+ * carries two different TITLES, not just different bodies —
+ * FormDialog's `successMessage` is a string (or a function returning
+ * one), with no separate title slot, so this stays a direct
+ * `toastSuccess` call inside `onSubmit` with FormDialog's own
+ * `successMessage` omitted, rather than forcing a fit that isn't there.
+ */
 export function SendDirectiveModal({
   open,
   onOpenChange,
   lockedAgentId,
-}: SendDirectiveModalProps): React.ReactElement {
+}: SendDirectiveModalProps): ReactElement {
   const locked = lockedAgentId != null && lockedAgentId !== ""
-  const [pickedAgentId, setPickedAgentId] = React.useState<string | null>(null)
-  const [prompt, setPrompt] = React.useState("")
-  const [sending, setSending] = React.useState(false)
+  const [pickedAgentId, setPickedAgentId] = useState<string | null>(null)
+  const [prompt, setPrompt] = useState("")
 
   const agentId = locked ? (lockedAgentId as string) : pickedAgentId
 
@@ -84,7 +88,7 @@ export function SendDirectiveModal({
   // selection can't leak across opens. `refresh()` force-refetches the
   // shared `/all-data` query so the live `wait_for_events_in_flight`
   // flag the hint uses is current on every open.
-  React.useEffect(() => {
+  useEffect(() => {
     if (open) {
       setPickedAgentId(null)
       setPrompt("")
@@ -97,7 +101,7 @@ export function SendDirectiveModal({
   // and correct: the store polls /api/all-data, which snapshots the
   // in-flight wait_for_events registry server-side.
   const data = useAllData()
-  const targetAgent = React.useMemo(
+  const targetAgent = useMemo(
     () => (agentId ? data?.agents?.find((a) => a.agent_id === agentId) ?? null : null),
     [data?.agents, agentId],
   )
@@ -108,128 +112,91 @@ export function SendDirectiveModal({
     setPrompt("")
   }
 
-  const submit = async () => {
+  const handleSubmit = async () => {
     if (!agentId || !prompt.trim()) return
-    setSending(true)
-    try {
-      const res = await apiClient.pokeAgent(agentId, { prompt })
-      if (res.delivered) {
-        toastSuccess(
-          `Delivered to ${agentId} — the agent was listening and picked it up now.`,
-          "Directive delivered",
-        )
-      } else {
-        toastSuccess(
-          `Queued for ${agentId} — will arrive on its next check-in (highest priority).`,
-          "Directive queued",
-        )
-      }
-      onOpenChange(false)
-      reset()
-    } catch (e) {
-      toastError(e, "Failed to send directive")
-    } finally {
-      setSending(false)
+    const res = await apiClient.pokeAgent(agentId, { prompt })
+    if (res.delivered) {
+      toastSuccess(
+        `Delivered to ${agentId} — the agent was listening and picked it up now.`,
+        "Directive delivered",
+      )
+    } else {
+      toastSuccess(
+        `Queued for ${agentId} — will arrive on its next check-in (highest priority).`,
+        "Directive queued",
+      )
     }
+    reset()
   }
 
   return (
-    <Dialog
+    <FormDialog
       open={open}
       onOpenChange={(o) => {
         onOpenChange(o)
         if (!o) reset()
       }}
+      title={locked ? `Send directive to ${lockedAgentId}` : "Send directive"}
+      description="Push a one-shot directive to an agent. Delivered immediately if the agent is listening, otherwise queued as its highest-priority next check-in."
+      icon={Send}
+      onSubmit={handleSubmit}
+      submitLabel="Send now"
+      submittingLabel="Sending…"
+      submitDisabled={!agentId || !prompt.trim()}
+      errorMessage="Failed to send directive"
     >
-      <DialogContent
-        data-testid="send-directive-modal"
-        className="w-[calc(100vw-2rem)] flex max-h-[calc(100dvh-2rem)] flex-col overflow-hidden sm:!max-w-lg"
-      >
-        <DialogHeader className="flex-shrink-0">
-          <DialogTitle>
-            {locked ? `Send directive to ${lockedAgentId}` : "Send directive"}
-          </DialogTitle>
-          <DialogDescription>
-            Push a one-shot directive to an agent. Delivered immediately if
-            the agent is listening, otherwise queued as its highest-priority
-            next check-in.
-          </DialogDescription>
-        </DialogHeader>
-
-        <div className="flex-1 min-h-0 space-y-3 overflow-y-auto py-1 pr-1">
-          {!locked && (
-            <div className="space-y-1">
-              <Label htmlFor="send-directive-agent">Agent</Label>
-              <AgentSelect
-                id="send-directive-agent"
-                ariaLabel="Target agent"
-                value={pickedAgentId}
-                onChange={setPickedAgentId}
-                pinAdmin={false}
-                placeholder="Select an agent"
-              />
-            </div>
-          )}
-
-          <div className="space-y-1">
-            <Label htmlFor="send-directive-prompt">Directive</Label>
-            <Textarea
-              id="send-directive-prompt"
-              value={prompt}
-              onChange={(e) => setPrompt(e.target.value)}
-              placeholder="e.g. stop and report your current status"
-              data-testid="send-directive-prompt"
-            />
-          </div>
-
-          {/* Live listening hint for the resolved target. Best-effort:
-              reflects the last poll of wait_for_events_in_flight. */}
-          {agentId && (
-            listening ? (
-              <div
-                className="flex items-center gap-2 text-xs text-primary"
-                data-testid="send-directive-listening"
-              >
-                <RadioTower className="h-3.5 w-3.5" />
-                <span>
-                  {agentId} is listening now — this will be delivered
-                  immediately.
-                </span>
-              </div>
-            ) : (
-              <div
-                className="flex items-center gap-2 text-xs text-muted-foreground"
-                data-testid="send-directive-not-listening"
-              >
-                <Radio className="h-3.5 w-3.5" />
-                <span>
-                  {agentId} isn&apos;t listening — this will be queued for
-                  its next check-in.
-                </span>
-              </div>
-            )
-          )}
+      {!locked && (
+        <div className="space-y-1">
+          <Label htmlFor="send-directive-agent">Agent</Label>
+          <AgentSelect
+            id="send-directive-agent"
+            ariaLabel="Target agent"
+            value={pickedAgentId}
+            onChange={setPickedAgentId}
+            pinAdmin={false}
+            placeholder="Select an agent"
+          />
         </div>
+      )}
 
-        <DialogFooter className="flex-shrink-0">
-          <Button
-            variant="outline"
-            onClick={() => {
-              onOpenChange(false)
-              reset()
-            }}
+      <div className="space-y-1">
+        <Label htmlFor="send-directive-prompt">Directive</Label>
+        <Textarea
+          id="send-directive-prompt"
+          value={prompt}
+          onChange={(e) => setPrompt(e.target.value)}
+          placeholder="e.g. stop and report your current status"
+          data-testid="send-directive-prompt"
+        />
+      </div>
+
+      {/* Live listening hint for the resolved target. Best-effort:
+          reflects the last poll of wait_for_events_in_flight. */}
+      {agentId && (
+        listening ? (
+          <div
+            className="flex items-center gap-2 text-xs text-primary"
+            data-testid="send-directive-listening"
           >
-            Cancel
-          </Button>
-          <Button
-            onClick={() => void submit()}
-            disabled={sending || !agentId || !prompt.trim()}
-            data-testid="send-directive-submit"
+            <RadioTower className="h-3.5 w-3.5" />
+            <span>
+              {agentId} is listening now — this will be delivered
+              immediately.
+            </span>
+          </div>
+        ) : (
+          <div
+            className="flex items-center gap-2 text-xs text-muted-foreground"
+            data-testid="send-directive-not-listening"
           >
-            {sending ? "Sending…" : "Send now"}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
+            <Radio className="h-3.5 w-3.5" />
+            <span>
+              {agentId} isn&apos;t listening — this will be queued for
+              its next check-in.
+            </span>
+          </div>
+        )
+      )}
+    </FormDialog>
   )
 }
