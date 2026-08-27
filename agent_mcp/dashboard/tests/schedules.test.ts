@@ -68,6 +68,29 @@ describe("formatNextFire", () => {
   it("past reads 'overdue'", () => {
     expect(formatNextFire("2026-01-15T11:00:00.000Z")).toBe("overdue")
   })
+
+  // Bug: a paused/completed schedule's next_due_at is still a real
+  // future-looking timestamp (interval-reset-from-delivery keeps
+  // advancing it even after the row is disabled), so without a status
+  // check the cell showed a live "in Nm" countdown right next to a
+  // "paused" badge in the Status column -- implying it would fire when
+  // it can't. Surfaced live: an operator paused their own schedule and
+  // saw "paused" + "in 7m" side by side.
+  it("paused schedule reads 'paused' regardless of next_due_at", () => {
+    expect(
+      formatNextFire("2026-01-15T12:04:00.000Z", NOW, "paused"),
+    ).toBe("paused")
+  })
+  it("completed schedule reads '—' regardless of next_due_at", () => {
+    expect(
+      formatNextFire("2026-01-15T12:04:00.000Z", NOW, "completed"),
+    ).toBe("—")
+  })
+  it("active schedule still computes the real countdown", () => {
+    expect(
+      formatNextFire("2026-01-15T12:04:00.000Z", NOW, "active"),
+    ).toBe("in 4m")
+  })
 })
 
 describe("formatEndCondition", () => {
