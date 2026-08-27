@@ -25,6 +25,7 @@ from ...core.config import logger
 # dashboard refetches the whole all-data envelope regardless.
 _ACTION_SCOPE_HINTS = (
     ("task", "tasks"),
+    ("schedule", "schedules"),
     ("directive", "tasks"),
     ("message", "messages"),
     ("broadcast", "messages"),

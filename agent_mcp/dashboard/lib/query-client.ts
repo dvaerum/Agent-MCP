@@ -113,6 +113,37 @@ export function invalidateTasks(): Promise<void> {
   })
 }
 
+/** Query-key root for the schedules list (`GET /schedules`). */
+export const SCHEDULES_KEY = "schedules" as const
+
+/**
+ * Stable query key for the schedules list, namespaced by project.
+ *
+ * Deliberately NOT parameterized by filters (contrast `tasksQueryKey`):
+ * `GET /schedules` returns the WHOLE set with no server-side filters, and
+ * both the agent and status filters in `schedules-dashboard.tsx` are
+ * client-side over the full fetched list — matching the messages/tasks
+ * "bare project key" shape where the endpoint has no server-side
+ * parameters, not the filter-embedded variant `tasksQueryKey` uses.
+ */
+export const schedulesQueryKey = (projectName: string | null) =>
+  [SCHEDULES_KEY, projectName ?? "standalone"] as const
+
+/**
+ * Invalidate the active-project schedules list, forcing a refetch of the
+ * mounted schedules query. Joins the same debounced SSE choke point as
+ * `invalidateTasks()` / `invalidateMessages()` (see
+ * `lib/mcp-notifications.ts`) so a schedule mutation OR a background
+ * directive fire (a separate backend change publishes a
+ * `resources/updated` notification when a scheduled directive fires)
+ * surfaces on the Schedules page without its own poll.
+ */
+export function invalidateSchedules(): Promise<void> {
+  return queryClient.invalidateQueries({
+    queryKey: [SCHEDULES_KEY, projectContext.projectName ?? "standalone"],
+  })
+}
+
 /** Query-key root for the messages list (`POST /messages/query`). */
 export const MESSAGES_KEY = "messages" as const
 

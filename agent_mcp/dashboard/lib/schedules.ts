@@ -64,7 +64,7 @@ export type StatusFilter = "all" | "active" | "paused" | "completed"
 
 /** Filter by agent (or all) and status (or all). */
 export function filterSchedules(
-  schedules: Schedule[],
+  schedules: readonly Schedule[],
   agentFilter: string,
   statusFilter: StatusFilter,
 ): Schedule[] {
@@ -76,7 +76,7 @@ export function filterSchedules(
 }
 
 /** Distinct agent ids present in the schedule set, sorted. */
-export function agentsInSchedules(schedules: Schedule[]): string[] {
+export function agentsInSchedules(schedules: readonly Schedule[]): string[] {
   return Array.from(new Set(schedules.map((s) => s.agent_id))).sort()
 }
 

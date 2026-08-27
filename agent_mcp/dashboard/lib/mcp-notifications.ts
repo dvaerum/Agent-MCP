@@ -82,6 +82,7 @@ import {
   invalidateAllData,
   invalidateTasks,
   invalidateMessages,
+  invalidateSchedules,
 } from "./query-client"
 import { projectContext } from "./project-context"
 import { eventsUrl } from "./urls"
@@ -213,6 +214,14 @@ interface JsonRpcNotification {
 // lose. `invalidateQueries` only refetches MOUNTED queries, so calling
 // this from the Memories page refetches `/all-data` once and no-ops on
 // the unmounted tasks/messages keys.
+//
+// The schedules list is likewise a separate TanStack Query (`['schedules',
+// project]`, fetched from `GET /schedules` — not part of the `/all-data`
+// envelope), so neither an operator schedule mutation nor a background
+// directive fire is covered by `invalidateAllData()`. `invalidateSchedules()`
+// joins the same debounced tick for the same reason as tasks/messages
+// above — this is what fixes the "Next fire" column freezing until a
+// manual page refresh.
 const DASHBOARD_REFRESH_DEBOUNCE_MS = 300
 let _dashboardRefreshTimer: ReturnType<typeof setTimeout> | null = null
 export function scheduleDashboardRefresh(): void {
@@ -222,6 +231,7 @@ export function scheduleDashboardRefresh(): void {
     void invalidateAllData()
     void invalidateTasks()
     void invalidateMessages()
+    void invalidateSchedules()
   }, DASHBOARD_REFRESH_DEBOUNCE_MS)
 }
 

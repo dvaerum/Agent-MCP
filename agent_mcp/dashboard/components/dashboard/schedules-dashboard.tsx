@@ -14,7 +14,7 @@
 // source, the column spec, and the create/edit/delete/poke modals.
 
 import { useCallback, useEffect, useMemo, useState } from "react"
-import { CalendarClock, Pencil, Trash2, Send, Plus } from "lucide-react"
+import { CalendarClock, Pencil, Trash2, Send, Plus, Loader2 } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -36,10 +36,18 @@ import type { Column } from "@/components/dashboard/shared/responsive-data-table
 import { toastError, toastSuccess } from "@/components/ui/toast"
 import { apiClient, type Schedule } from "@/lib/api"
 import { useActiveAgents } from "@/lib/queries/all-data"
+import { useSchedulesQuery } from "@/lib/queries/schedules"
+import { queryClient, schedulesQueryKey } from "@/lib/query-client"
+import { projectContext } from "@/lib/project-context"
 import {
   agentsInSchedules, filterSchedules, formatAbsolute, formatEndCondition,
   formatInterval, formatNextFire, sortByNextFire, type StatusFilter,
 } from "@/lib/schedules"
+
+// Stable empty singleton for the no-data path — mirrors `EMPTY_TASKS` in
+// tasks-dashboard.tsx (a fresh `[]` on every render would defeat
+// reference equality in the downstream `useMemo`s).
+const EMPTY_SCHEDULES: readonly Schedule[] = Object.freeze([])
 
 const STATUS_BADGE: Record<string, string> = {
   active: "border-green-500/40 text-green-600 dark:text-green-400",
@@ -72,7 +80,17 @@ function toIsoOrNull(local: string): string | null {
 }
 
 export function SchedulesDashboard() {
-  const [schedules, setSchedules] = useState<Schedule[]>([])
+  // Schedules list on TanStack Query (mirrors `useTasksQuery` — see
+  // `lib/queries/schedules.ts`). Replaces the hand-rolled `useState` +
+  // one-shot `apiClient.getSchedules()` `useEffect`, which never refreshed
+  // on its own: SSE-driven invalidation (`invalidateSchedules()`, wired
+  // into the debounced tick in `lib/mcp-notifications.ts`) plus the PF-3
+  // SSE-gated 60s fallback poll is what fixes "Next fire" freezing until a
+  // manual page refresh.
+  const query = useSchedulesQuery()
+  const schedules = query.data ?? EMPTY_SCHEDULES
+  const { refetch } = query
+  const refresh = useCallback(() => { void refetch() }, [refetch])
   // W6-followup F1: the agent list for the filter + create/edit pickers
   // reads the shared `/all-data` query (the single agents source) rather
   // than the retired lean `apiClient.getAgents()`. `useActiveAgents()`
@@ -80,7 +98,6 @@ export function SchedulesDashboard() {
   // terminated agent is meaningless — and a still-scheduled terminated
   // agent is re-surfaced below via `agentsInSchedules`.
   const activeAgents = useActiveAgents()
-  const [loading, setLoading] = useState(true)
   const [floor, setFloor] = useState<number>(60)
   const [maxPerAgent, setMaxPerAgent] = useState<number>(10)
 
@@ -109,19 +126,43 @@ export function SchedulesDashboard() {
     setDirectiveOpen(true)
   }, [])
 
-  const load = useCallback(async () => {
-    setLoading(true)
+  // Per-row "Send now" — fires the ROW's own prompt directly, no modal.
+  // (Bug fix: previously this button called `openDirective(s.agent_id)`,
+  // opening the shared modal with a BLANK textarea — the operator had to
+  // retype the schedule's own prompt to poke it now. Toast copy mirrors
+  // `send-directive-modal.tsx`'s `submit()` verbatim.)
+  const [sendingId, setSendingId] = useState<string | null>(null)
+  const sendNow = useCallback(async (s: Schedule) => {
+    setSendingId(s.directive_id)
     try {
-      const rows = await apiClient.getSchedules()
-      setSchedules(rows)
+      const res = await apiClient.pokeAgent(s.agent_id, { prompt: s.prompt })
+      if (res.delivered) {
+        toastSuccess(
+          `Delivered to ${s.agent_id} — the agent was listening and picked it up now.`,
+          "Directive delivered",
+        )
+      } else {
+        toastSuccess(
+          `Queued for ${s.agent_id} — will arrive on its next check-in (highest priority).`,
+          "Directive queued",
+        )
+      }
     } catch (e) {
-      toastError(e, "Failed to load schedules")
+      toastError(e, "Failed to send directive")
     } finally {
-      setLoading(false)
+      setSendingId(null)
     }
   }, [])
 
-  useEffect(() => { void load() }, [load])
+  // Live-ticking "Next fire" label (Bug fix: the column previously froze
+  // at its value from the last fetch — this forces the `formatNextFire`
+  // cell to re-evaluate against a fresh `Date` every ~15s between
+  // fetches/SSE pushes, independent of any actual data refresh).
+  const [tick, setTick] = useState(0)
+  useEffect(() => {
+    const id = setInterval(() => setTick((t) => t + 1), 15_000)
+    return () => clearInterval(id)
+  }, [])
 
   // Guardrail floor/max shown inline in the create/edit form.
   useEffect(() => {
@@ -191,29 +232,34 @@ export function SchedulesDashboard() {
         run_now: form.run_now,
       })
     }
-    await load()
+    await refetch()
   }
 
   const toggleEnabled = useCallback(async (s: Schedule, next: boolean) => {
-    // Optimistic flip; revert on error.
-    setSchedules((prev) => prev.map((x) =>
-      x.directive_id === s.directive_id ? { ...x, enabled: next } : x))
+    // Optimistic flip via the query cache; revert on error. No local
+    // `schedules` state exists anymore to flip directly (see
+    // `useSchedulesQuery` above) — this is the standard TanStack Query
+    // optimistic-update pattern for exactly this case.
+    const key = schedulesQueryKey(projectContext.projectName)
+    const previous = queryClient.getQueryData<Schedule[]>(key)
+    queryClient.setQueryData<Schedule[]>(key, (rows) =>
+      (rows ?? []).map((x) =>
+        x.directive_id === s.directive_id ? { ...x, enabled: next } : x))
     try {
       await apiClient.updateSchedule(s.directive_id, { enabled: next })
-      await load()
+      refetch()
     } catch (e) {
       toastError(e, "Failed to update schedule")
-      setSchedules((prev) => prev.map((x) =>
-        x.directive_id === s.directive_id ? { ...x, enabled: s.enabled } : x))
+      queryClient.setQueryData(key, previous)
     }
-  }, [load])
+  }, [refetch])
 
   const confirmDelete = async () => {
     if (!deleteId) return
     try {
       await apiClient.deleteSchedule(deleteId)
       toastSuccess("Schedule deleted")
-      await load()
+      refetch()
     } catch (e) {
       toastError(e, "Failed to delete schedule")
       // Re-throw so <ConfirmActionModal> keeps itself open and shows
@@ -224,7 +270,13 @@ export function SchedulesDashboard() {
 
   // One column spec drives the desktop table and the mobile card stack
   // (this page had no mobile list at all before the migration).
-  const columns: Column<Schedule>[] = useMemo(() => [
+  const columns: Column<Schedule>[] = useMemo(() => {
+    // Force recompute every ~15s (tick) purely to re-evaluate
+    // `formatNextFire(s.next_due_at, new Date())` against a fresh Date —
+    // NOT a refetch. Underlying data is unchanged; only the rendered
+    // relative label needs to stay live between polls/SSE pushes.
+    void tick
+    return [
     {
       id: "enabled",
       header: "Enabled",
@@ -278,7 +330,7 @@ export function SchedulesDashboard() {
         <TooltipProvider>
           <Tooltip>
             <TooltipTrigger asChild>
-              <span>{formatNextFire(s.next_due_at)}</span>
+              <span>{formatNextFire(s.next_due_at, new Date())}</span>
             </TooltipTrigger>
             <TooltipContent>
               {formatAbsolute(s.next_due_at)}
@@ -318,10 +370,13 @@ export function SchedulesDashboard() {
       cell: (s) => (
         <div className="flex justify-end gap-1">
           <Button variant="ghost" size="sm"
-                  onClick={() => openDirective(s.agent_id)}
-                  aria-label={`Poke ${s.agent_id}`}
+                  onClick={() => void sendNow(s)}
+                  disabled={sendingId === s.directive_id}
+                  aria-label={`Send now to ${s.agent_id}`}
                   data-testid={`poke-${s.directive_id}`}>
-            <Send className="h-4 w-4" />
+            {sendingId === s.directive_id
+              ? <Loader2 className="h-4 w-4 animate-spin" />
+              : <Send className="h-4 w-4" />}
           </Button>
           <Button variant="ghost" size="sm"
                   onClick={() => openEdit(s)}
@@ -338,7 +393,8 @@ export function SchedulesDashboard() {
         </div>
       ),
     },
-  ], [toggleEnabled, openEdit, openDirective])
+    ]
+  }, [toggleEnabled, openEdit, sendNow, sendingId, tick])
 
   const filterBar = (
     <>
@@ -374,8 +430,8 @@ export function SchedulesDashboard() {
         header={{
           title: "Schedules",
           subtitle: "Recurring directives delivered to this project's agents",
-          onRefresh: () => void load(),
-          refreshing: loading,
+          onRefresh: refresh,
+          refreshing: query.isFetching,
           actions: (
             <>
               <Badge variant="outline">{schedules.length}</Badge>
@@ -392,7 +448,7 @@ export function SchedulesDashboard() {
             </>
           ),
         }}
-        loading={loading}
+        loading={query.isLoading}
         filterBar={filterBar}
         columns={columns}
         rows={visible}

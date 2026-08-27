@@ -1938,12 +1938,23 @@ def _collect_scheduled_directive_events_for(
     conn = None
     try:
         from ..repositories import scheduled_directive_repository as _sched
+        from ..db.actions.agent_actions_db import log_agent_action_to_db
         now_iso = datetime.datetime.now().isoformat()
         conn = get_db_connection()
         cursor = conn.cursor()
         events = _sched.collect_due_and_fire(
             agent_id, now_iso, connection=cursor
         )
+        for ev in events:
+            log_agent_action_to_db(
+                cursor,
+                agent_id=agent_id,
+                action_type="scheduled_directive_fired",
+                details={
+                    "directive_id": ev.get("ref_id"),
+                    "prompt": ev.get("data", {}).get("prompt"),
+                },
+            )
         conn.commit()
         return events
     except Exception as e:  # pragma: no cover - defensive; fires next time
