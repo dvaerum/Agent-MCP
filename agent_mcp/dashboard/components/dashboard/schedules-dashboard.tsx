@@ -31,6 +31,7 @@ import {
 import { ConfirmActionModal } from "@/components/dashboard/modals/confirm-action-modal"
 import { SendDirectiveModal } from "@/components/dashboard/shared/send-directive-modal"
 import { FormDialog } from "@/components/dashboard/shared/form-dialog"
+import { AgentSelect } from "@/components/dashboard/shared/agent-select"
 import { DataTablePage } from "@/components/dashboard/shared/data-table-page"
 import type { Column } from "@/components/dashboard/shared/responsive-data-table"
 import { toastError, toastSuccess } from "@/components/ui/toast"
@@ -193,7 +194,11 @@ export function SchedulesDashboard() {
 
   const openCreate = () => {
     setEditId(null)
-    setForm({ ...EMPTY_FORM, agent_id: agentOptions[0] ?? "" })
+    // Seed from the active-only list (not agentOptions, the filter
+    // dropdown's superset that deliberately re-surfaces terminated
+    // agents still referenced by an existing schedule) — defaulting a
+    // NEW schedule to a terminated agent would be meaningless.
+    setForm({ ...EMPTY_FORM, agent_id: activeAgents[0]?.agent_id ?? "" })
     setFormOpen(true)
   }
 
@@ -477,17 +482,19 @@ export function SchedulesDashboard() {
           {!editId && (
             <div className="space-y-1">
               <Label htmlFor="sched-agent">Agent</Label>
-              <Select value={form.agent_id}
-                      onValueChange={(v) => setForm((f) => ({ ...f, agent_id: v }))}>
-                <SelectTrigger id="sched-agent" aria-label="Agent">
-                  <SelectValue placeholder="Select an agent" />
-                </SelectTrigger>
-                <SelectContent>
-                  {agentOptions.map((a) => (
-                    <SelectItem key={a} value={a}>{a}</SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+              {/* Active agents only — assigning a new schedule to a
+                  terminated agent is meaningless. The filter dropdown
+                  above (agentOptions) deliberately stays a superset so
+                  a still-scheduled terminated agent stays filterable;
+                  this picker doesn't need that. */}
+              <AgentSelect
+                id="sched-agent"
+                ariaLabel="Agent"
+                value={form.agent_id || null}
+                onChange={(v) => setForm((f) => ({ ...f, agent_id: v ?? "" }))}
+                pinAdmin={false}
+                placeholder="Select an agent"
+              />
             </div>
           )}
           <div className="space-y-1">

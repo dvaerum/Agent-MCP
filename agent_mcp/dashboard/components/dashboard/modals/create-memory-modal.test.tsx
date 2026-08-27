@@ -8,6 +8,15 @@
 // accessibly). The modal's own contract is: close on success, and stay
 // open on failure so the admin can retry. This test pins that contract
 // (previously the catch only console.error'd).
+//
+// The component is externally controlled (open/onOpenChange) — it
+// adopted the shared <FormDialog> shell, which owns its own <Dialog>
+// root and so can't host an embedded <DialogTrigger> from a second
+// instance (memories-dashboard.tsx now mounts one shared, always-open-
+// capable instance triggered by two separate plain buttons). The test
+// harness below holds the open state itself so onOpenChange(false)
+// actually hides the dialog, matching how the real parent behaves.
+import { useState } from "react"
 import { describe, it, expect, vi, afterEach } from "vitest"
 import { render, cleanup, screen, waitFor } from "@testing-library/react"
 import { setupUser } from "@/tests/support/user-event"
@@ -22,10 +31,16 @@ import { CreateMemoryModal } from "@/components/dashboard/modals/create-memory-m
 
 afterEach(() => cleanup())
 
-async function openAndSubmit(onCreateMemory: () => Promise<void>) {
+function Harness({ onCreateMemory }: { onCreateMemory: () => Promise<void> }) {
+  const [open, setOpen] = useState(true)
+  return (
+    <CreateMemoryModal open={open} onOpenChange={setOpen} onCreateMemory={onCreateMemory} />
+  )
+}
+
+async function fillAndSubmit(onCreateMemory: () => Promise<void>) {
   const u = setupUser()
-  render(<CreateMemoryModal onCreateMemory={onCreateMemory} />)
-  await u.click(screen.getByRole("button", { name: /New Memory/i }))
+  render(<Harness onCreateMemory={onCreateMemory} />)
   const key = await screen.findByLabelText(/Memory Key/i)
   await u.type(key, "api.config.base_url")
   await u.click(screen.getByRole("button", { name: /Create Memory/i }))
@@ -35,7 +50,7 @@ async function openAndSubmit(onCreateMemory: () => Promise<void>) {
 describe("CreateMemoryModal result feedback (AX-2)", () => {
   it("closes the dialog on success", async () => {
     const onCreate = vi.fn().mockResolvedValue(undefined)
-    await openAndSubmit(onCreate)
+    await fillAndSubmit(onCreate)
     await waitFor(() => expect(onCreate).toHaveBeenCalledTimes(1))
     await waitFor(() =>
       expect(screen.queryByRole("dialog")).toBeNull(),
@@ -44,7 +59,7 @@ describe("CreateMemoryModal result feedback (AX-2)", () => {
 
   it("keeps the dialog open on failure so the admin can retry", async () => {
     const onCreate = vi.fn().mockRejectedValue(new Error("boom"))
-    await openAndSubmit(onCreate)
+    await fillAndSubmit(onCreate)
     await waitFor(() => expect(onCreate).toHaveBeenCalledTimes(1))
     // Dialog must still be present after the rejection.
     expect(screen.getByRole("dialog")).toBeTruthy()

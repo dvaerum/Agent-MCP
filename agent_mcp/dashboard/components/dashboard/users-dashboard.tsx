@@ -19,19 +19,12 @@
 // spec and the create/edit/delete modals.
 
 import React, { useCallback, useMemo, useState } from "react"
-import { Loader2, Plus, Pencil, Trash2, Shield, Users } from "lucide-react"
+import { Plus, Pencil, Trash2, Shield, Users } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { Switch } from "@/components/ui/switch"
 import { routerUsersUrl, routerUserUrl } from "@/lib/urls"
 import { routerApi } from "@/lib/router-api"
 import { ApiError } from "@/lib/api"
@@ -39,6 +32,7 @@ import { toastError, toastSuccess } from "@/components/ui/toast"
 import { useUsersQuery, type UserRow } from "@/lib/queries/users"
 import { invalidateUsers } from "@/lib/query-client"
 import { DataTablePage } from "@/components/dashboard/shared/data-table-page"
+import { FormDialog } from "@/components/dashboard/shared/form-dialog"
 import type { Column } from "@/components/dashboard/shared/responsive-data-table"
 import { DeleteConfirmModal } from "./modals/delete-confirm-modal"
 
@@ -233,7 +227,6 @@ function AddUserModal({
   const [password, setPassword] = useState("")
   const [email, setEmail] = useState("")
   const [isSysadmin, setIsSysadmin] = useState(false)
-  const [submitting, setSubmitting] = useState(false)
 
   const passwordTooShort =
     password.length > 0 && password.length < PASSWORD_MIN_LENGTH
@@ -243,119 +236,83 @@ function AddUserModal({
     setPassword("")
     setEmail("")
     setIsSysadmin(false)
-    setSubmitting(false)
   }
 
-  // Mutation errors go through the shared toast (architecture review
-  // Class 1) — no per-modal error state / inline banner.
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault()
-    setSubmitting(true)
-    try {
-      await routerApi.request(routerUsersUrl(), {
-        method: "POST",
-        body: JSON.stringify({
-          username,
-          password,
-          email: email || undefined,
-          is_sysadmin: isSysadmin,
-        }),
-      })
-      await onCreated()
-      toastSuccess(`User "${username}" created.`)
-      reset()
-      onOpenChange(false)
-    } catch (e) {
-      toastError(e, "Failed to create user")
-      setSubmitting(false)
-    }
+  const handleSubmit = async () => {
+    await routerApi.request(routerUsersUrl(), {
+      method: "POST",
+      body: JSON.stringify({
+        username,
+        password,
+        email: email || undefined,
+        is_sysadmin: isSysadmin,
+      }),
+    })
+    await onCreated()
+    reset()
   }
 
   return (
-    <Dialog
+    <FormDialog
       open={open}
       onOpenChange={(o) => {
-        if (!o) reset()
         onOpenChange(o)
+        if (!o) reset()
       }}
+      title="Add user"
+      description={`Create a new operator account. Password must be at least ${PASSWORD_MIN_LENGTH} characters.`}
+      onSubmit={handleSubmit}
+      submitLabel="Create"
+      submitDisabled={password.length < PASSWORD_MIN_LENGTH}
+      successMessage={`User "${username}" created.`}
+      errorMessage="Failed to create user"
     >
-      <DialogContent className="w-[calc(100vw-2rem)] flex max-h-[calc(100dvh-2rem)] flex-col overflow-hidden sm:!max-w-lg">
-        <form onSubmit={handleSubmit} className="flex min-h-0 flex-1 flex-col">
-          <DialogHeader className="flex-shrink-0">
-            <DialogTitle>Add user</DialogTitle>
-            <DialogDescription>
-              Create a new operator account. Password must be at least{" "}
-              {PASSWORD_MIN_LENGTH} characters.
-            </DialogDescription>
-          </DialogHeader>
-          <div className="flex-1 min-h-0 space-y-4 overflow-y-auto py-4 pr-1">
-            <div className="space-y-2">
-              <Label htmlFor="add-user-username">Username</Label>
-              <Input
-                id="add-user-username"
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
-                required
-              />
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="add-user-password">Password</Label>
-              <Input
-                id="add-user-password"
-                type="password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                minLength={PASSWORD_MIN_LENGTH}
-                aria-invalid={passwordTooShort}
-                required
-              />
-              {passwordTooShort && (
-                <p className="text-xs text-destructive">
-                  Password must be at least {PASSWORD_MIN_LENGTH} characters.
-                </p>
-              )}
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="add-user-email">Email (optional)</Label>
-              <Input
-                id="add-user-email"
-                type="email"
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-              />
-            </div>
-            <label className="flex items-center gap-2 text-sm">
-              <input
-                type="checkbox"
-                checked={isSysadmin}
-                onChange={(e) => setIsSysadmin(e.target.checked)}
-              />
-              Grant sysadmin
-            </label>
-          </div>
-          <DialogFooter className="flex-shrink-0">
-            <Button
-              type="button"
-              variant="ghost"
-              onClick={() => {
-                reset()
-                onOpenChange(false)
-              }}
-              disabled={submitting}
-            >
-              Cancel
-            </Button>
-            <Button
-              type="submit"
-              disabled={submitting || password.length < PASSWORD_MIN_LENGTH}
-            >
-              {submitting && <Loader2 className="h-4 w-4 mr-1 animate-spin" />}
-              Create
-            </Button>
-          </DialogFooter>
-        </form>
-      </DialogContent>
-    </Dialog>
+      <div className="space-y-2">
+        <Label htmlFor="add-user-username">Username</Label>
+        <Input
+          id="add-user-username"
+          value={username}
+          onChange={(e) => setUsername(e.target.value)}
+          required
+        />
+      </div>
+      <div className="space-y-2">
+        <Label htmlFor="add-user-password">Password</Label>
+        <Input
+          id="add-user-password"
+          type="password"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          minLength={PASSWORD_MIN_LENGTH}
+          aria-invalid={passwordTooShort}
+          required
+        />
+        {passwordTooShort && (
+          <p className="text-xs text-destructive">
+            Password must be at least {PASSWORD_MIN_LENGTH} characters.
+          </p>
+        )}
+      </div>
+      <div className="space-y-2">
+        <Label htmlFor="add-user-email">Email (optional)</Label>
+        <Input
+          id="add-user-email"
+          type="email"
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+        />
+      </div>
+      <div className="flex items-center gap-2">
+        <Switch
+          id="add-user-sysadmin"
+          checked={isSysadmin}
+          onCheckedChange={setIsSysadmin}
+        />
+        <Label htmlFor="add-user-sysadmin" className="text-sm font-normal">
+          Grant sysadmin
+        </Label>
+      </div>
+    </FormDialog>
   )
 }
 
@@ -373,70 +330,47 @@ function EditUserModal({
 }): React.ReactElement {
   const [isSysadmin, setIsSysadmin] = useState(user.is_sysadmin)
   const [email, setEmail] = useState(user.email ?? "")
-  const [submitting, setSubmitting] = useState(false)
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault()
-    setSubmitting(true)
-    try {
-      await routerApi.request(routerUserUrl(user.user_id), {
-        method: "PATCH",
-        body: JSON.stringify({
-          is_sysadmin: isSysadmin,
-          email: email || null,
-        }),
-      })
-      await onSaved()
-      toastSuccess(`User "${user.username}" updated.`)
-      onOpenChange(false)
-    } catch (e) {
-      toastError(e, "Failed to update user")
-      setSubmitting(false)
-    }
+  const handleSubmit = async () => {
+    await routerApi.request(routerUserUrl(user.user_id), {
+      method: "PATCH",
+      body: JSON.stringify({
+        is_sysadmin: isSysadmin,
+        email: email || null,
+      }),
+    })
+    await onSaved()
   }
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="w-[calc(100vw-2rem)] flex max-h-[calc(100dvh-2rem)] flex-col overflow-hidden sm:!max-w-lg">
-        <form onSubmit={handleSubmit} className="flex min-h-0 flex-1 flex-col">
-          <DialogHeader className="flex-shrink-0">
-            <DialogTitle>Edit {user.username}</DialogTitle>
-          </DialogHeader>
-          <div className="flex-1 min-h-0 space-y-4 overflow-y-auto py-4 pr-1">
-            <div className="space-y-2">
-              <Label htmlFor="edit-user-email">Email</Label>
-              <Input
-                id="edit-user-email"
-                type="email"
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-              />
-            </div>
-            <label className="flex items-center gap-2 text-sm">
-              <input
-                type="checkbox"
-                checked={isSysadmin}
-                onChange={(e) => setIsSysadmin(e.target.checked)}
-              />
-              Grant sysadmin
-            </label>
-          </div>
-          <DialogFooter className="flex-shrink-0">
-            <Button
-              type="button"
-              variant="ghost"
-              onClick={() => onOpenChange(false)}
-              disabled={submitting}
-            >
-              Cancel
-            </Button>
-            <Button type="submit" disabled={submitting}>
-              {submitting && <Loader2 className="h-4 w-4 mr-1 animate-spin" />}
-              Save
-            </Button>
-          </DialogFooter>
-        </form>
-      </DialogContent>
-    </Dialog>
+    <FormDialog
+      open={open}
+      onOpenChange={onOpenChange}
+      title={`Edit ${user.username}`}
+      onSubmit={handleSubmit}
+      submitLabel="Save"
+      successMessage={`User "${user.username}" updated.`}
+      errorMessage="Failed to update user"
+    >
+      <div className="space-y-2">
+        <Label htmlFor="edit-user-email">Email</Label>
+        <Input
+          id="edit-user-email"
+          type="email"
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+        />
+      </div>
+      <div className="flex items-center gap-2">
+        <Switch
+          id="edit-user-sysadmin"
+          checked={isSysadmin}
+          onCheckedChange={setIsSysadmin}
+        />
+        <Label htmlFor="edit-user-sysadmin" className="text-sm font-normal">
+          Grant sysadmin
+        </Label>
+      </div>
+    </FormDialog>
   )
 }

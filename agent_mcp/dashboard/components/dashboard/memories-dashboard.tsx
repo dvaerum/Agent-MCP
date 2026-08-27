@@ -144,6 +144,11 @@ export function MemoriesDashboard() {
   const viewDialog = useDialog<Memory>(memorySelector)
   const editDialog = useDialog<Memory>(memorySelector)
   const deleteDialog = useDialog<Memory>(memorySelector)
+  // Create-memory dialog is now externally controlled (FormDialog owns
+  // its own <Dialog> root, so it can't host a <DialogTrigger> from a
+  // second instance) — one shared open state for both mount points
+  // (the header action button + the empty-state CTA button) below.
+  const [createOpen, setCreateOpen] = useState(false)
 
   // Deleted-while-open: if the row is purged from the store, the
   // selector returns null. Auto-close so the user isn't stuck on an
@@ -501,7 +506,12 @@ export function MemoriesDashboard() {
         lastUpdated: data?.timestamp,
         onRefresh: refreshData,
         refreshing: loading,
-        actions: <CreateMemoryModal onCreateMemory={handleCreateMemory} />,
+        actions: (
+          <Button size="sm" onClick={() => setCreateOpen(true)}>
+            <Plus className="mr-1.5 h-4 w-4" />
+            New Memory
+          </Button>
+        ),
       }}
       stats={statsCards}
       filterBar={filterBar}
@@ -526,18 +536,21 @@ export function MemoriesDashboard() {
             : 'No memories match your current filters.',
         action:
           memories.length === 0 ? (
-            <CreateMemoryModal
-              onCreateMemory={handleCreateMemory}
-              trigger={
-                <Button>
-                  <Plus className="h-4 w-4 mr-2" />
-                  Create first memory
-                </Button>
-              }
-            />
+            <Button onClick={() => setCreateOpen(true)}>
+              <Plus className="mr-2 h-4 w-4" />
+              Create first memory
+            </Button>
           ) : undefined,
       }}
     >
+      {/* Create Memory Modal — single controlled instance shared by
+          both trigger buttons above (header action + empty-state CTA). */}
+      <CreateMemoryModal
+        open={createOpen}
+        onOpenChange={setCreateOpen}
+        onCreateMemory={handleCreateMemory}
+      />
+
       {/* View Memory Modal */}
       <ViewMemoryModal
         memory={viewDialog.data}

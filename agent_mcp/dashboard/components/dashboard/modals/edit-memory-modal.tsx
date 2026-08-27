@@ -1,21 +1,13 @@
 "use client"
 
-import React, { useState } from 'react'
-import { Pencil } from 'lucide-react'
-import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
-import { Textarea } from '@/components/ui/textarea'
-import { Label } from '@/components/ui/label'
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog'
-import { SmartValueEditor } from './smart-value-editor'
-import type { Memory } from '@/lib/api'
+import { useEffect, useState } from "react"
+import { Pencil } from "lucide-react"
+import { Input } from "@/components/ui/input"
+import { Textarea } from "@/components/ui/textarea"
+import { Label } from "@/components/ui/label"
+import { FormDialog } from "@/components/dashboard/shared/form-dialog"
+import { SmartValueEditor } from "./smart-value-editor"
+import type { Memory } from "@/lib/api"
 
 interface EditMemoryData {
   context_key: string
@@ -36,21 +28,27 @@ interface EditMemoryModalProps {
 // re-seeds the form only on a *different* memory (key change) so a
 // background refresh can't clobber the admin's in-progress edits —
 // live-lookup useDialog (Candidate D, 2026-06-02).
+//
+// Adopts the shared <FormDialog> shell (mobile dvh-cap + scrollable
+// body). `onUpdateMemory` (the parent's handleUpdateMemory) already
+// toasts both outcomes, so FormDialog's own successMessage/
+// errorMessage are omitted — the shell just owns the open/close +
+// stay-open-on-error mechanics; `onUpdateMemory` throwing is what
+// keeps it open.
 export function EditMemoryModal({ memory, open, onOpenChange, onUpdateMemory }: EditMemoryModalProps) {
-  const [loading, setLoading] = useState(false)
   const [formData, setFormData] = useState({
     context_key: memory.context_key,
     context_value: memory.value,
-    description: memory.description || ''
+    description: memory.description || "",
   })
 
   const memoryKey = memory?.context_key
-  React.useEffect(() => {
+  useEffect(() => {
     if (open && memory) {
       setFormData({
         context_key: memory.context_key,
         context_value: memory.value,
-        description: memory.description || ''
+        description: memory.description || "",
       })
     }
     // Deliberately keyed on memoryKey, not memory — see comment above.
@@ -58,113 +56,58 @@ export function EditMemoryModal({ memory, open, onOpenChange, onUpdateMemory }: 
   }, [open, memoryKey])
 
   const handleValueChange = (value: unknown) => {
-    setFormData(prev => ({ ...prev, context_value: value }))
+    setFormData((prev) => ({ ...prev, context_value: value }))
   }
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault()
-
-    setLoading(true)
-    try {
-      await onUpdateMemory({
-        context_key: formData.context_key,
-        context_value: formData.context_value,
-        description: formData.description.trim() || undefined
-      })
-      // Self-close on success — matches EditTaskDialog. On failure the
-      // parent surfaces a toast and we keep the dialog open (the throw
-      // below lands in the catch).
-      onOpenChange(false)
-    } catch {
-      // Parent (handleUpdateMemory) already surfaced the error via
-      // toastError; keep the dialog open so the admin can retry.
-    } finally {
-      setLoading(false)
-    }
+  const handleSubmit = async () => {
+    await onUpdateMemory({
+      context_key: formData.context_key,
+      context_value: formData.context_value,
+      description: formData.description.trim() || undefined,
+    })
   }
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-lg bg-card border-border text-card-foreground max-h-[90dvh] overflow-y-auto">
-        <DialogHeader>
-          <DialogTitle className="text-lg">Edit Memory</DialogTitle>
-          <DialogDescription className="text-muted-foreground">
-            Update the memory entry. The key cannot be changed.
-          </DialogDescription>
-        </DialogHeader>
+    <FormDialog
+      open={open}
+      onOpenChange={onOpenChange}
+      title="Edit Memory"
+      description="Update the memory entry. The key cannot be changed."
+      icon={Pencil}
+      onSubmit={handleSubmit}
+      submitLabel="Update Memory"
+      submittingLabel="Updating…"
+    >
+      <div className="space-y-2">
+        <Label htmlFor="context_key">Memory Key (Read-only)</Label>
+        <Input
+          id="context_key"
+          value={formData.context_key}
+          disabled
+          className="bg-muted/50 font-mono text-sm text-muted-foreground"
+        />
+      </div>
 
-        <form onSubmit={handleSubmit} className="space-y-4">
-          {/* Context Key (Read-only) */}
-          <div className="space-y-2">
-            <Label htmlFor="context_key" className="text-sm font-medium text-foreground">
-              Memory Key (Read-only)
-            </Label>
-            <Input
-              id="context_key"
-              value={formData.context_key}
-              disabled
-              className="bg-muted/50 border-border text-muted-foreground font-mono text-sm"
-            />
-          </div>
+      <div className="space-y-2">
+        <Label>Memory Value</Label>
+        <SmartValueEditor
+          value={formData.context_value}
+          onChange={handleValueChange}
+          className="rounded-lg border bg-background p-3"
+        />
+      </div>
 
-          {/* Context Value */}
-          <div className="space-y-2">
-            <Label className="text-sm font-medium text-foreground">
-              Memory Value
-            </Label>
-            <SmartValueEditor
-              value={formData.context_value}
-              onChange={handleValueChange}
-              className="border rounded-lg p-3 bg-background"
-            />
-          </div>
-
-          {/* Description */}
-          <div className="space-y-2">
-            <Label htmlFor="description" className="text-sm font-medium text-foreground">
-              Description (Optional)
-            </Label>
-            <Textarea
-              id="description"
-              value={formData.description}
-              onChange={(e) => setFormData(prev => ({ ...prev, description: e.target.value }))}
-              placeholder="Brief description of what this memory stores..."
-              className="bg-background border-border text-foreground h-20 resize-none"
-              rows={3}
-            />
-          </div>
-
-          <DialogFooter className="gap-2 pt-4">
-            <Button
-              type="button"
-              variant="outline"
-              onClick={() => onOpenChange(false)}
-              size="sm"
-              disabled={loading}
-            >
-              Cancel
-            </Button>
-            <Button
-              type="submit"
-              size="sm"
-              disabled={loading}
-              className="bg-primary hover:bg-primary/90 shadow-lg hover:shadow-primary/25 transition-all"
-            >
-              {loading ? (
-                <>
-                  <div className="h-3 w-3 border-2 border-primary-foreground border-t-transparent rounded-full animate-spin mr-2" />
-                  Updating...
-                </>
-              ) : (
-                <>
-                  <Pencil className="h-3 w-3 mr-2" />
-                  Update Memory
-                </>
-              )}
-            </Button>
-          </DialogFooter>
-        </form>
-      </DialogContent>
-    </Dialog>
+      <div className="space-y-2">
+        <Label htmlFor="description">Description (Optional)</Label>
+        <Textarea
+          id="description"
+          value={formData.description}
+          onChange={(e) => setFormData((prev) => ({ ...prev, description: e.target.value }))}
+          placeholder="Brief description of what this memory stores..."
+          className="h-20 resize-none"
+          rows={3}
+        />
+      </div>
+    </FormDialog>
   )
 }

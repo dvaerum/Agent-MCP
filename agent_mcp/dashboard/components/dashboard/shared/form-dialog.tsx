@@ -69,6 +69,19 @@ export interface FormDialogProps {
   wide?: boolean
   /** Extra footer content, rendered left of Cancel. */
   footerExtra?: React.ReactNode
+  /**
+   * Opt the underlying `<DialogContent>` into `role="alertdialog"` —
+   * for a destructive/high-stakes confirm-style form (see
+   * `components/ui/dialog.tsx`). Default false.
+   */
+  alertDialog?: boolean
+  /**
+   * Passed straight through to `useAsyncSubmit`: close the dialog on
+   * a successful submit (default) or leave it open — for the rare
+   * case where a successful submit reveals a result the operator
+   * needs to see (e.g. a generated token) rather than dismissing.
+   */
+  closeOnSuccess?: boolean
 }
 
 export function FormDialog({
@@ -89,6 +102,8 @@ export function FormDialog({
   onSuccess,
   wide = false,
   footerExtra,
+  alertDialog = false,
+  closeOnSuccess = true,
 }: FormDialogProps): React.ReactElement {
   const { submit, submitting } = useAsyncSubmit<void>({
     onSubmit,
@@ -96,6 +111,7 @@ export function FormDialog({
     errorMessage,
     onSuccess,
     onOpenChange,
+    closeOnSuccess,
   })
 
   const canSubmit = !submitting && !submitDisabled
@@ -113,6 +129,7 @@ export function FormDialog({
           size variant is a string concat for the same reason. */}
       <DialogContent
         {...(description ? {} : { "aria-describedby": undefined })}
+        alertDialog={alertDialog}
         className={"w-[calc(100vw-2rem)] flex max-h-[calc(100dvh-2rem)] flex-col overflow-hidden [&>*]:min-w-0 " + (wide ? "sm:max-w-2xl" : "sm:max-w-lg")}
         onKeyDown={onEnterSubmit(canSubmit, () => void submit())}
       >
