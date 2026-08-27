@@ -983,11 +983,12 @@ async def poke_agent_directive_api_route(
     check-in. 404 if the agent doesn't exist or is terminated.
     """
     import secrets as _secrets
-    import datetime as _dt
+    import datetime as _datetime
 
     from ...core import globals as _g
     from ...db.unit_of_work import unit_of_work
     from ...db.actions.agent_actions_db import log_agent_action_to_db
+    from ...features import delivery_transport as _dt
     from ...repositories import agent_repo
     from ...repositories import pending_directive_repository as _poke
 
@@ -1021,6 +1022,7 @@ async def poke_agent_directive_api_route(
 
     poke_id = f"poke_{_secrets.token_hex(8)}"
     operator_id = caller_identity(auth)
+    now_iso = _datetime.datetime.now().isoformat()
     try:
         with unit_of_work() as u:
             _poke.create_poke(
@@ -1030,7 +1032,7 @@ async def poke_agent_directive_api_route(
                 priority=priority,
                 created_by=operator_id,
                 connection=u.cursor,
-                now_iso=_dt.datetime.now().isoformat(),
+                now_iso=now_iso,
             )
             log_agent_action_to_db(
                 u.cursor, operator_id, "poke_agent_directive",
@@ -1040,6 +1042,26 @@ async def poke_agent_directive_api_route(
             # Immediate delivery: wake a listening wait_for_events waiter so
             # it re-queries and collects this poke now (post-commit).
             u.on_commit(lambda a=agent_id: _g.notify_agent_inbox(a))
+            # Same fix as ADR-0026's directive.due trigger, applied to
+            # ad-hoc pokes: a chat-style session connected via the
+            # delivery transport (aoe-bridge) but not currently blocked
+            # in wait_for_events never saw the pending_directive row
+            # otherwise -- it just sat there until (if ever) the agent
+            # happened to check in again. Push a poke_due frame
+            # immediately when the target is connected; this is IN
+            # ADDITION TO the waiter-wake above (independent channels --
+            # an agent can be delivery-transport-connected, have a
+            # parked waiter, both, or neither).
+            if _dt.is_connected(agent_id):
+                frame = {
+                    "type": "delivery",
+                    "reason": "poke_due",
+                    "directive": _poke._poke_event(
+                        poke_id=poke_id, prompt=prompt, priority=priority,
+                        timestamp=now_iso,
+                    ),
+                }
+                u.on_commit(lambda a=agent_id, f=frame: _dt.push(a, f))
     except Exception as e:
         logger.error("poke_agent_directive failed: %s", e, exc_info=True)
         return JSONResponse(
