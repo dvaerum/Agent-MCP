@@ -89,7 +89,7 @@ export function ViewMemoryModal({ memory, open, onOpenChange, onEdit, onDelete }
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-2xl bg-card border-border text-card-foreground max-h-[90vh] overflow-y-auto">
+      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-2xl bg-card border-border text-card-foreground max-h-[90dvh] overflow-y-auto">
         <DialogHeader>
           <div className="flex items-center gap-2">
             <Eye className="h-5 w-5 text-primary" />

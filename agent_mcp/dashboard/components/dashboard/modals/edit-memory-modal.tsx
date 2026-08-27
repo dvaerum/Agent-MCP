@@ -85,7 +85,7 @@ export function EditMemoryModal({ memory, open, onOpenChange, onUpdateMemory }: 
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-lg bg-card border-border text-card-foreground max-h-[90vh] overflow-y-auto">
+      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-lg bg-card border-border text-card-foreground max-h-[90dvh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle className="text-lg">Edit Memory</DialogTitle>
           <DialogDescription className="text-muted-foreground">

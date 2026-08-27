@@ -62,7 +62,7 @@ const SnippetBlock = ({
 // Uses the same Dialog primitive as the Messages row-detail popup
 // (PR #36). Polished to match the Tasks page dialog idiom (PR #54):
 // - sm:!max-w-3xl beats the base sm:max-w-lg
-// - max-h-[90vh] + flex-col body with a single
+// - max-h-[90dvh] + flex-col body with a single
 //   flex-1 min-h-0 overflow-y-auto scroll region
 // - sticky header / footer (flex-shrink-0)
 // - long values use [overflow-wrap:anywhere] (32-hex tokens, snippets)
@@ -172,12 +172,12 @@ export const AgentDetailDialog = ({
     <Dialog open={open} onOpenChange={onOpenChange}>
       {/*
         Width: sm:!max-w-3xl (Tailwind important) beats the base
-        DialogContent's sm:max-w-lg. Height capped at 90vh so a long
+        DialogContent's sm:max-w-lg. Height capped at 90dvh so a long
         snippet/notes block scrolls inside the modal instead of
         pushing it past the viewport. Body is the single scroll
         region via flex-1 min-h-0 overflow-y-auto.
       */}
-      <DialogContent className="sm:!max-w-3xl w-[calc(100vw-2rem)] bg-card border-border text-card-foreground p-0 gap-0 max-h-[90vh] flex flex-col">
+      <DialogContent className="sm:!max-w-3xl w-[calc(100vw-2rem)] bg-card border-border text-card-foreground p-0 gap-0 max-h-[90dvh] flex flex-col">
         <DialogHeader className="px-6 pt-6 pb-4 border-b border-border flex-shrink-0">
           <DialogTitle className="flex items-start justify-between pr-8 gap-3">
             {/* Title wraps up to 3 lines via line-clamp-3 break-words —

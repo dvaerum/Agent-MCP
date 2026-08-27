@@ -26,14 +26,11 @@ import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select"
 import {
-  Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog"
-import {
   Tooltip, TooltipContent, TooltipProvider, TooltipTrigger,
 } from "@/components/ui/tooltip"
 import { ConfirmActionModal } from "@/components/dashboard/modals/confirm-action-modal"
 import { SendDirectiveModal } from "@/components/dashboard/shared/send-directive-modal"
+import { FormDialog } from "@/components/dashboard/shared/form-dialog"
 import { DataTablePage } from "@/components/dashboard/shared/data-table-page"
 import type { Column } from "@/components/dashboard/shared/responsive-data-table"
 import { toastError, toastSuccess } from "@/components/ui/toast"
@@ -94,7 +91,6 @@ export function SchedulesDashboard() {
   const [formOpen, setFormOpen] = useState(false)
   const [editId, setEditId] = useState<string | null>(null)
   const [form, setForm] = useState<FormState>(EMPTY_FORM)
-  const [saving, setSaving] = useState(false)
 
   // delete confirm
   const [deleteId, setDeleteId] = useState<string | null>(null)
@@ -173,36 +169,29 @@ export function SchedulesDashboard() {
     setFormOpen(true)
   }, [])
 
+  // The save mutation. Throws on failure so the shared <FormDialog> shell
+  // keeps the dialog open with the operator's edits intact + surfaces the
+  // toast (Wave 5 pattern — mirrors EditTaskDialog/AddGroupModal).
   const submitForm = async () => {
-    setSaving(true)
-    try {
-      const interval = Number(form.interval_seconds)
-      if (editId) {
-        await apiClient.updateSchedule(editId, {
-          prompt: form.prompt,
-          interval_seconds: interval,
-          until: form.until ? toIsoOrNull(form.until) : undefined,
-          count: form.count ? Number(form.count) : undefined,
-        })
-        toastSuccess("Schedule updated")
-      } else {
-        await apiClient.createSchedule({
-          agent_id: form.agent_id,
-          prompt: form.prompt,
-          interval_seconds: interval,
-          until: toIsoOrNull(form.until),
-          count: form.count ? Number(form.count) : null,
-          run_now: form.run_now,
-        })
-        toastSuccess("Schedule created")
-      }
-      setFormOpen(false)
-      await load()
-    } catch (e) {
-      toastError(e, "Failed to save schedule")
-    } finally {
-      setSaving(false)
+    const interval = Number(form.interval_seconds)
+    if (editId) {
+      await apiClient.updateSchedule(editId, {
+        prompt: form.prompt,
+        interval_seconds: interval,
+        until: form.until ? toIsoOrNull(form.until) : undefined,
+        count: form.count ? Number(form.count) : undefined,
+      })
+    } else {
+      await apiClient.createSchedule({
+        agent_id: form.agent_id,
+        prompt: form.prompt,
+        interval_seconds: interval,
+        until: toIsoOrNull(form.until),
+        count: form.count ? Number(form.count) : null,
+        run_now: form.run_now,
+      })
     }
+    await load()
   }
 
   const toggleEnabled = useCallback(async (s: Schedule, next: boolean) => {
@@ -415,80 +404,71 @@ export function SchedulesDashboard() {
         }}
         skeletonRows={3}
       >
-        {/* Create / edit modal */}
-        <Dialog open={formOpen} onOpenChange={setFormOpen}>
-          <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-lg">
-            <DialogHeader>
-              <DialogTitle>{editId ? "Edit schedule" : "New schedule"}</DialogTitle>
-              <DialogDescription>
-                Interval floor is {floor}s; max {maxPerAgent} active schedules
-                per agent.
-              </DialogDescription>
-            </DialogHeader>
-            <div className="space-y-3">
-              {!editId && (
-                <div className="space-y-1">
-                  <Label htmlFor="sched-agent">Agent</Label>
-                  <Select value={form.agent_id}
-                          onValueChange={(v) => setForm((f) => ({ ...f, agent_id: v }))}>
-                    <SelectTrigger id="sched-agent" aria-label="Agent">
-                      <SelectValue placeholder="Select an agent" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {agentOptions.map((a) => (
-                        <SelectItem key={a} value={a}>{a}</SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
-              )}
-              <div className="space-y-1">
-                <Label htmlFor="sched-prompt">Directive</Label>
-                <Textarea id="sched-prompt" value={form.prompt}
-                          onChange={(e) => setForm((f) => ({ ...f, prompt: e.target.value }))}
-                          placeholder="e.g. check the CI status and report" />
-              </div>
-              <div className="grid grid-cols-2 gap-3">
-                <div className="space-y-1">
-                  <Label htmlFor="sched-interval">Interval (seconds)</Label>
-                  <Input id="sched-interval" type="number" min={floor}
-                         value={form.interval_seconds}
-                         onChange={(e) => setForm((f) => ({ ...f, interval_seconds: e.target.value }))} />
-                </div>
-                <div className="space-y-1">
-                  <Label htmlFor="sched-count">Max runs (optional)</Label>
-                  <Input id="sched-count" type="number" min={1}
-                         value={form.count}
-                         onChange={(e) => setForm((f) => ({ ...f, count: e.target.value }))} />
-                </div>
-              </div>
-              <div className="space-y-1">
-                <Label htmlFor="sched-until">Until (optional)</Label>
-                <Input id="sched-until" type="datetime-local"
-                       value={form.until}
-                       onChange={(e) => setForm((f) => ({ ...f, until: e.target.value }))} />
-              </div>
-              {!editId && (
-                <label className="flex items-center gap-2 text-sm">
-                  <Switch checked={form.run_now}
-                          onCheckedChange={(v) => setForm((f) => ({ ...f, run_now: v }))}
-                          aria-label="Run now" />
-                  Fire once immediately (run now)
-                </label>
-              )}
+        {/* Create / edit modal — shared <FormDialog> shell (mobile dvh-cap
+            + scrollable body, matches tasks/groups/messages; see
+            docs/learnings/dashboard-dialog-mobile-clipping.md). */}
+        <FormDialog
+          open={formOpen}
+          onOpenChange={setFormOpen}
+          title={editId ? "Edit schedule" : "New schedule"}
+          description={`Interval floor is ${floor}s; max ${maxPerAgent} active schedules per agent.`}
+          onSubmit={submitForm}
+          submitLabel={editId ? "Save" : "Create"}
+          submitDisabled={!form.prompt || (!editId && !form.agent_id)}
+          successMessage={editId ? "Schedule updated." : "Schedule created."}
+          errorMessage="Failed to save schedule"
+        >
+          {!editId && (
+            <div className="space-y-1">
+              <Label htmlFor="sched-agent">Agent</Label>
+              <Select value={form.agent_id}
+                      onValueChange={(v) => setForm((f) => ({ ...f, agent_id: v }))}>
+                <SelectTrigger id="sched-agent" aria-label="Agent">
+                  <SelectValue placeholder="Select an agent" />
+                </SelectTrigger>
+                <SelectContent>
+                  {agentOptions.map((a) => (
+                    <SelectItem key={a} value={a}>{a}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
             </div>
-            <DialogFooter>
-              <Button variant="outline" onClick={() => setFormOpen(false)}>
-                Cancel
-              </Button>
-              <Button onClick={() => void submitForm()}
-                      disabled={saving || !form.prompt || (!editId && !form.agent_id)}
-                      data-testid="save-schedule-btn">
-                {saving ? "Saving…" : editId ? "Save" : "Create"}
-              </Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
+          )}
+          <div className="space-y-1">
+            <Label htmlFor="sched-prompt">Directive</Label>
+            <Textarea id="sched-prompt" value={form.prompt}
+                      onChange={(e) => setForm((f) => ({ ...f, prompt: e.target.value }))}
+                      placeholder="e.g. check the CI status and report" />
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div className="space-y-1">
+              <Label htmlFor="sched-interval">Interval (seconds)</Label>
+              <Input id="sched-interval" type="number" min={floor}
+                     value={form.interval_seconds}
+                     onChange={(e) => setForm((f) => ({ ...f, interval_seconds: e.target.value }))} />
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="sched-count">Max runs (optional)</Label>
+              <Input id="sched-count" type="number" min={1}
+                     value={form.count}
+                     onChange={(e) => setForm((f) => ({ ...f, count: e.target.value }))} />
+            </div>
+          </div>
+          <div className="space-y-1">
+            <Label htmlFor="sched-until">Until (optional)</Label>
+            <Input id="sched-until" type="datetime-local"
+                   value={form.until}
+                   onChange={(e) => setForm((f) => ({ ...f, until: e.target.value }))} />
+          </div>
+          {!editId && (
+            <label className="flex items-center gap-2 text-sm">
+              <Switch checked={form.run_now}
+                      onCheckedChange={(v) => setForm((f) => ({ ...f, run_now: v }))}
+                      aria-label="Run now" />
+              Fire once immediately (run now)
+            </label>
+          )}
+        </FormDialog>
 
         {/* Delete confirm — TIER 1 (shared <ConfirmActionModal>).
             A schedule is cheap to re-create and the cascade is bounded

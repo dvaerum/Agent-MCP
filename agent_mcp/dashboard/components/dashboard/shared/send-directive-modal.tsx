@@ -143,9 +143,9 @@ export function SendDirectiveModal({
     >
       <DialogContent
         data-testid="send-directive-modal"
-        className="w-[calc(100vw-2rem)] sm:!max-w-lg"
+        className="w-[calc(100vw-2rem)] flex max-h-[calc(100dvh-2rem)] flex-col overflow-hidden sm:!max-w-lg"
       >
-        <DialogHeader>
+        <DialogHeader className="flex-shrink-0">
           <DialogTitle>
             {locked ? `Send directive to ${lockedAgentId}` : "Send directive"}
           </DialogTitle>
@@ -156,7 +156,7 @@ export function SendDirectiveModal({
           </DialogDescription>
         </DialogHeader>
 
-        <div className="space-y-3">
+        <div className="flex-1 min-h-0 space-y-3 overflow-y-auto py-1 pr-1">
           {!locked && (
             <div className="space-y-1">
               <Label htmlFor="send-directive-agent">Agent</Label>
@@ -211,7 +211,7 @@ export function SendDirectiveModal({
           )}
         </div>
 
-        <DialogFooter>
+        <DialogFooter className="flex-shrink-0">
           <Button
             variant="outline"
             onClick={() => {

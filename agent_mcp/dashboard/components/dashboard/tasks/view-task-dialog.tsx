@@ -59,7 +59,7 @@ export function ViewTaskDialog({ task, onOpenChange, onEdit, onDelete }: ViewTas
         is required because both classes share the same specificity and the
         base class is declared later in the merged className string.
       */}
-      <DialogContent className="sm:!max-w-3xl w-[calc(100vw-2rem)] bg-card border-border text-card-foreground p-0 gap-0 max-h-[90vh] flex flex-col">
+      <DialogContent className="sm:!max-w-3xl w-[calc(100vw-2rem)] bg-card border-border text-card-foreground p-0 gap-0 max-h-[90dvh] flex flex-col">
         {task && (
           <>
             <DialogHeader className="px-6 pt-6 pb-4 border-b border-border flex-shrink-0">
@@ -90,7 +90,7 @@ export function ViewTaskDialog({ task, onOpenChange, onEdit, onDelete }: ViewTas
               expands to fill remaining space and is the single scroll region.
               Previously `max-h-[80vh]` on the body alone could push the dialog
               past the viewport (we observed h=984 on a 1000px viewport for a
-              65k-char description), so the dialog now caps at 90vh total.
+              65k-char description), so the dialog now caps at 90dvh total.
             */}
             <div className="px-6 py-4 flex-1 min-h-0 overflow-y-auto space-y-4 text-sm">
               {/* Group 1: core metadata in a 2-col grid */}
@@ -147,7 +147,7 @@ export function ViewTaskDialog({ task, onOpenChange, onEdit, onDelete }: ViewTas
                   (we have one in the wild — `XXX…XXX`) wraps inside the
                   block instead of forcing the body to a giant scroll-X.
                 - NO inner `max-h-[Nvh] overflow-y-auto`. The dialog body
-                  (`max-h-[90vh]` + `flex-1 min-h-0 overflow-y-auto`) is
+                  (`max-h-[90dvh]` + `flex-1 min-h-0 overflow-y-auto`) is
                   the single vertical scroll region; nesting another one
                   here forced users to scroll twice (PR #54's polish
                   over-corrected for monster bodies). Long descriptions

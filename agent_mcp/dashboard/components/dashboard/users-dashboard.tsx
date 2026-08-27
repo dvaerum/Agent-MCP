@@ -279,16 +279,16 @@ function AddUserModal({
         onOpenChange(o)
       }}
     >
-      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-lg">
-        <form onSubmit={handleSubmit}>
-          <DialogHeader>
+      <DialogContent className="w-[calc(100vw-2rem)] flex max-h-[calc(100dvh-2rem)] flex-col overflow-hidden sm:!max-w-lg">
+        <form onSubmit={handleSubmit} className="flex min-h-0 flex-1 flex-col">
+          <DialogHeader className="flex-shrink-0">
             <DialogTitle>Add user</DialogTitle>
             <DialogDescription>
               Create a new operator account. Password must be at least{" "}
               {PASSWORD_MIN_LENGTH} characters.
             </DialogDescription>
           </DialogHeader>
-          <div className="space-y-4 py-4">
+          <div className="flex-1 min-h-0 space-y-4 overflow-y-auto py-4 pr-1">
             <div className="space-y-2">
               <Label htmlFor="add-user-username">Username</Label>
               <Input
@@ -333,7 +333,7 @@ function AddUserModal({
               Grant sysadmin
             </label>
           </div>
-          <DialogFooter>
+          <DialogFooter className="flex-shrink-0">
             <Button
               type="button"
               variant="ghost"
@@ -397,12 +397,12 @@ function EditUserModal({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-lg">
-        <form onSubmit={handleSubmit}>
-          <DialogHeader>
+      <DialogContent className="w-[calc(100vw-2rem)] flex max-h-[calc(100dvh-2rem)] flex-col overflow-hidden sm:!max-w-lg">
+        <form onSubmit={handleSubmit} className="flex min-h-0 flex-1 flex-col">
+          <DialogHeader className="flex-shrink-0">
             <DialogTitle>Edit {user.username}</DialogTitle>
           </DialogHeader>
-          <div className="space-y-4 py-4">
+          <div className="flex-1 min-h-0 space-y-4 overflow-y-auto py-4 pr-1">
             <div className="space-y-2">
               <Label htmlFor="edit-user-email">Email</Label>
               <Input
@@ -421,7 +421,7 @@ function EditUserModal({
               Grant sysadmin
             </label>
           </div>
-          <DialogFooter>
+          <DialogFooter className="flex-shrink-0">
             <Button
               type="button"
               variant="ghost"

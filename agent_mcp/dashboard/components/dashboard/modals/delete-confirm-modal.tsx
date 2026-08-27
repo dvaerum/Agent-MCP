@@ -140,12 +140,20 @@ export function DeleteConfirmModal({
           screen-reader user needs before the confirm input, so it is the
           one aria-describedby names. The visible <DialogDescription> is
           still read in document order. */}
+      {/* max-h + flex-col caps the dialog to the viewport (dvh, not vh,
+          so mobile Safari/Chrome's collapsing address bar doesn't clip
+          the footer — see docs/learnings/dashboard-dialog-mobile-clipping.md);
+          the middle content div is the scroll region so header/footer
+          stay pinned. This was PurgeAgentDialog's own fix (cf3d053)
+          before b0ca430 routed it through this shared modal instead —
+          the height-cap needs to live HERE now, once, for every caller
+          (messages, users, groups, tasks-delete, purge). */}
       <DialogContent
         alertDialog
         aria-describedby={warningId}
-        className="w-[calc(100vw-2rem)] sm:!max-w-lg bg-card border-border text-card-foreground"
+        className="w-[calc(100vw-2rem)] flex max-h-[calc(100dvh-2rem)] flex-col overflow-hidden sm:!max-w-lg bg-card border-border text-card-foreground"
       >
-        <DialogHeader>
+        <DialogHeader className="flex-shrink-0">
           <div className="flex items-center gap-2">
             <div className="flex h-8 w-8 items-center justify-center rounded-full bg-destructive/15">
               <Trash2 className="h-4 w-4 text-destructive" />
@@ -159,7 +167,7 @@ export function DeleteConfirmModal({
           </DialogDescription>
         </DialogHeader>
 
-        <div className="space-y-4">
+        <div className="flex-1 min-h-0 space-y-4 overflow-y-auto py-1 pr-1">
           {/* Warning Banner */}
           <div className="flex items-start gap-3 p-3 bg-destructive/10 border border-destructive/20 rounded-lg">
             <AlertTriangle className="h-5 w-5 text-destructive mt-0.5 flex-shrink-0" />
@@ -223,7 +231,7 @@ export function DeleteConfirmModal({
           )}
         </div>
 
-        <DialogFooter className="gap-2 pt-4">
+        <DialogFooter className="gap-2 pt-4 flex-shrink-0">
           <Button
             type="button"
             variant="outline"

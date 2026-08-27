@@ -190,14 +190,15 @@ def test_view_dialog_has_max_w_3xl_override() -> None:
 
 
 def test_view_dialog_caps_height_at_90vh() -> None:
-    """The DialogContent must cap at 90vh so very long snippets don't
-    push the modal past the viewport."""
+    """The DialogContent must cap at 90dvh so very long snippets don't
+    push the modal past the viewport. `dvh`, not `vh` — see
+    docs/learnings/dashboard-dialog-mobile-clipping.md."""
     src = _read_agents()
     assert re.search(
-        r"const AgentDetailDialog = [\s\S]*?DialogContent[^>]*max-h-\[90vh\]",
+        r"const AgentDetailDialog = [\s\S]*?DialogContent[^>]*max-h-\[90dvh\]",
         src,
     ), (
-        "AgentDetailDialog DialogContent must declare max-h-[90vh]"
+        "AgentDetailDialog DialogContent must declare max-h-[90dvh]"
     )
 
 

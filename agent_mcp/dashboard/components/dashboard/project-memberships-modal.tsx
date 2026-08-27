@@ -23,6 +23,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import { Label } from "@/components/ui/label"
+import { FormDialog } from "@/components/dashboard/shared/form-dialog"
 import {
   Select,
   SelectContent,
@@ -159,15 +160,20 @@ export function ProjectMembershipsModal({
       {/* CC-14: `w-[calc(100vw-2rem)]` keeps a 1rem gutter each side at
           375px; without it the sm:max-w-3xl width applies below sm too
           and the dialog clips horizontally. */}
-      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-3xl">
-        <DialogHeader>
+      {/* max-h + flex-col caps the dialog to the viewport (dvh, not vh,
+          for mobile Safari/Chrome's collapsing address bar); the
+          membership table can grow arbitrarily long, so it needs its
+          own scroll region rather than pushing Close off-screen — see
+          docs/learnings/dashboard-dialog-mobile-clipping.md. */}
+      <DialogContent className="w-[calc(100vw-2rem)] flex max-h-[calc(100dvh-2rem)] flex-col overflow-hidden sm:!max-w-3xl">
+        <DialogHeader className="flex-shrink-0">
           <DialogTitle>Memberships for {projectName}</DialogTitle>
           <DialogDescription>
             Users and groups with access to this project. Roles:
             operator (full) or viewer (read-only).
           </DialogDescription>
         </DialogHeader>
-        <div className="space-y-4 py-2">
+        <div className="flex-1 min-h-0 space-y-4 overflow-y-auto py-2 pr-1">
           <div className="flex justify-end">
             <Button size="sm" onClick={() => setAddOpen(true)}>
               <Plus className="h-4 w-4 mr-1" /> Add
@@ -262,7 +268,7 @@ export function ProjectMembershipsModal({
             </Table>
           )}
         </div>
-        <DialogFooter>
+        <DialogFooter className="flex-shrink-0">
           <Button variant="ghost" onClick={() => onOpenChange(false)}>
             Close
           </Button>
@@ -295,13 +301,16 @@ function AddMembershipModal({
   const [groups, setGroups] = useState<GroupOption[]>([])
   const [selectedId, setSelectedId] = useState("")
   const [role, setRole] = useState<Role>("operator")
-  const [submitting, setSubmitting] = useState(false)
-  const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
+  // Separate from submit errors (which <FormDialog> surfaces as a
+  // toast): this fires in a useEffect outside onSubmit's flow, so it
+  // needs its own inline surface.
+  const [loadError, setLoadError] = useState<string | null>(null)
 
   useEffect(() => {
     if (!open) return
     setLoading(true)
+    setLoadError(null)
     void Promise.all([
       routerApi.request<{ users?: UserOption[] }>(routerUsersUrl()),
       routerApi.request<{ groups?: GroupOption[] }>(routerGroupsUrl()),
@@ -310,123 +319,99 @@ function AddMembershipModal({
         setUsers(u.users || [])
         setGroups(g.groups || [])
       })
-      .catch((e) => setError(e instanceof Error ? e.message : String(e)))
+      .catch((e) => setLoadError(e instanceof Error ? e.message : String(e)))
       .finally(() => setLoading(false))
   }, [open])
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault()
-    if (!selectedId) {
-      setError("Pick a user or group")
-      return
-    }
-    setSubmitting(true)
-    setError(null)
-    try {
-      const body =
-        kind === "user"
-          ? { user_id: selectedId, role }
-          : { group_id: selectedId, role }
-      await routerApi.request(projectMembershipsUrl(projectName), {
-        method: "POST",
-        body: JSON.stringify(body),
-      })
-      await onAdded()
-      setSelectedId("")
-      onOpenChange(false)
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setSubmitting(false)
-    }
+  const handleSubmit = async () => {
+    const body =
+      kind === "user"
+        ? { user_id: selectedId, role }
+        : { group_id: selectedId, role }
+    await routerApi.request(projectMembershipsUrl(projectName), {
+      method: "POST",
+      body: JSON.stringify(body),
+    })
+    await onAdded()
+    setSelectedId("")
   }
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-lg">
-        <form onSubmit={handleSubmit}>
-          <DialogHeader>
-            <DialogTitle>Add membership to {projectName}</DialogTitle>
-          </DialogHeader>
-          <div className="space-y-4 py-4">
-            <div className="space-y-2">
-              <Label htmlFor="pm-kind">Kind</Label>
-              <Select
-                value={kind}
-                onValueChange={(v) => {
-                  setKind(v as "user" | "group")
-                  setSelectedId("")
-                }}
-              >
-                <SelectTrigger id="pm-kind">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="user">User</SelectItem>
-                  <SelectItem value="group">Group</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="pm-entity">{kind === "user" ? "User" : "Group"}</Label>
-              {loading ? (
-                <div className="text-sm text-muted-foreground">Loading…</div>
-              ) : (
-                <Select value={selectedId} onValueChange={setSelectedId}>
-                  <SelectTrigger id="pm-entity">
-                    <SelectValue placeholder={`Select a ${kind}`} />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {(kind === "user" ? users : groups).length === 0 && (
-                      <SelectItem disabled value="__none__">
-                        None available
-                      </SelectItem>
-                    )}
-                    {kind === "user"
-                      ? users.map((u) => (
-                          <SelectItem key={u.user_id} value={u.user_id}>
-                            {u.username}
-                          </SelectItem>
-                        ))
-                      : groups.map((g) => (
-                          <SelectItem key={g.group_id} value={g.group_id}>
-                            {g.name}
-                          </SelectItem>
-                        ))}
-                  </SelectContent>
-                </Select>
+    <FormDialog
+      open={open}
+      onOpenChange={onOpenChange}
+      title={`Add membership to ${projectName}`}
+      onSubmit={handleSubmit}
+      submitLabel="Add"
+      submitDisabled={!selectedId}
+      successMessage="Membership added."
+      errorMessage="Failed to add membership"
+    >
+      <div className="space-y-2">
+        <Label htmlFor="pm-kind">Kind</Label>
+        <Select
+          value={kind}
+          onValueChange={(v) => {
+            setKind(v as "user" | "group")
+            setSelectedId("")
+          }}
+        >
+          <SelectTrigger id="pm-kind">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="user">User</SelectItem>
+            <SelectItem value="group">Group</SelectItem>
+          </SelectContent>
+        </Select>
+      </div>
+      <div className="space-y-2">
+        <Label htmlFor="pm-entity">{kind === "user" ? "User" : "Group"}</Label>
+        {loading ? (
+          <div className="text-sm text-muted-foreground">Loading…</div>
+        ) : (
+          <Select value={selectedId} onValueChange={setSelectedId}>
+            <SelectTrigger id="pm-entity">
+              <SelectValue placeholder={`Select a ${kind}`} />
+            </SelectTrigger>
+            <SelectContent>
+              {(kind === "user" ? users : groups).length === 0 && (
+                <SelectItem disabled value="__none__">
+                  None available
+                </SelectItem>
               )}
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="pm-role">Role</Label>
-              <Select value={role} onValueChange={(v) => setRole(v as Role)}>
-                <SelectTrigger id="pm-role">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="operator">operator</SelectItem>
-                  <SelectItem value="viewer">viewer</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-            {error && <div className="text-sm text-destructive">{error}</div>}
-          </div>
-          <DialogFooter>
-            <Button
-              type="button"
-              variant="ghost"
-              onClick={() => onOpenChange(false)}
-              disabled={submitting}
-            >
-              Cancel
-            </Button>
-            <Button type="submit" disabled={submitting || !selectedId}>
-              {submitting && <Loader2 className="h-4 w-4 mr-1 animate-spin" />}
-              Add
-            </Button>
-          </DialogFooter>
-        </form>
-      </DialogContent>
-    </Dialog>
+              {kind === "user"
+                ? users.map((u) => (
+                    <SelectItem key={u.user_id} value={u.user_id}>
+                      {u.username}
+                    </SelectItem>
+                  ))
+                : groups.map((g) => (
+                    <SelectItem key={g.group_id} value={g.group_id}>
+                      {g.name}
+                    </SelectItem>
+                  ))}
+            </SelectContent>
+          </Select>
+        )}
+      </div>
+      <div className="space-y-2">
+        <Label htmlFor="pm-role">Role</Label>
+        <Select value={role} onValueChange={(v) => setRole(v as Role)}>
+          <SelectTrigger id="pm-role">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="operator">operator</SelectItem>
+            <SelectItem value="viewer">viewer</SelectItem>
+          </SelectContent>
+        </Select>
+      </div>
+      {loadError && (
+        <div className="text-sm text-destructive">
+          Failed to load users/groups: {loadError}
+        </div>
+      )}
+    </FormDialog>
   )
 }
