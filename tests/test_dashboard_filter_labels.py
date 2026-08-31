@@ -36,6 +36,13 @@ dialog's own form fields are a different, already-adjacent concern
 (most already use a real `<Label htmlFor>`, the standard shadcn form
 idiom) and dialog-hosted tables/selects were deliberately scoped out of
 CC-7 for the same reason: a different bar for a different UI role.
+
+Some top-level dashboard files ALSO embed such a dialog inline (e.g.
+prompt-book-dashboard.tsx's Prompt Builder, whose per-variable fields
+pair `<Label htmlFor={variable.name}>` with `id={variable.name}` on the
+control) — a real `for`/`id` association is the native HTML idiom and
+strictly satisfies both halves of this audit on its own, so it's
+recognized as a pass rather than special-cased out of the file glob.
 Tests parse the .tsx source; no dashboard runtime needed (matches the
 pattern set by test_dashboard_polish_mobile_pass.py).
 """
@@ -106,6 +113,30 @@ _VISIBLE_LABEL_RE = re.compile(r"<(FilterField|Label)\b")
 # won't wander into an unrelated PRIOR control's label.
 _LABEL_LOOKBACK = 400
 
+# A control's `id=` attribute — either a string literal or a JSX
+# expression — and a `<Label htmlFor=...>` using the same value is the
+# native HTML label-association idiom (e.g. prompt-book-dashboard's
+# per-variable builder fields: `<Label htmlFor={variable.name}>` paired
+# with `<SelectTrigger id={variable.name}>`). It's STRICTLY better than
+# either `aria-label` or a merely-nearby `<FilterField>`/`<Label>` — a
+# real `for`/`id` pairing is what actually wires the two together for
+# assistive tech — so a control with this pairing satisfies BOTH the
+# accessible-name and visible-label requirements outright, regardless
+# of distance (an unambiguous exact match, unlike an unlinked nearby
+# label that could just be lucky proximity).
+_ID_ATTR_RE = re.compile(r'\bid=(\{[^}]*\}|"[^"]*")')
+_LABEL_FOR_RE = re.compile(r'<Label\b[^>]*?\bhtmlFor=(\{[^}]*\}|"[^"]*")', re.DOTALL)
+
+
+def _has_matching_label_for(src: str, tag: str) -> bool:
+    id_match = _ID_ATTR_RE.search(tag)
+    if not id_match:
+        return False
+    control_id = id_match.group(1)
+    return any(
+        m.group(1) == control_id for m in _LABEL_FOR_RE.finditer(src)
+    )
+
 
 def _filter_bar_dashboards() -> list[Path]:
     """The list-page dashboards in scope for this audit — same
@@ -141,6 +172,8 @@ def test_filter_and_sort_controls_are_self_describing() -> None:
             kind = m.group(1)
             tag = _tag_span(src, m.start())
             line = src[: m.start()].count("\n") + 1
+            if _has_matching_label_for(src, tag):
+                continue
             aria_attr = "aria-label=" if kind == "SelectTrigger" else "ariaLabel="
             has_aria = aria_attr in tag
             lookback_start = max(0, m.start() - _LABEL_LOOKBACK)

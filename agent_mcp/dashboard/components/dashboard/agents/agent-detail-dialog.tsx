@@ -9,11 +9,11 @@ import {
   Dialog,
   DialogContent,
   DialogDescription,
-  DialogFooter,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { ViewDialogFooter } from "@/components/dashboard/shared/view-dialog-footer"
 import { agentPresence, type Agent, type Task } from "@/lib/api"
 import { useAgentTasks } from "@/lib/queries/all-data"
 import { formatRelative } from "@/lib/utils"
@@ -536,7 +536,7 @@ export const AgentDetailDialog = ({
           </div>
         </div>
 
-        <DialogFooter className="px-6 py-4 border-t border-border flex-shrink-0">
+        <ViewDialogFooter className="px-6 py-4 border-t border-border flex-shrink-0">
           {onSendDirective && agent.status !== 'terminated' && agent.agent_id !== 'Admin' && (
             <Button type="button" variant="outline" size="sm" onClick={onSendDirective}>
               <Send className="h-4 w-4 mr-1" />
@@ -569,7 +569,7 @@ export const AgentDetailDialog = ({
           >
             Close
           </Button>
-        </DialogFooter>
+        </ViewDialogFooter>
       </DialogContent>
     </Dialog>
   )

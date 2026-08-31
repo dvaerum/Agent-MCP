@@ -23,6 +23,7 @@ import { TaskDetailsDialog } from "./task-details-dialog"
 import { SendDirectiveModal } from "@/components/dashboard/shared/send-directive-modal"
 import { AgentMobileCard } from "@/components/dashboard/agents-mobile-list"
 import { DataTablePage } from "@/components/dashboard/shared/data-table-page"
+import { FilterField } from "@/components/dashboard/shared/filter-field"
 import type { StatsCardProps } from "@/components/dashboard/shared/stats-card"
 import {
   AGENTS_TABLE_CLASS,
@@ -366,20 +367,22 @@ export function AgentsDashboard() {
           className="pl-10 bg-background border-border text-foreground placeholder:text-muted-foreground focus:border-primary/50 focus:ring-primary/20 transition-all"
         />
       </div>
-      <Select value={statusFilter} onValueChange={(v) => setFilter("statusFilter", v)}>
-        <SelectTrigger className="w-full sm:w-32 bg-background border-border text-foreground">
-          <SelectValue />
-        </SelectTrigger>
-        {/* Wave 7 PR 2 — filter on derived presence. Matches
-            `AgentPresence` in `lib/api.ts`. */}
-        <SelectContent className="bg-background border-border">
-          <SelectItem value="all">All Status</SelectItem>
-          <SelectItem value="online">Online</SelectItem>
-          <SelectItem value="pending">Pending</SelectItem>
-          <SelectItem value="offline">Offline</SelectItem>
-          <SelectItem value="terminated">Terminated</SelectItem>
-        </SelectContent>
-      </Select>
+      <FilterField label="Status">
+        <Select value={statusFilter} onValueChange={(v) => setFilter("statusFilter", v)}>
+          <SelectTrigger aria-label="Filter by status" className="w-full sm:w-32 bg-background border-border text-foreground">
+            <SelectValue />
+          </SelectTrigger>
+          {/* Wave 7 PR 2 — filter on derived presence. Matches
+              `AgentPresence` in `lib/api.ts`. */}
+          <SelectContent className="bg-background border-border">
+            <SelectItem value="all">All Status</SelectItem>
+            <SelectItem value="online">Online</SelectItem>
+            <SelectItem value="pending">Pending</SelectItem>
+            <SelectItem value="offline">Offline</SelectItem>
+            <SelectItem value="terminated">Terminated</SelectItem>
+          </SelectContent>
+        </Select>
+      </FilterField>
     </>
   )
 

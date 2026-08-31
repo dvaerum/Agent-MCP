@@ -14,6 +14,7 @@ import { useDialog } from "@/hooks/use-dialog"
 import { useFilters } from "@/hooks/use-filters"
 import { useTasksQuery } from "@/lib/queries/tasks"
 import { AgentSelect } from "@/components/dashboard/shared/agent-select"
+import { FilterField } from "@/components/dashboard/shared/filter-field"
 import { TaskMobileCard } from "@/components/dashboard/tasks-mobile-list"
 import { DataTablePage } from "@/components/dashboard/shared/data-table-page"
 import type { StatsCardProps } from "@/components/dashboard/shared/stats-card"
@@ -344,55 +345,62 @@ export function TasksDashboard() {
       {/* Status (server-side). "Incomplete (open)" sends
           status=incomplete — the backend alias for every non-terminal
           task (pending + in_progress). */}
-      <Select value={statusFilter} onValueChange={(v) => setFilter("statusFilter", v)}>
-        <SelectTrigger className="w-full sm:w-44">
-          <SelectValue />
-        </SelectTrigger>
-        <SelectContent>
-          <SelectItem value="all">Any status</SelectItem>
-          <SelectItem value="incomplete">Incomplete (open)</SelectItem>
-          <SelectItem value="pending">Pending</SelectItem>
-          <SelectItem value="in_progress">In Progress</SelectItem>
-          <SelectItem value="completed">Completed</SelectItem>
-          <SelectItem value="cancelled">Cancelled</SelectItem>
-          <SelectItem value="failed">Failed</SelectItem>
-        </SelectContent>
-      </Select>
+      <FilterField label="Status" className="w-full sm:w-44">
+        <Select value={statusFilter} onValueChange={(v) => setFilter("statusFilter", v)}>
+          <SelectTrigger aria-label="Filter by status" className="w-full">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">Any status</SelectItem>
+            <SelectItem value="incomplete">Incomplete (open)</SelectItem>
+            <SelectItem value="pending">Pending</SelectItem>
+            <SelectItem value="in_progress">In Progress</SelectItem>
+            <SelectItem value="completed">Completed</SelectItem>
+            <SelectItem value="cancelled">Cancelled</SelectItem>
+            <SelectItem value="failed">Failed</SelectItem>
+          </SelectContent>
+        </Select>
+      </FilterField>
       {/* Assignment (server-side). Maps to the dedicated
           assigned=true / unassigned=true booleans — never a magic
           assigned_to="unassigned" value. */}
-      <Select value={assignment} onValueChange={(v) => setFilter("assignment", v)}>
-        <SelectTrigger className="w-full sm:w-40">
-          <SelectValue />
-        </SelectTrigger>
-        <SelectContent>
-          <SelectItem value="all">Any assignment</SelectItem>
-          <SelectItem value="assigned">Assigned</SelectItem>
-          <SelectItem value="unassigned">Unassigned</SelectItem>
-        </SelectContent>
-      </Select>
+      <FilterField label="Assignment" className="w-full sm:w-40">
+        <Select value={assignment} onValueChange={(v) => setFilter("assignment", v)}>
+          <SelectTrigger aria-label="Filter by assignment" className="w-full">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">Any assignment</SelectItem>
+            <SelectItem value="assigned">Assigned</SelectItem>
+            <SelectItem value="unassigned">Unassigned</SelectItem>
+          </SelectContent>
+        </Select>
+      </FilterField>
       {/* Created by (server-side) → created_by. Live-agents picker
           (shared <AgentSelect>); noneLabel="— Any —" means no filter. */}
-      <div className="w-full sm:w-44">
+      <FilterField label="Created by" className="w-full sm:w-44">
         <AgentSelect
           value={createdBy || null}
           onChange={(v) => setFilter("createdBy", v ?? "")}
           noneLabel="— Any —"
           placeholder="created by"
+          ariaLabel="Filter by creator"
         />
-      </div>
+      </FilterField>
       {/* Priority (client-side — not part of the GET /tasks contract). */}
-      <Select value={priorityFilter} onValueChange={(v) => setFilter("priorityFilter", v)}>
-        <SelectTrigger className="w-full sm:w-32">
-          <SelectValue />
-        </SelectTrigger>
-        <SelectContent>
-          <SelectItem value="all">Any priority</SelectItem>
-          <SelectItem value="high">High</SelectItem>
-          <SelectItem value="medium">Medium</SelectItem>
-          <SelectItem value="low">Low</SelectItem>
-        </SelectContent>
-      </Select>
+      <FilterField label="Priority" className="w-full sm:w-32">
+        <Select value={priorityFilter} onValueChange={(v) => setFilter("priorityFilter", v)}>
+          <SelectTrigger aria-label="Filter by priority" className="w-full">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">Any priority</SelectItem>
+            <SelectItem value="high">High</SelectItem>
+            <SelectItem value="medium">Medium</SelectItem>
+            <SelectItem value="low">Low</SelectItem>
+          </SelectContent>
+        </Select>
+      </FilterField>
       {isActive && (
         <Button variant="ghost" size="sm" onClick={clearAll}>
           <X className="h-4 w-4 mr-1" />

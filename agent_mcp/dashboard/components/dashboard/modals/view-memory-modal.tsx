@@ -14,6 +14,7 @@ import { toastError, toastSuccess } from '@/components/ui/toast'
 import type { Memory } from '@/lib/api'
 import { MemoryValueView } from '@/components/dashboard/memory-value-view'
 import { decodeMemoryValue } from '@/lib/memory-value'
+import { ViewDialogFooter } from '@/components/dashboard/shared/view-dialog-footer'
 
 interface ViewMemoryModalProps {
   memory: Memory | null
@@ -264,7 +265,7 @@ export function ViewMemoryModal({ memory, open, onOpenChange, onEdit, onDelete }
         </div>
 
         {/* Footer with copy + edit/delete actions */}
-        <div className="flex justify-end gap-2 pt-4 border-t border-border">
+        <ViewDialogFooter className="pt-4 border-t border-border">
           {onEdit && (
             <Button variant="outline" size="sm" onClick={onEdit}>
               <Pencil className="h-4 w-4 mr-1" />
@@ -312,7 +313,7 @@ export function ViewMemoryModal({ memory, open, onOpenChange, onEdit, onDelete }
             <Copy className="h-3 w-3 mr-2" />
             Copy All
           </Button>
-        </div>
+        </ViewDialogFooter>
       </DialogContent>
     </Dialog>
   )

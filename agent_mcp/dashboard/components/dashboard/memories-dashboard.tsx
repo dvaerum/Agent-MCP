@@ -37,6 +37,7 @@ import { ViewMemoryModal } from './modals/view-memory-modal'
 import { EditMemoryModal } from './modals/edit-memory-modal'
 import { ConfirmActionModal } from './modals/confirm-action-modal'
 import { MemoryMobileCard } from '@/components/dashboard/memories-mobile-list'
+import { FilterField } from '@/components/dashboard/shared/filter-field'
 import {
   DataTablePage,
 } from '@/components/dashboard/shared/data-table-page'
@@ -473,16 +474,18 @@ export function MemoriesDashboard() {
           className="pl-10 bg-background border-border text-foreground placeholder:text-muted-foreground focus:border-primary/50 focus:ring-primary/20 transition-all"
         />
       </div>
-      <Select value={sortBy} onValueChange={setSortBy}>
-        <SelectTrigger className="w-full sm:w-40 bg-background border-border text-foreground">
-          <SelectValue />
-        </SelectTrigger>
-        <SelectContent className="bg-background border-border">
-          <SelectItem value="updated_at">Latest First</SelectItem>
-          <SelectItem value="key">Alphabetical</SelectItem>
-          <SelectItem value="size">Size (Large First)</SelectItem>
-        </SelectContent>
-      </Select>
+      <FilterField label="Sort by">
+        <Select value={sortBy} onValueChange={setSortBy}>
+          <SelectTrigger aria-label="Sort memories by" className="w-full sm:w-40 bg-background border-border text-foreground">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent className="bg-background border-border">
+            <SelectItem value="updated_at">Latest First</SelectItem>
+            <SelectItem value="key">Alphabetical</SelectItem>
+            <SelectItem value="size">Size (Large First)</SelectItem>
+          </SelectContent>
+        </Select>
+      </FilterField>
     </>
   )
 

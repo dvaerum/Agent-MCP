@@ -43,6 +43,7 @@ import {
 import { useDataStore } from '@/lib/stores/data-store'
 import { getAgentTokenCached } from '@/lib/queries/all-data'
 import { AgentSelect } from '@/components/dashboard/shared/agent-select'
+import { FilterField } from '@/components/dashboard/shared/filter-field'
 import { CreatePromptModal, type CreatePromptData } from './modals/create-prompt-modal'
 import { PromptBookTutorial, usePromptBookTutorial } from './onboarding/prompt-book-tutorial'
 // CC-3 audit 2026-06-02: imported Skeleton primitive for the
@@ -563,19 +564,21 @@ export function PromptBookDashboard() {
             className="pl-10"
           />
         </div>
-        <Select value={selectedCategory} onValueChange={setSelectedCategory}>
-          <SelectTrigger className="w-full sm:w-48">
-            <SelectValue placeholder="All Categories" />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="all">All Categories</SelectItem>
-            {promptCategories.map(category => (
-              <SelectItem key={category.id} value={category.id}>
-                {category.name}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
+        <FilterField label="Category">
+          <Select value={selectedCategory} onValueChange={setSelectedCategory}>
+            <SelectTrigger aria-label="Filter by category" className="w-full sm:w-48">
+              <SelectValue placeholder="All Categories" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All Categories</SelectItem>
+              {promptCategories.map(category => (
+                <SelectItem key={category.id} value={category.id}>
+                  {category.name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </FilterField>
       </div>
 
       {/* Quick Start Guide */}

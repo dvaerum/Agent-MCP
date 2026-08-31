@@ -32,6 +32,7 @@ import { ConfirmActionModal } from "@/components/dashboard/modals/confirm-action
 import { SendDirectiveModal } from "@/components/dashboard/shared/send-directive-modal"
 import { FormDialog } from "@/components/dashboard/shared/form-dialog"
 import { AgentSelect } from "@/components/dashboard/shared/agent-select"
+import { FilterField } from "@/components/dashboard/shared/filter-field"
 import { DataTablePage } from "@/components/dashboard/shared/data-table-page"
 import type { Column } from "@/components/dashboard/shared/responsive-data-table"
 import { toastError, toastSuccess } from "@/components/ui/toast"
@@ -403,29 +404,33 @@ export function SchedulesDashboard() {
 
   const filterBar = (
     <>
-      <Select value={agentFilter} onValueChange={setAgentFilter}>
-        <SelectTrigger className="w-full sm:w-[180px]" aria-label="Filter by agent">
-          <SelectValue placeholder="All agents" />
-        </SelectTrigger>
-        <SelectContent>
-          <SelectItem value="all">All agents</SelectItem>
-          {agentOptions.map((a) => (
-            <SelectItem key={a} value={a}>{a}</SelectItem>
-          ))}
-        </SelectContent>
-      </Select>
-      <Select value={statusFilter}
-              onValueChange={(v) => setStatusFilter(v as StatusFilter)}>
-        <SelectTrigger className="w-full sm:w-[160px]" aria-label="Filter by status">
-          <SelectValue placeholder="All statuses" />
-        </SelectTrigger>
-        <SelectContent>
-          <SelectItem value="all">All statuses</SelectItem>
-          <SelectItem value="active">Active</SelectItem>
-          <SelectItem value="paused">Paused</SelectItem>
-          <SelectItem value="completed">Completed</SelectItem>
-        </SelectContent>
-      </Select>
+      <FilterField label="Agent">
+        <Select value={agentFilter} onValueChange={setAgentFilter}>
+          <SelectTrigger className="w-full sm:w-[180px]" aria-label="Filter by agent">
+            <SelectValue placeholder="All agents" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">All agents</SelectItem>
+            {agentOptions.map((a) => (
+              <SelectItem key={a} value={a}>{a}</SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </FilterField>
+      <FilterField label="Status">
+        <Select value={statusFilter}
+                onValueChange={(v) => setStatusFilter(v as StatusFilter)}>
+          <SelectTrigger className="w-full sm:w-[160px]" aria-label="Filter by status">
+            <SelectValue placeholder="All statuses" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">All statuses</SelectItem>
+            <SelectItem value="active">Active</SelectItem>
+            <SelectItem value="paused">Paused</SelectItem>
+            <SelectItem value="completed">Completed</SelectItem>
+          </SelectContent>
+        </Select>
+      </FilterField>
     </>
   )
 
