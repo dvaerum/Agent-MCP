@@ -17,7 +17,6 @@ import {
   Dialog,
   DialogContent,
   DialogDescription,
-  DialogFooter,
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
@@ -26,6 +25,7 @@ import {
   priorityBadgeClass,
   messageTypeBadgeClass,
 } from '@/components/dashboard/shared/message-badges'
+import { ViewDialogFooter } from '@/components/dashboard/shared/view-dialog-footer'
 import { getMessageThread, type Message } from '@/lib/api'
 import { projectContext } from '@/lib/project-context'
 
@@ -390,7 +390,7 @@ export function ViewMessageModal({
           Message ID: {message.message_id}
         </div>
 
-        <DialogFooter>
+        <ViewDialogFooter>
           {/* v5.0.22: Reply opens the compose form pre-wired with
               parent_message_id pinned to this row (threads onto this
               conversation).
@@ -421,7 +421,7 @@ export function ViewMessageModal({
           <Button variant="ghost" size="sm" onClick={() => onOpenChange(false)}>
             Close
           </Button>
-        </DialogFooter>
+        </ViewDialogFooter>
       </DialogContent>
     </Dialog>
   )

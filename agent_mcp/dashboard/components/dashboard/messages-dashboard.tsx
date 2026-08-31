@@ -1,6 +1,6 @@
 "use client"
 
-import React, { useCallback, useEffect, useMemo, useState } from "react"
+import { useCallback, useEffect, useMemo, useState } from "react"
 import {
   MessageSquare,
   X,
@@ -21,7 +21,6 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { type Message } from "@/lib/api"
-import { cn } from "@/lib/utils"
 import { useDialog } from "@/hooks/use-dialog"
 import { useFilters } from "@/hooks/use-filters"
 import { useMessagesQuery } from "@/lib/queries/messages"
@@ -44,6 +43,7 @@ import { toastError, toastSuccess } from "@/components/ui/toast"
 import { DataTablePage } from "@/components/dashboard/shared/data-table-page"
 import type { EmptyStateProps } from "@/components/dashboard/shared/empty-state"
 import type { StatsCardProps } from "@/components/dashboard/shared/stats-card"
+import { FilterField } from "@/components/dashboard/shared/filter-field"
 
 interface Filters {
   from: string
@@ -66,26 +66,6 @@ const PAGE_SIZE = 100
 // query disabled) — a fresh object each render would defeat reference
 // equality on `messages` and re-run the memoised filtered/stats passes.
 const EMPTY_PAGE = { messages: [] as Message[], total: 0 }
-
-// A filter control with a small visible label stacked above it, so each
-// dropdown is self-describing before it's opened (the From/To agent
-// pickers otherwise both just read "— Any —").
-const FilterField = ({
-  label,
-  className,
-  children,
-}: {
-  label: string
-  className?: string
-  children: React.ReactNode
-}) => (
-  <div className={cn("flex flex-col gap-1", className)}>
-    <span className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-      {label}
-    </span>
-    {children}
-  </div>
-)
 
 export function MessagesDashboard() {
   // Server-online indicator (matches Agents/Tasks/Memories header).

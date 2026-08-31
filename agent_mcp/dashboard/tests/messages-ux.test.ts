@@ -460,7 +460,12 @@ describe("MUX-13: reply-as-recipient", () => {
 describe("MUX-12: filter dropdowns have visible labels", () => {
   const src = read("components/dashboard/messages-dashboard.tsx")
   it("wraps each filter in a labeled FilterField (From/To/Type/Priority/Status)", () => {
-    expect(/const FilterField/.test(src)).toBe(true)
+    // FilterField was promoted to shared/filter-field.tsx (the audit
+    // that gave Tasks/Agents/Memories/Prompt-Book/Schedules the same
+    // fix) — this page now imports it instead of declaring its own.
+    expect(
+      /from ["']@\/components\/dashboard\/shared\/filter-field["']/.test(src),
+    ).toBe(true)
     for (const label of ["Search", "From", "To", "Type", "Priority", "Status"]) {
       expect(
         new RegExp(`<FilterField label="${label}"`).test(src),

@@ -7,7 +7,6 @@ import {
   Dialog,
   DialogContent,
   DialogDescription,
-  DialogFooter,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
@@ -20,6 +19,7 @@ import {
   isTombstone,
   parseTaskNotes,
 } from "@/components/dashboard/tasks/tasks-api"
+import { ViewDialogFooter } from "@/components/dashboard/shared/view-dialog-footer"
 
 // =========================================================================
 // Row-action dialogs: View / Edit / Delete
@@ -257,7 +257,7 @@ export function ViewTaskDialog({ task, onOpenChange, onEdit, onDelete }: ViewTas
               </div>
             </div>
 
-            <DialogFooter className="px-6 py-4 border-t border-border flex-shrink-0">
+            <ViewDialogFooter className="px-6 py-4 border-t border-border flex-shrink-0">
               {onEdit && (
                 <Button variant="outline" size="sm" onClick={onEdit}>
                   <Pencil className="h-4 w-4 mr-1" />
@@ -271,7 +271,7 @@ export function ViewTaskDialog({ task, onOpenChange, onEdit, onDelete }: ViewTas
                 </Button>
               )}
               <Button variant="outline" size="sm" onClick={() => onOpenChange(false)}>Close</Button>
-            </DialogFooter>
+            </ViewDialogFooter>
           </>
         )}
       </DialogContent>
