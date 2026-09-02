@@ -10,7 +10,7 @@ receive every agent's plaintext bearer token, then re-authenticate as
 those agents to escalate to write.
 
 PR #263 closed the equivalent REST surfaces (``/api/all-data``,
-``/api/node-details``, ``/api/tokens``) with
+``/api/tokens``) with
 ``is_confirmed_operator_tier`` + a masking / allowlist rule in
 ``app/routers/composition.py`` but missed this MCP tool. This module
 pins the MCP tool to the same contract so REST and MCP agree:

@@ -55,7 +55,6 @@ EXPECTED_SECTIONS = {
     "messages",
     "schedules",
     "settings",
-    "system",
     "prompts",
 }
 

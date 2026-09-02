@@ -5,19 +5,16 @@ matching their already-gated in-file siblings.
 FINDING (owner-authorized security review, 2026-07):
 
   * ``GET /api/status``          — system status
-  * ``GET /api/graph-data``      — agents/tasks/files relationship graph
-  * ``GET /api/task-tree-data``  — task tree
 
 had NO backend auth dependency at all, while every sibling composition
-READ in the same router — ``/api/node-details`` (#281), ``/api/all-data``
-and ``/api/context-data`` (#280) — carries
-``Depends(require_operator_session)``. ``AuthHeaderMiddleware`` gates
-only ``/mcp``, not ``/api/*``, so on the backend's own (Unix-domain
-socket) surface these three were unauthenticated — the exact
-direct-UDS defense-in-depth tier PRs #280 / #281 were shipped to close.
-The aiohttp router still fronts them with cookie+membership, so this is
-NOT remotely exploitable; the fix restores parity for the direct-backend
-tier.
+READ in the same router — ``/api/all-data`` and ``/api/context-data``
+(#280) — carries ``Depends(require_operator_session)``.
+``AuthHeaderMiddleware`` gates only ``/mcp``, not ``/api/*``, so on the
+backend's own (Unix-domain socket) surface this was unauthenticated —
+the exact direct-UDS defense-in-depth tier PRs #280 / #281 were shipped
+to close. The aiohttp router still fronts it with cookie+membership, so
+this is NOT remotely exploitable; the fix restores parity for the
+direct-backend tier.
 
 Mirrors the assertion shape of
 ``test_sec_composition_secret_exposure.py``:
@@ -34,7 +31,7 @@ from tests.harness import mcp_session
 pytestmark = pytest.mark.asyncio
 
 
-_COMPOSITION_READS = ("/api/status", "/api/graph-data", "/api/task-tree-data")
+_COMPOSITION_READS = ("/api/status",)
 
 
 @pytest.mark.parametrize("path", _COMPOSITION_READS)

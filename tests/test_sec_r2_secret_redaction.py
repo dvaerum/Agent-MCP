@@ -123,23 +123,6 @@ async def test_all_data_returns_secret_context_value(tmp_path) -> None:
         assert _SECRET_VALUE in r2.text
 
 
-@pytest.mark.asyncio
-async def test_node_details_returns_secret_context_value(tmp_path) -> None:
-    async with mcp_session(tmp_path) as admin:
-        _seed(admin, key="db_password", value=_SECRET_VALUE)
-
-        node = "context_db_password"
-        r = admin.get(f"/api/node-details?node_id={node}")
-        assert r.status_code == 200, r.text
-        assert _SECRET_VALUE in r.text
-
-        r2 = admin.client.get(
-            f"/api/node-details?node_id={node}", headers=_bearer(admin)
-        )
-        assert r2.status_code == 200, r2.text
-        assert _SECRET_VALUE in r2.text
-
-
 # ── max_results clamp (unrelated; preserved) ─────────────────────────
 
 

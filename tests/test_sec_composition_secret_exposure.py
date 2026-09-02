@@ -16,8 +16,7 @@ secret-exposure class as the RAG side-channel):
     ``require_operator_session`` (POST is a mutation → viewers rejected).
   * ``GET /api/all-data`` shipped ``aoe_session_id`` (the AoE
     side-channel session credential) for every agent to the viewer
-    tier, while ``/api/node-details`` deliberately strips it. Fix:
-    strip ``aoe_session_id`` from all-data too.
+    tier. Fix: strip ``aoe_session_id`` from all-data.
 """
 
 from __future__ import annotations
@@ -174,8 +173,8 @@ async def test_create_sample_memories_operator_succeeds(tmp_path) -> None:
 
 
 async def test_all_data_strips_aoe_session_id(tmp_path) -> None:
-    """all-data must not ship the AoE side-channel session id to any tier
-    (node-details already strips it)."""
+    """all-data must not ship the AoE side-channel session id to any
+    tier."""
     async with mcp_session(tmp_path) as admin:
         aoe = "deadbeefcafe0011"
         _seed_agent_with_aoe("aoe-agent", aoe)

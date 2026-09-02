@@ -1,36 +1,13 @@
-// System / composition resource module — status, relationship graphs,
-// the bulk `/all-data` envelope, tokens, the prompt-book catalog, and
-// node-details. These are the cross-cutting composition reads that
-// don't belong to a single resource.
+// System / composition resource module — status, the bulk `/all-data`
+// envelope, tokens, and the prompt-book catalog. These are the
+// cross-cutting composition reads that don't belong to a single
+// resource.
 
 import type { ApiClient } from './client'
 import { ShapeError, isRecord, describe } from './client'
 import type { Agent } from './agents'
 import { type RawTask, type Task, normalizeTask } from './tasks'
 import type { RawContextEntry } from './memories'
-
-export interface GraphNode {
-  id: string
-  label: string
-  group?: 'agent' | 'task' | 'context' | 'file' | 'admin'
-  type?: 'agent' | 'task' | 'context' | 'file' | 'admin'
-  status?: string
-  priority?: string
-  assigned_to?: string
-  current_task?: string
-  metadata?: Record<string, unknown>
-  [key: string]: unknown
-}
-
-export interface GraphEdge {
-  id?: string
-  from: string
-  to: string
-  type?: string
-  title?: string
-  label?: string
-  [key: string]: unknown
-}
 
 export interface SystemStatus {
   server_running: boolean
@@ -105,14 +82,6 @@ export function systemApi(core: ApiClient) {
       return core.request<SystemStatus>('/status', {}, systemStatusGuard)
     },
 
-    getGraphData(): Promise<{ nodes: GraphNode[]; edges: GraphEdge[] }> {
-      return core.request<{ nodes: GraphNode[]; edges: GraphEdge[] }>('/graph-data')
-    },
-
-    getTaskTreeData(): Promise<{ nodes: GraphNode[]; edges: GraphEdge[] }> {
-      return core.request<{ nodes: GraphNode[]; edges: GraphEdge[] }>('/task-tree-data')
-    },
-
     // Token endpoints
     //
     // Wave 2 (cleanup-wave-2): ``admin_token`` is intentionally NOT
@@ -178,17 +147,6 @@ export function systemApi(core: ApiClient) {
         allDataGuard,
       )
       return { ...env, tasks: (env.tasks ?? []).map(normalizeTask) }
-    },
-
-    // Node details endpoint
-    getNodeDetails(nodeId: string): Promise<{
-      id: string
-      type: string
-      data: Record<string, unknown>
-      actions: Array<Record<string, unknown>>
-      related?: Record<string, unknown>
-    }> {
-      return core.request(`/node-details?node_id=${encodeURIComponent(nodeId)}`)
     },
   }
 }

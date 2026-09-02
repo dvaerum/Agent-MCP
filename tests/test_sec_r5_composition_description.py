@@ -116,31 +116,6 @@ async def test_context_data_returns_secret_in_description(tmp_path) -> None:
         assert _SECRET_IN_DESC in r2.text
 
 
-@pytest.mark.asyncio
-async def test_node_details_returns_secret_in_description(tmp_path) -> None:
-    async with mcp_session(tmp_path) as admin:
-        _seed(
-            admin,
-            key=_BENIGN_KEY,
-            value=_BENIGN_VALUE,
-            description=_DESC_WITH_SECRET,
-        )
-
-        node = f"context_{_BENIGN_KEY}"
-        r = admin.get(f"/api/node-details?node_id={node}")
-        assert r.status_code == 200, r.text
-        _assert_desc_present(r.text)
-        data = r.json()["data"]
-        assert _BENIGN_VALUE in data["value"]
-        assert data["description"] == _DESC_WITH_SECRET
-
-        r2 = admin.client.get(
-            f"/api/node-details?node_id={node}", headers=_bearer(admin)
-        )
-        assert r2.status_code == 200, r2.text
-        assert _SECRET_IN_DESC in r2.text
-
-
 def _find_ctx(rows, key):
     for row in rows:
         if row.get("context_key") == key:

@@ -70,23 +70,6 @@ async def test_all_data_returns_embedded_secret_value(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_node_details_returns_embedded_secret_value(tmp_path) -> None:
-    async with mcp_session(tmp_path) as admin:
-        _seed(admin, key=_BENIGN_KEY, value=_BENIGN_VALUE)
-
-        node = f"context_{_BENIGN_KEY}"
-        r = admin.get(f"/api/node-details?node_id={node}")
-        assert r.status_code == 200, r.text
-        _assert_value_present(r.text)
-
-        r2 = admin.client.get(
-            f"/api/node-details?node_id={node}", headers=_bearer(admin)
-        )
-        assert r2.status_code == 200, r2.text
-        assert _EMBEDDED_AWS in r2.text
-
-
-@pytest.mark.asyncio
 async def test_context_data_returns_embedded_secret_value(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
         _seed(admin, key=_BENIGN_KEY, value=_BENIGN_VALUE)
@@ -106,7 +89,7 @@ async def test_context_data_returns_embedded_secret_value(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_node_details_500_hides_exception_string(
+async def test_all_data_500_hides_exception_string(
     tmp_path, monkeypatch
 ) -> None:
     """A DB failure must not reflect ``str(e)`` (schema/paths) to the
@@ -120,7 +103,7 @@ async def test_node_details_500_hides_exception_string(
 
     async with mcp_session(tmp_path) as admin:
         monkeypatch.setattr(comp, "get_db_connection", _boom)
-        r = admin.get("/api/node-details?node_id=context_anything")
+        r = admin.get("/api/all-data")
         assert r.status_code == 500, r.text
         assert sentinel not in r.text, (
             "raw exception string leaked to the client on 500"

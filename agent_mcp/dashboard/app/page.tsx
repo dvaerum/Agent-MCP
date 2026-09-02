@@ -11,7 +11,7 @@ import { projectContext } from "@/lib/project-context"
 // Per-section code-splitting — each section dashboard ships in its own
 // JS chunk and is fetched on demand when the user lands on (or
 // navigates to) that section. The previous static imports pulled all
-// nine section trees into the `/page-*.js` initial bundle (~321 KB),
+// eight section trees into the `/page-*.js` initial bundle (~321 KB),
 // which dominated mobile cold-load parse time. After this split the
 // first-load bundle only carries the layout shell + the section the
 // user actually opened; switching sections pays a one-time ~100 ms
@@ -77,10 +77,6 @@ const PromptBookDashboard = dynamic(
   () => import("@/components/dashboard/prompt-book-dashboard").then(m => m.PromptBookDashboard),
   { ssr: false, loading: () => <SectionSkeleton /> },
 )
-const SystemDashboard = dynamic(
-  () => import("@/components/dashboard/system-dashboard").then(m => m.SystemDashboard),
-  { ssr: false, loading: () => <SectionSkeleton /> },
-)
 
 function DashboardPage() {
   // URL-driven section routing — `?page=<section>` is the source of
@@ -116,8 +112,6 @@ function DashboardPage() {
         return <SchedulesDashboard />
       case 'settings':
         return <SettingsDashboard />
-      case 'system':
-        return <SystemDashboard />
       case 'prompts':
         return <PromptBookDashboard />
       default:

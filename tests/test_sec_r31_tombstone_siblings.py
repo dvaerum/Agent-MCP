@@ -63,36 +63,6 @@ def _insert_tombstone(agent_id: str) -> None:
         conn.close()
 
 
-# ---------------- 1. dashboard graph (the real leak) -------------------
-
-
-@pytest.mark.asyncio
-async def test_graph_data_excludes_tombstone_nodes(tmp_path) -> None:
-    """GET /api/graph-data (``fetch_graph_data_logic``) must NOT render
-    a tombstone row as a ``[deleted-<id>]`` agent node. A live agent
-    must still appear (regression)."""
-    async with mcp_session(tmp_path) as admin:
-        await admin.create_worker("alice")
-        _insert_tombstone("ghost")
-
-        resp = admin.get("/api/graph-data")
-        assert resp.status_code == 200, resp.text
-        nodes = resp.json().get("nodes", [])
-        node_ids = [n.get("id") for n in nodes]
-        labels = [n.get("label") for n in nodes]
-
-        # Regression: the live agent is still a graph node.
-        assert "agent_alice" in node_ids, node_ids
-
-        # Leak: no tombstone node.
-        assert "agent_[deleted-ghost]" not in node_ids, (
-            f"tombstone rendered as a graph node: {node_ids}"
-        )
-        assert not any(
-            isinstance(lbl, str) and lbl.startswith("[deleted-") for lbl in labels
-        ), f"tombstone [deleted-*] label leaked into graph: {labels}"
-
-
 # ---------------- 2. notify_unassigned_task_appeared -------------------
 
 

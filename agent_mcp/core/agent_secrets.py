@@ -1,7 +1,7 @@
 """One owner for "which columns on an ``agents`` row are credentials".
 
 N6 structural half (``docs/proposals/security-authz-architecture-hardening.md``,
-Phase 5). Four surfaces withhold agent bearer secrets and all four agreed
+Phase 5). Three surfaces withhold agent bearer secrets and all three agreed
 on the *who* — :func:`agent_mcp.core.operator_tier.is_confirmed_operator_tier`,
 already a single definition — but each answered *what is secret* and *what
 to do about it* on its own:
@@ -15,11 +15,10 @@ site                                             mechanic
                                                  ``aoe_session_id``, then
                                                  re-add a gated
                                                  ``auth_token``
-``app/routers/composition./node-details``        SQL column allowlist
 ``app/routers/settings./api/tokens``             403 or full plaintext
 ===============================================  ==========================
 
-Those four *mechanics* are genuinely different and are deliberately NOT
+Those three *mechanics* are genuinely different and are deliberately NOT
 collapsed into one — see "What is shared, and what isn't" below. What IS
 collapsed is the vocabulary they were each restating: the secret column
 set and the mask value, which is the half that could drift. It follows
@@ -32,12 +31,10 @@ Where the secret set comes from
 -------------------------------
 The ORM model, via ``mapped_column(..., info={"secret": True})`` on
 ``db/models/agent.py``. Not a list in this module — a list here would be
-the fifth hand-maintained copy of the same fact, and the one it replaced
-(``composition._AGENT_NODE_SAFE_COLUMNS``) carried the comment "Keep this
-in sync with the agents model when columns change", which is precisely
-the class of invariant this plan exists to convert from discipline into
-structure. A future credential column is declared secret where it is
-declared, or it is secret nowhere.
+a hand-maintained copy of the same fact, which is precisely the class of
+invariant this plan exists to convert from discipline into structure. A
+future credential column is declared secret where it is declared, or it
+is secret nowhere.
 
 What is shared, and what isn't
 ------------------------------
@@ -52,11 +49,6 @@ caller tier receives:
   drops (the raw column is an artefact of ``SELECT *`` — the endpoint's
   contract exposes a separate ``auth_token`` field, and adding a
   ``token: "***"`` key to that response would be a wire-shape change).
-* **conditional vs. unconditional.** ``/node-details`` withholds the
-  bearer from *every* tier including a confirmed operator — it is a
-  display panel, not a credential surface. Routing it through a
-  tier-conditional redactor would start handing operators a bearer they
-  do not get today.
 * **``/api/tokens`` is not a redaction site at all** — it is the one
   endpoint whose entire purpose is to serve plaintext bearers, so it
   gates (403) rather than masks. It shares the *who* predicate and
@@ -129,11 +121,11 @@ def strip_agent_secrets(row: Mapping[str, Any]) -> Dict[str, Any]:
 def without_secret_columns(columns: Iterable[str]) -> Tuple[str, ...]:
     """Filter a hand-chosen display-column list down to the non-secret ones.
 
-    The ``/node-details`` projection is a *presentation* decision (it
-    deliberately shows fewer columns than the model has), so it stays a
-    hand-written allowlist rather than becoming "everything non-secret".
-    Running it through here makes the security half structural anyway: a
-    secret column added to that list is dropped rather than served.
+    For a surface that deliberately shows a curated subset of columns (a
+    *presentation* decision), rather than becoming "everything
+    non-secret". Running it through here makes the security half
+    structural anyway: a secret column added to that list is dropped
+    rather than served.
     """
     secrets = agent_secret_columns()
     return tuple(c for c in columns if c not in secrets)

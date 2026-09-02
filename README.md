@@ -27,12 +27,6 @@ Beyond the philosophical issues, traditional AI coding assistants hit practical 
 
 Agent-MCP transforms AI development from a single assistant to a coordinated team:
 
-<div align="center">
-  <img src="assets/images/dashboard-overview.png" alt="Multi-Agent Collaboration Network" width="800">
-</div>
-
-**Real-time visualization** shows your AI team at work - purple nodes represent context entries, blue nodes are agents, and connections show active collaborations. It's like having a mission control center for your development team.
-
 ### Core Capabilities
 
 **Parallel Execution**  

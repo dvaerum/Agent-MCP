@@ -3,12 +3,10 @@
 import React, { useMemo } from "react"
 import {
   Activity,
-  ArrowRight,
   Brain,
   CheckCircle2,
   Cpu,
   ListTodo,
-  Network,
   RefreshCw,
   Server,
 } from "lucide-react"
@@ -17,7 +15,6 @@ import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { useServerStore } from "@/lib/stores/server-store"
 import { useAllData, useAllDataStatus } from "@/lib/queries/all-data"
-import { useSectionRoute } from "@/lib/use-section-route"
 
 // Render an ISO timestamp as a coarse relative-time string ("5m ago",
 // "2h ago"). The Overview uses this for the recent-activity feed and
@@ -38,10 +35,11 @@ function relativeTime(iso: string | undefined | null): string {
 }
 
 // Stat-card primitive — title, big number, optional sub-line, and an
-// icon. The mobile-load PR replaced the full vis-network graph on this
-// page with a handful of these so the cold-load doesn't drag in the
-// 617 KB vis chunk just to render the landing page. The full graph
-// still lives behind the System page link below.
+// icon. The mobile-load PR replaced the full collaboration graph on
+// this page with a handful of these so the cold-load doesn't drag in
+// the 617 KB graph-library chunk just to render the landing page.
+// That graph (and the System page that hosted it) was later removed
+// entirely.
 function StatCard({
   title,
   icon: Icon,
@@ -92,7 +90,6 @@ export function OverviewDashboard() {
   // force-refetch behind the manual Refresh button.
   const data = useAllData()
   const { loading, isRefreshing, refresh } = useAllDataStatus()
-  const { setSection } = useSectionRoute()
 
   const isConnected = !!activeServerId && activeServer?.status === 'connected'
 
@@ -177,7 +174,7 @@ export function OverviewDashboard() {
             <Server className="h-12 w-12 text-muted-foreground mb-4" />
             <h3 className="text-lg font-medium text-foreground mb-2">Connect to an MCP Server</h3>
             <p className="text-muted-foreground text-sm">
-              Select an MCP server from the project picker in the header to view the system graph and manage agents.
+              Select an MCP server from the project picker in the header to view activity and manage agents.
             </p>
             {activeServer && activeServer.status === 'error' && (
               <div className="text-sm text-destructive mt-4">
@@ -259,9 +256,9 @@ export function OverviewDashboard() {
         />
       </div>
 
-      {/* Recent activity feed + System link */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 sm:gap-6 flex-1 min-h-0">
-        <Card className="lg:col-span-2 flex flex-col">
+      {/* Recent activity feed */}
+      <div className="grid grid-cols-1 gap-4 sm:gap-6 flex-1 min-h-0">
+        <Card className="flex flex-col">
           <CardHeader className="pb-3">
             <CardTitle className="text-base">Recent activity</CardTitle>
           </CardHeader>
@@ -308,30 +305,6 @@ export function OverviewDashboard() {
                 })}
               </ul>
             )}
-          </CardContent>
-        </Card>
-
-        <Card className="flex flex-col">
-          <CardHeader className="pb-3">
-            <CardTitle className="text-base flex items-center gap-2">
-              <Network className="h-4 w-4 text-muted-foreground" />
-              Collaboration network
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="flex-1 flex flex-col justify-between gap-4">
-            <p className="text-sm text-muted-foreground">
-              The interactive agent / task / memory graph lives on the System page.
-              Open it to inspect relationships and click through to node details.
-            </p>
-            <Button
-              variant="outline"
-              size="sm"
-              className="self-start"
-              onClick={() => setSection('system')}
-            >
-              View Collaboration Network
-              <ArrowRight className="h-3.5 w-3.5 ml-1.5" />
-            </Button>
           </CardContent>
         </Card>
       </div>
