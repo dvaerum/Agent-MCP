@@ -206,6 +206,40 @@ jobs:
       - name: Build static export
         run: npm run build
 
+      # A dead `@import "some-pkg/x.css";` in globals.css (referencing
+      # a package that's since been removed from package.json) is NOT
+      # a build failure: webpack prints the unresolvable-import error
+      # as diagnostic output but `next build` still exits 0 and still
+      # prints "Compiled successfully" — it just silently emits a
+      # 0-byte production CSS bundle instead of the real one. This
+      # shipped straight to the internet-facing production dashboard
+      # (every page rendered as unstyled plain HTML) because nothing
+      # else in this job would catch it: `npm test` doesn't render
+      # globals.css, `npm run lint` doesn't check CSS output size, and
+      # the build step above treats a 0-byte artifact as success.
+      # tests/test_dashboard_css_imports_resolve.py (Python static
+      # source check) catches the specific "stale @import" shape of
+      # this bug ahead of a build; this step is the build-level
+      # backstop that catches ANY cause of a near-empty CSS bundle
+      # (a broken Tailwind/PostCSS config, a bad plugin, a future
+      # variant of the same import mistake) — the two are
+      # complementary, not redundant.
+      - name: Verify CSS bundle is not empty
+        run: |
+          css_files=(out/_next/static/css/*.css)
+          if [ ! -e "${css_files[0]}" ]; then
+            echo "::error::No CSS output file found under out/_next/static/css/ — the build produced zero stylesheet chunks."
+            exit 1
+          fi
+          for f in "${css_files[@]}"; do
+            size=$(wc -c < "$f")
+            echo "$f: $size bytes"
+            if [ "$size" -lt 10000 ]; then
+              echo "::error::$f is only $size bytes (expected >10000) — this is exactly the failure mode that shipped a completely unstyled dashboard to production (see tests/test_dashboard_css_imports_resolve.py and docs/learnings/next-build-swallows-unresolvable-css-import.md)."
+              exit 1
+            fi
+          done
+
   nix-flake-check:
     # Sharded: each of the four nixosTest VMs builds on its own runner in
     # parallel, so the job's wall-clock is a single VM (~4-6 min warm)
