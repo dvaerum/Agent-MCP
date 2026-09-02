@@ -105,7 +105,7 @@ def test_deleted_db_actions_facades_are_gone():
 
 def test_kept_db_actions_facades_still_import():
     """Files carrying genuine logic are untouched and still importable."""
-    kept = ("agent_actions_db", "task_notes_db")
+    kept = ("agent_actions_db", "task_comments_db")
     for name in kept:
         mod = importlib.import_module(f"agent_mcp.db.actions.{name}")
         assert mod is not None

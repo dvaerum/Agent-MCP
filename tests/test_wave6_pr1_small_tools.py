@@ -3,8 +3,8 @@
 Pins the Principal + ToolResult contract end-to-end for each
 file that was migrated in Wave 6 PR 1:
 
-* ``tools/task_notes_tools.py`` — ``edit_task_note``,
-  ``delete_task_note`` (``add_task_note`` was the PR 0 demo)
+* ``tools/task_comments_tools.py`` — ``edit_task_comment``,
+  ``delete_task_comment`` (``add_task_comment`` was the PR 0 demo)
 * ``tools/rag_tools.py`` — ``ask_project_rag``
 * ``tools/file_management_tools.py`` — ``check_file_status``,
   ``update_file_status``
@@ -15,7 +15,7 @@ Each test drives a real :class:`Principal` (operator or
 agent_bearer) through ``dispatch_tool_call`` to assert the
 typed-return contract. The pre-existing wire-level coverage
 (``test_phase2_wave3_permission_matrix.py``,
-``test_sqlalchemy_task_note.py``, ``test_wave3_admin_token_removal.py``)
+``test_sqlalchemy_task_comment.py``, ``test_wave3_admin_token_removal.py``)
 still exercises the MCP-handler path through
 ``WorkerSession.call`` — the tests in this file pin the new
 :data:`ToolResult` shape *directly* so a future PR that
@@ -141,60 +141,60 @@ def _set_file_metadata(filepath: str, metadata: dict[str, Any]) -> None:
         conn.close()
 
 
-# ── task_notes_tools.py: edit + delete ───────────────────────────
+# ── task_comments_tools.py: edit + delete ─────────────────────────
 
 
-async def test_edit_task_note_returns_ok_for_author(tmp_path) -> None:
-    """A worker editing their own note returns ``Ok(data={"note_id": N})``."""
-    from agent_mcp.db.actions import task_notes_db
+async def test_edit_task_comment_returns_ok_for_author(tmp_path) -> None:
+    """A worker editing their own comment returns ``Ok(data={"note_id": N})``."""
+    from agent_mcp.db.actions import task_comments_db
     from agent_mcp.tools.registry import dispatch_tool_call
 
     async with mcp_session(tmp_path) as admin:
         _insert_task("pr1-task-edit-ok")
         alice = await admin.create_worker("alice")
-        note_id = task_notes_db.add_note(
+        note_id = task_comments_db.add_comment(
             "pr1-task-edit-ok", "alice", "v1",
         )
 
         p = _agent_principal("alice", bearer=alice.token)
         result = await dispatch_tool_call(
-            "edit_task_note",
+            "edit_task_comment",
             {"note_id": note_id, "text": "v2"},
             principal=p,
         )
 
         assert isinstance(result, Ok), f"expected Ok, got {result!r}"
         assert result.data == {"note_id": note_id}
-        assert task_notes_db.get_note(note_id)["text"] == "v2"
+        assert task_comments_db.get_comment(note_id)["text"] == "v2"
 
 
-async def test_edit_task_note_permission_denied_for_non_author(
+async def test_edit_task_comment_permission_denied_for_non_author(
     tmp_path,
 ) -> None:
-    """A worker editing someone else's note is rejected.
+    """A worker editing someone else's comment is rejected.
 
     PF-1 (round 4): the rejection is a typed :class:`NotFound`
-    indistinguishable from a nonexistent note — closing the
-    note-existence oracle — and must never leak the authoring agent's
+    indistinguishable from a nonexistent comment — closing the
+    comment-existence oracle — and must never leak the authoring agent's
     id (the DB layer's ``"owned by 'alice'"`` string). (Previously this
     surfaced as PermissionDenied naming the author.)"""
-    from agent_mcp.db.actions import task_notes_db
+    from agent_mcp.db.actions import task_comments_db
     from agent_mcp.tools.registry import dispatch_tool_call
 
     async with mcp_session(tmp_path) as admin:
         _insert_task("pr1-task-edit-denied")
-        # Seed Alice as the note's author via direct DB write — we
+        # Seed Alice as the comment's author via direct DB write — we
         # don't need her bearer for this test, only Bob's.
         await admin.create_worker("alice")
         bob = await admin.create_worker("bob")
-        note_id = task_notes_db.add_note(
+        note_id = task_comments_db.add_comment(
             "pr1-task-edit-denied", "alice", "v1",
         )
 
-        # Bob (worker, non-author) attempts to edit Alice's note.
+        # Bob (worker, non-author) attempts to edit Alice's comment.
         p = _agent_principal("bob", bearer=bob.token)
         result = await dispatch_tool_call(
-            "edit_task_note",
+            "edit_task_comment",
             {"note_id": note_id, "text": "hijack"},
             principal=p,
         )
@@ -206,11 +206,11 @@ async def test_edit_task_note_permission_denied_for_non_author(
             f"author id must not leak; got {result!r}"
         )
         # Note unchanged.
-        assert task_notes_db.get_note(note_id)["text"] == "v1"
+        assert task_comments_db.get_comment(note_id)["text"] == "v1"
 
 
-async def test_edit_task_note_not_found(tmp_path) -> None:
-    """Editing a non-existent note returns :class:`NotFound`.
+async def test_edit_task_comment_not_found(tmp_path) -> None:
+    """Editing a non-existent comment returns :class:`NotFound`.
 
     Pins the typed-variant classification on the DB-error path so a
     REST consumer would see 404, not 500."""
@@ -220,7 +220,7 @@ async def test_edit_task_note_not_found(tmp_path) -> None:
         alice = await admin.create_worker("alice")
         p = _agent_principal("alice", bearer=alice.token)
         result = await dispatch_tool_call(
-            "edit_task_note",
+            "edit_task_comment",
             {"note_id": 999999, "text": "ghost"},
             principal=p,
         )
@@ -228,11 +228,11 @@ async def test_edit_task_note_not_found(tmp_path) -> None:
         assert isinstance(result, NotFound), (
             f"expected NotFound, got {result!r}"
         )
-        assert result.resource == "task note"
+        assert result.resource == "task comment"
         assert result.identifier == "999999"
 
 
-async def test_edit_task_note_invalid_input(tmp_path) -> None:
+async def test_edit_task_comment_invalid_input(tmp_path) -> None:
     """Missing required ``text`` field returns :class:`Invalid`."""
     from agent_mcp.tools.registry import dispatch_tool_call
 
@@ -240,7 +240,7 @@ async def test_edit_task_note_invalid_input(tmp_path) -> None:
         alice = await admin.create_worker("alice")
         p = _agent_principal("alice", bearer=alice.token)
         result = await dispatch_tool_call(
-            "edit_task_note",
+            "edit_task_comment",
             {"note_id": 1, "text": ""},
             principal=p,
         )
@@ -251,13 +251,13 @@ async def test_edit_task_note_invalid_input(tmp_path) -> None:
         assert result.field == "text"
 
 
-async def test_delete_task_note_operator_can_delete_worker_note(
+async def test_delete_task_comment_operator_can_delete_worker_comment(
     tmp_path,
 ) -> None:
     """An operator-session principal (manager-tier) can delete a
-    worker-authored note via the same is_admin=True path that
+    worker-authored comment via the same is_admin=True path that
     manager-role agents use."""
-    from agent_mcp.db.actions import task_notes_db
+    from agent_mcp.db.actions import task_comments_db
     from agent_mcp.tools.registry import dispatch_tool_call
 
     async with mcp_session(tmp_path) as admin:
@@ -265,21 +265,21 @@ async def test_delete_task_note_operator_can_delete_worker_note(
         # Seed Alice's row so the agents-table FK is satisfied; the
         # operator does the deletion, so we don't need her bearer.
         await admin.create_worker("alice")
-        note_id = task_notes_db.add_note(
+        note_id = task_comments_db.add_comment(
             "pr1-task-delete-op", "alice", "soon to die",
         )
 
         # Operator session — dashboard moderation path.
         p = _operator_principal("op-bob")
         result = await dispatch_tool_call(
-            "delete_task_note",
+            "delete_task_comment",
             {"note_id": note_id},
             principal=p,
         )
 
         assert isinstance(result, Ok), f"expected Ok, got {result!r}"
         assert result.data == {"note_id": note_id}
-        assert task_notes_db.get_note(note_id) is None
+        assert task_comments_db.get_comment(note_id) is None
 
 
 # ── rag_tools.py: ask_project_rag ────────────────────────────────
@@ -613,8 +613,8 @@ async def test_update_file_metadata_invalid_non_serializable(tmp_path) -> None:
 @pytest.mark.parametrize(
     "tool_name,arguments",
     [
-        ("edit_task_note", {"note_id": 1, "text": "x"}),
-        ("delete_task_note", {"note_id": 1}),
+        ("edit_task_comment", {"note_id": 1, "text": "x"}),
+        ("delete_task_comment", {"note_id": 1}),
         ("ask_project_rag", {"query": "hi"}),
         ("check_file_status", {"filepath": "/tmp/x"}),
         ("update_file_status", {"filepath": "/tmp/x", "status": "editing"}),

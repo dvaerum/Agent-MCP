@@ -8,19 +8,20 @@ frozen sink, because the invariant
 ``_is_status_transition_allowed``) was enforced opt-in, per call-site,
 in Python. Migration ``0025_terminal_task_guard_trigger`` installs a
 structural backstop one layer below every Python call-site: a pair of
-SQLite ``TRIGGER``s (one on ``tasks``, two on the ``task_notes`` side
-table — see the migration docstring for the exact field/table
-coverage and the class-sweep that added the ``task_notes`` pair) that
-refuse the write at the DB layer, so a future write path can't forget
-the check even if it never heard of the Python-level convention.
+SQLite ``TRIGGER``s (one on ``tasks``, two on the ``task_comments``
+side table — formerly ``task_notes``, renamed in migration 0026; see
+the migration docstring for the exact field/table coverage and the
+class-sweep that added the side-table pair) that refuse the write at
+the DB layer, so a future write path can't forget the check even if
+it never heard of the Python-level convention.
 
 Two writers can observe the trigger's ``RAISE(ABORT, ...)``:
 
 * ``agent_mcp.repositories.task_repository`` (the ``tasks`` table
   writers — ``update_fields`` / ``_update_fields_with_cursor`` /
   ``update_task_fields_in_db``).
-* ``agent_mcp.db.actions.task_notes_db`` (the ``task_notes`` side
-  table writers — ``add_note`` / ``edit_note``).
+* ``agent_mcp.db.actions.task_comments_db`` (the ``task_comments``
+  side table writers — ``add_comment`` / ``edit_comment``).
 
 Both import this one module so the marker string and the exception
 type can't drift between the two writers and the migration that
@@ -44,7 +45,7 @@ class TerminalTaskWriteBlocked(Exception):
     Defense-in-depth UNDERNEATH the Python-level checks in
     ``tools/task_tools.py`` (``_TERMINAL_TASK_STATUSES`` /
     ``_is_status_transition_allowed``) and the per-task terminal check
-    in ``tools/task_notes_tools.py`` / ``db/actions/task_notes_db.py``
+    in ``tools/task_comments_tools.py`` / ``db/actions/task_comments_db.py``
     — it exists to catch a write path that never checked task
     terminality at all (the exact OBS-R12-2 class). Every already-
     guarded call site refuses the mutation in Python before reaching
@@ -59,6 +60,6 @@ class TerminalTaskWriteBlocked(Exception):
                 f"Cannot modify task '{task_id}': it is in a terminal "
                 "state (completed/cancelled/failed); its "
                 "status/assigned_to/priority/notes/title/description "
-                "(and its task_notes) are frozen."
+                "(and its task_comments) are frozen."
             )
         )

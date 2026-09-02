@@ -36,7 +36,7 @@ function PurgePreviewBlock({
         <code className="font-mono">
           {preview?.tombstone ?? `[deleted-${agentId ?? ''}]`}
         </code>
-        . Task notes are preserved as an audit trail.
+        . Task comments are preserved as an audit trail.
       </div>
       {loading && (
         <div className="text-sm text-muted-foreground py-2">
@@ -157,7 +157,7 @@ export function PurgeAgentDialog({
       requiredWord={agentId ?? ''}
       matchCase
       title={`Purge agent ${agentId ?? ''}?`}
-      description="This deletes the agent row and tombstones every reference to it. Task notes are preserved as an audit trail."
+      description="This deletes the agent row and tombstones every reference to it. Task comments are preserved as an audit trail."
       warningText="The agent row is deleted outright and every message, task and action that referenced it is rewritten to a tombstone. This action cannot be reversed."
       confirmLabel="Confirm purge"
       inputId="purge-confirmation"

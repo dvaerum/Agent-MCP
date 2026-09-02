@@ -243,7 +243,7 @@ def _can_agents_communicate(sender_id: str, recipient_id: str, is_admin: bool) -
     if sender_id == recipient_id:
         return False, (
             "you cannot message yourself. To record your own "
-            "progress/context on a task, use add_task_note(task_id=..., "
+            "progress/context on a task, use add_task_comment(task_id=..., "
             "text=...) instead."
         )
 

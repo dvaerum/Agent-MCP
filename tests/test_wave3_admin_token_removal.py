@@ -10,7 +10,7 @@ loop on the backend: the API responses no longer surface
 bearer to satisfy a downstream ``@requires("admin")`` gate (they now
 rely on the operator-session-active ContextVar that
 ``_dispatch_through_tool`` derives from the route's ``RestPrincipal``), and
-the ``task_notes`` privilege check moves from the raw
+the ``task_comments`` privilege check moves from the raw
 ``token == g.admin_token`` comparison to ``verify_token(..., "manager")``.
 
 The RED protocol per ``feedback_tdd_red_green_for_bugs``:
@@ -26,7 +26,7 @@ The RED protocol per ``feedback_tdd_red_green_for_bugs``:
   - (c) reject anonymous auth with 401
   Cookie path is integration-covered by
   ``tests/router/test_dashboard_session_auth.py``.
-* ``task_notes`` privilege: ``edit_task_note`` admits the system
+* ``task_comments`` privilege: ``edit_task_comment`` admits the system
   bearer (legacy admin), admits a manager-role agent token, denies a
   worker-role agent token that isn't the author, and continues to
   admit a worker-role agent token that IS the author.
@@ -326,10 +326,11 @@ async def _seed_task(
     Direct INSERT is the harness convention for "we need a row,
     not exercising the public-API path".
 
-    SEC Wave-B: ``add_task_note`` now gates note authorship on the
-    task's assignee / creator (or a manager-tier caller). Tests that
-    have a worker author a note pass ``assigned_to=<worker_agent_id>``
-    so the worker owns the task it annotates.
+    SEC Wave-B: ``add_task_comment`` now gates comment authorship on
+    the task's assignee / creator (or a manager-tier caller). Tests
+    that have a worker author a comment pass
+    ``assigned_to=<worker_agent_id>`` so the worker owns the task it
+    annotates.
     """
     import datetime
 
@@ -428,14 +429,16 @@ async def _seed_manager_agent(agent_id: str) -> str:
     return token
 
 
-async def _add_note(token: str, task_id: str, text: str) -> int:
-    """Add a note via the MCP tool and return its note_id.
+async def _add_comment(token: str, task_id: str, text: str) -> int:
+    """Add a comment via the MCP tool and return its note_id.
 
     Wave 6 PR 0 — ``dispatch_tool_call`` now returns
-    :data:`agent_mcp.core.tool_result.ToolResult`; ``add_task_note``
+    :data:`agent_mcp.core.tool_result.ToolResult`; ``add_task_comment``
     is the first tool to ship the migrated signature returning
     ``Ok(data={"note_id": ..., "task_id": ...}, ...)``. Pull the
     note_id from ``Ok.data`` rather than re-parsing the message.
+    (``note_id`` is deliberately NOT renamed to ``comment_id`` by the
+    task_notes -> task_comments rename — see migration 0026.)
     """
     from agent_mcp.core.tool_result import Ok
     from agent_mcp.tools.registry import (
@@ -446,18 +449,18 @@ async def _add_note(token: str, task_id: str, text: str) -> int:
     cv = request_auth_token.set(token)
     try:
         result = await dispatch_tool_call(
-            "add_task_note",
+            "add_task_comment",
             {"token": token, "task_id": task_id, "text": text},
         )
     finally:
         request_auth_token.reset(cv)
-    assert isinstance(result, Ok), f"unexpected add_task_note result: {result!r}"
+    assert isinstance(result, Ok), f"unexpected add_task_comment result: {result!r}"
     note_id = result.data["note_id"]
     return int(note_id)
 
 
-async def _edit_note(token: str, note_id: int, new_text: str) -> str:
-    """Wave 6 PR 1 — ``edit_task_note`` is now migrated; the return
+async def _edit_comment(token: str, note_id: int, new_text: str) -> str:
+    """Wave 6 PR 1 — ``edit_task_comment`` is now migrated; the return
     is a typed :data:`ToolResult` variant. Render it through the MCP
     text-content renderer so the helper returns the same wire-shape
     prose an MCP client would see, regardless of variant. That keeps
@@ -473,7 +476,7 @@ async def _edit_note(token: str, note_id: int, new_text: str) -> str:
     cv = request_auth_token.set(token)
     try:
         result = await dispatch_tool_call(
-            "edit_task_note",
+            "edit_task_comment",
             {"token": token, "note_id": note_id, "text": new_text},
         )
     finally:
@@ -482,54 +485,54 @@ async def _edit_note(token: str, note_id: int, new_text: str) -> str:
     return blocks[0].text if blocks else ""
 
 
-async def test_edit_task_note_admits_system_bearer(tmp_path) -> None:
+async def test_edit_task_comment_admits_system_bearer(tmp_path) -> None:
     """The system bearer (legacy admin) must continue to admit
     non-author edits — the Wave 3 rewrite must preserve this."""
     async with mcp_session(tmp_path) as admin:
         await _seed_task(admin, "tn-task-1", assigned_to="note-author-1")
         worker = await admin.create_worker("note-author-1")
-        note_id = await _add_note(worker.token, "tn-task-1", "v1")
+        note_id = await _add_comment(worker.token, "tn-task-1", "v1")
 
-        result = await _edit_note(admin.admin_token, note_id, "v2-by-admin")
+        result = await _edit_comment(admin.admin_token, note_id, "v2-by-admin")
         assert "updated" in result.lower(), result
 
 
-async def test_edit_task_note_admits_manager_token(tmp_path) -> None:
+async def test_edit_task_comment_admits_manager_token(tmp_path) -> None:
     """Manager-role agent token must admit non-author edits — that's
     the Wave 3 generalisation: ``is_admin`` becomes
     ``verify_token(..., 'manager')``, so manager-tier callers can
-    moderate worker notes."""
+    moderate worker comments."""
     async with mcp_session(tmp_path) as admin:
         await _seed_task(admin, "tn-task-2", assigned_to="note-author-2")
         worker = await admin.create_worker("note-author-2")
-        note_id = await _add_note(worker.token, "tn-task-2", "v1")
+        note_id = await _add_comment(worker.token, "tn-task-2", "v1")
 
         manager_token = await _seed_manager_agent("note-manager-2")
-        result = await _edit_note(manager_token, note_id, "v2-by-manager")
+        result = await _edit_comment(manager_token, note_id, "v2-by-manager")
         assert "updated" in result.lower(), (
-            f"manager-role agent must edit non-author note; got {result!r}"
+            f"manager-role agent must edit non-author comment; got {result!r}"
         )
 
 
-async def test_edit_task_note_rejects_worker_non_author(tmp_path) -> None:
+async def test_edit_task_comment_rejects_worker_non_author(tmp_path) -> None:
     """A worker-role agent token who is NOT the author must be
-    rejected — the per-note ownership check is the only gate that
-    stops cross-worker note mutation.
+    rejected — the per-comment ownership check is the only gate that
+    stops cross-worker comment mutation.
 
     PF-1 (round 4): the rejection must be INDISTINGUISHABLE from a
-    nonexistent note — a typed :class:`NotFound` — so a worker holding
-    a foreign ``note_id`` can't use the 403-vs-404 shape as a
-    note-existence oracle, and the DB layer's ``"owned by {author}"``
+    nonexistent comment — a typed :class:`NotFound` — so a worker
+    holding a foreign ``note_id`` can't use the 403-vs-404 shape as a
+    comment-existence oracle, and the DB layer's ``"owned by {author}"``
     string never leaks the authoring agent's id. (Previously this
     surfaced as ``PermissionDenied`` naming the author.)
     """
     async with mcp_session(tmp_path) as admin:
         await _seed_task(admin, "tn-task-3", assigned_to="note-author-3")
         author = await admin.create_worker("note-author-3")
-        note_id = await _add_note(author.token, "tn-task-3", "v1")
+        note_id = await _add_comment(author.token, "tn-task-3", "v1")
 
         intruder = await admin.create_worker("note-intruder-3")
-        result = await _edit_note(intruder.token, note_id, "v2-by-intruder")
+        result = await _edit_comment(intruder.token, note_id, "v2-by-intruder")
         lower = result.lower()
         # Rejected as not-found …
         assert "not found" in lower, (
@@ -545,21 +548,22 @@ async def test_edit_task_note_rejects_worker_non_author(tmp_path) -> None:
             f"got {result!r}"
         )
 
-        # Oracle parity: a genuinely nonexistent note yields the SAME
+        # Oracle parity: a genuinely nonexistent comment yields the SAME
         # response shape (no existence differential).
-        missing = await _edit_note(intruder.token, note_id + 9999, "nope")
+        missing = await _edit_comment(intruder.token, note_id + 9999, "nope")
         assert "not found" in missing.lower(), missing
 
 
-async def test_edit_task_note_admits_worker_author(tmp_path) -> None:
+async def test_edit_task_comment_admits_worker_author(tmp_path) -> None:
     """The original author (worker-role) must still be able to edit
-    their own note — that's the pre-Wave-3 behaviour we must preserve."""
+    their own comment — that's the pre-Wave-3 behaviour we must
+    preserve."""
     async with mcp_session(tmp_path) as admin:
         await _seed_task(admin, "tn-task-4", assigned_to="note-author-4")
         author = await admin.create_worker("note-author-4")
-        note_id = await _add_note(author.token, "tn-task-4", "v1")
+        note_id = await _add_comment(author.token, "tn-task-4", "v1")
 
-        result = await _edit_note(author.token, note_id, "v2-by-self")
+        result = await _edit_comment(author.token, note_id, "v2-by-self")
         assert "updated" in result.lower(), result
 
 

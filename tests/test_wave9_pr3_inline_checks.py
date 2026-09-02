@@ -10,7 +10,7 @@ identity tier the legacy bridge happened to expand to.
 Coverage matrix (cap → call sites):
 
 * ``tasks.assign`` — task_tools (7 sites, all ``is_admin_request``)
-  and task_notes_tools (``is_admin`` flag on edit/delete moderation)
+  and task_comments_tools (``is_admin`` flag on edit/delete moderation)
 * ``system.config.write`` — agent_communication_tools
   (``_is_operator_tier``), project_context_tools
   (``_is_admin_principal``), file_metadata_tools (entry gate on
@@ -277,10 +277,10 @@ def test_requires_authenticated_caller_admits_all_authenticated_identities() -> 
     assert denied is not None
 
 
-# ── task_notes_tools — entry gate + `tasks.assign` moderator flag ──
+# ── task_comments_tools — entry gate + `tasks.assign` moderator flag ──
 
 
-def test_task_notes_entry_gate_blocks_viewer_admits_operator() -> None:
+def test_task_comments_entry_gate_blocks_viewer_admits_operator() -> None:
     """The add/edit/delete entry gate (operator OR agent_bearer) now
     uses ``system.config.write`` for the operator path; viewer-tier
     operators are denied (tightening) but every agent_bearer still
@@ -298,38 +298,38 @@ def test_task_notes_entry_gate_blocks_viewer_admits_operator() -> None:
     # gate is what we're testing, so a clean entry should fall
     # through to the Invalid path (no denial at all).
     async def _exercise():
-        from agent_mcp.tools.task_notes_tools import (
-            add_task_note_tool_impl,
-            delete_task_note_tool_impl,
-            edit_task_note_tool_impl,
+        from agent_mcp.tools.task_comments_tools import (
+            add_task_comment_tool_impl,
+            delete_task_comment_tool_impl,
+            edit_task_comment_tool_impl,
         )
 
         # Operator admits → falls past gate to Invalid (no task_id).
         op = _operator_principal(project_role="operator")
-        await add_task_note_tool_impl({}, principal=op)
+        await add_task_comment_tool_impl({}, principal=op)
 
         # Viewer denied at gate.
         viewer = _operator_principal(project_role="viewer")
         with pytest.raises(AuthRejected):
-            await add_task_note_tool_impl({}, principal=viewer)
+            await add_task_comment_tool_impl({}, principal=viewer)
 
         # Agent bearer admits → falls past gate.
         worker = _agent_bearer(agent_role="worker", agent_id="wkr")
-        await add_task_note_tool_impl({}, principal=worker)
+        await add_task_comment_tool_impl({}, principal=worker)
 
         # Same gate semantics on edit + delete.
         with pytest.raises(AuthRejected):
-            await edit_task_note_tool_impl({}, principal=viewer)
+            await edit_task_comment_tool_impl({}, principal=viewer)
         with pytest.raises(AuthRejected):
-            await delete_task_note_tool_impl({}, principal=viewer)
+            await delete_task_comment_tool_impl({}, principal=viewer)
 
     import asyncio
     asyncio.run(_exercise())
 
 
-def test_task_notes_is_admin_flag_uses_tasks_assign() -> None:
-    """The ``is_admin`` flag passed to ``task_notes_db.edit_note`` /
-    ``delete_note`` (bypasses per-note ownership) is sourced from
+def test_task_comments_is_admin_flag_uses_tasks_assign() -> None:
+    """The ``is_admin`` flag passed to ``task_comments_db.edit_note`` /
+    ``delete_note`` (bypasses per-comment ownership) is sourced from
     ``has_capability("tasks.assign")``: operator + manager-role
     agent + sysadmin admits, worker + viewer denies."""
     # The flag is computed inline; exercise via _is_operator_tier

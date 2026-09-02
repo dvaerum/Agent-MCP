@@ -38,7 +38,7 @@ from pathlib import Path
 EXPECTED_TABLES = {
     "agents",
     "tasks",
-    "task_notes",
+    "task_comments",
     "agent_actions",
     "project_context",
     "project_settings",

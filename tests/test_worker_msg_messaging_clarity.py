@@ -5,7 +5,7 @@ A worker driving ``send_agent_message`` hits four denial gates in
 The pre-existing wording named the failed policy but offered no working
 alternative, so a worker had nothing to do but retry the same call. These
 tests pin the improved wording: each denial now points at the escalation
-path that actually works (``request_assistance`` / ``add_task_note``).
+path that actually works (``request_assistance`` / ``add_task_comment``).
 
 SECURITY invariants pinned here:
   * The "recipient not active" denial COLLAPSES offline / terminated /
@@ -131,8 +131,8 @@ def test_stop_command_admin_only_offers_text_and_escalation(monkeypatch):
 # --- #4 self-communication --------------------------------------------
 
 
-def test_self_communication_points_at_add_task_note(monkeypatch):
-    """Messaging yourself is denied with a pointer to add_task_note."""
+def test_self_communication_points_at_add_task_comment(monkeypatch):
+    """Messaging yourself is denied with a pointer to add_task_comment."""
     monkeypatch.setattr(
         _mod._access, "_get_config_bool", lambda *a, **k: True
     )
@@ -146,4 +146,4 @@ def test_self_communication_points_at_add_task_note(monkeypatch):
     assert isinstance(denial, PermissionDenied), denial
     reason = denial.reason.lower()
     assert "cannot message yourself" in reason, denial.reason
-    assert "add_task_note" in reason, denial.reason
+    assert "add_task_comment" in reason, denial.reason
