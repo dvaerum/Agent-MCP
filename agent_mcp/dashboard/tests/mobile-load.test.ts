@@ -1,16 +1,17 @@
 /**
  * Regression guards for the mobile-load PR (verify-all + mobile diag,
- * 2026-06-28). Three independent fixes shipped in one PR; each gets a
+ * 2026-06-28). Independent fixes shipped in one PR; each gets a
  * source-shape assertion here so a future refactor can't silently
- * undo any of them.
+ * undo any of them. (The graph-loader double-fetch guard that used to
+ * live here was removed along with the System page and its
+ * collaboration-graph library.)
  *
  * Why grep-based: the dashboard test harness is intentionally
  * node-only (see vitest.config.ts) — no jsdom, no React-testing-
- * library. The properties we owe — "the initial graph-data fetch is
- * guarded by a ref", "every section dashboard is loaded via
- * next/dynamic", "Overview no longer references VisGraph" — are
- * properties of the SOURCE, not the runtime, so source assertions are
- * the right shape and they sit alongside the existing
+ * library. The properties we owe — "every section dashboard is loaded
+ * via next/dynamic", "Overview no longer mounts the collaboration
+ * graph" — are properties of the SOURCE, not the runtime, so source
+ * assertions are the right shape and they sit alongside the existing
  * mcp-notifications-no-poll guard.
  */
 
@@ -23,44 +24,6 @@ const read = (rel: string) =>
   readFileSync(resolve(DASHBOARD_ROOT, rel), "utf8")
 
 describe("mobile-load regression guards", () => {
-  describe("D — vis-network-loader: no double-fetch in StrictMode", () => {
-    const src = read("components/dashboard/vis-network-loader.tsx")
-
-    it("guards the initial graph-data fetch behind a ref", () => {
-      // Pre-fix: a single useEffect called `fetchGraphData(true)`
-      // unconditionally on mount. React 18+ StrictMode double-mount
-      // (dev) plus the `fetchGraphData` callback's `nodeCount`
-      // dependency together produced 2× GET /graph-data on every
-      // cold load. The fix is a one-shot ref guard.
-      expect(
-        /initialFetchRef|hasFetchedRef|didFetchRef/.test(src),
-        "vis-network-loader.tsx must guard its initial graph-data fetch behind a ref " +
-          "(e.g. `initialFetchRef`) so StrictMode double-mount does not double-fetch.",
-      ).toBe(true)
-    })
-
-    it("auto-refresh effect is separate from the initial-fetch effect", () => {
-      // The split matters: combining them re-wires the interval on
-      // every fetchGraphData identity change and risks re-firing the
-      // initial fetch. The split keeps each effect independent.
-      const initEffectMatches = src.match(
-        /initialFetchRef\.current\s*=\s*true/g,
-      )
-      expect(
-        initEffectMatches != null && initEffectMatches.length >= 1,
-        "vis-network-loader.tsx must flip `initialFetchRef.current = true` before " +
-          "firing the initial fetch.",
-      ).toBe(true)
-      expect(
-        /setInterval\(\s*\(\s*\)\s*=>\s*fetchGraphData\s*\(\s*false\s*\)/.test(
-          src,
-        ),
-        "vis-network-loader.tsx must keep the auto-refresh interval in its own " +
-          "useEffect, calling fetchGraphData(false).",
-      ).toBe(true)
-    })
-  })
-
   describe("A — page.tsx: per-section code-split via next/dynamic", () => {
     const src = read("app/page.tsx")
 
@@ -72,7 +35,7 @@ describe("mobile-load regression guards", () => {
 
       // Each section dashboard component must be created via
       // `dynamic(() => import(...))`. The dashboards listed here are
-      // the nine sections rendered by the section-router switch
+      // the eight sections rendered by the section-router switch
       // statement in DashboardPage().
       const expected = [
         "overview-dashboard",
@@ -83,7 +46,6 @@ describe("mobile-load regression guards", () => {
         "messages-dashboard",
         "settings-dashboard",
         "prompt-book-dashboard",
-        "system-dashboard",
       ]
       for (const mod of expected) {
         const re = new RegExp(
@@ -126,7 +88,6 @@ describe("mobile-load regression guards", () => {
         "messages-dashboard",
         "settings-dashboard",
         "prompt-book-dashboard",
-        "system-dashboard",
       ]
       for (const mod of offending) {
         const re = new RegExp(
@@ -148,7 +109,7 @@ describe("mobile-load regression guards", () => {
       expect(
         /from\s+["'][^"']*vis-graph[^"']*["']/.test(src),
         "overview-dashboard.tsx must not import any vis-graph module — the " +
-          "graph stays on the System page.",
+          "graph was removed entirely.",
       ).toBe(false)
       expect(
         /<\s*VisGraph[\s>]/.test(src),
@@ -158,8 +119,7 @@ describe("mobile-load regression guards", () => {
 
     it("does not import or render <NodeDetailPanel>", () => {
       // Without the graph there is nothing to click into, so the node
-      // detail panel must be gone too. (System still owns the
-      // graph-driven panel.)
+      // detail panel must be gone too.
       expect(
         /from\s+["'][^"']*node-detail-panel[^"']*["']/.test(src),
         "overview-dashboard.tsx must not import node-detail-panel.",
@@ -168,18 +128,6 @@ describe("mobile-load regression guards", () => {
         /<\s*NodeDetailPanel[\s>]/.test(src),
         "overview-dashboard.tsx must not render <NodeDetailPanel>.",
       ).toBe(false)
-    })
-
-    it("System page still owns the VisGraph", () => {
-      // Belt-and-braces: a future refactor that moved the graph back
-      // off System would defeat the "graph still reachable via
-      // System page" reviewer note in the PR body. Pin it.
-      const sys = read("components/dashboard/system-dashboard.tsx")
-      expect(
-        /<\s*VisGraph\b/.test(sys),
-        "system-dashboard.tsx must still render <VisGraph> — Overview removed " +
-          "its copy, System is now the only renderer.",
-      ).toBe(true)
     })
   })
 })

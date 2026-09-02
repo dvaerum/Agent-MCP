@@ -5,9 +5,6 @@ both unified by living on the bare ``/api`` prefix:
 
 Cross-resource reads (genuine composition):
   * ``GET /api/status`` — system status
-  * ``GET /api/graph-data`` — agents/tasks/files relationship graph
-  * ``GET /api/task-tree-data`` — task tree
-  * ``GET /api/node-details`` — node detail panel reads
   * ``GET /api/all-data`` — single-call dashboard hydration blob
   * ``GET /api/context-data`` — memory-only payload (URL doesn't
     match ``/api/memories`` so it stays here, not on the memories
@@ -50,10 +47,7 @@ from ..rest_principal import RestPrincipal
 from ...core.authorize import AuthRejected
 from ...core.config import logger
 from ...core import globals as g
-from ...core.agent_secrets import (
-    strip_agent_secrets,
-    without_secret_columns,
-)
+from ...core.agent_secrets import strip_agent_secrets
 from ...core.operator_tier import (
     is_confirmed_operator_tier as _shared_is_confirmed_operator_tier,
 )
@@ -70,10 +64,6 @@ from ...core.tool_result import (
 from ...db.connection import get_db_connection
 from ...db.engine import SessionLocal
 from ...db.models import ProjectContext
-from ...features.dashboard.api import (
-    fetch_graph_data_logic,
-    fetch_task_tree_data_logic,
-)
 from ...tools.registry import ToolInputValidationError, dispatch_tool_call
 from ...utils.json_utils import get_sanitized_json_body
 from .agents import _mcp_presence_for
@@ -201,7 +191,7 @@ async def simple_status_api_route(
     auth: RestPrincipal = Depends(require_operator_session),
 ) -> JSONResponse:
     # SECURITY (AZ-R28-1): gated to match the composition router's other
-    # reads (node-details / all-data / context-data). AuthHeaderMiddleware
+    # reads (all-data / context-data). AuthHeaderMiddleware
     # gates only /mcp, not /api/*, so without this dep the backend's own
     # (UDS) surface served system status unauthenticated — the direct-UDS
     # defense-in-depth tier PRs #280 / #281 closed on the sibling reads.
@@ -234,162 +224,6 @@ async def simple_status_api_route(
     except Exception as e:
         logger.error(f"Error in simple_status_api_route: {e}", exc_info=True)
         return JSONResponse({"error": "Failed to get simple status."}, status_code=500)
-
-
-@router.get("/graph-data")
-async def graph_data_api_route(
-    request: Request,
-    auth: RestPrincipal = Depends(require_operator_session),
-) -> JSONResponse:
-    # SECURITY (AZ-R28-1): gated to match the sibling composition reads —
-    # see simple_status_api_route.
-    #
-    # ADR-0017 (Wave 12 PR B): project_context node descriptions render
-    # AS-IS — no content-based redaction, so no confirmed-operator-tier
-    # signal is threaded into the graph builder any more.
-    #
-    # PERF/DOS (pentest R2-F2): bound the per-section reads with the SAME
-    # clamp ``/api/all-data`` uses (``_clamp_section_limit``) so this
-    # sibling can't full-table-scan tasks / project_context /
-    # agent_actions on every dashboard refresh. ``?limit=`` overrides
-    # within ``[1, _ALL_DATA_MAX_LIMIT]``.
-    try:
-        data = await fetch_graph_data_logic(
-            g.file_map.copy(),
-            limit=_clamp_section_limit(request),
-        )
-        return JSONResponse(data)
-    except Exception as e:
-        logger.error(f"Error serving graph data: {e}", exc_info=True)
-        return JSONResponse({'nodes': [], 'edges': [], 'error': 'Failed to serve graph data.'}, status_code=500)
-
-
-@router.get("/task-tree-data")
-async def task_tree_data_api_route(
-    request: Request,
-    auth: RestPrincipal = Depends(require_operator_session),
-) -> JSONResponse:
-    # SECURITY (AZ-R28-1): gated to match the sibling composition reads —
-    # see simple_status_api_route.
-    #
-    # PERF/DOS (pentest R2-F2): bound the task read with the SAME clamp
-    # ``/api/all-data`` uses (``_clamp_section_limit``); ``?limit=``
-    # overrides within ``[1, _ALL_DATA_MAX_LIMIT]``.
-    try:
-        data = await fetch_task_tree_data_logic(
-            limit=_clamp_section_limit(request)
-        )
-        return JSONResponse(data)
-    except Exception as e:
-        logger.error(f"Error serving task tree data: {e}", exc_info=True)
-        return JSONResponse({'nodes': [], 'edges': [], 'error': 'Failed to serve task tree data.'}, status_code=500)
-
-
-#: Columns the node-details panel DISPLAYS for an ``agent_<id>`` node.
-#: A presentation choice, deliberately narrower than the agents model
-#: (it omits the profile bookkeeping and ``last_activity_at``) — the
-#: previous ``SELECT *`` + ``dict(row)`` returned everything verbatim,
-#: including the bearer.
-#:
-#: N6: the SECURITY half is no longer this list's job. It is filtered
-#: through ``without_secret_columns``, so a credential column added to
-#: the display list — or a new column marked ``info={"secret": True}``
-#: on the model — is dropped structurally instead of relying on the
-#: "keep this in sync with the agents model" comment that used to sit
-#: here. This panel withholds bearers from EVERY tier, confirmed
-#: operators included: it is a display surface, not a credential one.
-_AGENT_NODE_DISPLAY_COLUMNS = (
-    "agent_id",
-    "status",
-    "agent_role",
-    "created_at",
-    "updated_at",
-    "terminated_at",
-    "current_task",
-    "working_directory",
-    "color",
-    "auto_event_loop",
-    "last_event_seen_at",
-)
-
-_AGENT_NODE_SAFE_COLUMNS = without_secret_columns(_AGENT_NODE_DISPLAY_COLUMNS)
-
-
-@router.get("/node-details")
-async def node_details_api_route(
-    request: Request,
-    auth: RestPrincipal = Depends(require_operator_session),
-) -> JSONResponse:
-    # SECURITY: this endpoint previously had NO auth dependency and, for
-    # an ``agent_<id>`` node, returned ``SELECT * FROM agents`` verbatim
-    # — including the secret bearer ``token`` column. The router admits
-    # viewer-tier operators on GET, so any viewer could harvest an
-    # agent's bearer and replay it to escalate to write. The gate below
-    # + the safe-column projection in the ``agent`` branch close it.
-    node_id = request.query_params.get('node_id')
-    if not node_id:
-        return JSONResponse({'error': 'Missing node_id parameter'}, status_code=400)
-    details: Dict[str, Any] = {'id': node_id, 'type': 'unknown', 'data': {}, 'actions': [], 'related': {}}
-    conn = None
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        parts = node_id.split('_', 1)
-        node_type_from_id = parts[0] if len(parts) > 1 else node_id
-        actual_id_from_node = parts[1] if len(parts) > 1 else (node_id if node_type_from_id != 'admin' else 'admin')
-        details['type'] = node_type_from_id
-        if node_type_from_id == 'agent':
-            # Explicit safe-column projection — NEVER ``SELECT *`` here:
-            # the agents table holds credential columns which must not
-            # reach any dashboard client. See ``_AGENT_NODE_SAFE_COLUMNS``,
-            # which is the display list minus whatever
-            # ``core.agent_secrets`` says is secret.
-            _cols = ", ".join(_AGENT_NODE_SAFE_COLUMNS)
-            cursor.execute(
-                f"SELECT {_cols} FROM agents WHERE agent_id = ?",
-                (actual_id_from_node,),
-            )
-            row = cursor.fetchone()
-            if row:
-                details['data'] = dict(row)
-            cursor.execute("SELECT timestamp, action_type, task_id, details FROM agent_actions WHERE agent_id = ? ORDER BY timestamp DESC LIMIT 10", (actual_id_from_node,))
-            details['actions'] = [dict(r) for r in cursor.fetchall()]
-            cursor.execute("SELECT task_id, title, status, priority FROM tasks WHERE assigned_to = ? ORDER BY created_at DESC LIMIT 10", (actual_id_from_node,))
-            details['related']['assigned_tasks'] = [dict(r) for r in cursor.fetchall()]
-        elif node_type_from_id == 'task':
-            cursor.execute("SELECT * FROM tasks WHERE task_id = ?", (actual_id_from_node,))
-            row = cursor.fetchone()
-            if row:
-                details['data'] = dict(row)
-            cursor.execute("SELECT timestamp, agent_id, action_type, details FROM agent_actions WHERE task_id = ? ORDER BY timestamp DESC LIMIT 10", (actual_id_from_node,))
-            details['actions'] = [dict(r) for r in cursor.fetchall()]
-        elif node_type_from_id == 'context':
-            cursor.execute("SELECT * FROM project_context WHERE context_key = ?", (actual_id_from_node,))
-            row = cursor.fetchone()
-            if row:
-                # ADR-0017 (Wave 12 PR B): project_context is shared
-                # project knowledge — returned AS-IS, no content-based
-                # secret redaction.
-                details['data'] = dict(row)
-            cursor.execute("SELECT timestamp, agent_id, action_type FROM agent_actions WHERE (action_type = 'updated_context' OR action_type = 'update_project_context') AND details LIKE ? ORDER BY timestamp DESC LIMIT 5", (f'%"{actual_id_from_node}"%',))
-            details['actions'] = [dict(r) for r in cursor.fetchall()]
-        elif node_type_from_id == 'file':
-            details['data'] = {'filepath': actual_id_from_node, 'info': g.file_map.get(actual_id_from_node, {})}
-            cursor.execute("SELECT timestamp, agent_id, action_type, details FROM agent_actions WHERE (action_type LIKE '%_file' OR action_type LIKE 'claim_file_%' OR action_type = 'release_file') AND details LIKE ? ORDER BY timestamp DESC LIMIT 5", (f'%"{actual_id_from_node}"%',))
-            details['actions'] = [dict(r) for r in cursor.fetchall()]
-        elif node_type_from_id == 'admin':
-            details['data'] = {'name': 'Admin User / System'}
-            cursor.execute("SELECT timestamp, action_type, task_id, details FROM agent_actions WHERE agent_id = 'admin' ORDER BY timestamp DESC LIMIT 10")
-            details['actions'] = [dict(r) for r in cursor.fetchall()]
-        if not details.get('data') and node_type_from_id not in ['admin']:
-            return JSONResponse({'error': 'Node data not found or type unrecognized'}, status_code=404)
-    except Exception as e:
-        logger.error(f"Error fetching details for node {node_id}: {e}", exc_info=True)
-        return JSONResponse({'error': 'Failed to fetch node details.'}, status_code=500)
-    finally:
-        if conn:
-            conn.close()
-    return JSONResponse(details)
 
 
 # --- Comprehensive Data Endpoint ---
@@ -480,10 +314,9 @@ async def all_data_api_route(
             # disclosure that ``auth_token`` gating otherwise closes, and
             # /api/all-data IS served to the viewer tier (the router
             # admits viewers on GET). N6: the column NAMES come from
-            # ``core.agent_secrets`` — the same declaration node-details
-            # projects against — so the two agent-exposing surfaces
-            # cannot disagree about what a credential is. (Operators edit
-            # AoE via the operator-gated POST /api/agents/<id>/edit path.)
+            # ``core.agent_secrets`` — the single declaration of what
+            # counts as an agent credential. (Operators edit AoE via the
+            # operator-gated POST /api/agents/<id>/edit path.)
             agent_dict = strip_agent_secrets(dict(row))
             # Defensive skip for the legacy 'admin' pseudo-agent row.
             # Wave 4 (migration 0014) deletes it; this filter remains

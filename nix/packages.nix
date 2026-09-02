@@ -190,9 +190,9 @@ let
     src = "${src}/agent_mcp/dashboard";
     # Re-set whenever the dashboard's package-lock.json changes
     # upstream (rare). On hash mismatch, nix prints the correct
-    # value; paste it here. Updated 2026-08-19 for pentest-all R1-F3 —
-    # nanoid override (^3.3.18) closing GHSA-2v37-7h3g-55p8.
-    npmDepsHash = "sha256-LhcOeeLIbG5Jezjc7UVZSWzywvMxyV6xttoBHytqoeI=";
+    # value; paste it here. Updated 2026-09-02: vis-network dropped
+    # (System page removed).
+    npmDepsHash = "sha256-ULW168sMSy2igETqZAfJ+n4Pgeh/sbh+LCGQoVBglpE=";
     NEXT_PUBLIC_AUTO_CONNECT = "false";
     NEXT_PUBLIC_DEFAULT_SERVER_HOST = "";
     NEXT_PUBLIC_DEFAULT_SERVER_PORT = "";

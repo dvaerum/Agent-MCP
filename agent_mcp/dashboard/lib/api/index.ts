@@ -65,8 +65,6 @@ export {
 } from './messages'
 
 export {
-  type GraphNode,
-  type GraphEdge,
   type SystemStatus,
   type RawAllData,
   systemStatusGuard,

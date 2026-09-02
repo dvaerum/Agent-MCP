@@ -1,7 +1,7 @@
 """Per-(name, role) lock serialises ``_ensure()`` calls.
 
 The dashboard's first-paint fires several parallel API calls
-(``/status``, ``/agents``, ``/tasks``, ``/graph-data``). Without the
+(``/status``, ``/agents``, ``/tasks``). Without the
 ``ensure_locks`` mutex each one races ``systemctl`` independently —
 fastest wins, the rest see the unit in a transient state and issue a
 ``restart``, causing a stop/start storm and a ~10-second window where

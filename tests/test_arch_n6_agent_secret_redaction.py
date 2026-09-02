@@ -1,21 +1,18 @@
 """N6 structural half — one owner for "which agent columns are secret".
 
-Four surfaces withhold agent bearer secrets. They agreed on the *who*
+Three surfaces withhold agent bearer secrets. They agreed on the *who*
 (``core/operator_tier.is_confirmed_operator_tier``) but each restated the
 *what* — which columns count as credentials — in its own way:
 
 * ``tools/admin_tools.get_agent_tokens`` overwrote ``token`` with
   ``"***"`` (and knew about ``token`` only);
 * ``routers/composition./all-data`` ``pop``'d two hardcoded column names;
-* ``routers/composition./node-details`` kept a hand-written safe-column
-  allowlist whose comment said "Keep this in sync with the agents model
-  when columns change";
 * ``routers/settings./api/tokens`` gates the whole endpoint instead.
 
-Four restatements of one fact is the shape that drifts. This module pins
+Three restatements of one fact is the shape that drifts. This module pins
 both halves of the fix:
 
-1. **Behaviour is unchanged.** Every per-tier outcome at all four sites
+1. **Behaviour is unchanged.** Every per-tier outcome at all three sites
    is asserted here against the exact wire shape, so the consolidation
    cannot quietly widen or narrow what any caller receives. These
    assertions were written against the OLD mechanics and pass unmodified
@@ -23,7 +20,7 @@ both halves of the fix:
 2. **The vocabulary is now derived, once.** The secret set comes from
    ``mapped_column(..., info={"secret": True})`` on the ORM model, and a
    synthetic extra secret column proves every consuming site closes over
-   it automatically rather than needing four edits.
+   it automatically rather than needing multiple edits.
 """
 
 from __future__ import annotations
@@ -105,12 +102,9 @@ def test_strip_drops_every_declared_secret_column() -> None:
     assert strip_agent_secrets(row) == {"agent_id": "w1"}
 
 
-def test_display_allowlist_cannot_carry_a_secret_column() -> None:
-    """``/node-details``' projection stays a hand-chosen presentation
-    list, but a secret slipped into it is filtered out structurally."""
-    from agent_mcp.app.routers.composition import _AGENT_NODE_SAFE_COLUMNS
-
-    assert not set(_AGENT_NODE_SAFE_COLUMNS) & agent_secret_columns()
+def test_without_secret_columns_filters_declared_secrets() -> None:
+    """A hand-chosen display allowlist has any declared secret filtered
+    out structurally, regardless of which surface builds the list."""
     assert without_secret_columns(
         ("agent_id", "token", "status", "aoe_session_id")
     ) == ("agent_id", "status")
@@ -237,37 +231,7 @@ async def test_all_data_never_returns_a_raw_secret_column(
         assert w1["auth_token"] == (worker.token if confirmed else None)
 
 
-# ── site C: REST /api/node-details (allowlist, no tier at all) ────
-
-
-@pytest.mark.parametrize("confirmed", [True, False])
-async def test_node_details_withholds_secrets_from_every_tier(
-    tmp_path, confirmed: bool,
-) -> None:
-    """Including a CONFIRMED operator: this panel is a display surface,
-    not a credential surface. Pinning both tiers is the point — routing
-    it through a tier-conditional redactor would change this."""
-    async with mcp_session(tmp_path) as admin:
-        _seed_agent("w-node", "tok-node-1234567890")
-
-        url = "/api/node-details?node_id=agent_w-node"
-        if confirmed:
-            r = admin.client.get(
-                url, headers={"Authorization": f"Bearer {admin.admin_token}"},
-            )
-        else:
-            r = admin.get(url)
-        assert r.status_code == 200, r.text
-
-        data = r.json()["data"]
-        assert data["agent_id"] == "w-node"
-        assert "token" not in data
-        assert "aoe_session_id" not in data
-        assert "tok-node-1234567890" not in r.text
-        assert "deadbeefcafe0000" not in r.text
-
-
-# ── site D: REST /api/tokens (gate, not redaction) ────────────────
+# ── site C: REST /api/tokens (gate, not redaction) ────────────────
 
 
 async def test_tokens_endpoint_gates_rather_than_masks(tmp_path) -> None:

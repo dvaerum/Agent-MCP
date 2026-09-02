@@ -35,8 +35,7 @@ def _clamp_section_limit(request: Request) -> int:
 
     Single source of truth for the bounded-read clamp. ``/api/all-data``
     grew this clamp first (db review item 2); pentest R2-F2 converged the
-    sibling composition reads (``/api/graph-data``,
-    ``/api/task-tree-data``, ``/api/context-data``) onto it, and pentest
+    sibling composition read ``/api/context-data`` onto it, and pentest
     R3-F3 converged the remaining standalone list reads
     (``/api/tasks``, ``/api/agents``) onto it too — so every list read
     shares ONE default + upper bound and can't drift. Callers that want
