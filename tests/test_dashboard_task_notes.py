@@ -19,6 +19,19 @@ Notes are append-only — the backend has no per-note primary key. The brief
 mentioned per-note edit / delete REST endpoints; those would require a
 schema migration and are intentionally out of scope here. See
 /tmp/task-notes-investigation-20260602-054631Z.md for the full rationale.
+
+**note→comment rename (PR 1/3, prancy-napping-pie)**: this dashboard
+feature is a DIFFERENT, unrelated system from the `task_comments` side
+table / `add_task_comment` MCP tool the rest of this rename PR touches —
+this file's UI writes to the legacy `tasks.notes` JSON-blob column via
+`/api/update-task-dashboard`, not the side table. The wire contract
+(the `notes` field name in the Task type, the API client, and the
+backend route/tool) is UNCHANGED and correctly still says "notes"
+throughout this file's backend-facing tests. Only the user-visible
+COPY was renamed to "Comment(s)" for product-wide vocabulary
+consistency — the four label-checking tests below were updated to
+match; everything below "ApiClient + types" stays on "notes" on
+purpose.
 """
 
 from __future__ import annotations
@@ -63,82 +76,89 @@ def _src(p: Path) -> str:
 # ---------- View dialog ------------------------------------------------
 
 
-def test_view_dialog_has_notes_section_label() -> None:
-    """The View dialog must render a literal "Notes" section label so the
-    admin can see the notes list (and the empty state when empty).
+def test_view_dialog_has_comments_section_label() -> None:
+    """The View dialog must render a literal "Comments" section label so
+    the admin can see the comments list (and the empty state when empty).
     Previously the section was gated on `notes.length > 0` so empty-notes
     tasks rendered no notes section at all — confusing because there's
-    then no visible affordance saying "this task has no notes".
+    then no visible affordance saying "this task has no comments".
     """
     src = _src(DASHBOARD)
-    # Match the Label/header for the notes section. Accepts either the
-    # legacy `Notes ({notes.length})` static label or the dynamic
-    # variant that drops the count when there are zero notes.
-    assert re.search(r">\s*Notes\b", src), (
-        "expected the View dialog to render a 'Notes' label/header. "
+    # Match the Label/header for the comments section. Accepts either the
+    # legacy `Comments ({comments.length})` static label or the dynamic
+    # variant that drops the count when there are zero comments.
+    assert re.search(r">\s*Comments\b", src), (
+        "expected the View dialog to render a 'Comments' label/header. "
         "After PR #49 / #68, the notes block is gated on `notes.length > 0` "
         "and silently absent for empty-notes tasks."
     )
 
 
-def test_view_dialog_notes_section_renders_unconditionally() -> None:
-    """The Notes section must render even when the task has zero notes
-    (with an empty-state message). Otherwise the admin can't tell whether
-    the feature exists for empty tasks. The fix is to drop the
-    `notes.length > 0 &&` guard on the section wrapper.
+def test_view_dialog_comments_section_renders_unconditionally() -> None:
+    """The Comments section must render even when the task has zero
+    comments (with an empty-state message). Otherwise the admin can't
+    tell whether the feature exists for empty tasks. The fix is to drop
+    any `comments.length > 0 &&` early-return guard on the section
+    wrapper — the section should render both branches (list or empty
+    state) unconditionally, e.g. via a ternary.
     """
     src = _src(DASHBOARD)
-    # The legacy gating expression we want to be GONE.
-    assert "{notes.length > 0 && (" not in src, (
-        "expected the `{notes.length > 0 && (` guard around the View "
-        "dialog Notes section to be removed — the section should always "
-        "render with an empty state when there are no notes."
+    # The legacy gating expression we want to be GONE. Checked against
+    # the CURRENT variable name (`comments`, post note→comment rename)
+    # — checking the old `notes` spelling here would trivially always
+    # pass post-rename regardless of whether this exact bug regressed.
+    assert "{comments.length > 0 && (" not in src, (
+        "expected the `{comments.length > 0 && (` guard around the View "
+        "dialog Comments section to be removed — the section should "
+        "always render with an empty state when there are no comments."
     )
 
 
-def test_view_dialog_has_empty_notes_state() -> None:
-    """When there are zero notes the View dialog should show an empty
-    state ("No notes yet." or similar) rather than rendering nothing."""
+def test_view_dialog_has_empty_comments_state() -> None:
+    """When there are zero comments the View dialog should show an empty
+    state ("No comments yet." or similar) rather than rendering nothing."""
     src = _src(DASHBOARD)
     # Accept either the exact phrase or a reasonable variant.
-    assert re.search(r"No notes yet", src, re.IGNORECASE), (
-        "expected an empty-state message like 'No notes yet.' in the "
-        "View dialog Notes section so admins can see the section even "
-        "when the task has no notes."
+    assert re.search(r"No comments yet", src, re.IGNORECASE), (
+        "expected an empty-state message like 'No comments yet.' in the "
+        "View dialog Comments section so admins can see the section even "
+        "when the task has no comments."
     )
 
 
 # ---------- Edit dialog ------------------------------------------------
 
 
-def test_edit_dialog_has_add_note_textarea() -> None:
+def test_edit_dialog_has_add_comment_textarea() -> None:
     """The Edit dialog must have a `<Textarea>` field for adding a new
-    note. Old design had an "Add Note" sidebar button using window.prompt;
-    PR #49 replaced the sidebar but the Edit dialog never grew a notes
-    textarea, so the feature was effectively lost.
+    comment. Old design had an "Add Note" sidebar button using
+    window.prompt; PR #49 replaced the sidebar but the Edit dialog never
+    grew a notes textarea, so the feature was effectively lost.
     """
     src = _src(DASHBOARD)
-    assert "edit-task-note" in src, (
-        "expected an `id=\"edit-task-note\"` Textarea (or similar) in "
-        "the Edit dialog for adding a new note. The Edit dialog "
+    assert "edit-task-comment" in src, (
+        "expected an `id=\"edit-task-comment\"` Textarea (or similar) in "
+        "the Edit dialog for adding a new comment. The Edit dialog "
         "currently has title / description / status / priority / "
-        "assigned_to but no notes field, so the dashboard cannot append "
-        "notes anywhere — feature regressed in PR #49."
+        "assigned_to but no comment field, so the dashboard cannot "
+        "append comments anywhere — feature regressed in PR #49."
     )
 
 
-def test_edit_dialog_has_add_note_label() -> None:
-    """The Add-note Textarea needs a visible label ("Add note" or "New
-    note") so the admin knows what the field does. Distinguishing this
-    from `description` matters because `notes` is *append* semantics
-    (server adds a new entry to the JSON array) while `description` is
-    *overwrite* semantics.
+def test_edit_dialog_has_add_comment_label() -> None:
+    """The Add-comment Textarea needs a visible label ("Add comment" or
+    "New comment") so the admin knows what the field does.
+    Distinguishing this from `description` matters because `notes` is
+    *append* semantics (server adds a new entry to the JSON array) while
+    `description` is *overwrite* semantics.
     """
     src = _src(DASHBOARD)
-    assert re.search(r"(Add note|Add a note|New note)", src, re.IGNORECASE), (
-        "expected a visible 'Add note' / 'New note' label in the Edit "
-        "dialog near the notes textarea so the field's append semantics "
-        "are clear (vs description which is overwrite)."
+    assert re.search(
+        r"(Add comment|Add a comment|New comment)", src, re.IGNORECASE
+    ), (
+        "expected a visible 'Add comment' / 'New comment' label in the "
+        "Edit dialog near the comment textarea so the field's append "
+        "semantics are clear (vs description which is overwrite)."
     )
 
 
@@ -168,7 +188,9 @@ def test_edit_dialog_submits_notes_in_patch() -> None:
         "pattern needs updating."
     )
     region = edit_dialog_region.group(0)
-    assert re.search(r"\b(patch\.notes|notes:\s*\w+|editNote)\b", region), (
+    assert re.search(
+        r"\b(patch\.notes|notes:\s*\w+|editNote|editComment)\b", region
+    ), (
         "expected the Edit dialog save handler to wire the new-note "
         "textarea (`editNote` or similar) into the patch sent to "
         "`apiClient.updateTask`, either as `notes: trimmedNote` in the "

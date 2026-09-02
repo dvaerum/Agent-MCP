@@ -7,7 +7,7 @@ source of truth for the schema. This module is now a thin runner:
 * `init_database()` calls `Base.metadata.create_all(engine)` against
   every model registered under `agent_mcp.db.models`. That covers
   every persistent table the application owns (agents, tasks,
-  task_notes, agent_actions, project_context, file_metadata,
+  task_comments, agent_actions, project_context, file_metadata,
   rag_chunks, rag_meta, agent_messages, claude_code_sessions,
   mcp_sessions) along with their canonical indexes.
 

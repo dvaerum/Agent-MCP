@@ -16,7 +16,7 @@ import { apiClient, type Task } from "@/lib/api"
 import { cn, formatRelative } from "@/lib/utils"
 import { AgentSelect } from "@/components/dashboard/shared/agent-select"
 import { FormDialog } from "@/components/dashboard/shared/form-dialog"
-import { isTombstone, parseTaskNotes } from "@/components/dashboard/tasks/tasks-api"
+import { isTombstone, parseTaskComments } from "@/components/dashboard/tasks/tasks-api"
 
 export interface EditTaskDialogProps {
   task: Task | null
@@ -41,22 +41,22 @@ export function EditTaskDialog({ task, onOpenChange, onSaved }: EditTaskDialogPr
   const [editPriority, setEditPriority] = useState<Task['priority']>('medium')
   // AgentSelect speaks `string | null` directly; null = unassigned.
   const [editAssignedTo, setEditAssignedTo] = useState<string | null>(null)
-  // New-note textarea is append-only: the backend stores notes as a
+  // New-comment textarea is append-only: the backend stores notes as a
   // JSON array and `/api/update-task-dashboard` appends a single
-  // entry per request. Empty string = no note added. Cleared on save.
-  const [editNote, setEditNote] = useState<string>('')
+  // entry per request. Empty string = no comment added. Cleared on save.
+  const [editComment, setEditComment] = useState<string>('')
 
-  // Existing notes for the "Existing notes" preview block at the
+  // Existing comments for the "Existing comments" preview block at the
   // bottom of the Edit dialog. Read-only here — to edit historical
-  // notes you'd need per-note IDs which don't exist in the schema.
-  const existingNotes = task ? parseTaskNotes(task.notes) : []
+  // comments you'd need per-comment IDs which don't exist in the schema.
+  const existingComments = task ? parseTaskComments(task.notes) : []
 
   // Re-seed form whenever the dialog opens for a *different* task.
   // Note: with live-lookup useDialog (Candidate D, 2026-06-02) the
   // `task` prop reference can change on every background refresh
   // even when the underlying fields are unchanged — keying the effect
   // on task identity prevents the refresh from blowing away the
-  // admin's in-progress edits. Only the New-note textarea is reset
+  // admin's in-progress edits. Only the New-comment textarea is reset
   // between opens; existing field edits survive.
   const taskId = task?.task_id
   useEffect(() => {
@@ -66,7 +66,7 @@ export function EditTaskDialog({ task, onOpenChange, onSaved }: EditTaskDialogPr
     setEditStatus(task.status || 'pending')
     setEditPriority(task.priority || 'medium')
     setEditAssignedTo(task.assigned_to || null)
-    setEditNote('')
+    setEditComment('')
     // We deliberately depend on taskId, not the whole task object —
     // see the comment above.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -94,15 +94,15 @@ export function EditTaskDialog({ task, onOpenChange, onSaved }: EditTaskDialogPr
       // AgentSelect speaks string|null directly — pass it through.
       assigned_to: editAssignedTo,
     }
-    // Append-only: only include `notes` in the patch when the new-note
+    // Append-only: only include `notes` in the patch when the new-comment
     // textarea has content. The backend treats `notes: str` as "append
     // a new entry with author=admin + timestamp"; passing empty would
     // be a no-op but we omit it to keep the request body minimal.
-    const trimmedNote = editNote.trim()
-    if (trimmedNote) patch.notes = trimmedNote
+    const trimmedComment = editComment.trim()
+    if (trimmedComment) patch.notes = trimmedComment
     await apiClient.updateTask(task.task_id, patch)
     onSaved()
-    setEditNote('')
+    setEditComment('')
   }
 
   return (
@@ -189,44 +189,44 @@ export function EditTaskDialog({ task, onOpenChange, onSaved }: EditTaskDialogPr
             />
           </div>
           {/*
-            Add-note section. Append-only — the backend appends a new
+            Add-comment section. Append-only — the backend appends a new
             {timestamp, author, content} entry to the JSON notes array;
-            we cannot edit/delete historical notes per-id (no PK in the
+            we cannot edit/delete historical comments per-id (no PK in the
             schema). Leaving the textarea empty skips the notes field in
-            the patch. The existing-notes preview below is read-only and
-            gives the admin context for the new note they're typing.
+            the patch. The existing-comments preview below is read-only and
+            gives the admin context for the new comment they're typing.
           */}
           <div className="border-t border-border pt-4 space-y-2">
-            <Label htmlFor="edit-task-note" className="text-sm text-muted-foreground">
-              Add note
+            <Label htmlFor="edit-task-comment" className="text-sm text-muted-foreground">
+              Add comment
             </Label>
             <Textarea
-              id="edit-task-note"
-              value={editNote}
-              onChange={(e) => setEditNote(e.target.value)}
-              placeholder="Optional. Appended to the task notes log with your admin id and a timestamp."
+              id="edit-task-comment"
+              value={editComment}
+              onChange={(e) => setEditComment(e.target.value)}
+              placeholder="Optional. Appended to the task comments log with your admin id and a timestamp."
               className="w-full bg-background border-border text-foreground min-h-[60px] whitespace-pre-wrap text-sm"
             />
-            {existingNotes.length > 0 && (
+            {existingComments.length > 0 && (
               <details className="text-xs text-muted-foreground">
                 <summary className="cursor-pointer hover:text-foreground">
-                  Existing notes ({existingNotes.length})
+                  Existing comments ({existingComments.length})
                 </summary>
                 <div className="mt-2 space-y-2 max-h-[20vh] overflow-y-auto">
-                  {existingNotes.map((note, idx: number) => (
+                  {existingComments.map((comment, idx: number) => (
                     <div key={idx} className="bg-muted/40 rounded p-2">
                       <div className="flex items-center justify-between mb-1">
                         <span className={cn(
                           "font-medium",
-                          isTombstone(note.author) && "italic"
+                          isTombstone(comment.author) && "italic"
                         )}>
-                          {note.author || 'unknown'}
+                          {comment.author || 'unknown'}
                         </span>
-                        <span title={note.timestamp}>
-                          {formatRelative(note.timestamp)}
+                        <span title={comment.timestamp}>
+                          {formatRelative(comment.timestamp)}
                         </span>
                       </div>
-                      <p className="whitespace-pre-wrap text-foreground">{note.content}</p>
+                      <p className="whitespace-pre-wrap text-foreground">{comment.content}</p>
                     </div>
                   ))}
                 </div>

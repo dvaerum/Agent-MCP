@@ -81,9 +81,9 @@ class NotFound:
     caller-visible surface (MCP text, HTTP body, legacy error string). It
     exists so a tool can FUSE "no such resource" with an
     authorization-shaped rejection into ONE opaque outcome without a
-    second ``ToolResult`` variant — e.g. ``edit_task_note`` deliberately
-    returns the SAME ``NotFound`` for a missing note and a foreign-authored
-    one (PF-1 note-existence oracle) while still telling the worker the
+    second ``ToolResult`` variant — e.g. ``edit_task_comment`` deliberately
+    returns the SAME ``NotFound`` for a missing comment and a foreign-authored
+    one (PF-1 comment-existence oracle) while still telling the worker the
     author-only edit/delete policy. Keep it a STATIC clause: never
     interpolate a resource owner's identity into it, or the fused message
     leaks the very fact the fusion is meant to hide. ``None`` (the default)

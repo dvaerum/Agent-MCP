@@ -17,7 +17,7 @@ import {
   statusBadgeClass,
   priorityBadgeClass,
   isTombstone,
-  parseTaskNotes,
+  parseTaskComments,
 } from "@/components/dashboard/tasks/tasks-api"
 import { ViewDialogFooter } from "@/components/dashboard/shared/view-dialog-footer"
 
@@ -47,7 +47,7 @@ export function ViewTaskDialog({ task, onOpenChange, onEdit, onDelete }: ViewTas
   // NOT normalized there, so it keeps a small typed parse.
   const dependencies = task?.depends_on_tasks ?? []
   const childTasks = task?.child_tasks ?? []
-  const notes = task ? parseTaskNotes(task.notes) : []
+  const comments = task ? parseTaskComments(task.notes) : []
   const createdBy: string | undefined = task?.created_by
 
   return (
@@ -192,39 +192,39 @@ export function ViewTaskDialog({ task, onOpenChange, onEdit, onDelete }: ViewTas
               )}
 
               {/*
-                Group 4: notes — always renders, with an empty state
-                when the task has none. Gating on `notes.length > 0`
+                Group 4: comments — always renders, with an empty state
+                when the task has none. Gating on `comments.length > 0`
                 hid the section completely for empty tasks (no
-                affordance, no hint the feature exists). The Add-note
+                affordance, no hint the feature exists). The Add-comment
                 affordance lives in the Edit dialog (`apiClient.updateTask`
                 with `notes: string` appends a new entry).
               */}
               <div className="border-t border-border pt-4 space-y-2">
                 <Label className="text-xs text-muted-foreground uppercase tracking-wider">
-                  Notes{notes.length > 0 ? ` (${notes.length})` : ''}
+                  Comments{comments.length > 0 ? ` (${comments.length})` : ''}
                 </Label>
-                {notes.length > 0 ? (
+                {comments.length > 0 ? (
                   <div className="space-y-2">
-                    {notes.map((note, idx) => (
+                    {comments.map((comment, idx) => (
                       <div key={idx} className="bg-muted/50 rounded-lg p-3">
                         <div className="flex items-center justify-between mb-1 text-xs">
                           <span className={cn(
                             "font-medium",
-                            isTombstone(note.author) && "text-muted-foreground italic"
+                            isTombstone(comment.author) && "text-muted-foreground italic"
                           )}>
-                            {note.author || 'unknown'}
+                            {comment.author || 'unknown'}
                           </span>
-                          <span className="text-muted-foreground" title={note.timestamp}>
-                            {formatRelative(note.timestamp)}
+                          <span className="text-muted-foreground" title={comment.timestamp}>
+                            {formatRelative(comment.timestamp)}
                           </span>
                         </div>
-                        <p className="text-sm whitespace-pre-wrap">{note.content}</p>
+                        <p className="text-sm whitespace-pre-wrap">{comment.content}</p>
                       </div>
                     ))}
                   </div>
                 ) : (
                   <p className="text-sm text-muted-foreground italic">
-                    No notes yet. Use the Edit dialog to add one.
+                    No comments yet. Use the Edit dialog to add one.
                   </p>
                 )}
               </div>

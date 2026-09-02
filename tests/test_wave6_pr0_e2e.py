@@ -41,16 +41,16 @@ pytestmark = pytest.mark.asyncio
 
 
 def _insert_task(task_id: str, *, assigned_to: str | None = None) -> None:
-    """Seed a task row so add_note's FK is satisfied.
+    """Seed a task row so add_comment's FK is satisfied.
 
-    Mirrors the helper in ``tests/test_sqlalchemy_task_note.py`` —
-    the side-table FK rejects orphan notes, so each test that adds
-    a note has to seed the parent first. Kept inline rather than
+    Mirrors the helper in ``tests/test_sqlalchemy_task_comment.py`` —
+    the side-table FK rejects orphan comments, so each test that adds
+    a comment has to seed the parent first. Kept inline rather than
     imported so this file is self-contained when other tests
     reference it.
 
-    SEC Wave-B: ``add_task_note`` gates authorship on task ownership;
-    a worker authoring a note passes ``assigned_to=<worker_agent_id>``.
+    SEC Wave-B: ``add_task_comment`` gates authorship on task ownership;
+    a worker authoring a comment passes ``assigned_to=<worker_agent_id>``.
     """
     from agent_mcp.db.connection import get_db_connection
 
@@ -88,8 +88,8 @@ def _insert_task(task_id: str, *, assigned_to: str | None = None) -> None:
 # ── REST adapter path (operator-session) ─────────────────────────
 
 
-async def test_add_task_note_via_dispatch_returns_ok_with_data(tmp_path) -> None:
-    """The migrated ``add_task_note`` returns
+async def test_add_task_comment_via_dispatch_returns_ok_with_data(tmp_path) -> None:
+    """The migrated ``add_task_comment`` returns
     ``Ok(data={"note_id": ..., "task_id": ...}, message=...)`` for
     an operator-session principal. Proves the new return shape
     flows through the dispatch bridge unchanged.
@@ -111,7 +111,7 @@ async def test_add_task_note_via_dispatch_returns_ok_with_data(tmp_path) -> None
             source_token=None,
         )
         result = await dispatch_tool_call(
-            "add_task_note",
+            "add_task_comment",
             {"task_id": "wave6-demo-1", "text": "from alice"},
             principal=p,
         )
@@ -127,14 +127,14 @@ async def test_rest_adapter_maps_ok_with_data_to_200(tmp_path) -> None:
     """``_dispatch_through_tool`` maps an ``Ok(data=..., message=...)``
     return onto a 200 JSON envelope carrying the data field. This
     is the path the dashboard would take if it had a REST route
-    for add_task_note.
+    for add_task_comment.
     """
     from agent_mcp.app._dispatch_helpers import _dispatch_through_tool
 
     async with mcp_session(tmp_path) as admin:  # noqa: F841 (lifespan)
         _insert_task("wave6-demo-rest-1")
         response = await _dispatch_through_tool(
-            "add_task_note",
+            "add_task_comment",
             {"task_id": "wave6-demo-rest-1", "text": "rest path"},
             bearer_token=None,
             auth=RestPrincipal(kind="session", user={"username": "alice"}),
@@ -164,7 +164,7 @@ async def test_rest_adapter_maps_invalid_to_400(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:  # noqa: F841
         _insert_task("wave6-demo-rest-invalid")
         response = await _dispatch_through_tool(
-            "add_task_note",
+            "add_task_comment",
             {"task_id": "wave6-demo-rest-invalid", "text": ""},
             bearer_token=None,
             auth=RestPrincipal(kind="session", user={"username": "alice"}),
@@ -180,9 +180,9 @@ async def test_rest_adapter_maps_invalid_to_400(tmp_path) -> None:
 # ── MCP wire path (agent bearer) ─────────────────────────────────
 
 
-async def test_add_task_note_via_mcp_wire_renders_text_content(tmp_path) -> None:
+async def test_add_task_comment_via_mcp_wire_renders_text_content(tmp_path) -> None:
     """An agent-bearer call through the registered MCP handler
-    receives a ``[TextContent(text="Note ... added to task ...")]``
+    receives a ``[TextContent(text="Comment ... added to task ...")]``
     response. Proves the renderer at
     :func:`agent_mcp.core.tool_result.render_as_text_content`
     correctly converts ``Ok(message=...)`` back to the legacy MCP
@@ -191,7 +191,7 @@ async def test_add_task_note_via_mcp_wire_renders_text_content(tmp_path) -> None
     async with mcp_session(tmp_path) as admin:
         _insert_task("wave6-demo-mcp-1")
         result = await admin.assert_tool_succeeds(
-            "add_task_note",
+            "add_task_comment",
             {"task_id": "wave6-demo-mcp-1", "text": "via mcp wire"},
         )
         text = result[0].text
@@ -199,7 +199,7 @@ async def test_add_task_note_via_mcp_wire_renders_text_content(tmp_path) -> None
         assert "wave6-demo-mcp-1" in text
 
 
-async def test_add_task_note_worker_bearer_admits_as_agent(tmp_path) -> None:
+async def test_add_task_comment_worker_bearer_admits_as_agent(tmp_path) -> None:
     """Workers are agent_bearer principals; the migrated tool's
     policy admits any agent_bearer (or operator). Pins that the
     bridge derives the worker's Principal correctly from
@@ -209,14 +209,14 @@ async def test_add_task_note_worker_bearer_admits_as_agent(tmp_path) -> None:
         _insert_task("wave6-demo-worker-1", assigned_to="alice")
         alice = await admin.create_worker("alice")
         result = await alice.assert_tool_succeeds(
-            "add_task_note",
+            "add_task_comment",
             {"task_id": "wave6-demo-worker-1", "text": "from worker"},
         )
         text = result[0].text
         assert "added" in text.lower()
 
-        from agent_mcp.db.actions import task_notes_db
-        notes = task_notes_db.list_notes_for_task("wave6-demo-worker-1")
+        from agent_mcp.db.actions import task_comments_db
+        notes = task_comments_db.list_comments_for_task("wave6-demo-worker-1")
         # The author is "alice" because the bridge derives an
         # agent_bearer Principal from the worker's bearer token.
         assert len(notes) == 1
@@ -226,8 +226,8 @@ async def test_add_task_note_worker_bearer_admits_as_agent(tmp_path) -> None:
 # ── Bridge: unmigrated tool still works ──────────────────────────
 
 
-async def test_migrated_edit_task_note_returns_ok_through_renderer(tmp_path) -> None:
-    """The migrated ``edit_task_note`` returns :class:`Ok`; the
+async def test_migrated_edit_task_comment_returns_ok_through_renderer(tmp_path) -> None:
+    """The migrated ``edit_task_comment`` returns :class:`Ok`; the
     renderer at :func:`render_as_text_content` converts the
     ``Ok(message=...)`` back into the legacy ``list[TextContent]``
     shape MCP clients consume. Wave 6 PR 6: the legacy
@@ -240,28 +240,28 @@ async def test_migrated_edit_task_note_returns_ok_through_renderer(tmp_path) -> 
     ``arguments["token"]``; this is the same path real MCP clients
     take.
     """
-    from agent_mcp.db.actions import task_notes_db
+    from agent_mcp.db.actions import task_comments_db
 
     async with mcp_session(tmp_path) as admin:
         _insert_task("wave6-demo-bridge-1")
-        # Seed a note.
+        # Seed a comment.
         seed = await admin.assert_tool_succeeds(
-            "add_task_note",
+            "add_task_comment",
             {"task_id": "wave6-demo-bridge-1", "text": "v1"},
         )
         assert "added" in seed[0].text.lower()
-        notes = task_notes_db.list_notes_for_task("wave6-demo-bridge-1")
+        notes = task_comments_db.list_comments_for_task("wave6-demo-bridge-1")
         note_id = notes[0]["note_id"]
 
         result = await admin.assert_tool_succeeds(
-            "edit_task_note",
+            "edit_task_comment",
             {"note_id": note_id, "text": "v2"},
         )
 
         assert "updated" in result[0].text.lower(), result[0].text
         # Re-fetch (still inside mcp_session) to confirm the tool
         # actually performed its update.
-        updated = task_notes_db.get_note(note_id)
+        updated = task_comments_db.get_comment(note_id)
         assert updated is not None and updated["text"] == "v2"
 
 
@@ -279,7 +279,7 @@ async def test_with_principal_helper_stamps_request_principal(tmp_path) -> None:
     the request context, but the dispatcher itself never reads from
     a ContextVar fallback.
     """
-    from agent_mcp.db.actions import task_notes_db
+    from agent_mcp.db.actions import task_comments_db
     from agent_mcp.tools.registry import dispatch_tool_call, request_principal
 
     async with mcp_session(tmp_path):
@@ -303,7 +303,7 @@ async def test_with_principal_helper_stamps_request_principal(tmp_path) -> None:
             # The dispatcher itself requires explicit principal — no
             # ContextVar bridge in PR 6 — so we pass it through.
             result = await dispatch_tool_call(
-                "add_task_note",
+                "add_task_comment",
                 {"task_id": "wave6-demo-helper-1", "text": "from bob"},
                 principal=p,
             )
@@ -311,6 +311,6 @@ async def test_with_principal_helper_stamps_request_principal(tmp_path) -> None:
         assert isinstance(result, Ok)
         assert result.data["task_id"] == "wave6-demo-helper-1"
 
-        notes = task_notes_db.list_notes_for_task("wave6-demo-helper-1")
+        notes = task_comments_db.list_comments_for_task("wave6-demo-helper-1")
         # Author resolved from principal.user_id via the migrated tool.
         assert notes[0]["author"] == "bob"

@@ -246,10 +246,10 @@ async def test_worker_claims_then_updates_pool_task(tmp_path) -> None:
         assert row["assigned_to"] == alice.agent_id
 
 
-# --- 5. add_task_note sibling: unassigned pool task is guided ---------
+# --- 5. add_task_comment sibling: unassigned pool task is guided ------
 
 
-async def test_worker_note_on_unassigned_task_is_guided_to_claim(
+async def test_worker_comment_on_unassigned_task_is_guided_to_claim(
     tmp_path,
 ) -> None:
     async with mcp_session(tmp_path) as admin:
@@ -259,7 +259,7 @@ async def test_worker_note_on_unassigned_task_is_guided_to_claim(
 
         text = _text(
             await alice.call(
-                "add_task_note",
+                "add_task_comment",
                 {
                     "task_id": pool_id,
                     "text": "progress note",
@@ -277,7 +277,7 @@ async def test_worker_note_on_unassigned_task_is_guided_to_claim(
         )
 
 
-async def test_worker_note_on_foreign_task_stays_phantom_not_found(
+async def test_worker_comment_on_foreign_task_stays_phantom_not_found(
     tmp_path,
 ) -> None:
     async with mcp_session(tmp_path) as admin:
@@ -288,7 +288,7 @@ async def test_worker_note_on_foreign_task_stays_phantom_not_found(
 
         text = _text(
             await alice.call(
-                "add_task_note",
+                "add_task_comment",
                 {
                     "task_id": bobs_id,
                     "text": "sneaky note",

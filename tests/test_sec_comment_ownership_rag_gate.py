@@ -1,18 +1,18 @@
-"""Security (Wave-B): per-task note ownership + RAG capability gate.
+"""Security (Wave-B): per-task comment ownership + RAG capability gate.
 
 Two findings, both the stored-content-injection / capability-bypass
 class (companion to the viewer project_context write guard,
 ``test_sec_viewer_context_write_guard.py``):
 
-Finding 1 — ``add_task_note`` had NO per-task ownership check. Any
-``agent_bearer`` could append a note to ANY ``task_id`` (another
-agent's, the admin's, or a nonexistent one). Task notes feed other
+Finding 1 — ``add_task_comment`` had NO per-task ownership check. Any
+``agent_bearer`` could append a comment to ANY ``task_id`` (another
+agent's, the admin's, or a nonexistent one). Task comments feed other
 agents' / the operator's LLM context, so an unrelated worker writing
-into a foreign task's notes is a cross-agent stored-injection
-primitive. Fix: a note author must be the task's assignee or creator,
-OR a manager-tier caller (``tasks.assign`` — operators + manager-role
-agents + sysadmin). Notes to nonexistent tasks are rejected
-(``NotFound``).
+into a foreign task's comments is a cross-agent stored-injection
+primitive. Fix: a comment author must be the task's assignee or
+creator, OR a manager-tier caller (``tasks.assign`` — operators +
+manager-role agents + sysadmin). Comments to nonexistent tasks are
+rejected (``NotFound``).
 
 Finding 2 — ``ask_project_rag`` gated on ``kind == "agent_bearer"``
 rather than a capability, so a bearer whose ``agent_role`` is ``None``
@@ -36,7 +36,7 @@ from agent_mcp.core.authorize import AuthRejected
 from agent_mcp.core.principal import Principal
 from agent_mcp.core.tool_result import NotFound, Ok
 from agent_mcp.tools.rag_tools import ask_project_rag_tool_impl
-from agent_mcp.tools.task_notes_tools import add_task_note_tool_impl
+from agent_mcp.tools.task_comments_tools import add_task_comment_tool_impl
 from tests.harness import make_principal, mcp_session
 
 pytestmark = pytest.mark.asyncio
@@ -99,13 +99,13 @@ def _insert_task(
         conn.close()
 
 
-def _notes_for(task_id: str) -> list:
-    from agent_mcp.db.actions import task_notes_db
+def _comments_for(task_id: str) -> list:
+    from agent_mcp.db.actions import task_comments_db
 
-    return task_notes_db.list_notes_for_task(task_id)
+    return task_comments_db.list_comments_for_task(task_id)
 
 
-# ── Finding 1: add_task_note per-task ownership ───────────────────
+# ── Finding 1: add_task_comment per-task ownership ────────────────
 
 
 async def test_worker_cannot_note_foreign_task(tmp_path) -> None:
@@ -118,75 +118,75 @@ async def test_worker_cannot_note_foreign_task(tmp_path) -> None:
     async with mcp_session(tmp_path):
         _insert_task("t-foreign", created_by="alice", assigned_to="alice")
         bob = _agent(agent_id="bob", role="worker")
-        result = await add_task_note_tool_impl(
+        result = await add_task_comment_tool_impl(
             {"task_id": "t-foreign", "text": "injected"},
             principal=bob,
         )
         assert isinstance(result, NotFound), result
         assert "alice" not in repr(result)
-        assert _notes_for("t-foreign") == []
+        assert _comments_for("t-foreign") == []
 
 
 async def test_worker_can_note_assigned_task(tmp_path) -> None:
-    """A worker CAN note a task it is assigned to."""
+    """A worker CAN comment on a task it is assigned to."""
     async with mcp_session(tmp_path):
         _insert_task("t-assigned", created_by="alice", assigned_to="bob")
         bob = _agent(agent_id="bob", role="worker")
-        result = await add_task_note_tool_impl(
+        result = await add_task_comment_tool_impl(
             {"task_id": "t-assigned", "text": "progress"},
             principal=bob,
         )
         assert isinstance(result, Ok), result
-        assert len(_notes_for("t-assigned")) == 1
+        assert len(_comments_for("t-assigned")) == 1
 
 
 async def test_worker_can_note_own_created_task(tmp_path) -> None:
-    """A worker CAN note a task it created (creator ownership)."""
+    """A worker CAN comment on a task it created (creator ownership)."""
     async with mcp_session(tmp_path):
         _insert_task("t-created", created_by="bob", assigned_to=None)
         bob = _agent(agent_id="bob", role="worker")
-        result = await add_task_note_tool_impl(
+        result = await add_task_comment_tool_impl(
             {"task_id": "t-created", "text": "mine"},
             principal=bob,
         )
         assert isinstance(result, Ok), result
-        assert len(_notes_for("t-created")) == 1
+        assert len(_comments_for("t-created")) == 1
 
 
 async def test_manager_agent_can_note_any_task(tmp_path) -> None:
-    """A manager-role agent (carries ``tasks.assign``) may note any
-    task regardless of ownership."""
+    """A manager-role agent (carries ``tasks.assign``) may comment on
+    any task regardless of ownership."""
     async with mcp_session(tmp_path):
         _insert_task("t-mgr", created_by="alice", assigned_to="alice")
         mgr = _agent(agent_id="mgr", role="manager")
-        result = await add_task_note_tool_impl(
+        result = await add_task_comment_tool_impl(
             {"task_id": "t-mgr", "text": "supervisory note"},
             principal=mgr,
         )
         assert isinstance(result, Ok), result
-        assert len(_notes_for("t-mgr")) == 1
+        assert len(_comments_for("t-mgr")) == 1
 
 
 async def test_operator_can_note_any_task(tmp_path) -> None:
-    """An operator-session (carries ``tasks.assign``) may note any
-    task — the dashboard moderation path is preserved."""
+    """An operator-session (carries ``tasks.assign``) may comment on
+    any task — the dashboard moderation path is preserved."""
     async with mcp_session(tmp_path):
         _insert_task("t-op", created_by="alice", assigned_to="alice")
         op = _operator()
-        result = await add_task_note_tool_impl(
+        result = await add_task_comment_tool_impl(
             {"task_id": "t-op", "text": "operator note"},
             principal=op,
         )
         assert isinstance(result, Ok), result
-        assert len(_notes_for("t-op")) == 1
+        assert len(_comments_for("t-op")) == 1
 
 
 async def test_note_to_nonexistent_task_rejected(tmp_path) -> None:
-    """A note to a task that does not exist is rejected as NotFound —
-    no orphan notes, even for a manager-tier caller."""
+    """A comment on a task that does not exist is rejected as
+    NotFound — no orphan comments, even for a manager-tier caller."""
     async with mcp_session(tmp_path):
         mgr = _agent(agent_id="mgr", role="manager")
-        result = await add_task_note_tool_impl(
+        result = await add_task_comment_tool_impl(
             {"task_id": "t-ghost", "text": "orphan"},
             principal=mgr,
         )

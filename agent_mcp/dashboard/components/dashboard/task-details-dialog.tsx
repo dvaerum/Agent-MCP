@@ -89,22 +89,22 @@ export function TaskDetailsDialog({ task, open, onOpenChange }: TaskDetailsDialo
               </>
             )}
 
-            {/* Notes */}
+            {/* Comments */}
             {(() => {
-              const notes = parseJsonField(task.notes) as Array<{ author: string; timestamp: string; content: string }>
-              return notes.length > 0 && (
+              const comments = parseJsonField(task.notes) as Array<{ author: string; timestamp: string; content: string }>
+              return comments.length > 0 && (
                 <div>
-                  <h4 className="text-sm font-semibold mb-3">Notes</h4>
+                  <h4 className="text-sm font-semibold mb-3">Comments</h4>
                   <div className="space-y-3">
-                    {notes.map((note, index) => (
+                    {comments.map((comment, index) => (
                       <div key={index} className="bg-muted rounded-lg p-3">
                         <div className="flex items-center justify-between mb-2">
-                          <span className="text-xs font-medium">{note.author}</span>
+                          <span className="text-xs font-medium">{comment.author}</span>
                           <span className="text-xs text-muted-foreground">
-                            {new Date(note.timestamp).toLocaleString()}
+                            {new Date(comment.timestamp).toLocaleString()}
                           </span>
                         </div>
-                        <p className="text-sm">{note.content}</p>
+                        <p className="text-sm">{comment.content}</p>
                       </div>
                     ))}
                   </div>

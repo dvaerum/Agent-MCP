@@ -1067,7 +1067,7 @@ async def _create_unassigned_tasks(
         # operator-owned parent, mutating the victim parent's child_tasks
         # JSON mirror (a cross-agent stored-injection primitive — the
         # victim sees an unexpected child appear under their task). Mirrors
-        # the ownership gate ``add_task_note`` / ``request_assistance``
+        # the ownership gate ``add_task_comment`` / ``request_assistance``
         # enforce (assigned_to == requesting agent). A FOREIGN *or*
         # NONEXISTENT parent collapses to the SAME phantom NotFound the
         # existence-oracle-safe siblings return (AZ-R17-1 / AZ-R18-1) so a
@@ -2760,7 +2760,7 @@ async def create_self_task_tool_impl(
             # parent's child_tasks JSON mirror (a cross-agent stored-injection
             # primitive — the victim sees an unexpected child appear under
             # their task). A FOREIGN *or* NONEXISTENT parent collapses to the
-            # SAME phantom NotFound the Mode-0 / add_task_note /
+            # SAME phantom NotFound the Mode-0 / add_task_comment /
             # request_assistance gates return (no existence oracle).
             # NOTE (claim-first split): this gate is about a DIFFERENT task
             # than the one being created — the PARENT the worker is
@@ -4303,7 +4303,7 @@ async def request_assistance_tool_impl(
     # not apply: ``_worker_ownership_deny_result`` returns the actionable
     # "claim it first" PermissionDenied for the unassigned case and keeps
     # the UNCHANGED phantom-404 for the foreign-owned case (the sibling
-    # split applied in _update_single_task / add_task_note).
+    # split applied in _update_single_task / add_task_comment).
     if (
         parent_task_current_data.get("assigned_to") != requesting_agent_id
         and not is_admin_request

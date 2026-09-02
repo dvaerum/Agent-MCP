@@ -54,9 +54,9 @@ from tests.harness import (
 
 _REDACTED = "[redacted]"
 # The alembic head advances as migrations are added; keep this in lockstep
-# with the newest revision (0025 = OBS-R12-2 terminal-task DB guard
-# triggers).
-_MIGRATION_HEAD = "0025_terminal_task_guard_trigger"
+# with the newest revision (0026 = task_notes -> task_comments rename,
+# PR 1/3).
+_MIGRATION_HEAD = "0026_rename_task_notes_to_task_comments"
 
 
 # ---------------------------------------------------------------------------

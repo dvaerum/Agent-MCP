@@ -151,7 +151,7 @@ def test_capability_free_allowlist_has_no_stale_entries() -> None:
 # side effect. (It also pins the final ``visibility=`` shrink: deleting a
 # redundant kwarg must leave every tier byte-identical.)
 EXPECTED_ACCESS_LEVELS = {
-    "add_task_note": "any",
+    "add_task_comment": "any",
     "ask_project_rag": "any",
     "assign_task": (
         "worker-if-toggled:config_allow_worker_self_assign,"
@@ -176,9 +176,9 @@ EXPECTED_ACCESS_LEVELS = {
         "config_allow_manager_curate_schedules"
     ),
     "delete_task": "operator",
-    "delete_task_note": "any",
+    "delete_task_comment": "any",
     "edit_agent": "operator",
-    "edit_task_note": "any",
+    "edit_task_comment": "any",
     "fetch_events_since": "any",
     "get_agent_messages": "any",
     "get_agent_tokens": "operator",

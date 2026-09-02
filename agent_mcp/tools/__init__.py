@@ -23,7 +23,7 @@ logger.info("Initializing and registering MCP tools...")
 
 from . import admin_tools
 from . import task_tools
-from . import task_notes_tools  # PR-H — side-table notes tools
+from . import task_comments_tools  # PR-H — side-table comments tools
 from . import file_management_tools
 from . import project_context_tools
 from . import project_settings_tools  # noqa: E402,F401 — ADR-0016 settings store

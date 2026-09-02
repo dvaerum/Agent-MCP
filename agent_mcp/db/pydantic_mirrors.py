@@ -216,7 +216,7 @@ class TaskMirror(BaseModel):
     notes: Optional[str] = None
 
 
-class TaskNoteMirror(BaseModel):
+class TaskCommentMirror(BaseModel):
     model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
     note_id: int
@@ -276,7 +276,7 @@ MIRRORS: dict[str, type[BaseModel]] = {
     "rag_chunks": RagChunkMirror,
     "rag_meta": RagMetaMirror,
     "scheduled_directive": ScheduledDirectiveMirror,
-    "task_notes": TaskNoteMirror,
+    "task_comments": TaskCommentMirror,
     "tasks": TaskMirror,
 }
 
@@ -295,6 +295,6 @@ __all__ = [
     "RagChunkMirror",
     "RagMetaMirror",
     "ScheduledDirectiveMirror",
+    "TaskCommentMirror",
     "TaskMirror",
-    "TaskNoteMirror",
 ]

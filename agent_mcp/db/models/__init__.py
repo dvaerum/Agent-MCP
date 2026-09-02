@@ -35,7 +35,7 @@ from .rag_chunk import RagChunk
 from .rag_meta import RagMeta
 from .scheduled_directive import ScheduledDirective
 from .task import Task
-from .task_note import TaskNote
+from .task_comment import TaskComment
 
 __all__ = [
     "Agent",
@@ -51,5 +51,5 @@ __all__ = [
     "RagMeta",
     "ScheduledDirective",
     "Task",
-    "TaskNote",
+    "TaskComment",
 ]

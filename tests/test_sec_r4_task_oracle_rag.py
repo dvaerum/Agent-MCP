@@ -210,19 +210,19 @@ async def test_bulk_task_operations_foreign_task_not_found(tmp_path):
         )
 
 
-async def test_add_task_note_foreign_task_indistinguishable(tmp_path):
-    """add_task_note on a foreign existing task must match the response
+async def test_add_task_comment_foreign_task_indistinguishable(tmp_path):
+    """add_task_comment on a foreign existing task must match the response
     for a nonexistent task (no owner name, no 403-vs-404 oracle)."""
     async with mcp_session(tmp_path) as admin:
         _seed_task_row("foreign-task-c", assigned_to="alice")
         intruder = await admin.create_worker("bob")
 
         foreign = _text(await intruder.call(
-            "add_task_note",
+            "add_task_comment",
             {"task_id": "foreign-task-c", "text": "hi"},
         ))
         missing = _text(await intruder.call(
-            "add_task_note",
+            "add_task_comment",
             {"task_id": "phantom-task", "text": "hi"},
         ))
 
@@ -235,15 +235,15 @@ async def test_add_task_note_foreign_task_indistinguishable(tmp_path):
         )
 
 
-async def test_add_task_note_owner_still_succeeds(tmp_path):
-    """The task owner may still add a note — the fix only collapses the
-    non-owner branch."""
+async def test_add_task_comment_owner_still_succeeds(tmp_path):
+    """The task owner may still add a comment — the fix only collapses
+    the non-owner branch."""
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
         _seed_task_row("alice-task-note", assigned_to="alice")
 
         result = _text(await alice.call(
-            "add_task_note",
+            "add_task_comment",
             {"task_id": "alice-task-note", "text": "my note"},
         ))
         assert "not found" not in result.lower(), result

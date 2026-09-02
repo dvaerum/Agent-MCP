@@ -300,10 +300,10 @@ def test_tasks_trigger_allows_writes_on_nonterminal_task(tmp_path) -> None:
         conn.close()
 
 
-# --- task_notes side table (round-13 class-sweep addition) ----------------
+# --- task_comments side table (round-13 class-sweep addition) -------------
 
 
-def test_task_notes_insert_red_then_green_on_terminal_parent(tmp_path) -> None:
+def test_task_comments_insert_red_then_green_on_terminal_parent(tmp_path) -> None:
     db_path = _bootstrap_fresh_db(tmp_path)
     _run_alembic_upgrade(str(tmp_path))
     _run_alembic_downgrade(str(tmp_path), "0024_drop_config_aoe_settings")
@@ -313,7 +313,9 @@ def test_task_notes_insert_red_then_green_on_terminal_parent(tmp_path) -> None:
         _insert_task(conn, "n1", status="completed")
         conn.commit()
 
-        # RED: pre-fix, add_task_note's side table has no guard at all.
+        # RED: pre-fix, add_task_comment's side table has no guard at
+        # all. (At revision 0024 — before 0026's rename — the table is
+        # still named `task_notes`.)
         conn.execute(
             "INSERT INTO task_notes (task_id, author, timestamp, text) "
             "VALUES (?, 'alice', '2026-01-01T00:00:00', 'sneaky')",
@@ -329,23 +331,24 @@ def test_task_notes_insert_red_then_green_on_terminal_parent(tmp_path) -> None:
 
     _run_alembic_upgrade(str(tmp_path))
 
+    # GREEN: back at head, 0026 has renamed the table to `task_comments`.
     conn = sqlite3.connect(db_path)
     try:
         with pytest.raises(sqlite3.IntegrityError):
             conn.execute(
-                "INSERT INTO task_notes (task_id, author, timestamp, text) "
+                "INSERT INTO task_comments (task_id, author, timestamp, text) "
                 "VALUES (?, 'alice', '2026-01-01T00:00:01', 'sneaky2')",
                 ("n1",),
             )
         count = conn.execute(
-            "SELECT COUNT(*) FROM task_notes WHERE task_id='n1'"
+            "SELECT COUNT(*) FROM task_comments WHERE task_id='n1'"
         ).fetchone()[0]
         assert count == 1
     finally:
         conn.close()
 
 
-def test_task_notes_insert_allowed_on_nonterminal_parent(tmp_path) -> None:
+def test_task_comments_insert_allowed_on_nonterminal_parent(tmp_path) -> None:
     db_path = _bootstrap_fresh_db(tmp_path)
     _run_alembic_upgrade(str(tmp_path))
 
@@ -354,21 +357,21 @@ def test_task_notes_insert_allowed_on_nonterminal_parent(tmp_path) -> None:
         _insert_task(conn, "n2", status="pending")
         conn.commit()
         conn.execute(
-            "INSERT INTO task_notes (task_id, author, timestamp, text) "
+            "INSERT INTO task_comments (task_id, author, timestamp, text) "
             "VALUES (?, 'alice', '2026-01-01T00:00:00', 'fine')",
             ("n2",),
         )
         conn.commit()
         count = conn.execute(
-            "SELECT COUNT(*) FROM task_notes WHERE task_id='n2'"
+            "SELECT COUNT(*) FROM task_comments WHERE task_id='n2'"
         ).fetchone()[0]
         assert count == 1
     finally:
         conn.close()
 
 
-def test_task_notes_insert_allowed_when_parent_missing(tmp_path) -> None:
-    """A note whose ``task_id`` matches no row in ``tasks`` is NOT
+def test_task_comments_insert_allowed_when_parent_missing(tmp_path) -> None:
+    """A comment whose ``task_id`` matches no row in ``tasks`` is NOT
     blocked (NULL IN (...) is NULL, not true) — that's a job for the
     tool-layer NotFound check, not this trigger."""
     db_path = _bootstrap_fresh_db(tmp_path)
@@ -377,30 +380,31 @@ def test_task_notes_insert_allowed_when_parent_missing(tmp_path) -> None:
     conn = sqlite3.connect(db_path)
     try:
         conn.execute(
-            "INSERT INTO task_notes (task_id, author, timestamp, text) "
+            "INSERT INTO task_comments (task_id, author, timestamp, text) "
             "VALUES ('does-not-exist', 'alice', '2026-01-01T00:00:00', 'x')"
         )
         conn.commit()
         count = conn.execute(
-            "SELECT COUNT(*) FROM task_notes WHERE task_id='does-not-exist'"
+            "SELECT COUNT(*) FROM task_comments WHERE task_id='does-not-exist'"
         ).fetchone()[0]
         assert count == 1
     finally:
         conn.close()
 
 
-def test_task_notes_update_blocked_on_terminal_parent(tmp_path) -> None:
+def test_task_comments_update_blocked_on_terminal_parent(tmp_path) -> None:
     db_path = _bootstrap_fresh_db(tmp_path)
     _run_alembic_upgrade(str(tmp_path))
 
     conn = sqlite3.connect(db_path)
     try:
-        # Note added while the task is still non-terminal (the INSERT
-        # trigger would otherwise refuse this note itself); the task is
-        # driven terminal AFTERWARDS to isolate the UPDATE trigger.
+        # Comment added while the task is still non-terminal (the
+        # INSERT trigger would otherwise refuse this comment itself);
+        # the task is driven terminal AFTERWARDS to isolate the UPDATE
+        # trigger.
         _insert_task(conn, "n3", status="pending")
         conn.execute(
-            "INSERT INTO task_notes (note_id, task_id, author, timestamp, text) "
+            "INSERT INTO task_comments (note_id, task_id, author, timestamp, text) "
             "VALUES (1, 'n3', 'alice', '2026-01-01T00:00:00', 'orig')"
         )
         conn.execute("UPDATE tasks SET status = 'failed' WHERE task_id = 'n3'")
@@ -408,17 +412,17 @@ def test_task_notes_update_blocked_on_terminal_parent(tmp_path) -> None:
 
         with pytest.raises(sqlite3.IntegrityError):
             conn.execute(
-                "UPDATE task_notes SET text = 'edited' WHERE note_id = 1"
+                "UPDATE task_comments SET text = 'edited' WHERE note_id = 1"
             )
         text = conn.execute(
-            "SELECT text FROM task_notes WHERE note_id=1"
+            "SELECT text FROM task_comments WHERE note_id=1"
         ).fetchone()[0]
         assert text == "orig"
     finally:
         conn.close()
 
 
-def test_task_notes_delete_not_guarded_on_terminal_parent(tmp_path) -> None:
+def test_task_comments_delete_not_guarded_on_terminal_parent(tmp_path) -> None:
     """DELETE is deliberately unguarded (leaves room for a future
     cascade-delete-of-task cleanup fix)."""
     db_path = _bootstrap_fresh_db(tmp_path)
@@ -428,16 +432,16 @@ def test_task_notes_delete_not_guarded_on_terminal_parent(tmp_path) -> None:
     try:
         _insert_task(conn, "n4", status="pending")
         conn.execute(
-            "INSERT INTO task_notes (note_id, task_id, author, timestamp, text) "
+            "INSERT INTO task_comments (note_id, task_id, author, timestamp, text) "
             "VALUES (2, 'n4', 'alice', '2026-01-01T00:00:00', 'orig')"
         )
         conn.execute("UPDATE tasks SET status = 'cancelled' WHERE task_id = 'n4'")
         conn.commit()
 
-        conn.execute("DELETE FROM task_notes WHERE note_id = 2")
+        conn.execute("DELETE FROM task_comments WHERE note_id = 2")
         conn.commit()
         count = conn.execute(
-            "SELECT COUNT(*) FROM task_notes WHERE note_id=2"
+            "SELECT COUNT(*) FROM task_comments WHERE note_id=2"
         ).fetchone()[0]
         assert count == 0
     finally:

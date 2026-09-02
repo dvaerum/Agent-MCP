@@ -39,9 +39,9 @@ export const priorityBadgeClass = (priority: Task["priority"]): string => {
 export const isTombstone = (value: string | undefined | null): boolean =>
   typeof value === "string" && /^\[deleted-.+\]$/.test(value)
 
-// A single note entry as stored on a task (server appends
+// A single comment entry as stored on a task (server appends
 // `{timestamp, author, content}` on every `notes: str` update).
-export interface TaskNote {
+export interface TaskComment {
   timestamp: string
   author: string
   content: string
@@ -55,7 +55,7 @@ export interface TaskNote {
 // NOT normalized there — the wire still hands it back as either a
 // JSON-encoded string or a real array — so this small parse survives
 // (the last remnant of the page's old `parseJsonField`).
-export const parseTaskNotes = (field: unknown): TaskNote[] => {
+export const parseTaskComments = (field: unknown): TaskComment[] => {
   const arr = Array.isArray(field)
     ? field
     : typeof field === "string"
@@ -68,5 +68,5 @@ export const parseTaskNotes = (field: unknown): TaskNote[] => {
           }
         })()
       : []
-  return arr as TaskNote[]
+  return arr as TaskComment[]
 }

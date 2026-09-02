@@ -133,6 +133,9 @@ def test_migration_0009_copies_legacy_notes_to_side_table(tmp_path) -> None:
     _run_alembic_upgrade(project_dir)
 
     # The migration must have created the side table + indexed it.
+    # (Migration 0009 itself creates it as `task_notes`; migration 0026,
+    # downstream of 0009 and applied by this test's `upgrade head`,
+    # renames it to `task_comments` — assert the head-state name here.)
     conn = sqlite3.connect(db_path)
     try:
         tables = {
@@ -141,7 +144,7 @@ def test_migration_0009_copies_legacy_notes_to_side_table(tmp_path) -> None:
                 "SELECT name FROM sqlite_master WHERE type='table'"
             ).fetchall()
         }
-        assert "task_notes" in tables
+        assert "task_comments" in tables
 
         indexes = {
             r[0]
@@ -149,12 +152,12 @@ def test_migration_0009_copies_legacy_notes_to_side_table(tmp_path) -> None:
                 "SELECT name FROM sqlite_master WHERE type='index'"
             ).fetchall()
         }
-        assert "idx_task_notes_task" in indexes
+        assert "idx_task_comments_task" in indexes
 
         # Two notes copied (task-1 had two; task-2 corrupt; task-3 NULL).
         notes = conn.execute(
             "SELECT task_id, author, timestamp, text "
-            "FROM task_notes ORDER BY timestamp ASC"
+            "FROM task_comments ORDER BY timestamp ASC"
         ).fetchall()
         assert len(notes) == 2
 
@@ -211,7 +214,7 @@ def test_migration_0009_idempotent(tmp_path) -> None:
     # explode.)
     conn = sqlite3.connect(db_path)
     try:
-        first = conn.execute("SELECT COUNT(*) FROM task_notes").fetchone()[0]
+        first = conn.execute("SELECT COUNT(*) FROM task_comments").fetchone()[0]
     finally:
         conn.close()
 
@@ -221,7 +224,7 @@ def test_migration_0009_idempotent(tmp_path) -> None:
     conn = sqlite3.connect(db_path)
     try:
         second = conn.execute(
-            "SELECT COUNT(*) FROM task_notes"
+            "SELECT COUNT(*) FROM task_comments"
         ).fetchone()[0]
     finally:
         conn.close()
