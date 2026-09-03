@@ -109,10 +109,25 @@ impl Principal {
     }
 }
 
+/// True iff `principal` is an operator-tier caller.
+///
+/// Faithful port of `agent_mcp/core/principal_builder.py::
+/// is_operator_tier` — the single definition, collapsing two that had
+/// drifted in the Python source's history. Operator-tier = a caller
+/// carrying the per-project operator write marker
+/// (`system.config.write`, present in `project_role_bundle`'s operator
+/// tier and short-circuited by the sysadmin wildcard), OR the legacy
+/// `agent_id == "admin"` pseudo-agent label the test harness seeds. A
+/// viewer-tier operator lacks the write marker and is excluded.
+pub fn is_operator_tier(principal: &Principal) -> bool {
+    principal.has_capability(Capability::SystemConfigWrite)
+        || principal.agent_id.as_deref() == Some("admin")
+}
+
 #[cfg(test)]
 mod tests {
     use crate::capability::{Capabilities, Capability};
-    use crate::principal::{Principal, PrincipalKind};
+    use crate::principal::{is_operator_tier, Principal, PrincipalKind};
 
     fn base_principal(kind: PrincipalKind, capabilities: Capabilities) -> Principal {
         Principal {
@@ -195,5 +210,51 @@ mod tests {
 
         p.user_id = None;
         assert_eq!(p.actor_label(), "agent_bearer");
+    }
+
+    // ── is_operator_tier ────────────────────────────────────────────
+
+    #[test]
+    fn caller_with_system_config_write_is_operator_tier() {
+        let p = base_principal(
+            PrincipalKind::OperatorSession,
+            Capabilities::from_iter([Capability::SystemConfigWrite]),
+        );
+        assert!(is_operator_tier(&p));
+    }
+
+    #[test]
+    fn sysadmin_wildcard_is_operator_tier() {
+        let p = base_principal(PrincipalKind::OperatorSession, Capabilities::Sysadmin);
+        assert!(is_operator_tier(&p));
+    }
+
+    #[test]
+    fn legacy_admin_agent_id_is_operator_tier_even_without_the_capability() {
+        let mut p = base_principal(
+            PrincipalKind::AgentBearer,
+            Capabilities::from_iter([Capability::TasksView]),
+        );
+        p.agent_id = Some("admin".to_string());
+        assert!(is_operator_tier(&p));
+    }
+
+    #[test]
+    fn viewer_tier_lacking_the_write_marker_is_not_operator_tier() {
+        let p = base_principal(
+            PrincipalKind::OperatorSession,
+            Capabilities::from_iter([Capability::TasksView]),
+        );
+        assert!(!is_operator_tier(&p));
+    }
+
+    #[test]
+    fn agent_bearer_with_an_unrelated_agent_id_is_not_operator_tier() {
+        let mut p = base_principal(
+            PrincipalKind::AgentBearer,
+            Capabilities::from_iter([Capability::TasksView]),
+        );
+        p.agent_id = Some("worker-1".to_string());
+        assert!(!is_operator_tier(&p));
     }
 }

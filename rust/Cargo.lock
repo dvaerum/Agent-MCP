@@ -76,6 +76,7 @@ dependencies = [
  "conexus-core",
  "conexus-db",
  "rusqlite",
+ "serde_json",
 ]
 
 [[package]]
