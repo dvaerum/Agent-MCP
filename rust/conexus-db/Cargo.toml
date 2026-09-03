@@ -12,6 +12,11 @@ regex = "1"
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# default-features off + only "std": this crate never reads the wall
+# clock (see agent_repository.rs's module doc on that design rule) --
+# chrono is used purely for ISO-8601 parsing/arithmetic/formatting in
+# scheduled_directive_repository's interval math, not Utc::now().
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 [[bin]]
 name = "conexus-db-differential"
