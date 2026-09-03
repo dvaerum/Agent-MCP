@@ -41,14 +41,18 @@ static REGISTRATION_LOCK: Mutex<()> = Mutex::new(());
 
 /// Register `entry_point` process-wide, open a throwaway in-memory
 /// connection, and confirm `vec_version()` is actually callable on
-/// it — then always unregister, so this function leaves no global
-/// state behind regardless of outcome.
+/// it. `cancel_after` controls whether the registration is torn down
+/// again once probed (`true`, for a one-shot loadability check) or
+/// left in place for the rest of the process (`false`, for actually
+/// wanting a working `vec0` on connections opened afterward) — either
+/// way, a FAILED probe always cancels, so a failing call never leaks
+/// a dead registration.
 ///
 /// # Safety
 /// `entry_point` must be a valid SQLite extension entry point: safe
 /// to invoke with a live `sqlite3*` for the lifetime of any
 /// connection opened after registration and before cancellation.
-unsafe fn register_and_probe(entry_point: ExtEntryPoint) -> bool {
+unsafe fn register_impl(entry_point: ExtEntryPoint, cancel_after: bool) -> bool {
     let _guard = REGISTRATION_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -63,13 +67,28 @@ unsafe fn register_and_probe(entry_point: ExtEntryPoint) -> bool {
             })
             .is_ok();
 
-    // SAFETY: same entry point value passed to the matching register
-    // call above; cancel is safe to call even if register failed.
-    unsafe {
-        ffi::sqlite3_cancel_auto_extension(Some(entry_point));
+    if cancel_after || !loadable {
+        // SAFETY: same entry point value passed to the matching
+        // register call above; cancel is safe to call even if
+        // register failed.
+        unsafe {
+            ffi::sqlite3_cancel_auto_extension(Some(entry_point));
+        }
     }
 
     loadable
+}
+
+/// # Safety
+/// See [`register_impl`] — same contract, always cancels afterward.
+unsafe fn register_and_probe(entry_point: ExtEntryPoint) -> bool {
+    unsafe { register_impl(entry_point, true) }
+}
+
+/// # Safety
+/// See [`register_impl`] — same contract, only cancels on failure.
+unsafe fn register_persistently(entry_point: ExtEntryPoint) -> bool {
+    unsafe { register_impl(entry_point, false) }
 }
 
 /// The real `sqlite-vec` entry point. `sqlite-vec`'s own crate
@@ -94,6 +113,21 @@ fn real_entry_point() -> ExtEntryPoint {
 /// `is_vss_loadable()` contract.
 pub fn check_vss_loadable() -> bool {
     unsafe { register_and_probe(real_entry_point()) }
+}
+
+/// Permanently register the real sqlite-vec extension process-wide,
+/// so every connection opened AFTER this call (for the rest of the
+/// process) has a genuinely working `vec0` module — unlike
+/// [`check_vss_loadable`], which is a one-shot probe that always
+/// cancels its own registration before returning. Call this once at
+/// startup in any process that actually needs to read/write a real
+/// `rag_embeddings` table; checking loadability alone does not make
+/// the table usable afterward. Returns whether registration succeeded
+/// and a live probe connection could actually call `vec_version()`;
+/// on `false`, nothing is left registered — same never-leak-on-
+/// failure guarantee as `check_vss_loadable`.
+pub fn register_sqlite_vec() -> bool {
+    unsafe { register_persistently(real_entry_point()) }
 }
 
 #[cfg(test)]
@@ -138,6 +172,27 @@ mod tests {
     #[test]
     fn extension_corrupt_degrades_gracefully_to_false() {
         assert!(!unsafe { register_and_probe(fake_corrupt) });
+    }
+
+    #[test]
+    fn register_sqlite_vec_leaves_the_extension_usable_on_later_connections() {
+        assert!(register_sqlite_vec());
+
+        // Unlike check_vss_loadable (which always cancels its own
+        // registration), a FRESH connection opened well after this
+        // call must still be able to use vec0 -- that's the entire
+        // point of this function existing.
+        let conn = Connection::open_in_memory().unwrap();
+        let version: String = conn
+            .query_row("select vec_version()", [], |row| row.get(0))
+            .unwrap();
+        assert!(version.starts_with('v'));
+
+        // Clean up so this test doesn't leak process-wide state into
+        // whatever test happens to run after it in the same binary.
+        unsafe {
+            ffi::sqlite3_cancel_auto_extension(Some(real_entry_point()));
+        }
     }
 
     #[test]
