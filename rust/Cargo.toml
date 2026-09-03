@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["conexus-core"]
+members = ["conexus-core", "conexus-vec"]
 
 [workspace.package]
 edition = "2021"

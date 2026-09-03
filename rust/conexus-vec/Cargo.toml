@@ -1,0 +1,24 @@
+[package]
+name = "conexus-vec"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "sqlite-vec extension loading with a gracefully-degrade-to-no-RAG contract. Its own crate (not conexus-core, which stays zero-I/O; not conexus-db, which doesn't exist yet) per the Phase A migration plan — see /home/dennis/.claude/plans/prancy-napping-pie.md."
+
+[dependencies]
+# libsqlite3-sys is deliberately NOT a direct dependency: rusqlite
+# re-exports its own vendored copy as `rusqlite::ffi`, and using that
+# (rather than a separately-resolved libsqlite3-sys) guarantees our
+# `sqlite3`/`sqlite3_api_routines` FFI types match the ones the
+# `Connection` we open actually uses — a second, independently
+# resolved copy could diverge in patch version and produce ABI-
+# incompatible types that happen to share a name.
+rusqlite = { version = "0.32", features = ["bundled"] }
+# Pinned to 0.1.9, NOT the newer 0.1.10-alpha.* line: those releases'
+# published .crate tarball is missing sqlite-vec-diskann.c (a real
+# build-from-crates.io breakage, confirmed independently: `cargo
+# build` fails with "fatal error: sqlite-vec-diskann.c: No such file
+# or directory" compiling sqlite-vec.c). 0.1.9 is the last release
+# published before that regression.
+sqlite-vec = "=0.1.9"
