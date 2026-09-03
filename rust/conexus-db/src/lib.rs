@@ -28,4 +28,6 @@ pub use scheduled_directive_repository::{
     CollectDueError, NullableUpdate, ScheduledDirectiveFields, ScheduledDirectiveRow,
 };
 pub use schema::{init_rag_embeddings_table, init_router_schema, init_schema};
-pub use task_repository::{NewTask, TaskFields, TaskNote, TaskRow};
+pub use task_repository::{
+    NewTask, TaskFields, TaskNote, TaskRow, TerminalTaskWriteBlocked, UpdateTaskError,
+};
