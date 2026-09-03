@@ -48,6 +48,18 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             updated_at    TEXT NOT NULL,
             updated_by    TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS pending_directive (
+            poke_id       TEXT PRIMARY KEY,
+            agent_id      TEXT NOT NULL,
+            prompt        TEXT NOT NULL,
+            priority      TEXT NOT NULL DEFAULT 'urgent',
+            created_at    TEXT NOT NULL,
+            created_by    TEXT,
+            delivered_at  TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_pending_directive_undelivered
+            ON pending_directive (agent_id, delivered_at);
         "#,
     )
 }
