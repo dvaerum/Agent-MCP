@@ -70,6 +70,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "conexus-auth"
+version = "0.1.0"
+dependencies = [
+ "conexus-core",
+ "conexus-db",
+ "rusqlite",
+]
+
+[[package]]
 name = "conexus-core"
 version = "0.1.0"
 dependencies = [

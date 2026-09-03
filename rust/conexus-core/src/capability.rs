@@ -20,17 +20,17 @@
 //! into a `HashSet<Capability>` that would ever compare equal to the
 //! `Sysadmin` variant.
 //!
-//! What's ported here vs. deferred: [`Capability`], [`Capabilities`],
+//! What's ported here vs. elsewhere: [`Capability`], [`Capabilities`],
 //! [`AgentRole`]/[`ProjectRole`], and the bundle constants
 //! (`agent_role_bundle`/`project_role_bundle`) are all pure, zero-I/O
 //! data — they belong in `conexus-core` alongside `Principal` and
 //! `ToolResult`. The Python source's `resolve_capabilities` function
 //! ALSO does a DB-backed group-capability overlay
 //! (`group_capability_repository.fetch` / `group_resolver.
-//! resolve_user_groups`) — that half is NOT ported here; it belongs in
-//! `conexus-auth` (Phase C) once a DB layer exists, composed on top of
-//! `project_role_bundle`/`agent_role_bundle` rather than duplicating
-//! them.
+//! resolve_user_groups`) — that half is ported in `conexus-auth`
+//! (Phase C)'s `capabilities::resolve_capabilities`, composed on top
+//! of `project_role_bundle`/`agent_role_bundle` rather than
+//! duplicating them.
 
 use std::collections::HashSet;
 use std::fmt;
