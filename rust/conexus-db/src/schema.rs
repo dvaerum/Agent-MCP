@@ -129,6 +129,34 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             ON agent_messages (delivered);
         CREATE INDEX IF NOT EXISTS idx_agent_messages_parent
             ON agent_messages (parent_message_id);
+
+        CREATE TABLE IF NOT EXISTS tasks (
+            task_id            TEXT PRIMARY KEY,
+            title              TEXT NOT NULL,
+            description        TEXT,
+            assigned_to        TEXT,
+            created_by         TEXT NOT NULL,
+            status             TEXT NOT NULL,
+            priority           TEXT NOT NULL,
+            created_at         TEXT NOT NULL,
+            updated_at         TEXT NOT NULL,
+            parent_task        TEXT,
+            child_tasks        TEXT,
+            depends_on_tasks   TEXT,
+            notes              TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_tasks_assigned_to_updated_at
+            ON tasks (assigned_to, updated_at);
+        CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks (status);
+        CREATE INDEX IF NOT EXISTS idx_tasks_priority ON tasks (priority);
+        -- Single-root-task invariant (R15-BL-1): a plain UNIQUE(parent_task)
+        -- wouldn't work because SQLite treats every NULL as distinct: an
+        -- expression index on the constant boolean `(parent_task IS NULL)`,
+        -- filtered to only rows where it's true, makes every root task
+        -- collide on the same indexed value, so a second root violates
+        -- uniqueness.
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_single_root
+            ON tasks ((parent_task IS NULL)) WHERE parent_task IS NULL;
         "#,
     )
 }
