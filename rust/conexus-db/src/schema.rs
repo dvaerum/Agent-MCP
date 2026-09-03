@@ -49,6 +49,16 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             updated_by    TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS project_settings (
+            context_key   TEXT PRIMARY KEY,
+            value         TEXT NOT NULL,
+            description   TEXT,
+            created_at    TEXT,
+            created_by    TEXT,
+            updated_at    TEXT NOT NULL,
+            updated_by    TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS pending_directive (
             poke_id       TEXT PRIMARY KEY,
             agent_id      TEXT NOT NULL,
