@@ -331,6 +331,189 @@ impl AgentRepository {
         let changed = conn.execute("DELETE FROM agents WHERE agent_id = ?1", [agent_id])?;
         Ok(changed > 0)
     }
+
+    /// The one write path for the auth secret (`token` is off
+    /// `update_field`'s allowlist by design). `false` iff no agent
+    /// with that `agent_id` exists.
+    pub fn rotate_token(
+        conn: &Connection,
+        agent_id: &str,
+        new_token: &str,
+        now: &str,
+    ) -> Result<bool> {
+        let changed = conn.execute(
+            "UPDATE agents SET token = ?1, updated_at = ?2 WHERE agent_id = ?3",
+            (new_token, now, agent_id),
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Monotonically advance `last_event_seen_at`; never regresses.
+    /// Returns `true` only on a REAL advance (agent exists AND
+    /// `cursor_value` sorts after the current value) — the caller
+    /// uses this to decide whether a re-wake notification is
+    /// warranted, so a no-op write must report `false`, not just "the
+    /// UPDATE touched a row". ISO-8601 timestamps sort correctly as
+    /// plain strings, matching Python's `MAX(COALESCE(x,''), ?)`
+    /// pattern (the `COALESCE` guards the first-ever write, where the
+    /// column is still `NULL`; `''` sorts before any real timestamp).
+    pub fn advance_event_cursor(
+        conn: &Connection,
+        agent_id: &str,
+        cursor_value: &str,
+        now: &str,
+    ) -> Result<bool> {
+        let current: Option<Option<String>> = conn
+            .query_row(
+                "SELECT last_event_seen_at FROM agents WHERE agent_id = ?1",
+                [agent_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(current) = current else {
+            return Ok(false); // no such agent
+        };
+        if cursor_value <= current.unwrap_or_default().as_str() {
+            return Ok(false); // not an advance
+        }
+        let changed = conn.execute(
+            "UPDATE agents SET last_event_seen_at = ?1, updated_at = ?2 WHERE agent_id = ?3",
+            (cursor_value, now, agent_id),
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Always stamps `profile_reviewed_at`. Only writes `profile`/
+    /// `profile_updated_at`/`profile_updated_by` when the content
+    /// actually changed (SHA-256 comparison, matching Python) — a
+    /// reviewer re-approving an unchanged profile shouldn't churn its
+    /// update-audit trail. Returns `None` if the agent doesn't exist.
+    pub fn review_profile(
+        conn: &Connection,
+        agent_id: &str,
+        new_profile: Option<&str>,
+        editor_id: Option<&str>,
+        now: &str,
+    ) -> Result<Option<ReviewProfileResult>> {
+        use sha2::{Digest, Sha256};
+
+        let Some(existing) = Self::get_by_id(conn, agent_id)? else {
+            return Ok(None);
+        };
+
+        let hash =
+            |s: Option<&str>| -> Vec<u8> { Sha256::digest(s.unwrap_or("").as_bytes()).to_vec() };
+        let changed = hash(new_profile) != hash(existing.profile.as_deref());
+
+        if changed {
+            conn.execute(
+                "UPDATE agents SET profile = ?1, profile_updated_at = ?2, profile_updated_by = ?3, \
+                 profile_reviewed_at = ?2, updated_at = ?2 WHERE agent_id = ?4",
+                (new_profile, now, editor_id, agent_id),
+            )?;
+        } else {
+            conn.execute(
+                "UPDATE agents SET profile_reviewed_at = ?1, updated_at = ?1 WHERE agent_id = ?2",
+                (now, agent_id),
+            )?;
+        }
+
+        let agent = Self::get_by_id(conn, agent_id)?
+            .expect("row existed a moment ago under the same connection");
+        Ok(Some(ReviewProfileResult { agent, changed }))
+    }
+
+    /// Bulk-clear `current_task` for every agent pointing at a
+    /// completed/deleted task. Returns the number of agents cleared.
+    pub fn clear_current_task_for(conn: &Connection, task_id: &str, now: &str) -> Result<i64> {
+        let changed = conn.execute(
+            "UPDATE agents SET current_task = NULL, updated_at = ?1 WHERE current_task = ?2",
+            (now, task_id),
+        )?;
+        Ok(changed as i64)
+    }
+
+    /// Set-valued sibling of [`Self::clear_current_task_for`] — one
+    /// `IN (...)` UPDATE for cascade deletes instead of N single
+    /// UPDATEs. A no-op (returns `Ok(0)`, no query executed) for an
+    /// empty slice.
+    pub fn clear_current_task_for_many(
+        conn: &Connection,
+        task_ids: &[&str],
+        now: &str,
+    ) -> Result<i64> {
+        if task_ids.is_empty() {
+            return Ok(0);
+        }
+        let placeholders = std::iter::repeat_n("?", task_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("UPDATE agents SET current_task = NULL, updated_at = ? WHERE current_task IN ({placeholders})");
+        let mut params: Vec<&dyn rusqlite::ToSql> = vec![&now];
+        params.extend(task_ids.iter().map(|id| id as &dyn rusqlite::ToSql));
+        let changed = conn.execute(&sql, params.as_slice())?;
+        Ok(changed as i64)
+    }
+
+    /// Best-effort reconciliation run as a side effect of reassigning
+    /// `task_id` from `prior_assignee` to `new_assignee`: clears the
+    /// loser's stale pointer, and sets the gainer's pointer only if it
+    /// was `NULL` (never clobbers a gainer who's independently mid-way
+    /// through some other task). Unlike Python's version, real DB
+    /// errors here are NOT swallowed — this crate's whole design is
+    /// "no hidden behavior behind a `&Connection -> Result` seam"; a
+    /// caller that wants best-effort/log-and-continue semantics can
+    /// still choose to ignore the `Err`, but silently eating it here
+    /// would hide it from every caller forever, including ones that
+    /// legitimately want to know.
+    pub fn reconcile_current_task_on_reassign(
+        conn: &Connection,
+        task_id: &str,
+        prior_assignee: Option<&str>,
+        new_assignee: Option<&str>,
+        now: &str,
+    ) -> Result<()> {
+        if let Some(prior) = prior_assignee {
+            conn.execute(
+                "UPDATE agents SET current_task = NULL, updated_at = ?1 WHERE agent_id = ?2 AND current_task = ?3",
+                (now, prior, task_id),
+            )?;
+        }
+        if let Some(new) = new_assignee {
+            conn.execute(
+                "UPDATE agents SET current_task = ?1, updated_at = ?2 WHERE agent_id = ?3 AND current_task IS NULL",
+                (task_id, now, new),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// `INSERT OR IGNORE` a synthetic tombstone row so a purged
+    /// agent's `token`/`agent_id` still satisfies the FK from
+    /// `agent_messages`. Idempotent by construction — re-purging the
+    /// same id is a no-op, not a conflict.
+    pub fn insert_tombstone(
+        conn: &Connection,
+        token: &str,
+        tombstone_agent_id: &str,
+        now: &str,
+    ) -> Result<()> {
+        conn.execute(
+            "INSERT OR IGNORE INTO agents (token, agent_id, created_at, status, working_directory, color, updated_at) \
+             VALUES (?1, ?2, ?3, 'tombstone', '', '#000000', ?3)",
+            (token, tombstone_agent_id, now),
+        )?;
+        Ok(())
+    }
+}
+
+/// Result of [`AgentRepository::review_profile`] — the refreshed row
+/// plus whether the profile content actually changed (vs. just being
+/// re-stamped as reviewed).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReviewProfileResult {
+    pub agent: AgentRow,
+    pub changed: bool,
 }
 
 #[cfg(test)]
@@ -586,5 +769,418 @@ mod tests {
     fn delete_missing_agent_returns_false() {
         let conn = test_conn();
         assert!(!AgentRepository::delete(&conn, "nope").unwrap());
+    }
+
+    #[test]
+    fn rotate_token_writes_new_token_and_old_token_no_longer_resolves() {
+        let conn = test_conn();
+        seed(&conn, "alice", "tok-old", "active");
+        assert!(
+            AgentRepository::rotate_token(&conn, "alice", "tok-new", "2026-01-02T00:00:00Z")
+                .unwrap()
+        );
+        assert_eq!(
+            AgentRepository::get_by_token(&conn, "tok-old").unwrap(),
+            None
+        );
+        assert_eq!(
+            AgentRepository::get_by_token(&conn, "tok-new")
+                .unwrap()
+                .unwrap()
+                .agent_id,
+            "alice"
+        );
+    }
+
+    #[test]
+    fn rotate_token_missing_agent_returns_false() {
+        let conn = test_conn();
+        assert!(
+            !AgentRepository::rotate_token(&conn, "nope", "tok-new", "2026-01-01T00:00:00Z")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn advance_event_cursor_missing_agent_returns_false() {
+        let conn = test_conn();
+        assert!(!AgentRepository::advance_event_cursor(
+            &conn,
+            "nope",
+            "cursor-1",
+            "2026-01-01T00:00:00Z"
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn advance_event_cursor_first_write_advances_from_null() {
+        let conn = test_conn();
+        seed(&conn, "alice", "tok-alice", "active");
+        assert!(AgentRepository::advance_event_cursor(
+            &conn,
+            "alice",
+            "2026-01-01T00:00:01Z",
+            "2026-01-01T00:00:01Z"
+        )
+        .unwrap());
+        let row = AgentRepository::get_by_id(&conn, "alice").unwrap().unwrap();
+        assert_eq!(
+            row.last_event_seen_at.as_deref(),
+            Some("2026-01-01T00:00:01Z")
+        );
+    }
+
+    #[test]
+    fn advance_event_cursor_never_regresses() {
+        let conn = test_conn();
+        seed(&conn, "alice", "tok-alice", "active");
+        assert!(AgentRepository::advance_event_cursor(
+            &conn,
+            "alice",
+            "2026-01-01T00:00:05Z",
+            "2026-01-01T00:00:05Z"
+        )
+        .unwrap());
+
+        // An older cursor value must not overwrite the newer one, and
+        // must report "no advance" so the caller doesn't publish a
+        // spurious wake.
+        assert!(!AgentRepository::advance_event_cursor(
+            &conn,
+            "alice",
+            "2026-01-01T00:00:02Z",
+            "2026-01-01T00:00:06Z"
+        )
+        .unwrap());
+        let row = AgentRepository::get_by_id(&conn, "alice").unwrap().unwrap();
+        assert_eq!(
+            row.last_event_seen_at.as_deref(),
+            Some("2026-01-01T00:00:05Z")
+        );
+    }
+
+    #[test]
+    fn review_profile_missing_agent_returns_none() {
+        let conn = test_conn();
+        assert_eq!(
+            AgentRepository::review_profile(
+                &conn,
+                "nope",
+                Some("hi"),
+                Some("editor"),
+                "2026-01-01T00:00:00Z"
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn review_profile_always_stamps_reviewed_at() {
+        let conn = test_conn();
+        seed(&conn, "alice", "tok-alice", "active");
+        let result =
+            AgentRepository::review_profile(&conn, "alice", None, None, "2026-01-01T00:00:00Z")
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            result.agent.profile_reviewed_at.as_deref(),
+            Some("2026-01-01T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn review_profile_unchanged_content_does_not_touch_profile_updated_fields() {
+        let conn = test_conn();
+        seed(&conn, "alice", "tok-alice", "active");
+        let first = AgentRepository::review_profile(
+            &conn,
+            "alice",
+            Some("v1"),
+            Some("bob"),
+            "2026-01-01T00:00:00Z",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(first.changed);
+
+        // Re-reviewing the SAME content must not re-stamp
+        // profile_updated_at/profile_updated_by, only
+        // profile_reviewed_at.
+        let second = AgentRepository::review_profile(
+            &conn,
+            "alice",
+            Some("v1"),
+            Some("carol"),
+            "2026-01-02T00:00:00Z",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!second.changed);
+        assert_eq!(second.agent.profile.as_deref(), Some("v1"));
+        assert_eq!(
+            second.agent.profile_updated_at.as_deref(),
+            Some("2026-01-01T00:00:00Z")
+        );
+        assert_eq!(second.agent.profile_updated_by.as_deref(), Some("bob"));
+        assert_eq!(
+            second.agent.profile_reviewed_at.as_deref(),
+            Some("2026-01-02T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn review_profile_changed_content_updates_profile_and_attribution() {
+        let conn = test_conn();
+        seed(&conn, "alice", "tok-alice", "active");
+        AgentRepository::review_profile(
+            &conn,
+            "alice",
+            Some("v1"),
+            Some("bob"),
+            "2026-01-01T00:00:00Z",
+        )
+        .unwrap();
+
+        let second = AgentRepository::review_profile(
+            &conn,
+            "alice",
+            Some("v2"),
+            Some("carol"),
+            "2026-01-02T00:00:00Z",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(second.changed);
+        assert_eq!(second.agent.profile.as_deref(), Some("v2"));
+        assert_eq!(second.agent.profile_updated_by.as_deref(), Some("carol"));
+        assert_eq!(
+            second.agent.profile_updated_at.as_deref(),
+            Some("2026-01-02T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn clear_current_task_for_clears_every_matching_agent_and_returns_count() {
+        let conn = test_conn();
+        seed(&conn, "a1", "t1", "active");
+        seed(&conn, "a2", "t2", "active");
+        seed(&conn, "a3", "t3", "active");
+        AgentRepository::update_field(
+            &conn,
+            "a1",
+            AgentField::CurrentTask,
+            FieldValue::OptionalText(Some("task-x".into())),
+            "2026-01-01T00:00:00Z",
+        )
+        .unwrap();
+        AgentRepository::update_field(
+            &conn,
+            "a2",
+            AgentField::CurrentTask,
+            FieldValue::OptionalText(Some("task-x".into())),
+            "2026-01-01T00:00:00Z",
+        )
+        .unwrap();
+        AgentRepository::update_field(
+            &conn,
+            "a3",
+            AgentField::CurrentTask,
+            FieldValue::OptionalText(Some("task-y".into())),
+            "2026-01-01T00:00:00Z",
+        )
+        .unwrap();
+
+        let count =
+            AgentRepository::clear_current_task_for(&conn, "task-x", "2026-01-02T00:00:00Z")
+                .unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(
+            AgentRepository::get_by_id(&conn, "a1")
+                .unwrap()
+                .unwrap()
+                .current_task,
+            None
+        );
+        assert_eq!(
+            AgentRepository::get_by_id(&conn, "a3")
+                .unwrap()
+                .unwrap()
+                .current_task,
+            Some("task-y".into())
+        );
+    }
+
+    #[test]
+    fn clear_current_task_for_many_empty_slice_is_a_noop() {
+        let conn = test_conn();
+        assert_eq!(
+            AgentRepository::clear_current_task_for_many(&conn, &[], "2026-01-01T00:00:00Z")
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn clear_current_task_for_many_clears_across_the_whole_set() {
+        let conn = test_conn();
+        seed(&conn, "a1", "t1", "active");
+        seed(&conn, "a2", "t2", "active");
+        seed(&conn, "a3", "t3", "active");
+        AgentRepository::update_field(
+            &conn,
+            "a1",
+            AgentField::CurrentTask,
+            FieldValue::OptionalText(Some("task-x".into())),
+            "2026-01-01T00:00:00Z",
+        )
+        .unwrap();
+        AgentRepository::update_field(
+            &conn,
+            "a2",
+            AgentField::CurrentTask,
+            FieldValue::OptionalText(Some("task-y".into())),
+            "2026-01-01T00:00:00Z",
+        )
+        .unwrap();
+        AgentRepository::update_field(
+            &conn,
+            "a3",
+            AgentField::CurrentTask,
+            FieldValue::OptionalText(Some("task-z".into())),
+            "2026-01-01T00:00:00Z",
+        )
+        .unwrap();
+
+        let count = AgentRepository::clear_current_task_for_many(
+            &conn,
+            &["task-x", "task-y"],
+            "2026-01-02T00:00:00Z",
+        )
+        .unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(
+            AgentRepository::get_by_id(&conn, "a3")
+                .unwrap()
+                .unwrap()
+                .current_task,
+            Some("task-z".into())
+        );
+    }
+
+    #[test]
+    fn reconcile_current_task_on_reassign_clears_loser_and_sets_gainer_if_free() {
+        let conn = test_conn();
+        seed(&conn, "loser", "t1", "active");
+        seed(&conn, "gainer", "t2", "active");
+        AgentRepository::update_field(
+            &conn,
+            "loser",
+            AgentField::CurrentTask,
+            FieldValue::OptionalText(Some("task-1".into())),
+            "2026-01-01T00:00:00Z",
+        )
+        .unwrap();
+
+        AgentRepository::reconcile_current_task_on_reassign(
+            &conn,
+            "task-1",
+            Some("loser"),
+            Some("gainer"),
+            "2026-01-02T00:00:00Z",
+        )
+        .unwrap();
+
+        assert_eq!(
+            AgentRepository::get_by_id(&conn, "loser")
+                .unwrap()
+                .unwrap()
+                .current_task,
+            None
+        );
+        assert_eq!(
+            AgentRepository::get_by_id(&conn, "gainer")
+                .unwrap()
+                .unwrap()
+                .current_task,
+            Some("task-1".into())
+        );
+    }
+
+    #[test]
+    fn reconcile_current_task_on_reassign_never_clobbers_a_busy_gainer() {
+        let conn = test_conn();
+        seed(&conn, "gainer", "t1", "active");
+        AgentRepository::update_field(
+            &conn,
+            "gainer",
+            AgentField::CurrentTask,
+            FieldValue::OptionalText(Some("other-task".into())),
+            "2026-01-01T00:00:00Z",
+        )
+        .unwrap();
+
+        AgentRepository::reconcile_current_task_on_reassign(
+            &conn,
+            "task-1",
+            None,
+            Some("gainer"),
+            "2026-01-02T00:00:00Z",
+        )
+        .unwrap();
+
+        // gainer was already busy with a different task; must be untouched.
+        assert_eq!(
+            AgentRepository::get_by_id(&conn, "gainer")
+                .unwrap()
+                .unwrap()
+                .current_task,
+            Some("other-task".into())
+        );
+    }
+
+    #[test]
+    fn insert_tombstone_creates_placeholder_row() {
+        let conn = test_conn();
+        AgentRepository::insert_tombstone(
+            &conn,
+            "purged-token",
+            "purged-agent",
+            "2026-01-01T00:00:00Z",
+        )
+        .unwrap();
+        let row = AgentRepository::get_by_id(&conn, "purged-agent")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "tombstone");
+        assert_eq!(row.token, "purged-token");
+        assert_eq!(row.working_directory, "");
+        assert_eq!(row.color.as_deref(), Some("#000000"));
+    }
+
+    #[test]
+    fn insert_tombstone_is_idempotent_via_insert_or_ignore() {
+        let conn = test_conn();
+        AgentRepository::insert_tombstone(
+            &conn,
+            "purged-token",
+            "purged-agent",
+            "2026-01-01T00:00:00Z",
+        )
+        .unwrap();
+        // Re-purging the same id must not error (INSERT OR IGNORE).
+        AgentRepository::insert_tombstone(
+            &conn,
+            "purged-token",
+            "purged-agent",
+            "2026-01-02T00:00:00Z",
+        )
+        .unwrap();
+        let row = AgentRepository::get_by_id(&conn, "purged-agent")
+            .unwrap()
+            .unwrap();
+        // Second call was ignored -- original timestamp survives.
+        assert_eq!(row.created_at, "2026-01-01T00:00:00Z");
     }
 }
