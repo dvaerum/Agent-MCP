@@ -6,6 +6,8 @@ from typing import Any, Callable, Dict, List, Optional
 from ...core.config import (
     logger,
 )
+from ...core.task_ownership import can_access_task
+from ...core.task_ownership import sql_fragment as _task_ownership_sql_fragment
 from ...db.connection import get_db_connection, is_vss_loadable
 from ...external.embedding_service import embedding_client
 from ...external.completion_service import (
@@ -72,33 +74,26 @@ RAG_ERROR_SENTINELS = frozenset(
 # an AUTHORIZATION control (who owns the task), not content-guessing, so
 # it SURVIVES ADR-0017.
 #
-# ``view_tasks`` (``agent_mcp/tools/task_tools.py`` ~:3206-3238) scopes a
-# non-``tasks.assign`` caller by handing ``TaskQueryEngine`` an
-# ``agent_id=requesting_agent_id`` filter, which drops every row whose
-# ``assigned_to != requesting_agent_id`` (``task_queries.py`` ``_matches``)
-# — an EXACT match, so unassigned/NULL tasks are NOT worker-visible.
-# ``tasks.assign`` holders (operator / manager / sysadmin) get the
-# unscoped view. We MIRROR that exact rule here for the two task-bearing
-# RAG retrieval paths rather than refactoring task_tools.py (a sibling PR
-# owns that file); the predicate is small enough to replicate with this
-# signpost. See ``tests/test_sec_r4_f4_rag_task_ownership_scope.py``.
+# The rule itself — exact ``assigned_to`` match, ``tasks.assign`` holders
+# unscoped — now lives in ``core.task_ownership`` (the task-ownership
+# consolidation), imported above as ``_task_ownership_sql_fragment``.
+# This module wraps it under the pre-existing ``_task_ownership_sql``
+# name (kept local rather than inlined at each call site, since RAG's
+# two callers already pass it around as a first-class function) and adds
+# :func:`_drop_unowned_task_chunks`, the vector-search-results sibling.
+# See ``tests/test_sec_r4_f4_rag_task_ownership_scope.py`` and
+# ``tests/test_task_ownership.py`` (the SQL/dict equivalence property
+# test that keeps this in lockstep with the other 4 call sites).
 def _task_ownership_sql(
     requesting_agent_id: Optional[str],
     can_view_all_tasks: bool,
 ) -> tuple[str, List[str]]:
     """Return the ``(sql_fragment, params)`` that scopes a live-task
-    ``SELECT`` to the caller's ``view_tasks`` visibility.
-
-    A ``tasks.assign`` caller (``can_view_all_tasks``) gets an empty
-    fragment (unscoped). A worker gets ``AND assigned_to = ?`` bound to
-    their own agent_id — the SAME exact-match filter ``view_tasks``
-    applies, which excludes both other agents' tasks AND the unassigned
-    (NULL) pool. A missing agent_id degrades closed (``= ''`` matches no
-    row).
+    ``SELECT`` to the caller's ``view_tasks`` visibility. Thin wrapper
+    over ``core.task_ownership.sql_fragment`` — see that function's
+    docstring for the exact semantics.
     """
-    if can_view_all_tasks:
-        return "", []
-    return " AND assigned_to = ?", [requesting_agent_id or ""]
+    return _task_ownership_sql_fragment(requesting_agent_id, can_view_all_tasks)
 
 
 def _drop_unowned_task_chunks(
@@ -115,9 +110,10 @@ def _drop_unowned_task_chunks(
     ``source_ref`` is the ``task_id`` (see ``index_task_data`` in
     ``features/rag/indexing.py``). Context / code / markdown chunks are
     project-wide and always kept. A ``tasks.assign`` caller keeps every
-    chunk. For a worker, a task chunk survives iff the underlying task's
-    ``assigned_to`` equals the caller — the same exact-match rule
-    ``view_tasks`` applies (unassigned/NULL tasks are NOT visible).
+    chunk. For a worker, a task chunk survives iff
+    ``core.task_ownership.can_access_task`` says so (exact
+    ``assigned_to`` match; unassigned/NULL tasks are NOT visible) — the
+    same rule ``view_tasks`` applies.
     """
     if can_view_all_tasks:
         return results
@@ -128,13 +124,25 @@ def _drop_unowned_task_chunks(
     }
     visible_refs: set = set()
     if task_refs:
+        # Fetch the candidate rows (bounded by task_refs — already the
+        # small post-vector-search top-K, not the whole tasks table) and
+        # decide visibility in Python via the shared predicate, rather
+        # than re-deriving the ownership WHERE clause here by hand.
         placeholders = ",".join("?" for _ in task_refs)
         cursor.execute(
-            f"SELECT task_id FROM tasks "
-            f"WHERE assigned_to = ? AND task_id IN ({placeholders})",
-            [requesting_agent_id or "", *task_refs],
+            f"SELECT task_id, assigned_to FROM tasks "
+            f"WHERE task_id IN ({placeholders})",
+            list(task_refs),
         )
-        visible_refs = {row[0] for row in cursor.fetchall()}
+        visible_refs = {
+            row["task_id"]
+            for row in cursor.fetchall()
+            if can_access_task(
+                dict(row),
+                requester_id=requesting_agent_id,
+                can_view_all_tasks=False,
+            )
+        }
     return [
         r
         for r in results

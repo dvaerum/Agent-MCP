@@ -41,6 +41,7 @@ from typing import Any, Dict, Optional
 from ..core.authorize import requires_predicate
 from ..core.config import logger
 from ..core.principal import Principal
+from ..core.task_ownership import can_access_task
 from ..core.tool_result import (
     Conflict,
     Failed,
@@ -202,32 +203,35 @@ async def add_task_comment_tool_impl(
     if task is None:
         return NotFound(resource="task", identifier=str(task_id))
     requester = principal.agent_id or principal.user_id or ""
-    if not principal.has_capability("tasks.assign"):
-        owners = {task.get("assigned_to"), task.get("created_by")}
-        if not requester or requester not in owners:
-            # SECURITY (PF-1): for a FOREIGN-owned task return the SAME
-            # not-found result the phantom-task branch above returns, so
-            # a non-owner worker cannot use the 403-vs-404 shape to
-            # confirm a foreign task exists, and never interpolate the
-            # owner's identity.
-            #
-            # An UNASSIGNED task (``assigned_to`` NULL/empty) has no owner
-            # to hide and is already publicly listed in the claimable pool
-            # via view_tasks (#515) — so instead of stranding a worker
-            # that wants to annotate pool work, guide it to self-claim the
-            # task first. ``_worker_ownership_deny_result`` (shared with
-            # _update_single_task / request_assistance) returns the
-            # actionable "claim it first" PermissionDenied for the
-            # unassigned case and the UNCHANGED phantom-404 for the
-            # foreign-owned case. Lazy import avoids a heavy/cyclic
-            # module-load dependency on task_tools.
-            from .task_tools import _worker_ownership_deny_result
+    if not can_access_task(
+        task,
+        requester_id=requester,
+        can_view_all_tasks=principal.has_capability("tasks.assign"),
+        include_created_by=True,
+    ):
+        # SECURITY (PF-1): for a FOREIGN-owned task return the SAME
+        # not-found result the phantom-task branch above returns, so
+        # a non-owner worker cannot use the 403-vs-404 shape to
+        # confirm a foreign task exists, and never interpolate the
+        # owner's identity.
+        #
+        # An UNASSIGNED task (``assigned_to`` NULL/empty) has no owner
+        # to hide and is already publicly listed in the claimable pool
+        # via view_tasks (#515) — so instead of stranding a worker
+        # that wants to annotate pool work, guide it to self-claim the
+        # task first. ``_worker_ownership_deny_result`` (shared with
+        # _update_single_task / request_assistance) returns the
+        # actionable "claim it first" PermissionDenied for the
+        # unassigned case and the UNCHANGED phantom-404 for the
+        # foreign-owned case. Lazy import avoids a heavy/cyclic
+        # module-load dependency on task_tools.
+        from .task_tools import _worker_ownership_deny_result
 
-            return _worker_ownership_deny_result(
-                str(task_id),
-                task.get("assigned_to"),
-                action="add a comment to it",
-            )
+        return _worker_ownership_deny_result(
+            str(task_id),
+            task.get("assigned_to"),
+            action="add a comment to it",
+        )
 
     # SECURITY (OBS-R12-2, round-13 class-sweep): the terminal-sink
     # invariant every ``tasks.notes`` JSON-column write path already

@@ -21,6 +21,7 @@ from ..core import globals as g
 from ..core.auth import get_agent_id
 from ..core.authorize import requires_capability, requires_policy
 from ..core.principal import Principal
+from ..core.task_ownership import can_access_task
 from ..core.tool_result import (
     Conflict,
     Failed,
@@ -615,10 +616,10 @@ async def _update_single_task(
     # ownership gate — never the admin-field powers below — so it cannot
     # be used to smuggle a reassignment or priority change through the
     # worker path.
-    if (
-        task_current_data.get("assigned_to") != requesting_agent_id
-        and not is_admin_request
-        and not system_transition
+    if not system_transition and not can_access_task(
+        task_current_data,
+        requester_id=requesting_agent_id,
+        can_view_all_tasks=is_admin_request,
     ):
         return {
             "success": False,
@@ -1086,7 +1087,11 @@ async def _create_unassigned_tasks(
                     "SELECT assigned_to FROM tasks WHERE task_id = ?", (_pid,)
                 )
                 _prow = _read_cur.fetchone()
-                if _prow is None or _prow["assigned_to"] != worker_created_by:
+                if _prow is None or not can_access_task(
+                    dict(_prow),
+                    requester_id=worker_created_by,
+                    can_view_all_tasks=False,
+                ):
                     return NotFound(resource="task", identifier=_pid)
         finally:
             _read_conn.close()
@@ -1398,7 +1403,12 @@ async def _assign_to_existing_tasks(
                     # on this path, so ``assigned_to == target_agent_id`` is
                     # "already mine".
                     if any(
-                        t["assigned_to"] != target_agent_id for t in assigned_tasks
+                        not can_access_task(
+                            dict(t),
+                            requester_id=target_agent_id,
+                            can_view_all_tasks=False,
+                        )
+                        for t in assigned_tasks
                     ):
                         return phantom_not_found
                     own_ids = ", ".join(t["task_id"] for t in assigned_tasks)
@@ -2782,7 +2792,11 @@ async def create_self_task_tool_impl(
                     (final_parent_task_id,),
                 )
                 _prow = cursor.fetchone()
-                if _prow is None or _prow["assigned_to"] != requesting_agent_id:
+                if _prow is None or not can_access_task(
+                    dict(_prow),
+                    requester_id=requesting_agent_id,
+                    can_view_all_tasks=False,
+                ):
                     return NotFound(
                         resource="task", identifier=final_parent_task_id
                     )
@@ -2814,7 +2828,11 @@ async def create_self_task_tool_impl(
                         (_dep_id,),
                     )
                     _drow = cursor.fetchone()
-                    if _drow is None or _drow["assigned_to"] != requesting_agent_id:
+                    if _drow is None or not can_access_task(
+                        dict(_drow),
+                        requester_id=requesting_agent_id,
+                        can_view_all_tasks=False,
+                    ):
                         return NotFound(resource="task", identifier=_dep_id)
 
             # R21-F2 (class-sweep sibling of the update-path cycle guard):
@@ -4304,9 +4322,10 @@ async def request_assistance_tool_impl(
     # "claim it first" PermissionDenied for the unassigned case and keeps
     # the UNCHANGED phantom-404 for the foreign-owned case (the sibling
     # split applied in _update_single_task / add_task_comment).
-    if (
-        parent_task_current_data.get("assigned_to") != requesting_agent_id
-        and not is_admin_request
+    if not can_access_task(
+        parent_task_current_data,
+        requester_id=requesting_agent_id,
+        can_view_all_tasks=is_admin_request,
     ):
         return _worker_ownership_deny_result(
             parent_task_id,
@@ -4640,9 +4659,10 @@ async def bulk_task_operations_tool_impl(
                 # "claim it first" guidance instead of the phantom — the same
                 # split the single path makes via ``_worker_ownership_deny``.
                 # Self-owned (assigned_to == caller) passes this gate.
-                if (
-                    task_data.get("assigned_to") != requesting_agent_id
-                    and not is_admin_request
+                if not can_access_task(
+                    task_data,
+                    requester_id=requesting_agent_id,
+                    can_view_all_tasks=is_admin_request,
                 ):
                     results.append(
                         f"Operation {i+1}: "
@@ -5151,10 +5171,13 @@ async def search_tasks_tool_impl(
         # cross-worker isolation invariant (AZ-R17-1 / PF-1). Pool
         # visibility is unconditional (not gated on
         # config_allow_worker_self_assign, which only gates the claim).
-        if not is_admin_request:
-            assignee = task_data.get("assigned_to")
-            if assignee != requesting_agent_id and assignee not in (None, ""):
-                continue
+        if not is_admin_request and not can_access_task(
+            task_data,
+            requester_id=requesting_agent_id,
+            can_view_all_tasks=False,
+            include_unassigned=True,
+        ):
+            continue
 
         # Status filter — ``status_filter_matches`` also recognises the
         # ``incomplete``/``active``/``open`` pseudo-values (any non-terminal
