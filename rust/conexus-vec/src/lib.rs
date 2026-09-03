@@ -58,6 +58,31 @@ unsafe fn register_impl(entry_point: ExtEntryPoint, cancel_after: bool) -> bool 
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
     // SAFETY: caller's contract (see function doc) covers this call.
+    unsafe { register_impl_locked(entry_point, cancel_after) }
+}
+
+/// Same as [`register_impl`] but assumes `REGISTRATION_LOCK` is
+/// already held by the caller. Exists so a caller can extend the
+/// critical section PAST registration — e.g. to also open and use a
+/// second connection before releasing the lock — which plain
+/// `register_impl` can't do without deadlocking on its own
+/// non-reentrant lock. See
+/// `register_sqlite_vec_leaves_the_extension_usable_on_later_connections`'s
+/// test for why that extension matters: `sqlite3_auto_extension` runs
+/// EVERY registered entry point on EVERY new connection, so a caller
+/// that registers persistently, releases the lock, and only THEN
+/// opens a follow-up connection has a gap where a concurrent
+/// `register_and_probe` of a FAILING entry point (from an unrelated
+/// caller/test) can register itself in that gap and break the
+/// follow-up connection open — even though it has nothing to do with
+/// this caller's extension. Reproduced empirically: this crate's test
+/// suite flaked under parallel execution (the `cargo test` default)
+/// before this split existed.
+///
+/// # Safety
+/// Same contract as [`register_impl`], PLUS: `REGISTRATION_LOCK` must
+/// already be held by the calling thread.
+unsafe fn register_impl_locked(entry_point: ExtEntryPoint, cancel_after: bool) -> bool {
     let registered = unsafe { ffi::sqlite3_auto_extension(Some(entry_point)) } == ffi::SQLITE_OK;
 
     let loadable = registered
@@ -176,7 +201,22 @@ mod tests {
 
     #[test]
     fn register_sqlite_vec_leaves_the_extension_usable_on_later_connections() {
-        assert!(register_sqlite_vec());
+        // Hold REGISTRATION_LOCK across this test's ENTIRE body, not
+        // just the internal register call `register_sqlite_vec()`
+        // makes -- otherwise a concurrent test thread's
+        // `register_and_probe` of a FAILING fake entry point can land
+        // in the gap between `register_sqlite_vec()` returning (which
+        // only holds the lock for its own register+probe) and the
+        // `Connection::open_in_memory()` below, breaking that
+        // follow-up open. See `register_impl_locked`'s doc for the
+        // full mechanism; `holding_the_lock_blocks_a_concurrent_
+        // failing_probe` below proves the lock itself actually
+        // prevents that interleaving.
+        let _guard = REGISTRATION_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry_point = real_entry_point();
+        assert!(unsafe { register_impl_locked(entry_point, false) });
 
         // Unlike check_vss_loadable (which always cancels its own
         // registration), a FRESH connection opened well after this
@@ -191,17 +231,70 @@ mod tests {
         // Clean up so this test doesn't leak process-wide state into
         // whatever test happens to run after it in the same binary.
         unsafe {
-            ffi::sqlite3_cancel_auto_extension(Some(real_entry_point()));
+            ffi::sqlite3_cancel_auto_extension(Some(entry_point));
         }
     }
 
     #[test]
     fn probing_never_leaks_registration_state() {
-        // A corrupt probe must not leave its failing entry point
-        // registered — otherwise every connection opened by a LATER
-        // caller (including the next test, or production code after
-        // a failed probe) would start failing too.
-        assert!(!unsafe { register_and_probe(fake_corrupt) });
+        // Same class of race as
+        // `register_sqlite_vec_leaves_the_extension_usable_on_later_connections`:
+        // `register_and_probe` itself is fully lock-protected, but the
+        // follow-up `Connection::open_in_memory()` check below is a
+        // raw open with no lock of its own — a CONCURRENT test's own
+        // register_impl call briefly registers (and then cancels) its
+        // entry point while holding the SAME lock, and
+        // `sqlite3_auto_extension` runs every registered entry point
+        // on every new connection. An unprotected open landing inside
+        // that other call's tiny registered-but-not-yet-cancelled
+        // window can fail even though it has nothing to do with THIS
+        // test's own fake_corrupt (which is already gone by the time
+        // `register_and_probe` returns). Hold the lock across this
+        // test's own follow-up check too, for the same reason.
+        let _guard = REGISTRATION_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(!unsafe { register_impl_locked(fake_corrupt, true) });
         assert!(Connection::open_in_memory().is_ok());
+    }
+
+    #[test]
+    fn holding_the_lock_blocks_a_concurrent_failing_probe() {
+        // Regression test for a real flake reproduced against `main`
+        // (verified: `cargo test -p conexus-vec --lib` failed ~1 run
+        // in 5, always inside
+        // `register_sqlite_vec_leaves_the_extension_usable_on_later_connections`'s
+        // follow-up `Connection::open_in_memory()`, with error
+        // "automatic extension loading failed"). Root cause:
+        // `sqlite3_auto_extension` runs EVERY registered entry point
+        // on EVERY new connection, and the old `register_impl` only
+        // held `REGISTRATION_LOCK` for its own register+probe+cancel
+        // -- a caller that registers persistently and only opens its
+        // follow-up connection AFTER releasing the lock has a gap
+        // where a concurrent `register_and_probe(fake_corrupt)` (from
+        // an unrelated test thread) can register itself and break
+        // that follow-up open.
+        //
+        // The fix (`register_impl_locked` + holding the guard across
+        // the whole register-then-use sequence, see the test above)
+        // relies on `REGISTRATION_LOCK` actually blocking a concurrent
+        // registration attempt for as long as it's held. This test
+        // proves that mechanism directly.
+        let _guard = REGISTRATION_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let handle = std::thread::spawn(|| unsafe { register_and_probe(fake_corrupt) });
+
+        // Give the spawned thread every chance to run first if the
+        // lock weren't actually serializing against it.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            !handle.is_finished(),
+            "a concurrent registration attempt must block while REGISTRATION_LOCK is held"
+        );
+
+        drop(_guard);
+        assert!(!handle.join().unwrap());
     }
 }
