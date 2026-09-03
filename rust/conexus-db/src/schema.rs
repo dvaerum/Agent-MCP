@@ -70,6 +70,25 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_pending_directive_undelivered
             ON pending_directive (agent_id, delivered_at);
+
+        CREATE TABLE IF NOT EXISTS scheduled_directive (
+            directive_id      TEXT PRIMARY KEY,
+            agent_id          TEXT NOT NULL,
+            prompt            TEXT NOT NULL,
+            interval_seconds  INTEGER NOT NULL,
+            next_due_at       TEXT NOT NULL,
+            enabled           INTEGER NOT NULL DEFAULT 1,
+            status            TEXT NOT NULL DEFAULT 'active',
+            until_at          TEXT,
+            max_runs          INTEGER,
+            run_count         INTEGER NOT NULL DEFAULT 0,
+            created_at        TEXT NOT NULL,
+            created_by        TEXT,
+            updated_at        TEXT,
+            updated_by        TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_scheduled_directive_due
+            ON scheduled_directive (agent_id, enabled, next_due_at);
         "#,
     )
 }
