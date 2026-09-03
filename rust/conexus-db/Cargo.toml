@@ -1,0 +1,11 @@
+[package]
+name = "conexus-db"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "CoNexus data layer — unifies agent_mcp's 8 Python repositories into one rusqlite crate (Phase B). See /home/dennis/.claude/plans/prancy-napping-pie.md."
+
+[dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+regex = "1"
