@@ -89,8 +89,39 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_scheduled_directive_due
             ON scheduled_directive (agent_id, enabled, next_due_at);
+
+        CREATE TABLE IF NOT EXISTS rag_chunks (
+            chunk_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_type  TEXT NOT NULL,
+            source_ref   TEXT NOT NULL,
+            chunk_text   TEXT NOT NULL,
+            indexed_at   TEXT NOT NULL,
+            metadata     TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_rag_chunks_source_type_ref
+            ON rag_chunks (source_type, source_ref);
+
+        CREATE TABLE IF NOT EXISTS rag_meta (
+            meta_key    TEXT PRIMARY KEY,
+            meta_value  TEXT
+        );
         "#,
     )
+}
+
+/// Create the `rag_embeddings` sqlite-vec `vec0` virtual table.
+/// Deliberately NOT part of [`init_schema`] above: unlike every other
+/// table there, this one requires the sqlite-vec extension to already
+/// be registered on the process (see `conexus-vec`), and forcing that
+/// dependency onto every unrelated repository's tests (agents,
+/// project_context, ...) would be wrong — this table is a
+/// `rag_repository`-specific opt-in, matching Python's own schema
+/// bootstrap, which also creates this table conditionally, separate
+/// from `Base.metadata.create_all()`'s unconditional ORM tables.
+pub fn init_rag_embeddings_table(conn: &Connection, dimension: u32) -> Result<()> {
+    conn.execute_batch(&format!(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS rag_embeddings USING vec0(embedding FLOAT[{dimension}])"
+    ))
 }
 
 /// Create the ROUTER-database tables `group_capability_repository`
