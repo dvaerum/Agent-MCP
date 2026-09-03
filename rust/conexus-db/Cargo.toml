@@ -18,6 +18,14 @@ serde_json = "1"
 # scheduled_directive_repository's interval math, not Utc::now().
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 
+[dev-dependencies]
+# Only needed to register the real sqlite-vec extension for THIS
+# crate's own rag_repository tests -- production rag_repository code
+# never calls into conexus-vec itself (it only checks whether
+# `rag_embeddings` exists in sqlite_master, a plain SQL query), so
+# this stays a dev-dependency, not a real one.
+conexus-vec = { path = "../conexus-vec" }
+
 [[bin]]
 name = "conexus-db-differential"
 path = "src/bin/conexus-db-differential.rs"
