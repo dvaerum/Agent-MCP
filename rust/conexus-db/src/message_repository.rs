@@ -1,19 +1,19 @@
-//! Port of `agent_mcp/repositories/message_repository.py` — Phase 1
-//! (core CRUD). Pagination (`query`/`count_query`, the `StableOrderCache`
-//! pair), threading (`fetch_thread`), and admin/maintenance surface
-//! (`rename_participant`, `list_participants`, `prune_read_before`,
-//! subject-backfill) are deliberately deferred to follow-up PRs — see
-//! the migration plan's progress log for the phase split rationale.
+//! Port of `agent_mcp/repositories/message_repository.py` — Phases 1-2
+//! (core CRUD + pagination). Threading (`fetch_thread`) and
+//! admin/maintenance surface (`rename_participant`, `list_participants`,
+//! `prune_read_before`, subject-backfill) are deliberately deferred to
+//! a follow-up PR 3/3 — see the migration plan's progress log for the
+//! phase split rationale.
 //!
-//! A module of plain functions. Python's version is class-based
-//! (`MessageRepository`) but its own docstring states there is NO
-//! message cache — "every read goes straight to the DB" — matching
-//! this crate's rule (`project_context_repository`) that no state to
-//! hold means no wrapper type is needed for THIS phase. (The
-//! pagination phase will need a real `StableOrderCache` instance
-//! field, at which point this module gains a struct — matching
+//! Mostly plain functions, plus [`MessageRepository`] for the two
+//! methods (`query`/`count_query`) that need a real
+//! [`StableOrderCache`] instance — Python's version is fully
+//! class-based, but its own docstring states there is NO message
+//! *row* cache ("every read goes straight to the DB"); the pagination
+//! *ordering* cache is a different concern (consistency, not perf),
+//! which is why only those two methods live on a struct, matching
 //! `AgentRepository`'s own precedent of starting as free functions and
-//! growing a wrapper only once real state showed up.)
+//! growing a wrapper only once real state showed up.
 //!
 //! Simplified from Python's three-connection-shape design (`None`
 //! self-opening / raw sqlite3 cursor / SQLAlchemy `Session`, detected
@@ -41,8 +41,10 @@
 //!   doesn't publish events at all yet — noted for when a
 //!   composition layer adds that.)
 
-use rusqlite::{Connection, OptionalExtension, Result, Row};
+use rusqlite::{Connection, OptionalExtension, Result, Row, ToSql};
+use std::collections::HashMap;
 
+use crate::pagination_cache::StableOrderCache;
 use crate::sql_util::{in_placeholders, to_sql_refs};
 
 /// One row of the `agent_messages` table.
@@ -301,6 +303,274 @@ pub fn delete(conn: &Connection, message_id: &str) -> Result<bool> {
         [message_id],
     )?;
     Ok(changed > 0)
+}
+
+/// Filters accepted by [`MessageRepository::query`]/
+/// [`MessageRepository::count_query`] — a typed port of Python's
+/// `_apply_query_filters` dict, following `AgentQueryFilters`'s
+/// pattern. `limit`/`offset` live here too (matching Python passing
+/// the same `filters` dict to both `query` and `count_query`) but are
+/// deliberately EXCLUDED from the pagination cache key — see
+/// [`MessageQueryCacheKey`].
+pub struct MessageQueryFilters<'a> {
+    pub from: Option<&'a str>,
+    pub to: Option<&'a str>,
+    /// Either-direction sender/recipient pair: `(a, b)` matches
+    /// `a->b` OR `b->a`.
+    pub between: Option<(&'a str, &'a str)>,
+    pub message_type: Option<&'a str>,
+    pub priority: Option<&'a str>,
+    pub read: Option<bool>,
+    pub since: Option<&'a str>,
+    pub until: Option<&'a str>,
+    /// Substring match across `message_content`, `subject`,
+    /// `sender_id`, `recipient_id`.
+    pub q: Option<&'a str>,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+impl Default for MessageQueryFilters<'_> {
+    fn default() -> Self {
+        Self {
+            from: None,
+            to: None,
+            between: None,
+            message_type: None,
+            priority: None,
+            read: None,
+            since: None,
+            until: None,
+            q: None,
+            limit: 50,
+            offset: 0,
+        }
+    }
+}
+
+/// The `StableOrderCache` key: every filter dimension EXCEPT
+/// `limit`/`offset` (those vary within one sweep and must not
+/// fragment the anchor), plus `oldest_first`. `count_query`
+/// deliberately hard-codes `oldest_first: false` when building this,
+/// regardless of what a caller might pass elsewhere — matching Python
+/// exactly (`count_query` has no `oldest_first` parameter at all).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct MessageQueryCacheKey {
+    from: Option<String>,
+    to: Option<String>,
+    between: Option<(String, String)>,
+    message_type: Option<String>,
+    priority: Option<String>,
+    read: Option<bool>,
+    since: Option<String>,
+    until: Option<String>,
+    q: Option<String>,
+    oldest_first: bool,
+}
+
+impl MessageQueryCacheKey {
+    fn from_filters(filters: &MessageQueryFilters, oldest_first: bool) -> Self {
+        Self {
+            from: filters.from.map(String::from),
+            to: filters.to.map(String::from),
+            between: filters.between.map(|(a, b)| (a.to_string(), b.to_string())),
+            message_type: filters.message_type.map(String::from),
+            priority: filters.priority.map(String::from),
+            read: filters.read,
+            since: filters.since.map(String::from),
+            until: filters.until.map(String::from),
+            q: filters.q.map(String::from),
+            oldest_first,
+        }
+    }
+}
+
+/// Builds the `WHERE` fragment + bind params for `filters` — shared
+/// verbatim by [`compute_ordered_ids`] (the only query that actually
+/// needs it; `query`/`count_query` fetch rows/counts by anchored id
+/// list afterward, not by re-applying filters).
+fn build_where_clause(filters: &MessageQueryFilters) -> (String, Vec<Box<dyn ToSql>>) {
+    let mut clauses: Vec<&str> = Vec::new();
+    let mut params: Vec<Box<dyn ToSql>> = Vec::new();
+
+    if let Some(v) = filters.from {
+        clauses.push("sender_id = ?");
+        params.push(Box::new(v.to_string()));
+    }
+    if let Some(v) = filters.to {
+        clauses.push("recipient_id = ?");
+        params.push(Box::new(v.to_string()));
+    }
+    if let Some((a, b)) = filters.between {
+        clauses
+            .push("((sender_id = ? AND recipient_id = ?) OR (sender_id = ? AND recipient_id = ?))");
+        params.push(Box::new(a.to_string()));
+        params.push(Box::new(b.to_string()));
+        params.push(Box::new(b.to_string()));
+        params.push(Box::new(a.to_string()));
+    }
+    if let Some(v) = filters.message_type {
+        clauses.push("message_type = ?");
+        params.push(Box::new(v.to_string()));
+    }
+    if let Some(v) = filters.priority {
+        clauses.push("priority = ?");
+        params.push(Box::new(v.to_string()));
+    }
+    if let Some(v) = filters.read {
+        clauses.push("read = ?");
+        params.push(Box::new(v));
+    }
+    if let Some(v) = filters.since {
+        clauses.push("timestamp >= ?");
+        params.push(Box::new(v.to_string()));
+    }
+    if let Some(v) = filters.until {
+        clauses.push("timestamp <= ?");
+        params.push(Box::new(v.to_string()));
+    }
+    if let Some(v) = filters.q {
+        let pattern = format!("%{v}%");
+        clauses.push(
+            "(message_content LIKE ? OR subject LIKE ? OR sender_id LIKE ? OR recipient_id LIKE ?)",
+        );
+        params.push(Box::new(pattern.clone()));
+        params.push(Box::new(pattern.clone()));
+        params.push(Box::new(pattern.clone()));
+        params.push(Box::new(pattern));
+    }
+
+    let where_sql = if clauses.is_empty() {
+        "1=1".to_string()
+    } else {
+        clauses.join(" AND ")
+    };
+    (where_sql, params)
+}
+
+/// The ONE `ORDER BY` both `query` and `count_query` must route
+/// through (R18-F2: `count_query` used to have its own unordered
+/// closure with no `.order_by()` at all, which — because
+/// `get_or_anchor` unconditionally overwrites the shared cache entry
+/// on every `offset == 0` call — silently clobbered `query`'s
+/// correctly-ordered anchor with whatever unspecified order SQLite's
+/// planner picked). A fixed `message_id ASC` tiebreak guarantees a
+/// deterministic order even when `timestamp` collides.
+fn compute_ordered_ids(
+    conn: &Connection,
+    filters: &MessageQueryFilters,
+    oldest_first: bool,
+) -> Result<Vec<String>> {
+    let (where_sql, params) = build_where_clause(filters);
+    let order_dir = if oldest_first { "ASC" } else { "DESC" };
+    let sql = format!("SELECT message_id FROM agent_messages WHERE {where_sql} ORDER BY timestamp {order_dir}, message_id ASC");
+
+    let mut stmt = conn.prepare(&sql)?;
+    let param_refs: Vec<&dyn ToSql> = params.iter().map(|b| b.as_ref()).collect();
+    let rows = stmt.query_map(param_refs.as_slice(), |row| row.get::<_, String>(0))?;
+    rows.collect()
+}
+
+/// Owns the [`StableOrderCache`] instance `query`/`count_query` need.
+/// A per-instance field (NOT a process-wide singleton) — Python's
+/// `MessageRepository._pagination_cache` is a class attribute (shared
+/// across every instance/request), but the Rust convention already
+/// established for `AgentRepository` is deliberately per-instance
+/// (see `pagination_cache.rs`'s own doc: "never a single process-wide
+/// singleton"); this repository follows that same established
+/// convention rather than copying Python's.
+#[derive(Default)]
+pub struct MessageRepository {
+    pagination_cache: StableOrderCache<MessageQueryCacheKey, String>,
+}
+
+impl MessageRepository {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Filtered, sorted, paginated listing. Ordering is anchored via
+    /// [`StableOrderCache`] exactly like `AgentRepository::query` —
+    /// `offset == 0` always recomputes+re-anchors; `offset > 0`
+    /// replays the anchor from this sweep unless it's missing/expired.
+    /// Returns `Vec::new()` for an empty/exhausted window rather than
+    /// an error.
+    pub fn query(
+        &self,
+        conn: &Connection,
+        filters: &MessageQueryFilters,
+        oldest_first: bool,
+    ) -> Result<Vec<MessageRow>> {
+        let limit = filters.limit.clamp(1, 500);
+        let offset = filters.offset.max(0);
+        let cache_key = MessageQueryCacheKey::from_filters(filters, oldest_first);
+
+        let ordered_ids: Vec<String> =
+            self.pagination_cache.get_or_anchor(cache_key, offset, || {
+                compute_ordered_ids(conn, filters, oldest_first)
+            })?;
+
+        let offset_usize = offset as usize;
+        let window_ids: Vec<&String> = if offset_usize < ordered_ids.len() {
+            ordered_ids[offset_usize..]
+                .iter()
+                .take(limit as usize)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if window_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let sql = format!(
+            "SELECT {COLUMNS} FROM agent_messages WHERE message_id IN ({})",
+            in_placeholders(window_ids.len())
+        );
+        let params = to_sql_refs(&window_ids);
+        let mut stmt = conn.prepare(&sql)?;
+        let rows_by_id: HashMap<String, MessageRow> = stmt
+            .query_map(params.as_slice(), row_to_message)?
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .map(|row| (row.message_id.clone(), row))
+            .collect();
+
+        // Reassemble in window_ids (anchored) order, silently
+        // dropping any id that no longer resolves.
+        Ok(window_ids
+            .into_iter()
+            .filter_map(|id| rows_by_id.get(id).cloned())
+            .collect())
+    }
+
+    /// Total matching `filters`, anchored to the SAME `StableOrderCache`
+    /// entry `query` uses for identical filters (R18-F2) — NOT a fresh
+    /// `COUNT(*)`. Reconciles the anchored id list against rows that
+    /// still exist right now (R21-F3), so a hard delete of an
+    /// already-anchored-but-undelivered row is reflected on every
+    /// later page. Always uses `oldest_first: false` for its cache key
+    /// (matching Python: `count_query` has no such parameter).
+    pub fn count_query(&self, conn: &Connection, filters: &MessageQueryFilters) -> Result<i64> {
+        let offset = filters.offset.max(0);
+        let cache_key = MessageQueryCacheKey::from_filters(filters, false);
+
+        let ordered_ids: Vec<String> =
+            self.pagination_cache.get_or_anchor(cache_key, offset, || {
+                compute_ordered_ids(conn, filters, false)
+            })?;
+
+        if ordered_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let sql = format!(
+            "SELECT COUNT(*) FROM agent_messages WHERE message_id IN ({})",
+            in_placeholders(ordered_ids.len())
+        );
+        let params = to_sql_refs(&ordered_ids);
+        conn.query_row(&sql, params.as_slice(), |row| row.get(0))
+    }
 }
 
 #[cfg(test)]
@@ -601,5 +871,349 @@ mod tests {
     fn delete_missing_message_returns_false() {
         let conn = test_conn();
         assert!(!delete(&conn, "nope").unwrap());
+    }
+
+    fn seed_msg(conn: &Connection, id: &str, sender: &str, recipient: &str, timestamp: &str) {
+        let mut msg = new_msg(id, sender, recipient, "content");
+        msg.timestamp = timestamp;
+        send(conn, msg).unwrap();
+    }
+
+    fn ids(rows: &[MessageRow]) -> Vec<&str> {
+        rows.iter().map(|r| r.message_id.as_str()).collect()
+    }
+
+    #[test]
+    fn query_default_sort_is_newest_first_with_message_id_tiebreaker() {
+        let conn = test_conn();
+        seed_agent(&conn, "alice");
+        seed_agent(&conn, "bob");
+        seed_msg(&conn, "z", "alice", "bob", "2026-01-01T00:00:00Z");
+        seed_msg(&conn, "a", "alice", "bob", "2026-01-01T00:00:00Z"); // same timestamp
+        seed_msg(&conn, "m", "alice", "bob", "2026-01-02T00:00:00Z");
+
+        let repo = MessageRepository::new();
+        let rows = repo
+            .query(&conn, &MessageQueryFilters::default(), false)
+            .unwrap();
+        // "m" newest -> first. "z"/"a" tie on timestamp -> message_id ASC.
+        assert_eq!(ids(&rows), vec!["m", "a", "z"]);
+    }
+
+    #[test]
+    fn query_oldest_first_reverses_order() {
+        let conn = test_conn();
+        seed_agent(&conn, "alice");
+        seed_agent(&conn, "bob");
+        seed_msg(&conn, "old", "alice", "bob", "2026-01-01T00:00:00Z");
+        seed_msg(&conn, "new", "alice", "bob", "2026-01-02T00:00:00Z");
+
+        let repo = MessageRepository::new();
+        let rows = repo
+            .query(&conn, &MessageQueryFilters::default(), true)
+            .unwrap();
+        assert_eq!(ids(&rows), vec!["old", "new"]);
+    }
+
+    #[test]
+    fn query_filters_from_to_and_substring_q() {
+        let conn = test_conn();
+        seed_agent(&conn, "alice");
+        seed_agent(&conn, "bob");
+        seed_agent(&conn, "carol");
+        send(&conn, new_msg("m1", "alice", "bob", "hello there")).unwrap();
+        send(&conn, new_msg("m2", "alice", "carol", "unrelated")).unwrap();
+        send(&conn, new_msg("m3", "bob", "alice", "hello back")).unwrap();
+
+        let repo = MessageRepository::new();
+        let from_alice = repo
+            .query(
+                &conn,
+                &MessageQueryFilters {
+                    from: Some("alice"),
+                    ..Default::default()
+                },
+                false,
+            )
+            .unwrap();
+        assert_eq!(ids(&from_alice).len(), 2);
+
+        let to_carol = repo
+            .query(
+                &conn,
+                &MessageQueryFilters {
+                    to: Some("carol"),
+                    ..Default::default()
+                },
+                false,
+            )
+            .unwrap();
+        assert_eq!(ids(&to_carol), vec!["m2"]);
+
+        let hello = repo
+            .query(
+                &conn,
+                &MessageQueryFilters {
+                    q: Some("hello"),
+                    ..Default::default()
+                },
+                false,
+            )
+            .unwrap();
+        assert_eq!(ids(&hello).len(), 2);
+    }
+
+    #[test]
+    fn query_between_matches_either_direction() {
+        let conn = test_conn();
+        seed_agent(&conn, "alice");
+        seed_agent(&conn, "bob");
+        seed_agent(&conn, "carol");
+        send(&conn, new_msg("m1", "alice", "bob", "a to b")).unwrap();
+        send(&conn, new_msg("m2", "bob", "alice", "b to a")).unwrap();
+        send(&conn, new_msg("m3", "alice", "carol", "a to c")).unwrap();
+
+        let repo = MessageRepository::new();
+        let rows = repo
+            .query(
+                &conn,
+                &MessageQueryFilters {
+                    between: Some(("alice", "bob")),
+                    ..Default::default()
+                },
+                false,
+            )
+            .unwrap();
+        let mut got = ids(&rows);
+        got.sort();
+        assert_eq!(got, vec!["m1", "m2"]);
+    }
+
+    #[test]
+    fn query_limit_is_clamped_between_1_and_500() {
+        let conn = test_conn();
+        seed_agent(&conn, "alice");
+        seed_agent(&conn, "bob");
+        seed_msg(&conn, "m1", "alice", "bob", "2026-01-01T00:00:00Z");
+
+        let repo = MessageRepository::new();
+        let rows = repo
+            .query(
+                &conn,
+                &MessageQueryFilters {
+                    limit: 0,
+                    ..Default::default()
+                },
+                false,
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1, "limit=0 clamps to 1, not 'everything'");
+    }
+
+    #[test]
+    fn count_query_matches_query_total_for_unfiltered_sweep() {
+        let conn = test_conn();
+        seed_agent(&conn, "alice");
+        seed_agent(&conn, "bob");
+        for i in 1..=3 {
+            seed_msg(
+                &conn,
+                &format!("m{i}"),
+                "alice",
+                "bob",
+                &format!("2026-01-0{i}T00:00:00Z"),
+            );
+        }
+
+        let repo = MessageRepository::new();
+        assert_eq!(
+            repo.count_query(&conn, &MessageQueryFilters::default())
+                .unwrap(),
+            3
+        );
+    }
+
+    /// Port of Python's
+    /// `test_query_offset_pagination_survives_concurrent_read_flag_change`
+    /// (R17-F2).
+    #[test]
+    fn query_offset_pagination_survives_concurrent_read_flag_change() {
+        let conn = test_conn();
+        seed_agent(&conn, "alice");
+        seed_agent(&conn, "bob");
+        for i in 1..=5 {
+            seed_msg(
+                &conn,
+                &format!("m{i}"),
+                "alice",
+                "bob",
+                &format!("2026-01-01T00:0{i}:00Z"),
+            );
+        }
+        let repo = MessageRepository::new();
+        let filters = || MessageQueryFilters {
+            to: Some("bob"),
+            read: Some(false),
+            limit: 2,
+            ..Default::default()
+        };
+
+        // Newest-first: m5, m4, m3, m2, m1. Anchors that ordering.
+        let page1 = repo
+            .query(
+                &conn,
+                &MessageQueryFilters {
+                    offset: 0,
+                    ..filters()
+                },
+                false,
+            )
+            .unwrap();
+        assert_eq!(ids(&page1), vec!["m5", "m4"]);
+
+        // Concurrent mutation OUTSIDE the paginated API: m5 (rank #1)
+        // gets marked read, which would drop it from this
+        // read=false filter and shift every later-ranked message up.
+        mark_read(&conn, "m5", true).unwrap();
+
+        // offset=2 must replay the ANCHOR from page1, not a
+        // re-filtered live query.
+        let page2 = repo
+            .query(
+                &conn,
+                &MessageQueryFilters {
+                    offset: 2,
+                    ..filters()
+                },
+                false,
+            )
+            .unwrap();
+        assert_eq!(ids(&page2), vec!["m3", "m2"]);
+
+        // m3 was in-filter the entire sweep and must never be skipped.
+        let seen: Vec<&str> = ids(&page1).into_iter().chain(ids(&page2)).collect();
+        assert!(seen.contains(&"m3"));
+    }
+
+    /// Port of Python's
+    /// `test_count_query_offset_pagination_survives_concurrent_read_flag_change`.
+    #[test]
+    fn count_query_total_stays_anchored_despite_concurrent_read_flag_change() {
+        let conn = test_conn();
+        seed_agent(&conn, "alice");
+        seed_agent(&conn, "bob");
+        for i in 1..=5 {
+            seed_msg(
+                &conn,
+                &format!("m{i}"),
+                "alice",
+                "bob",
+                &format!("2026-01-01T00:0{i}:00Z"),
+            );
+        }
+        let repo = MessageRepository::new();
+        let filters = |offset| MessageQueryFilters {
+            to: Some("bob"),
+            read: Some(false),
+            limit: 2,
+            offset,
+            ..Default::default()
+        };
+
+        assert_eq!(repo.count_query(&conn, &filters(0)).unwrap(), 5);
+        mark_read(&conn, "m5", true).unwrap();
+        // Total stays anchored at 5 despite the mid-sweep flag flip --
+        // NOT a fresh live COUNT (which would now be 4).
+        assert_eq!(repo.count_query(&conn, &filters(2)).unwrap(), 5);
+    }
+
+    /// Port of Python's `test_count_query_total_excludes_message_deleted_mid_sweep`
+    /// (R21-F3).
+    #[test]
+    fn count_query_total_excludes_message_deleted_mid_sweep() {
+        let conn = test_conn();
+        seed_agent(&conn, "alice");
+        seed_agent(&conn, "bob");
+        for i in 1..=7 {
+            seed_msg(
+                &conn,
+                &format!("m{i}"),
+                "alice",
+                "bob",
+                &format!("2026-01-01T00:0{i}:00Z"),
+            );
+        }
+        let repo = MessageRepository::new();
+        let filters = |offset| MessageQueryFilters {
+            to: Some("bob"),
+            limit: 2,
+            offset,
+            ..Default::default()
+        };
+
+        let page1 = repo.query(&conn, &filters(0), false).unwrap();
+        assert_eq!(repo.count_query(&conn, &filters(0)).unwrap(), 7);
+        let mut delivered = page1.len();
+
+        // Hard-delete the rank-3 message (m5, newest-first: m7 m6 m5
+        // m4 m3 m2 m1) -- not yet delivered by any page.
+        assert!(delete(&conn, "m5").unwrap());
+
+        for offset in [2, 4, 6] {
+            let total = repo.count_query(&conn, &filters(offset)).unwrap();
+            assert_eq!(
+                total, 6,
+                "total must reconcile the anchor against currently-existing rows"
+            );
+            delivered += repo.query(&conn, &filters(offset), false).unwrap().len();
+        }
+
+        // 2 (page1) + 1 (offset=2, m5's slot dropped) + 2 (offset=4) + 1 (offset=6) == 6.
+        assert_eq!(delivered, 6);
+    }
+
+    /// Port of Python's `test_query_and_count_query_anchor_the_identical_ordered_ids`.
+    #[test]
+    fn query_and_count_query_share_the_identical_anchor() {
+        let conn = test_conn();
+        seed_agent(&conn, "alice");
+        seed_agent(&conn, "bob");
+        for i in 1..=4 {
+            seed_msg(
+                &conn,
+                &format!("m{i}"),
+                "alice",
+                "bob",
+                &format!("2026-01-01T00:0{i}:00Z"),
+            );
+        }
+        let repo = MessageRepository::new();
+        let filters = MessageQueryFilters {
+            to: Some("bob"),
+            limit: 2,
+            ..Default::default()
+        };
+
+        // query() anchors the ordering first...
+        let page1 = repo.query(&conn, &filters, false).unwrap();
+        assert_eq!(ids(&page1), vec!["m4", "m3"]);
+
+        // ...count_query() must reuse that SAME anchor, not compute
+        // its own (unordered) closure -- if it did, this total could
+        // silently clobber query()'s anchor with a different order
+        // (R18-F2). Confirmed indirectly: a later query() page must
+        // still see the original DESC ordering.
+        assert_eq!(repo.count_query(&conn, &filters).unwrap(), 4);
+        let page2 = repo
+            .query(
+                &conn,
+                &MessageQueryFilters {
+                    offset: 2,
+                    ..filters
+                },
+                false,
+            )
+            .unwrap();
+        assert_eq!(ids(&page2), vec!["m2", "m1"]);
     }
 }
