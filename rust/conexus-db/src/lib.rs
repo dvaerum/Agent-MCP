@@ -3,6 +3,7 @@ pub mod group_capability_repository;
 pub mod pagination_cache;
 pub mod pending_directive_repository;
 pub mod project_context_repository;
+pub mod project_settings_repository;
 pub mod schema;
 mod sql_util;
 
@@ -13,4 +14,5 @@ pub use agent_repository::{
 pub use pagination_cache::StableOrderCache;
 pub use pending_directive_repository::{DirectiveEvent, DirectiveEventData, PendingDirectiveRow};
 pub use project_context_repository::{DeletedContextEntry, ProjectContextRow};
+pub use project_settings_repository::{DeletedSettingEntry, ProjectSettingRow};
 pub use schema::{init_router_schema, init_schema};
