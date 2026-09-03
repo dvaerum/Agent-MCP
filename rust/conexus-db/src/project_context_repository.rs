@@ -12,7 +12,7 @@ use crate::sql_util::{in_placeholders, to_sql_refs};
 use rusqlite::{Connection, OptionalExtension, Result, Row};
 
 /// One row of the `project_context` table.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct ProjectContextRow {
     pub context_key: String,
     pub value: String,
