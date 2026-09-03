@@ -51,3 +51,33 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
         "#,
     )
 }
+
+/// Create the ROUTER-database tables `group_capability_repository`
+/// touches. Deliberately separate from [`init_schema`] above: `agents`/
+/// `project_context` live in the per-project agent DB
+/// (`<project_dir>/.agent/mcp_state.db`), while `groups`/
+/// `group_capability` live in the entirely different router DB
+/// (`router.db`) — two physically separate SQLite files in
+/// production, whose schemas happen to be owned by two different
+/// Alembic migration chains (`agent_mcp/db/` vs.
+/// `agent_mcp/router/migrations/`). A test standing up an in-memory
+/// router-DB-shaped connection should call this, not [`init_schema`],
+/// to accurately reflect what tables actually coexist on that file.
+pub fn init_router_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS groups (
+            group_id     TEXT PRIMARY KEY,
+            name         TEXT NOT NULL UNIQUE,
+            is_sysadmin  INTEGER NOT NULL DEFAULT 0,
+            created_at   TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS group_capability (
+            group_id    TEXT NOT NULL REFERENCES groups(group_id) ON DELETE CASCADE,
+            capability  TEXT NOT NULL,
+            PRIMARY KEY (group_id, capability)
+        );
+        "#,
+    )
+}
