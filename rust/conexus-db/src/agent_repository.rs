@@ -21,8 +21,9 @@
 //! by exactly one place upstream (Phase D's app layer) rather than
 //! scattered across every write method.
 
+use crate::pagination_cache::StableOrderCache;
 use regex::Regex;
-use rusqlite::{Connection, OptionalExtension, Result, Row};
+use rusqlite::{Connection, OptionalExtension, Result, Row, ToSql};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
@@ -197,15 +198,28 @@ fn is_unique_violation(err: &rusqlite::Error) -> bool {
     )
 }
 
-/// Pure DB-CRUD surface for the `agents` table. Stateless — every
-/// method takes the connection it should run against, matching the
-/// Python source's `connection=` seam (this Rust port has ONLY that
-/// seam: there is no separate "standalone, opens its own connection"
-/// path, since owning a connection pool is an app-layer concern, not
-/// a repository concern).
-pub struct AgentRepository;
+/// Pure DB-CRUD surface for the `agents` table. Every method takes
+/// the connection it should run against, matching the Python source's
+/// `connection=` seam (this Rust port has ONLY that seam: there is no
+/// separate "standalone, opens its own connection" path, since owning
+/// a connection pool is an app-layer concern, not a repository
+/// concern). The one exception is [`Self::query`]'s pagination
+/// anchor: it's real, deliberate cross-call state (see
+/// [`pagination_cache`](crate::pagination_cache)'s docs for why it
+/// can't be a pure function of its arguments), held as an explicit
+/// instance field the caller owns — matching Python's
+/// `_pagination_cache` class attribute in spirit (one cache per
+/// repository), but never a hidden global static.
+#[derive(Default)]
+pub struct AgentRepository {
+    pagination_cache: StableOrderCache<AgentQueryCacheKey, String>,
+}
 
 impl AgentRepository {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     pub fn get_by_id(conn: &Connection, agent_id: &str) -> Result<Option<AgentRow>> {
         conn.query_row(
             &format!("SELECT {AGENT_COLUMNS} FROM agents WHERE agent_id = ?1"),
@@ -505,6 +519,299 @@ impl AgentRepository {
         )?;
         Ok(())
     }
+
+    /// Filtered, sorted, paginated agent listing backing `view_agents`.
+    /// `tombstone` rows are excluded UNCONDITIONALLY, before any
+    /// caller-supplied filter (BL-R31-3) — including a caller-supplied
+    /// `status: "tombstone"` filter, which becomes self-contradictory
+    /// against that unconditional exclusion and so always yields
+    /// `(vec![], 0)`. This is deliberately not special-cased: it's the
+    /// same emergent behavior Python gets from ANDing both `status`
+    /// predicates, preserved by construction rather than by an
+    /// explicit early return.
+    ///
+    /// Pagination is "stable": the ordering for `offset == 0` is
+    /// anchored via [`Self::pagination_cache`], and every later
+    /// `offset > 0` call in the same sweep replays that SAME ordering
+    /// rather than re-deriving it — so a status change or an
+    /// insertion elsewhere in the table between page requests can't
+    /// shift a still-matching row out of the sweep. `total` is NOT a
+    /// fresh `COUNT(*)`: it's the anchored id list reconciled against
+    /// rows that still exist right now, so a HARD DELETE of an
+    /// already-anchored (but not yet delivered) row is reflected in
+    /// `total` on every subsequent page, while the deleted row's
+    /// "slot" in the window is simply dropped, never backfilled by
+    /// promoting a later-ranked row (that would require re-deriving
+    /// the order, which anchoring exists specifically to avoid).
+    ///
+    /// Diverges from Python in one place: real DB errors propagate as
+    /// `Err`, they are not swallowed into `(vec![], 0)` — consistent
+    /// with every other method in this crate.
+    pub fn query(
+        &self,
+        conn: &Connection,
+        filters: AgentQueryFilters,
+    ) -> Result<(Vec<AgentRow>, i64)> {
+        // Never "0 rows" or "before the start" — matches Python's
+        // clamp exactly (a limit of 0 is not "everything", it's 1).
+        let limit = filters.limit.max(1);
+        let offset = filters.offset.max(0);
+
+        let status = filters.status.map(String::from);
+        let pattern = filters.agent_id_pattern.map(String::from);
+        let include_terminated = filters.include_terminated;
+        let created_after = filters.created_after.map(String::from);
+        let created_before = filters.created_before.map(String::from);
+        let sort_by = filters.sort_by;
+        let sort_order = filters.sort_order;
+
+        let cache_key = AgentQueryCacheKey {
+            status: status.clone(),
+            agent_id_pattern: pattern.clone(),
+            include_terminated,
+            created_after: created_after.clone(),
+            created_before: created_before.clone(),
+            sort_by,
+            sort_order,
+        };
+
+        let ordered_ids: Vec<String> =
+            self.pagination_cache.get_or_anchor(cache_key, offset, || {
+                Self::compute_ordered_ids(
+                    conn,
+                    status.as_deref(),
+                    pattern.as_deref(),
+                    include_terminated,
+                    created_after.as_deref(),
+                    created_before.as_deref(),
+                    sort_by,
+                    sort_order,
+                )
+            })?;
+
+        if ordered_ids.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+
+        // total = the anchored ids, reconciled against rows that
+        // still exist right now (NOT a fresh unconditional COUNT).
+        let total: i64 = {
+            let sql = format!(
+                "SELECT COUNT(*) FROM agents WHERE agent_id IN ({})",
+                in_placeholders(ordered_ids.len())
+            );
+            let params = to_sql_refs(&ordered_ids);
+            conn.query_row(&sql, params.as_slice(), |row| row.get(0))?
+        };
+
+        let offset_usize = offset as usize;
+        let window_ids: Vec<&String> = if offset_usize < ordered_ids.len() {
+            ordered_ids[offset_usize..]
+                .iter()
+                .take(limit as usize)
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        if window_ids.is_empty() {
+            return Ok((Vec::new(), total));
+        }
+
+        let sql = format!(
+            "SELECT {AGENT_COLUMNS} FROM agents WHERE agent_id IN ({})",
+            in_placeholders(window_ids.len())
+        );
+        let params = to_sql_refs(&window_ids);
+        let mut stmt = conn.prepare(&sql)?;
+        let rows_by_id: HashMap<String, AgentRow> = stmt
+            .query_map(params.as_slice(), row_to_agent)?
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .map(|row| (row.agent_id.clone(), row))
+            .collect();
+
+        // Reassemble in window_ids (anchored) order, silently
+        // dropping any id that no longer resolves — matches Python's
+        // `if aid in rows_by_id` guard exactly.
+        let ordered_rows = window_ids
+            .into_iter()
+            .filter_map(|id| rows_by_id.get(id).cloned())
+            .collect();
+
+        Ok((ordered_rows, total))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn compute_ordered_ids(
+        conn: &Connection,
+        status: Option<&str>,
+        pattern: Option<&str>,
+        include_terminated: bool,
+        created_after: Option<&str>,
+        created_before: Option<&str>,
+        sort_by: AgentSortBy,
+        sort_order: SortOrder,
+    ) -> Result<Vec<String>> {
+        let mut sql = String::from("SELECT agent_id FROM agents WHERE status != 'tombstone'");
+        let mut owned_params: Vec<String> = Vec::new();
+
+        if let Some(s) = status {
+            sql.push_str(" AND status = ?");
+            owned_params.push(s.to_string());
+        }
+        if let Some(p) = pattern {
+            sql.push_str(" AND agent_id LIKE ?");
+            owned_params.push(p.to_string());
+        }
+        if !include_terminated {
+            sql.push_str(" AND status != 'terminated'");
+        }
+        if let Some(a) = created_after {
+            sql.push_str(" AND created_at >= ?");
+            owned_params.push(a.to_string());
+        }
+        if let Some(b) = created_before {
+            sql.push_str(" AND created_at <= ?");
+            owned_params.push(b.to_string());
+        }
+        // Fixed `agent_id ASC` tiebreaker guarantees a fully
+        // deterministic total order even when the sort column has
+        // duplicate values — essential for offset pagination
+        // correctness (two agents created in the same second must
+        // still sort identically on every page).
+        sql.push_str(&format!(
+            " ORDER BY {} {}, agent_id ASC",
+            sort_by.column(),
+            sort_order.sql()
+        ));
+
+        let mut stmt = conn.prepare(&sql)?;
+        let params = to_sql_refs(&owned_params);
+        let rows = stmt.query_map(params.as_slice(), |row| row.get::<_, String>(0))?;
+        rows.collect()
+    }
+}
+
+fn in_placeholders(n: usize) -> String {
+    std::iter::repeat_n("?", n).collect::<Vec<_>>().join(", ")
+}
+
+fn to_sql_refs<S: ToSql>(items: &[S]) -> Vec<&dyn ToSql> {
+    items.iter().map(|v| v as &dyn ToSql).collect()
+}
+
+/// Allowlisted `query()` sort columns. A closed enum — unlike
+/// Python's runtime allowlist check (an invalid `sort_by` silently
+/// falls back to `created_at`), an unsupported value can't reach this
+/// type at all. [`parse_agent_sort_by`] provides Python's exact
+/// fallback-on-invalid behavior for callers translating a raw string
+/// at the API boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AgentSortBy {
+    AgentId,
+    Status,
+    CreatedAt,
+    TerminatedAt,
+}
+
+impl AgentSortBy {
+    fn column(self) -> &'static str {
+        match self {
+            AgentSortBy::AgentId => "agent_id",
+            AgentSortBy::Status => "status",
+            AgentSortBy::CreatedAt => "created_at",
+            AgentSortBy::TerminatedAt => "terminated_at",
+        }
+    }
+}
+
+/// Matches Python's `sort_by` allowlist-with-fallback exactly: any
+/// value outside `{agent_id, status, created_at, terminated_at}`
+/// (including an empty/garbage string) silently becomes `CreatedAt`,
+/// the same default Python falls back to. No error is raised here —
+/// deliberately, to stay a faithful boundary-translation helper; a
+/// caller wanting to REJECT an invalid value should validate before
+/// calling this.
+pub fn parse_agent_sort_by(s: &str) -> AgentSortBy {
+    match s {
+        "agent_id" => AgentSortBy::AgentId,
+        "status" => AgentSortBy::Status,
+        "terminated_at" => AgentSortBy::TerminatedAt,
+        _ => AgentSortBy::CreatedAt,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SortOrder {
+    Asc,
+    Desc,
+}
+
+impl SortOrder {
+    fn sql(self) -> &'static str {
+        match self {
+            SortOrder::Asc => "ASC",
+            SortOrder::Desc => "DESC",
+        }
+    }
+}
+
+/// Matches Python's `sort_order` allowlist-with-fallback: only an
+/// exact (case-insensitive) `"ASC"` becomes [`SortOrder::Asc`];
+/// everything else — including `"DESC"` and any garbage value —
+/// becomes [`SortOrder::Desc`], the same default Python falls back to.
+pub fn parse_sort_order(s: &str) -> SortOrder {
+    if s.eq_ignore_ascii_case("ASC") {
+        SortOrder::Asc
+    } else {
+        SortOrder::Desc
+    }
+}
+
+/// Parameters for [`AgentRepository::query`]. `Default` mirrors
+/// Python's own defaults (`include_terminated=True`, `sort_by=
+/// created_at`, `sort_order=DESC`, `limit=50`, `offset=0`).
+pub struct AgentQueryFilters<'a> {
+    pub status: Option<&'a str>,
+    pub agent_id_pattern: Option<&'a str>,
+    pub include_terminated: bool,
+    pub created_after: Option<&'a str>,
+    pub created_before: Option<&'a str>,
+    pub sort_by: AgentSortBy,
+    pub sort_order: SortOrder,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+impl Default for AgentQueryFilters<'_> {
+    fn default() -> Self {
+        Self {
+            status: None,
+            agent_id_pattern: None,
+            include_terminated: true,
+            created_after: None,
+            created_before: None,
+            sort_by: AgentSortBy::CreatedAt,
+            sort_order: SortOrder::Desc,
+            limit: 50,
+            offset: 0,
+        }
+    }
+}
+
+/// The `StableOrderCache` key: every filter/sort knob that affects
+/// the WHERE/ORDER BY — deliberately EXCLUDING `limit`/`offset`, so
+/// every page of one sweep shares the same anchor.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct AgentQueryCacheKey {
+    status: Option<String>,
+    agent_id_pattern: Option<String>,
+    include_terminated: bool,
+    created_after: Option<String>,
+    created_before: Option<String>,
+    sort_by: AgentSortBy,
+    sort_order: SortOrder,
 }
 
 /// Result of [`AgentRepository::review_profile`] — the refreshed row
@@ -1182,5 +1489,268 @@ mod tests {
             .unwrap();
         // Second call was ignored -- original timestamp survives.
         assert_eq!(row.created_at, "2026-01-01T00:00:00Z");
+    }
+
+    fn seed_with_timestamp(
+        conn: &Connection,
+        agent_id: &str,
+        token: &str,
+        status: &str,
+        created_at: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO agents (token, agent_id, created_at, status, working_directory, agent_role) \
+             VALUES (?1, ?2, ?3, ?4, '/tmp', 'worker')",
+            (token, agent_id, created_at, status),
+        )
+        .unwrap();
+    }
+
+    fn ids(rows: &[AgentRow]) -> Vec<&str> {
+        rows.iter().map(|r| r.agent_id.as_str()).collect()
+    }
+
+    #[test]
+    fn query_default_sort_is_created_at_desc_with_agent_id_tiebreaker() {
+        let conn = test_conn();
+        seed_with_timestamp(&conn, "z", "t1", "active", "2026-01-01T00:00:00Z");
+        seed_with_timestamp(&conn, "a", "t2", "active", "2026-01-01T00:00:00Z"); // same timestamp
+        seed_with_timestamp(&conn, "m", "t3", "active", "2026-01-02T00:00:00Z");
+
+        let repo = AgentRepository::new();
+        let (rows, total) = repo.query(&conn, AgentQueryFilters::default()).unwrap();
+        assert_eq!(total, 3);
+        // "m" is newest -> first. "z"/"a" tie on created_at -> broken by agent_id ASC.
+        assert_eq!(ids(&rows), vec!["m", "a", "z"]);
+    }
+
+    #[test]
+    fn query_excludes_tombstones_unconditionally() {
+        let conn = test_conn();
+        seed_with_timestamp(&conn, "live", "t1", "active", "2026-01-01T00:00:00Z");
+        AgentRepository::insert_tombstone(&conn, "t2", "tomb", "2026-01-01T00:00:00Z").unwrap();
+
+        let repo = AgentRepository::new();
+        let (rows, total) = repo.query(&conn, AgentQueryFilters::default()).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(ids(&rows), vec!["live"]);
+    }
+
+    #[test]
+    fn query_explicit_tombstone_status_filter_is_self_contradictory_and_returns_empty() {
+        let conn = test_conn();
+        seed_with_timestamp(&conn, "live", "t1", "active", "2026-01-01T00:00:00Z");
+        AgentRepository::insert_tombstone(&conn, "t2", "tomb", "2026-01-01T00:00:00Z").unwrap();
+
+        let repo = AgentRepository::new();
+        let (rows, total) = repo
+            .query(
+                &conn,
+                AgentQueryFilters {
+                    status: Some("tombstone"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!((rows.len(), total), (0, 0));
+    }
+
+    #[test]
+    fn query_offset_beyond_total_returns_empty_rows_but_real_total() {
+        let conn = test_conn();
+        seed_with_timestamp(&conn, "a1", "t1", "active", "2026-01-01T00:00:00Z");
+        seed_with_timestamp(&conn, "a2", "t2", "active", "2026-01-02T00:00:00Z");
+
+        let repo = AgentRepository::new();
+        let (rows, total) = repo
+            .query(
+                &conn,
+                AgentQueryFilters {
+                    offset: 100,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 0);
+        assert_eq!(
+            total, 2,
+            "total must still reflect real matching rows, not 0"
+        );
+    }
+
+    #[test]
+    fn query_limit_and_offset_are_clamped_like_python() {
+        let conn = test_conn();
+        seed_with_timestamp(&conn, "a1", "t1", "active", "2026-01-01T00:00:00Z");
+
+        let repo = AgentRepository::new();
+        // limit=0 clamps to 1, not "everything"; offset=-5 clamps to 0.
+        let (rows, _) = repo
+            .query(
+                &conn,
+                AgentQueryFilters {
+                    limit: 0,
+                    offset: -5,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn parse_agent_sort_by_falls_back_to_created_at_on_invalid_input() {
+        assert_eq!(parse_agent_sort_by("agent_id"), AgentSortBy::AgentId);
+        assert_eq!(parse_agent_sort_by("bogus"), AgentSortBy::CreatedAt);
+        assert_eq!(parse_agent_sort_by(""), AgentSortBy::CreatedAt);
+    }
+
+    #[test]
+    fn parse_sort_order_falls_back_to_desc_on_anything_but_asc() {
+        assert_eq!(parse_sort_order("ASC"), SortOrder::Asc);
+        assert_eq!(parse_sort_order("asc"), SortOrder::Asc);
+        assert_eq!(parse_sort_order("DESC"), SortOrder::Desc);
+        assert_eq!(parse_sort_order("garbage"), SortOrder::Desc);
+    }
+
+    /// Port of Python's
+    /// `test_query_offset_pagination_survives_concurrent_status_change`.
+    #[test]
+    fn query_offset_pagination_survives_concurrent_status_change() {
+        let conn = test_conn();
+        for i in 1..=5 {
+            seed_with_timestamp(
+                &conn,
+                &format!("pg-a{i}"),
+                &format!("t{i}"),
+                "active",
+                &format!("2026-01-01T00:0{i}:00Z"),
+            );
+        }
+        let repo = AgentRepository::new();
+        let filters = || AgentQueryFilters {
+            agent_id_pattern: Some("pg-a%"),
+            include_terminated: false,
+            limit: 2,
+            ..Default::default()
+        };
+
+        // Newest-first: pg-a5, pg-a4, pg-a3, pg-a2, pg-a1. Anchors
+        // that full ordering under this filter shape.
+        let (page1, _) = repo
+            .query(
+                &conn,
+                AgentQueryFilters {
+                    offset: 0,
+                    ..filters()
+                },
+            )
+            .unwrap();
+        assert_eq!(ids(&page1), vec!["pg-a5", "pg-a4"]);
+
+        // Concurrent mutation OUTSIDE the paginated API: pg-a5 (rank
+        // #1) flips to terminated, which would normally drop it from
+        // this include_terminated=false filter and shift every
+        // later-ranked agent up by one.
+        AgentRepository::terminate(&conn, "pg-a5", "2026-01-01T00:10:00Z").unwrap();
+
+        // offset=2 replays the ANCHOR from page1, not a re-filtered
+        // live query -- so the window is still ordered_ids[2:4] from
+        // the ORIGINAL 5-element ordering.
+        let (page2, _) = repo
+            .query(
+                &conn,
+                AgentQueryFilters {
+                    offset: 2,
+                    ..filters()
+                },
+            )
+            .unwrap();
+        assert_eq!(ids(&page2), vec!["pg-a3", "pg-a2"]);
+
+        // pg-a3 was in-filter for the entire sweep and must never be
+        // silently skipped despite pg-a5's status flip mid-sweep.
+        let seen: Vec<&str> = ids(&page1).into_iter().chain(ids(&page2)).collect();
+        assert!(seen.contains(&"pg-a3"));
+    }
+
+    /// Port of Python's `test_query_total_excludes_agent_deleted_mid_sweep`.
+    #[test]
+    fn query_total_excludes_agent_deleted_mid_sweep() {
+        let conn = test_conn();
+        for i in 1..=7 {
+            seed_with_timestamp(
+                &conn,
+                &format!("tc-a{i}"),
+                &format!("t{i}"),
+                "active",
+                &format!("2026-01-01T00:0{i}:00Z"),
+            );
+        }
+        let repo = AgentRepository::new();
+        let filters = |offset| AgentQueryFilters {
+            agent_id_pattern: Some("tc-a%"),
+            include_terminated: false,
+            limit: 2,
+            offset,
+            ..Default::default()
+        };
+
+        // Newest-first: tc-a7..tc-a1. Anchors the 7-element ordering.
+        let (page1, total1) = repo.query(&conn, filters(0)).unwrap();
+        assert_eq!(total1, 7);
+        let mut delivered = page1.len();
+
+        // Hard-delete the rank-3 agent (tc-a5) -- not yet delivered
+        // by any page.
+        assert!(AgentRepository::delete(&conn, "tc-a5").unwrap());
+
+        for offset in [2, 4, 6] {
+            let (page, total) = repo.query(&conn, filters(offset)).unwrap();
+            assert_eq!(
+                total, 6,
+                "total must reconcile the anchor against currently-existing rows"
+            );
+            delivered += page.len();
+        }
+
+        // 2 (page1) + 1 (offset=2, tc-a5's slot dropped, not
+        // backfilled) + 2 (offset=4) + 1 (offset=6) == 6.
+        assert_eq!(delivered, 6);
+    }
+
+    #[test]
+    fn query_pagination_cache_is_per_repository_instance_not_global() {
+        let conn = test_conn();
+        seed_with_timestamp(&conn, "a1", "t1", "active", "2026-01-01T00:00:00Z");
+        seed_with_timestamp(&conn, "a2", "t2", "active", "2026-01-02T00:00:00Z");
+
+        let repo_a = AgentRepository::new();
+        let repo_b = AgentRepository::new();
+        repo_a
+            .query(
+                &conn,
+                AgentQueryFilters {
+                    offset: 0,
+                    limit: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        // A fresh repository instance has no anchor for this shape,
+        // so its own offset>0 call must compute fresh rather than
+        // panicking or seeing repo_a's private cache state.
+        let (page, _) = repo_b
+            .query(
+                &conn,
+                AgentQueryFilters {
+                    offset: 1,
+                    limit: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(page.len(), 1);
     }
 }
