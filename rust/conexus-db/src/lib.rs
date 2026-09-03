@@ -14,7 +14,10 @@ pub use agent_repository::{
     AgentField, AgentQueryFilters, AgentRepository, AgentRow, AgentSortBy, CreateAgentError,
     FieldValue, NewAgent, ReviewProfileResult, SortOrder,
 };
-pub use message_repository::{MessageRow, NewMessage, SendMessageError};
+pub use message_repository::{
+    LiveParticipant, MessageQueryFilters, MessageRepository, MessageRow, NewMessage, Participants,
+    SendMessageError,
+};
 pub use pagination_cache::StableOrderCache;
 pub use pending_directive_repository::{DirectiveEvent, DirectiveEventData, PendingDirectiveRow};
 pub use project_context_repository::{DeletedContextEntry, ProjectContextRow};

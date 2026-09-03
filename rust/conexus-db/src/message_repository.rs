@@ -1,9 +1,6 @@
-//! Port of `agent_mcp/repositories/message_repository.py` — Phases 1-2
-//! (core CRUD + pagination). Threading (`fetch_thread`) and
-//! admin/maintenance surface (`rename_participant`, `list_participants`,
-//! `prune_read_before`, subject-backfill) are deliberately deferred to
-//! a follow-up PR 3/3 — see the migration plan's progress log for the
-//! phase split rationale.
+//! Full port of `agent_mcp/repositories/message_repository.py`,
+//! landed in 3 PRs per the migration plan's progress log (core CRUD,
+//! then pagination, then this — threading + admin/maintenance).
 //!
 //! Mostly plain functions, plus [`MessageRepository`] for the two
 //! methods (`query`/`count_query`) that need a real
@@ -571,6 +568,211 @@ impl MessageRepository {
         let params = to_sql_refs(&ordered_ids);
         conn.query_row(&sql, params.as_slice(), |row| row.get(0))
     }
+}
+
+/// Defensive cap on [`resolve_thread_root`]'s upward walk. The
+/// self-FK guarantees a legitimate thread is finite, so tripping this
+/// cap only ever indicates corrupt data (a cycle) — folds to `Ok(None)`
+/// (which `fetch_thread` turns into an empty result) rather than an
+/// infinite loop.
+const THREAD_WALK_CAP: usize = 10_000;
+
+/// Walks `parent_message_id` upward from `message_id` to find the
+/// thread root. Returns `None` — never an error — for: a missing
+/// message, a broken chain, a cycle, or exceeding [`THREAD_WALK_CAP`].
+fn resolve_thread_root(conn: &Connection, message_id: &str) -> Result<Option<String>> {
+    let mut current = message_id.to_string();
+    let mut seen = std::collections::HashSet::new();
+
+    for _ in 0..THREAD_WALK_CAP {
+        if !seen.insert(current.clone()) {
+            return Ok(None); // cycle
+        }
+        let parent: Option<Option<String>> = conn
+            .query_row(
+                "SELECT parent_message_id FROM agent_messages WHERE message_id = ?1",
+                [&current],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match parent {
+            None => return Ok(None), // message itself doesn't exist (broken chain)
+            Some(None) => return Ok(Some(current)), // reached the root
+            Some(Some(p)) => current = p,
+        }
+    }
+    Ok(None) // cap exceeded
+}
+
+/// The whole thread (root + every descendant) containing `message_id`,
+/// oldest-first. Empty (not an error) if [`resolve_thread_root`] can't
+/// resolve a root for any of its documented reasons.
+pub fn fetch_thread(conn: &Connection, message_id: &str) -> Result<Vec<MessageRow>> {
+    let Some(root) = resolve_thread_root(conn, message_id)? else {
+        return Ok(Vec::new());
+    };
+
+    let sql = format!(
+        "WITH RECURSIVE thread(message_id) AS ( \
+             SELECT message_id FROM agent_messages WHERE message_id = ?1 \
+             UNION \
+             SELECT m.message_id FROM agent_messages m JOIN thread t ON m.parent_message_id = t.message_id \
+         ) \
+         SELECT {COLUMNS} FROM agent_messages WHERE message_id IN (SELECT message_id FROM thread) ORDER BY timestamp ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([&root], row_to_message)?;
+    rows.collect()
+}
+
+/// Rewrites BOTH `sender_id` and `recipient_id` from `old_id` to
+/// `new_id` — used by the agent purge-cascade to point historical
+/// messages at a `[deleted-<id>]` tombstone row instead of orphaning
+/// them. Not a delete. Returns the total rows touched across both
+/// columns.
+pub fn rename_participant(conn: &Connection, old_id: &str, new_id: &str) -> Result<i64> {
+    let sender_changed = conn.execute(
+        "UPDATE agent_messages SET sender_id = ?1 WHERE sender_id = ?2",
+        (new_id, old_id),
+    )?;
+    let recipient_changed = conn.execute(
+        "UPDATE agent_messages SET recipient_id = ?1 WHERE recipient_id = ?2",
+        (new_id, old_id),
+    )?;
+    Ok((sender_changed + recipient_changed) as i64)
+}
+
+/// `DELETE`s read messages older than `cutoff_timestamp` — the
+/// background cleanup sweep. Returns the count removed.
+pub fn prune_read_before(conn: &Connection, cutoff_timestamp: &str) -> Result<i64> {
+    let changed = conn.execute(
+        "DELETE FROM agent_messages WHERE read = 1 AND timestamp < ?1",
+        [cutoff_timestamp],
+    )?;
+    Ok(changed as i64)
+}
+
+/// Bulk INSERT — a straight loop of parameterized inserts (rusqlite
+/// has no true `executemany`; a prepared statement reused per row is
+/// the idiomatic equivalent). Unlike [`send`], this does NOT validate
+/// recipients/parents per row — it's the bulk/import path, where rows
+/// are assumed pre-validated by the caller, matching Python's shape
+/// (a single bulk round-trip, no per-row existence-check overhead).
+pub fn bulk_send(conn: &Connection, rows: &[NewMessage]) -> Result<i64> {
+    let mut stmt = conn.prepare(
+        "INSERT INTO agent_messages (message_id, sender_id, recipient_id, message_content, message_type, \
+         priority, timestamp, delivered, read, subject, parent_message_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+    )?;
+    let mut inserted = 0i64;
+    for msg in rows {
+        stmt.execute((
+            msg.message_id,
+            msg.sender_id,
+            msg.recipient_id,
+            msg.message_content,
+            msg.message_type,
+            msg.priority,
+            msg.timestamp,
+            msg.delivered,
+            msg.read,
+            msg.subject,
+            msg.parent_message_id,
+        ))?;
+        inserted += 1;
+    }
+    Ok(inserted)
+}
+
+/// Root messages (`parent_message_id IS NULL AND subject IS NULL`),
+/// oldest-first, capped at `limit` — feeds the Phase-2 subject-backfill
+/// sweep.
+pub fn fetch_null_subject_roots(conn: &Connection, limit: i64) -> Result<Vec<MessageRow>> {
+    let sql = format!(
+        "SELECT {COLUMNS} FROM agent_messages WHERE parent_message_id IS NULL AND subject IS NULL \
+         ORDER BY timestamp ASC LIMIT ?1"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([limit], row_to_message)?;
+    rows.collect()
+}
+
+/// Backfill write-back: sets a currently-NULL subject to a real one.
+/// `false` if the message doesn't exist OR already has a non-NULL
+/// subject — this never overwrites a real subject, only fills a
+/// placeholder.
+pub fn set_message_subject(conn: &Connection, message_id: &str, subject: &str) -> Result<bool> {
+    let changed = conn.execute(
+        "UPDATE agent_messages SET subject = ?1 WHERE message_id = ?2 AND subject IS NULL",
+        (subject, message_id),
+    )?;
+    Ok(changed > 0)
+}
+
+/// One `agents` row as [`list_participants`] projects it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiveParticipant {
+    pub agent_id: String,
+    pub status: Option<String>,
+}
+
+/// Result of [`list_participants`] — feeds the Messages-tab dropdowns.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Participants {
+    pub live: Vec<LiveParticipant>,
+    pub tombstones: Vec<String>,
+}
+
+/// Three separately-`LIMIT`-capped reads (R4-F2 pentest hardening —
+/// prevents unbounded payload materialization on a project with
+/// thousands of agents/tombstones): live (non-terminal) agents, plus
+/// every distinct `[deleted-...]`-prefixed sender/recipient seen in
+/// `agent_messages`. A synthetic `{agent_id: "admin", status: "system"}`
+/// is prepended to `live` if not already present — this can push
+/// `live.len()` one past `limit`, matching Python's exact behavior
+/// (the prepend happens AFTER the limited query, not before).
+pub fn list_participants(conn: &Connection, limit: i64) -> Result<Participants> {
+    let mut stmt = conn.prepare(
+        "SELECT agent_id, status FROM agents WHERE status IS NULL OR status NOT IN ('terminated', 'tombstone') \
+         ORDER BY agent_id ASC LIMIT ?1",
+    )?;
+    let mut live: Vec<LiveParticipant> = stmt
+        .query_map([limit], |row| {
+            Ok(LiveParticipant {
+                agent_id: row.get(0)?,
+                status: row.get(1)?,
+            })
+        })?
+        .collect::<Result<Vec<_>>>()?;
+    drop(stmt);
+    if !live.iter().any(|p| p.agent_id == "admin") {
+        live.insert(
+            0,
+            LiveParticipant {
+                agent_id: "admin".to_string(),
+                status: Some("system".to_string()),
+            },
+        );
+    }
+
+    let mut tombstone_ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    {
+        let mut stmt = conn.prepare("SELECT DISTINCT sender_id FROM agent_messages WHERE sender_id LIKE '[deleted-%' LIMIT ?1")?;
+        for row in stmt.query_map([limit], |row| row.get::<_, String>(0))? {
+            tombstone_ids.insert(row?);
+        }
+    }
+    {
+        let mut stmt =
+            conn.prepare("SELECT DISTINCT recipient_id FROM agent_messages WHERE recipient_id LIKE '[deleted-%' LIMIT ?1")?;
+        for row in stmt.query_map([limit], |row| row.get::<_, String>(0))? {
+            tombstone_ids.insert(row?);
+        }
+    }
+    let mut tombstones: Vec<String> = tombstone_ids.into_iter().collect();
+    tombstones.truncate(limit.max(0) as usize);
+
+    Ok(Participants { live, tombstones })
 }
 
 #[cfg(test)]
@@ -1215,5 +1417,211 @@ mod tests {
             )
             .unwrap();
         assert_eq!(ids(&page2), vec!["m2", "m1"]);
+    }
+
+    #[test]
+    fn fetch_thread_from_leaf_or_root_returns_the_same_thread_oldest_first() {
+        let conn = test_conn();
+        seed_agent(&conn, "alice");
+        seed_agent(&conn, "bob");
+        let mut root = new_msg("root", "alice", "bob", "start");
+        root.timestamp = "2026-01-01T00:00:00Z";
+        send(&conn, root).unwrap();
+        let mut reply1 = new_msg("reply1", "bob", "alice", "r1");
+        reply1.timestamp = "2026-01-01T00:01:00Z";
+        reply1.parent_message_id = Some("root");
+        send(&conn, reply1).unwrap();
+        let mut reply2 = new_msg("reply2", "alice", "bob", "r2");
+        reply2.timestamp = "2026-01-01T00:02:00Z";
+        reply2.parent_message_id = Some("reply1");
+        send(&conn, reply2).unwrap();
+
+        let from_root = fetch_thread(&conn, "root").unwrap();
+        let from_leaf = fetch_thread(&conn, "reply2").unwrap();
+        assert_eq!(ids(&from_root), vec!["root", "reply1", "reply2"]);
+        assert_eq!(
+            ids(&from_leaf),
+            ids(&from_root),
+            "any thread member must resolve the same full thread"
+        );
+    }
+
+    #[test]
+    fn fetch_thread_lone_message_is_a_single_element_thread() {
+        let conn = test_conn();
+        seed_agent(&conn, "alice");
+        seed_agent(&conn, "bob");
+        send(&conn, new_msg("solo", "alice", "bob", "alone")).unwrap();
+
+        assert_eq!(ids(&fetch_thread(&conn, "solo").unwrap()), vec!["solo"]);
+    }
+
+    #[test]
+    fn fetch_thread_nonexistent_message_returns_empty() {
+        let conn = test_conn();
+        assert_eq!(fetch_thread(&conn, "nope").unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn rename_participant_rewrites_both_sender_and_recipient_columns() {
+        let conn = test_conn();
+        seed_agent(&conn, "alice");
+        seed_agent(&conn, "bob");
+        send(&conn, new_msg("m1", "alice", "bob", "a to b")).unwrap();
+        send(&conn, new_msg("m2", "bob", "alice", "b to a")).unwrap();
+
+        let touched = rename_participant(&conn, "alice", "[deleted-alice]").unwrap();
+        assert_eq!(touched, 2);
+        assert_eq!(
+            get_by_id(&conn, "m1").unwrap().unwrap().sender_id,
+            "[deleted-alice]"
+        );
+        assert_eq!(
+            get_by_id(&conn, "m2").unwrap().unwrap().recipient_id,
+            "[deleted-alice]"
+        );
+    }
+
+    #[test]
+    fn rename_participant_no_match_returns_zero() {
+        let conn = test_conn();
+        assert_eq!(
+            rename_participant(&conn, "nobody", "[deleted-nobody]").unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn prune_read_before_deletes_only_old_read_messages() {
+        let conn = test_conn();
+        seed_agent(&conn, "alice");
+        seed_agent(&conn, "bob");
+        seed_msg(&conn, "old-read", "alice", "bob", "2026-01-01T00:00:00Z");
+        mark_read(&conn, "old-read", true).unwrap();
+        seed_msg(&conn, "old-unread", "alice", "bob", "2026-01-01T00:00:00Z");
+        seed_msg(&conn, "new-read", "alice", "bob", "2026-02-01T00:00:00Z");
+        mark_read(&conn, "new-read", true).unwrap();
+
+        let pruned = prune_read_before(&conn, "2026-01-15T00:00:00Z").unwrap();
+        assert_eq!(pruned, 1);
+        assert_eq!(get_by_id(&conn, "old-read").unwrap(), None);
+        assert!(
+            get_by_id(&conn, "old-unread").unwrap().is_some(),
+            "unread must survive regardless of age"
+        );
+        assert!(
+            get_by_id(&conn, "new-read").unwrap().is_some(),
+            "too-recent read message must survive"
+        );
+    }
+
+    #[test]
+    fn bulk_send_inserts_every_row_and_returns_the_count() {
+        let conn = test_conn();
+        seed_agent(&conn, "alice");
+        seed_agent(&conn, "bob");
+        let rows = vec![
+            new_msg("m1", "alice", "bob", "a"),
+            new_msg("m2", "alice", "bob", "b"),
+        ];
+
+        assert_eq!(bulk_send(&conn, &rows).unwrap(), 2);
+        assert!(get_by_id(&conn, "m1").unwrap().is_some());
+        assert!(get_by_id(&conn, "m2").unwrap().is_some());
+    }
+
+    #[test]
+    fn fetch_null_subject_roots_excludes_replies_and_subjected_messages() {
+        let conn = test_conn();
+        seed_agent(&conn, "alice");
+        seed_agent(&conn, "bob");
+        send(&conn, new_msg("root-no-subject", "alice", "bob", "x")).unwrap();
+        let mut with_subject = new_msg("root-with-subject", "alice", "bob", "y");
+        with_subject.subject = Some("a real subject");
+        send(&conn, with_subject).unwrap();
+        let mut reply = new_msg("reply-no-subject", "bob", "alice", "z");
+        reply.parent_message_id = Some("root-no-subject");
+        send(&conn, reply).unwrap();
+
+        let roots = fetch_null_subject_roots(&conn, 10).unwrap();
+        assert_eq!(ids(&roots), vec!["root-no-subject"]);
+    }
+
+    #[test]
+    fn set_message_subject_only_fills_a_null_subject_never_overwrites() {
+        let conn = test_conn();
+        seed_agent(&conn, "alice");
+        seed_agent(&conn, "bob");
+        send(&conn, new_msg("m1", "alice", "bob", "x")).unwrap();
+        let mut with_subject = new_msg("m2", "alice", "bob", "y");
+        with_subject.subject = Some("already set");
+        send(&conn, with_subject).unwrap();
+
+        assert!(set_message_subject(&conn, "m1", "backfilled").unwrap());
+        assert_eq!(
+            get_by_id(&conn, "m1").unwrap().unwrap().subject.as_deref(),
+            Some("backfilled")
+        );
+
+        assert!(!set_message_subject(&conn, "m2", "should not apply").unwrap());
+        assert_eq!(
+            get_by_id(&conn, "m2").unwrap().unwrap().subject.as_deref(),
+            Some("already set")
+        );
+    }
+
+    #[test]
+    fn list_participants_excludes_terminated_and_tombstone_and_prepends_admin() {
+        let conn = test_conn();
+        seed_agent(&conn, "alice");
+        seed_agent(&conn, "bob");
+        AgentRepository::terminate(&conn, "bob", "2026-01-01T00:00:00Z").unwrap();
+
+        let participants = list_participants(&conn, 50).unwrap();
+        let ids: Vec<&str> = participants
+            .live
+            .iter()
+            .map(|p| p.agent_id.as_str())
+            .collect();
+        assert!(ids.contains(&"alice"));
+        assert!(!ids.contains(&"bob"), "terminated agents must be excluded");
+        assert!(
+            ids.contains(&"admin"),
+            "admin must be synthesized when not already present"
+        );
+    }
+
+    #[test]
+    fn list_participants_extracts_tombstones_from_message_participants() {
+        let conn = test_conn();
+        seed_agent(&conn, "alice");
+        AgentRepository::insert_tombstone(
+            &conn,
+            "tok-bob",
+            "[deleted-bob]",
+            "2026-01-01T00:00:00Z",
+        )
+        .unwrap();
+        AgentRepository::insert_tombstone(
+            &conn,
+            "tok-carol",
+            "[deleted-carol]",
+            "2026-01-01T00:00:00Z",
+        )
+        .unwrap();
+        send(&conn, new_msg("m1", "alice", "[deleted-bob]", "to a ghost")).unwrap();
+        send(
+            &conn,
+            new_msg("m2", "[deleted-carol]", "alice", "from a ghost"),
+        )
+        .unwrap();
+
+        let participants = list_participants(&conn, 50).unwrap();
+        assert!(participants
+            .tombstones
+            .contains(&"[deleted-bob]".to_string()));
+        assert!(participants
+            .tombstones
+            .contains(&"[deleted-carol]".to_string()));
     }
 }
