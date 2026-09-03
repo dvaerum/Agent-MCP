@@ -9,3 +9,4 @@ description = "CoNexus data layer — unifies agent_mcp's 8 Python repositories 
 [dependencies]
 rusqlite = { version = "0.32", features = ["bundled"] }
 regex = "1"
+sha2 = "0.10"
