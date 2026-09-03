@@ -261,12 +261,25 @@ async def test_wake_on_broadcast(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_wake_on_task_assigned(tmp_path: Path) -> None:
+async def test_wake_on_task_assigned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """`assign_task` to a worker wakes that worker's waiter with a
     `task_assigned` event (assigned_to transitioned INTO the agent
     since the cursor)."""
     from agent_mcp.tools.task_tools import assign_task_tool_impl
     from tests.harness import mcp_session
+
+    # This test's timing budget (5s wait_for below) covers the wake
+    # mechanism, not RAG placement-analysis latency — assign_task's
+    # create-and-assign path otherwise runs a real (network-dependent)
+    # RAG call first, which can push the actual assignment past the
+    # budget under load (worse on a host whose RAG backend serializes
+    # requests) and fail this test for a reason unrelated to wake
+    # events. Same pattern as test_sec_r3_task_cache.py.
+    monkeypatch.setattr(
+        "agent_mcp.tools.task_tools.ENABLE_TASK_PLACEMENT_RAG", False
+    )
 
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
