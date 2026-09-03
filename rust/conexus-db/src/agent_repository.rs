@@ -22,8 +22,9 @@
 //! scattered across every write method.
 
 use crate::pagination_cache::StableOrderCache;
+use crate::sql_util::{in_placeholders, to_sql_refs};
 use regex::Regex;
-use rusqlite::{Connection, OptionalExtension, Result, Row, ToSql};
+use rusqlite::{Connection, OptionalExtension, Result, Row};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
@@ -691,14 +692,6 @@ impl AgentRepository {
         let rows = stmt.query_map(params.as_slice(), |row| row.get::<_, String>(0))?;
         rows.collect()
     }
-}
-
-fn in_placeholders(n: usize) -> String {
-    std::iter::repeat_n("?", n).collect::<Vec<_>>().join(", ")
-}
-
-fn to_sql_refs<S: ToSql>(items: &[S]) -> Vec<&dyn ToSql> {
-    items.iter().map(|v| v as &dyn ToSql).collect()
 }
 
 /// Allowlisted `query()` sort columns. A closed enum — unlike
