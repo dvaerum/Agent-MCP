@@ -1,0 +1,12 @@
+[package]
+name = "conexus-auth"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "CoNexus Principal-resolution / tool-authorization layer (Phase C). See /home/dennis/.claude/plans/prancy-napping-pie.md."
+
+[dependencies]
+conexus-core = { path = "../conexus-core" }
+conexus-db = { path = "../conexus-db" }
+rusqlite = { version = "0.32", features = ["bundled"] }

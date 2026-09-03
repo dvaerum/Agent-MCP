@@ -17,12 +17,12 @@
 //! unit-of-work, and (like `project_context_repository`) has no cache
 //! to justify a wrapper type.
 //!
-//! Deferred, deliberately: the DB-backed group-capability overlay
-//! itself (composing this with `group_resolver.resolve_user_groups`
-//! and `conexus_core::capability`'s bundle functions into a full
-//! `resolve_capabilities()`) is future `conexus-auth` (Phase C) work,
-//! per `conexus-core::capability`'s own module doc — this crate only
-//! ports the two raw DB operations.
+//! The DB-backed group-capability overlay itself (composing this with
+//! `group_membership_repository::resolve_user_groups` and
+//! `conexus_core::capability`'s bundle functions into a full
+//! `resolve_capabilities()`) lives in `conexus-auth`
+//! (`capabilities::resolve_capabilities`) — this crate only ports the
+//! two raw DB operations.
 
 use rusqlite::{Connection, Result};
 use std::collections::HashSet;

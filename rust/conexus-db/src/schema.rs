@@ -227,6 +227,40 @@ pub fn init_router_schema(conn: &Connection) -> Result<()> {
             capability  TEXT NOT NULL,
             PRIMARY KEY (group_id, capability)
         );
+
+        -- Edge in the group-membership graph (ported from
+        -- `agent_mcp/router/migrations/versions/0002_groups_and_roles.py`
+        -- + `0006_group_membership_unique.py`), needed by
+        -- `group_membership_repository::resolve_user_groups` for
+        -- `conexus-auth`'s `resolve_capabilities`. Each edge is EITHER a
+        -- user-into-group or a group-into-group membership; the CHECK
+        -- constraint enforces exactly-one-set at the storage layer, same
+        -- as Python. `member_user_id` deliberately has NO `REFERENCES
+        -- users(user_id)` here (unlike the real Alembic migration) --
+        -- the `users` table itself isn't ported to this crate yet (it
+        -- belongs to Phase E2's router port); add the FK back when it
+        -- is.
+        CREATE TABLE IF NOT EXISTS group_membership (
+            group_id         TEXT NOT NULL REFERENCES groups(group_id) ON DELETE CASCADE,
+            member_user_id   TEXT,
+            member_group_id  TEXT REFERENCES groups(group_id) ON DELETE CASCADE,
+            added_at         TEXT NOT NULL,
+            CHECK ((member_user_id IS NOT NULL) <> (member_group_id IS NOT NULL))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_group_membership_group_id
+            ON group_membership(group_id);
+        CREATE INDEX IF NOT EXISTS idx_group_membership_member_user_id
+            ON group_membership(member_user_id);
+        CREATE INDEX IF NOT EXISTS idx_group_membership_member_group_id
+            ON group_membership(member_group_id);
+
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_group_membership_user
+            ON group_membership(group_id, member_user_id)
+            WHERE member_user_id IS NOT NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_group_membership_group
+            ON group_membership(group_id, member_group_id)
+            WHERE member_group_id IS NOT NULL;
         "#,
     )
 }

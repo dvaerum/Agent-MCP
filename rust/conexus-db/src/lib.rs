@@ -1,5 +1,6 @@
 pub mod agent_repository;
 pub mod group_capability_repository;
+pub mod group_membership_repository;
 pub mod message_repository;
 pub mod pagination_cache;
 pub mod pending_directive_repository;
