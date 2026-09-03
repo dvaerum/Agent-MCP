@@ -157,6 +157,31 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
         -- uniqueness.
         CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_single_root
             ON tasks ((parent_task IS NULL)) WHERE parent_task IS NULL;
+
+        -- Verbatim from agent_mcp/migrations/versions/0025_terminal_task_guard_trigger.py's
+        -- _TASKS_SQL. Only the `tasks`-table trigger is ported here —
+        -- the two `task_notes`/`task_comments` side-table triggers
+        -- from that same migration are deliberately NOT included:
+        -- comments are owned by a different, not-yet-ported module
+        -- (`db/actions/task_comments_db.py`, not one of the 8
+        -- `agent_mcp/repositories/*.py` files Phase B covers), so
+        -- creating that table/trigger pair here would be scope creep
+        -- into a module this phase doesn't touch.
+        CREATE TRIGGER IF NOT EXISTS trg_tasks_terminal_state_guard
+        BEFORE UPDATE ON tasks
+        FOR EACH ROW
+        WHEN OLD.status IN ('completed', 'cancelled', 'failed')
+          AND (
+            NEW.status IS NOT OLD.status
+            OR NEW.priority IS NOT OLD.priority
+            OR NEW.notes IS NOT OLD.notes
+            OR NEW.title IS NOT OLD.title
+            OR NEW.description IS NOT OLD.description
+            OR (NEW.assigned_to IS NOT OLD.assigned_to AND NEW.assigned_to IS NOT NULL)
+          )
+        BEGIN
+          SELECT RAISE(ABORT, 'terminal_task_guard: task is in a terminal state (completed/cancelled/failed); status/priority/notes/title/description are frozen and assigned_to may only be cleared, never reassigned');
+        END;
         "#,
     )
 }

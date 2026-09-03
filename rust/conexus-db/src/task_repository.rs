@@ -1,12 +1,17 @@
-//! Port of `agent_mcp/repositories/task_repository.py` — Phase 1
-//! (core CRUD, standalone connection path only). The `connection=`
-//! transaction-seam (raw cursor / `Session` branches on `create`/
-//! `update_fields`/`delete`), `bulk_update_fields`, and the
-//! `terminal_task_guard` DB-trigger detection (`TerminalTaskWriteBlocked`)
-//! are deliberately deferred to a follow-up PR — see the migration
-//! plan's progress log for the phase split rationale. This is the
-//! LAST of the 8 repositories; once it's fully ported, Phase B is
-//! complete.
+//! Full port of `agent_mcp/repositories/task_repository.py`, landed
+//! in 2 PRs per the migration plan's progress log (core CRUD, then
+//! this — `bulk_update_fields` + the `terminal_task_guard` DB-trigger
+//! detection). This is the LAST of the 8 repositories — Phase B is
+//! complete once this lands.
+//!
+//! Python's `connection=` transaction-seam (raw cursor / `Session`
+//! branches on `create`/`update_fields`/`delete`) has NO Rust
+//! equivalent to port: this crate already uses a uniform
+//! `&Connection`-only seam everywhere (see [`create`]'s doc) — the
+//! caller composing a wider transaction just passes the SAME
+//! `&Connection` it's already mid-transaction on, which is exactly
+//! what Python's cursor-shaped `connection=` was standing in for.
+//! There's no separate "shape" left to add.
 //!
 //! Unlike `AgentRepository`/`MessageRepository`, this repository has
 //! NO `StableOrderCache`/pagination method at all — confirmed via
@@ -264,17 +269,90 @@ pub struct TaskFields<'a> {
     pub notes: NullableUpdate<Vec<TaskNote>>,
 }
 
+/// The literal SQLite trigger names/checks
+/// `trg_tasks_terminal_state_guard`'s `RAISE(ABORT, ...)` message
+/// against — a static string embedded in `schema.rs`'s DDL, since
+/// SQLite's trigger grammar only accepts a literal for `RAISE`, never
+/// an interpolated value. Matched by substring, matching Python's own
+/// `GUARD_MARKER in str(e)` check exactly (verified against the real
+/// migration source, `0025_terminal_task_guard_trigger.py`).
+const GUARD_MARKER: &str = "terminal_task_guard";
+
+/// The DB-level terminal-state guard trigger refused a write — the
+/// task is `completed`/`cancelled`/`failed` and the attempted change
+/// touches a frozen column (`status`/`priority`/`notes`/`title`/
+/// `description`, or reassigning `assigned_to` to a non-NULL value;
+/// CLEARING `assigned_to` to `NULL`, and touching `child_tasks`/
+/// `depends_on_tasks`/`parent_task`, are explicitly exempt and never
+/// trigger this).
+#[derive(Debug)]
+pub struct TerminalTaskWriteBlocked {
+    pub task_id: String,
+    pub message: String,
+}
+
+impl std::fmt::Display for TerminalTaskWriteBlocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "cannot modify task {:?}: {}", self.task_id, self.message)
+    }
+}
+
+impl std::error::Error for TerminalTaskWriteBlocked {}
+
+/// Failure modes of [`update_fields`]/[`bulk_update_fields`].
+#[derive(Debug)]
+pub enum UpdateTaskError {
+    TerminalTaskWriteBlocked(TerminalTaskWriteBlocked),
+    Db(rusqlite::Error),
+}
+
+impl std::fmt::Display for UpdateTaskError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UpdateTaskError::TerminalTaskWriteBlocked(e) => write!(f, "{e}"),
+            UpdateTaskError::Db(e) => write!(f, "database error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for UpdateTaskError {}
+
+/// Classifies a failed `UPDATE tasks` as either the guard trigger
+/// firing (checked via [`GUARD_MARKER`] substring-matching the
+/// trigger's `RAISE` message, exactly mirroring Python's
+/// `GUARD_MARKER in str(e)`) or a genuine unrelated DB error —
+/// crucially, an ordinary FK/UNIQUE violation must NOT be
+/// misclassified as the guard firing just because it's also a
+/// `SqliteFailure`.
+fn classify_update_error(task_id: &str, e: rusqlite::Error) -> UpdateTaskError {
+    if let rusqlite::Error::SqliteFailure(_, Some(msg)) = &e {
+        if msg.contains(GUARD_MARKER) {
+            return UpdateTaskError::TerminalTaskWriteBlocked(TerminalTaskWriteBlocked {
+                task_id: task_id.to_string(),
+                message: msg.clone(),
+            });
+        }
+    }
+    UpdateTaskError::Db(e)
+}
+
 /// Partial UPDATE of the allowed columns; always refreshes
 /// `updated_at` regardless of whether any other field changed
-/// (matching every other `update_fields` in this crate). `None` if
-/// `task_id` doesn't exist.
+/// (matching every other `update_fields` in this crate). `Ok(None)`
+/// if `task_id` doesn't exist; `Err(UpdateTaskError::
+/// TerminalTaskWriteBlocked)` if the write touches a column the
+/// `trg_tasks_terminal_state_guard` trigger protects on a terminal
+/// task (see that struct's doc for exactly which columns).
 pub fn update_fields(
     conn: &Connection,
     task_id: &str,
     fields: &TaskFields,
     now: &str,
-) -> Result<Option<TaskRow>> {
-    if get_by_id(conn, task_id)?.is_none() {
+) -> std::result::Result<Option<TaskRow>, UpdateTaskError> {
+    if get_by_id(conn, task_id)
+        .map_err(UpdateTaskError::Db)?
+        .is_none()
+    {
         return Ok(None);
     }
 
@@ -357,9 +435,34 @@ pub fn update_fields(
         set_clauses.join(", ")
     );
     let param_refs: Vec<&dyn ToSql> = params.iter().map(|b| b.as_ref()).collect();
-    conn.execute(&sql, param_refs.as_slice())?;
+    conn.execute(&sql, param_refs.as_slice())
+        .map_err(|e| classify_update_error(task_id, e))?;
 
-    get_by_id(conn, task_id)
+    get_by_id(conn, task_id).map_err(UpdateTaskError::Db)
+}
+
+/// Applies the SAME field-set update across N task ids in a loop —
+/// unknown ids are silently skipped (matching Python), collecting the
+/// rows that WERE updated. Unlike Python (which fires exactly one
+/// `"task.bulk_updated"` event regardless of row count — a
+/// composition-layer/EventBus concern this crate doesn't implement),
+/// this stops at the first genuine error (including the first
+/// terminal-task-guard refusal) rather than silently skipping it —
+/// the safest interpretation absent an explicit "continue past
+/// per-row failures" contract from Python for this specific case.
+pub fn bulk_update_fields(
+    conn: &Connection,
+    task_ids: &[&str],
+    fields: &TaskFields,
+    now: &str,
+) -> std::result::Result<Vec<TaskRow>, UpdateTaskError> {
+    let mut updated = Vec::new();
+    for task_id in task_ids {
+        if let Some(row) = update_fields(conn, task_id, fields, now)? {
+            updated.push(row);
+        }
+    }
+    Ok(updated)
 }
 
 /// `true` iff a row existed and was removed. No cross-table cascade
@@ -685,5 +788,249 @@ mod tests {
         // Two non-root tasks with parent_task set must NOT collide.
         assert!(get_by_id(&conn, "task_child1").unwrap().is_some());
         assert!(get_by_id(&conn, "task_child2").unwrap().is_some());
+    }
+
+    /// `parent` avoids tripping `idx_tasks_single_root` when a test
+    /// needs more than one task and only the FIRST should be a root.
+    fn terminal_task_with_parent(conn: &Connection, task_id: &str, parent: Option<&str>) {
+        let mut t = new_task(Some(task_id), "will complete");
+        t.status = "in_progress";
+        t.parent_task = parent;
+        create(conn, t).unwrap();
+        update_fields(
+            conn,
+            task_id,
+            &TaskFields {
+                status: Some("completed"),
+                ..Default::default()
+            },
+            "2026-01-02T00:00:00Z",
+        )
+        .unwrap();
+    }
+
+    fn terminal_task(conn: &Connection, task_id: &str) {
+        terminal_task_with_parent(conn, task_id, None);
+    }
+
+    fn assert_blocked(
+        result: std::result::Result<Option<TaskRow>, UpdateTaskError>,
+        task_id: &str,
+    ) {
+        match result {
+            Err(UpdateTaskError::TerminalTaskWriteBlocked(e)) => assert_eq!(e.task_id, task_id),
+            other => panic!("expected TerminalTaskWriteBlocked, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn terminal_task_rejects_status_change() {
+        let conn = test_conn();
+        terminal_task(&conn, "task_1");
+        let result = update_fields(
+            &conn,
+            "task_1",
+            &TaskFields {
+                status: Some("in_progress"),
+                ..Default::default()
+            },
+            "2026-01-03T00:00:00Z",
+        );
+        assert_blocked(result, "task_1");
+    }
+
+    #[test]
+    fn terminal_task_rejects_priority_title_description_notes_changes() {
+        let conn = test_conn();
+        create(&conn, new_task(Some("task_shared_root"), "root")).unwrap();
+        for (label, fields) in [
+            (
+                "priority",
+                TaskFields {
+                    priority: Some("high"),
+                    ..Default::default()
+                },
+            ),
+            (
+                "title",
+                TaskFields {
+                    title: Some("new title"),
+                    ..Default::default()
+                },
+            ),
+            (
+                "description",
+                TaskFields {
+                    description: NullableUpdate::Set("new desc".to_string()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "notes",
+                TaskFields {
+                    notes: NullableUpdate::Set(vec![TaskNote {
+                        timestamp: "2026-01-01T00:00:00Z".to_string(),
+                        author: None,
+                        content: "x".to_string(),
+                    }]),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let conn2 = &conn;
+            let task_id = format!("task_{label}");
+            terminal_task_with_parent(conn2, &task_id, Some("task_shared_root"));
+            let result = update_fields(conn2, &task_id, &fields, "2026-01-03T00:00:00Z");
+            assert_blocked(result, &task_id);
+        }
+    }
+
+    #[test]
+    fn terminal_task_rejects_reassigning_to_a_new_agent() {
+        let conn = test_conn();
+        terminal_task(&conn, "task_1");
+        let result = update_fields(
+            &conn,
+            "task_1",
+            &TaskFields {
+                assigned_to: NullableUpdate::Set("bob".to_string()),
+                ..Default::default()
+            },
+            "2026-01-03T00:00:00Z",
+        );
+        assert_blocked(result, "task_1");
+    }
+
+    #[test]
+    fn terminal_task_allows_clearing_assigned_to() {
+        let conn = test_conn();
+        let mut t = new_task(Some("task_1"), "will complete");
+        t.status = "in_progress";
+        t.assigned_to = Some("alice");
+        create(&conn, t).unwrap();
+        update_fields(
+            &conn,
+            "task_1",
+            &TaskFields {
+                status: Some("completed"),
+                ..Default::default()
+            },
+            "2026-01-02T00:00:00Z",
+        )
+        .unwrap();
+
+        let row = update_fields(
+            &conn,
+            "task_1",
+            &TaskFields {
+                assigned_to: NullableUpdate::Clear,
+                ..Default::default()
+            },
+            "2026-01-03T00:00:00Z",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            row.assigned_to, None,
+            "clearing assigned_to on a terminal task must be allowed"
+        );
+    }
+
+    #[test]
+    fn terminal_task_allows_child_tasks_depends_on_and_parent_task_changes() {
+        let conn = test_conn();
+        terminal_task(&conn, "task_1");
+        let mut other = new_task(Some("task_other"), "sibling");
+        other.parent_task = Some("task_1");
+        create(&conn, other).unwrap();
+
+        let children = vec!["task_x".to_string()];
+        let row = update_fields(
+            &conn,
+            "task_1",
+            &TaskFields {
+                child_tasks: NullableUpdate::Set(children.clone()),
+                ..Default::default()
+            },
+            "2026-01-03T00:00:00Z",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            row.child_tasks,
+            Some(children),
+            "child_tasks must be writable even on a terminal task"
+        );
+    }
+
+    #[test]
+    fn non_terminal_task_is_fully_mutable_as_before() {
+        let conn = test_conn();
+        create(&conn, new_task(Some("task_1"), "still open")).unwrap();
+
+        let row = update_fields(
+            &conn,
+            "task_1",
+            &TaskFields {
+                status: Some("in_progress"),
+                title: Some("renamed"),
+                ..Default::default()
+            },
+            "2026-01-02T00:00:00Z",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(row.status, "in_progress");
+        assert_eq!(row.title, "renamed");
+    }
+
+    #[test]
+    fn bulk_update_fields_updates_every_existing_id_and_skips_unknown_ones() {
+        let conn = test_conn();
+        create(&conn, new_task(Some("task_1"), "a")).unwrap();
+        let mut t2 = new_task(Some("task_2"), "b");
+        t2.parent_task = Some("task_1");
+        create(&conn, t2).unwrap();
+
+        let updated = bulk_update_fields(
+            &conn,
+            &["task_1", "task_2", "task_missing"],
+            &TaskFields {
+                status: Some("in_progress"),
+                ..Default::default()
+            },
+            "2026-01-02T00:00:00Z",
+        )
+        .unwrap();
+
+        assert_eq!(
+            updated.len(),
+            2,
+            "the unknown id must be silently skipped, not an error"
+        );
+        assert!(updated.iter().all(|t| t.status == "in_progress"));
+    }
+
+    #[test]
+    fn bulk_update_fields_stops_on_the_first_terminal_task_guard_refusal() {
+        let conn = test_conn();
+        terminal_task(&conn, "task_1");
+        let mut t2 = new_task(Some("task_2"), "b");
+        t2.parent_task = Some("task_1");
+        create(&conn, t2).unwrap();
+
+        let result = bulk_update_fields(
+            &conn,
+            &["task_1", "task_2"],
+            &TaskFields {
+                status: Some("cancelled"),
+                ..Default::default()
+            },
+            "2026-01-03T00:00:00Z",
+        );
+        assert!(matches!(
+            result,
+            Err(UpdateTaskError::TerminalTaskWriteBlocked(_))
+        ));
     }
 }
