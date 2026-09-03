@@ -213,12 +213,29 @@ async def test_worker_agent_id_denial_points_to_token_free_self_claim(tmp_path) 
         )
 
 
-async def test_view_tasks_foreign_filter_gives_actionable_hint(tmp_path) -> None:
-    """view_tasks(agent_id=<another agent>) is denied for a worker — the
+async def test_view_tasks_foreign_filter_succeeds_by_default(tmp_path) -> None:
+    """config_allow_worker_view_foreign_tasks defaults True:
+    view_tasks(agent_id=<another agent>) is no longer denied for a
+    worker (the cross-agent task-access feature, PR 3/3)."""
+    async with mcp_session(tmp_path) as admin:
+        alice = await admin.create_worker("alice")
+        await admin.create_worker("bob")
+        text = _text(await alice.call("view_tasks", {"agent_id": "bob"})).lower()
+        assert "unauthorized" not in text and "denied" not in text, (
+            f"expected the foreign-agent filter to succeed; got: {text}"
+        )
+
+
+async def test_view_tasks_foreign_filter_gives_actionable_hint_when_toggle_off(
+    tmp_path,
+) -> None:
+    """With config_allow_worker_view_foreign_tasks disabled,
+    view_tasks(agent_id=<another agent>) is denied for a worker — the
     denial should point at the working path (omit the filter), not just say
     no. This is a blanket role check (fires regardless of whether the id
     names a real agent), so the hint is not an existence oracle."""
     async with mcp_session(tmp_path) as admin:
+        admin.set_toggle("config_allow_worker_view_foreign_tasks", "false")
         alice = await admin.create_worker("alice")
         await admin.create_worker("bob")
         text = _text(await alice.call("view_tasks", {"agent_id": "bob"})).lower()
