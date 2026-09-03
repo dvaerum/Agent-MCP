@@ -47,7 +47,7 @@ const RESERVED_AGENT_ID_PREFIX: &str = "admin";
 
 /// One row of the `agents` table, matching the ORM model
 /// (`agent_mcp/db/models/agent.py`) column-for-column.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct AgentRow {
     pub token: String,
     pub agent_id: String,
@@ -641,6 +641,17 @@ impl AgentRepository {
             .collect();
 
         Ok((ordered_rows, total))
+    }
+
+    /// Every row, unconditionally — no status filtering at all, unlike
+    /// every product-facing listing (which all exclude at least
+    /// tombstones). For backup/differential-testing tooling only.
+    pub fn dump_all(conn: &Connection) -> Result<Vec<AgentRow>> {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {AGENT_COLUMNS} FROM agents ORDER BY agent_id"
+        ))?;
+        let rows = stmt.query_map([], row_to_agent)?;
+        rows.collect()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1745,5 +1756,21 @@ mod tests {
             )
             .unwrap();
         assert_eq!(page.len(), 1);
+    }
+
+    #[test]
+    fn dump_all_includes_terminal_statuses_unlike_every_other_listing() {
+        let conn = test_conn();
+        seed(&conn, "live", "t1", "active");
+        seed(&conn, "dead", "t2", "terminated");
+        AgentRepository::insert_tombstone(&conn, "t3", "tomb", "2026-01-01T00:00:00Z").unwrap();
+
+        let mut ids: Vec<_> = AgentRepository::dump_all(&conn)
+            .unwrap()
+            .into_iter()
+            .map(|a| a.agent_id)
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["dead", "live", "tomb"]);
     }
 }
