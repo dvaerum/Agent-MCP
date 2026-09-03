@@ -2209,6 +2209,9 @@ async def assign_task_tool_impl(
                     principal=principal,
                     requesting_agent_id=_rag_requesting_agent_id,
                     can_view_all_tasks=is_admin_request,
+                    include_foreign=_access._get_config_bool(
+                        "config_allow_worker_view_foreign_tasks"
+                    ),
                 )
 
                 suggestion_message = format_suggestions_for_agent(
@@ -2668,6 +2671,9 @@ async def create_self_task_tool_impl(
                     created_by=requesting_agent_id,
                     principal=principal,
                     can_view_all_tasks=_rag_can_view_all_tasks,
+                    include_foreign=_access._get_config_bool(
+                        "config_allow_worker_view_foreign_tasks"
+                    ),
                 )
 
                 suggestion_message = format_suggestions_for_agent(
@@ -3674,9 +3680,19 @@ async def view_tasks_tool_impl(
         principal.agent_id or principal.user_id or "admin"
     )
 
-    # Permission check
+    # Permission check.
+    #
+    # config_allow_worker_view_foreign_tasks (default True): when on, a
+    # non-admin caller keeps whatever agent_id filter it passed —
+    # including someone else's, or none at all (unscoped, same as an
+    # admin) — instead of being pinned to its own agent_id. This is the
+    # actual cross-agent visibility unlock; TaskFilterSpec/_matches
+    # needs no changes for it, since an admin narrowing to an arbitrary
+    # agent_id is already exactly this same mechanism.
     target_agent_id_for_filter = filter_agent_id
-    if not is_admin_request:
+    if not is_admin_request and not _access._get_config_bool(
+        "config_allow_worker_view_foreign_tasks"
+    ):
         if filter_agent_id is None:
             target_agent_id_for_filter = requesting_agent_id
         elif filter_agent_id != requesting_agent_id:
@@ -3684,7 +3700,9 @@ async def view_tasks_tool_impl(
                 reason=(
                     "Non-admin agents can only view their own tasks. Omit the "
                     "agent_id filter to see your own tasks plus the unassigned "
-                    "(claimable) pool."
+                    "(claimable) pool. Ask admin to enable "
+                    "config_allow_worker_view_foreign_tasks to see other "
+                    "agents' tasks too."
                 )
             )
 
@@ -5166,16 +5184,22 @@ async def search_tasks_tool_impl(
     for task_id, task_data in g.tasks.items():
         # Permission check. A non-admin worker sees its own tasks PLUS
         # the unassigned (claimable) pool — mirrors view_tasks so the
-        # self-claim loop can discover a task_id. Foreign-owned rows
-        # (assigned_to == another worker) stay hidden, preserving the
-        # cross-worker isolation invariant (AZ-R17-1 / PF-1). Pool
-        # visibility is unconditional (not gated on
-        # config_allow_worker_self_assign, which only gates the claim).
+        # self-claim loop can discover a task_id. Pool visibility is
+        # unconditional (not gated on config_allow_worker_self_assign,
+        # which only gates the claim). Foreign-owned rows (assigned_to
+        # == another worker) are ALSO visible by default —
+        # config_allow_worker_view_foreign_tasks, the same toggle
+        # view_tasks honors; the cross-worker isolation invariant
+        # (AZ-R17-1 / PF-1) still applies when project policy disables
+        # it.
         if not is_admin_request and not can_access_task(
             task_data,
             requester_id=requesting_agent_id,
             can_view_all_tasks=False,
             include_unassigned=True,
+            include_foreign=_access._get_config_bool(
+                "config_allow_worker_view_foreign_tasks"
+            ),
         ):
             continue
 
@@ -5759,21 +5783,30 @@ def register_task_tools():
             "the response well under the per-call token cap.\n"
             "Common filters (combine freely):\n"
             "• assigned=true — just YOUR OWN tasks (workers see their own "
-            "tasks + the shared pool by default; this drops the pool).\n"
+            "tasks + the shared pool, and — by default — every other "
+            "agent's tasks too; this drops the pool and the other "
+            "agents).\n"
             "• assigned=true + status=incomplete — your OPEN tasks "
             "(pending/in_progress), the usual 'what should I work on'.\n"
             "• unassigned=true — the claimable POOL (tasks you can pick up "
             "and self-assign).\n"
             "• status=incomplete — all non-terminal tasks in one call "
             "(alias 'active'/'open').\n"
-            "• created_by=<agent_id> — tasks a given agent filed."
+            "• created_by=<agent_id> — tasks a given agent filed.\n"
+            "• agent_id=<other agent> — another agent's tasks specifically "
+            "(default-on; project policy may disable this)."
         ),
         input_schema={
             "type": "object",
             "properties": {
                 "agent_id": {
                     "type": "string",
-                    "description": "Filter tasks by agent ID (optional). If non-admin, can only be self.",
+                    "description": (
+                        "Filter tasks by agent ID (optional). Non-admins "
+                        "may target any agent by default "
+                        "(config_allow_worker_view_foreign_tasks); if "
+                        "project policy disables that, only self."
+                    ),
                 },
                 "status": {
                     "type": "string",

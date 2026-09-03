@@ -47,6 +47,8 @@ GOLDEN_DEFAULTS: dict[str, object] = {
     "config_allow_worker_self_assign": True,
     "config_allow_worker_create_unassigned": True,
     "config_allow_worker_update_own_status": True,
+    "config_allow_worker_view_foreign_tasks": True,
+    "config_allow_worker_comment_foreign_tasks": True,
     "config_auto_event_loop_global": True,
     "config_event_idle_stop_seconds": 604800,
     "config_debug_eventloop": False,
@@ -92,10 +94,10 @@ def test_golden_table_and_schema_cover_the_same_keys() -> None:
     assert set(GOLDEN_DEFAULTS) == {s.key for s in SETTINGS_SCHEMA}
 
 
-def test_schema_has_twenty_seven_ordered_specs() -> None:
-    assert len(SETTINGS_SCHEMA) == 27
+def test_schema_has_twenty_nine_ordered_specs() -> None:
+    assert len(SETTINGS_SCHEMA) == 29
     # Keys are unique.
-    assert len({s.key for s in SETTINGS_SCHEMA}) == 27
+    assert len({s.key for s in SETTINGS_SCHEMA}) == 29
 
 
 # ---------------------------------------------------------------------------
@@ -120,7 +122,7 @@ def test_every_spec_is_operator_tier() -> None:
 
 def test_known_setting_keys_complete() -> None:
     """KNOWN_SETTING_KEYS == the config_* keys the backend actually
-    reads (the 27 in the golden table)."""
+    reads (the 29 in the golden table)."""
     assert KNOWN_SETTING_KEYS == frozenset(GOLDEN_DEFAULTS)
 
 
@@ -162,7 +164,7 @@ async def test_settings_schema_endpoint_confirmed_operator(
         assert r.status_code == 200, r.text
         body = r.json()
         rows = _rows(body)
-        assert len(rows) == 27
+        assert len(rows) == 29
         # Row shape carries every schema field the frontend renders.
         first = rows[0]
         assert set(first) == {
@@ -217,4 +219,4 @@ async def test_settings_schema_caller_sysadmin_true_for_sysadmin() -> None:
     body = json.loads(resp.body)
     assert body["caller"]["sysadmin"] is True
     assert body["caller"]["confirmed_operator"] is True
-    assert len(body["schema"]) == 27
+    assert len(body["schema"]) == 29

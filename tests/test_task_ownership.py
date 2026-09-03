@@ -120,6 +120,99 @@ def test_real_assignee_is_not_unassigned():
     assert not is_unassigned({"assigned_to": "agent-a"})
 
 
+# --- include_foreign widening (config_allow_worker_view_foreign_tasks / --
+# --- config_allow_worker_comment_foreign_tasks, default-on cross-agent --
+# --- task access) -------------------------------------------------------
+
+
+def test_foreign_owned_task_allowed_when_foreign_widened():
+    task = {"assigned_to": "agent-a"}
+    assert can_access_task(
+        task,
+        requester_id="agent-c",
+        can_view_all_tasks=False,
+        include_foreign=True,
+    )
+
+
+def test_foreign_widening_does_not_grant_the_unassigned_pool():
+    # "foreign" means "assigned to someone ELSE" — an unassigned task
+    # has no owner at all, so it stays gated behind include_unassigned,
+    # not include_foreign (a caller wanting both passes both flags).
+    for sentinel in (None, ""):
+        task = {"assigned_to": sentinel}
+        assert not can_access_task(
+            task,
+            requester_id="agent-c",
+            can_view_all_tasks=False,
+            include_foreign=True,
+        )
+
+
+def test_own_task_still_allowed_when_foreign_widened():
+    task = {"assigned_to": "agent-a"}
+    assert can_access_task(
+        task,
+        requester_id="agent-a",
+        can_view_all_tasks=False,
+        include_foreign=True,
+    )
+
+
+def test_sql_fragment_foreign_scopes_to_any_assigned_task():
+    frag, params = sql_fragment(
+        "agent-a", can_view_all_tasks=False, include_foreign=True
+    )
+    assert params == []
+    assert "assigned_to" in frag
+
+
+def test_sql_fragment_agrees_with_can_access_task_foreign_widening():
+    """Same property check as the exact-match one above, but for
+    include_foreign — the SQL fragment used by rag/query.py's
+    pre-vector-search task fetch must never disagree with the dict
+    predicate used by search_tasks / _drop_unowned_task_chunks.
+    """
+    import sqlite3
+
+    tasks = [
+        {"task_id": "t1", "assigned_to": "agent-a"},
+        {"task_id": "t2", "assigned_to": "agent-b"},
+        {"task_id": "t3", "assigned_to": None},
+        {"task_id": "t4", "assigned_to": ""},
+    ]
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE tasks (task_id TEXT, assigned_to TEXT)")
+    conn.executemany(
+        "INSERT INTO tasks VALUES (?, ?)",
+        [(t["task_id"], t["assigned_to"]) for t in tasks],
+    )
+
+    for requester_id in ("agent-a", "agent-b", "agent-z", None):
+        frag, params = sql_fragment(
+            requester_id, can_view_all_tasks=False, include_foreign=True
+        )
+        rows = conn.execute(
+            f"SELECT task_id FROM tasks WHERE 1=1{frag}", params
+        ).fetchall()
+        sql_visible = {r[0] for r in rows}
+        dict_visible = {
+            t["task_id"]
+            for t in tasks
+            if can_access_task(
+                t,
+                requester_id=requester_id,
+                can_view_all_tasks=False,
+                include_foreign=True,
+            )
+        }
+        assert sql_visible == dict_visible, (
+            f"disagreement for requester_id={requester_id!r}: "
+            f"sql={sql_visible} dict={dict_visible}"
+        )
+    conn.close()
+
+
 # --- sql_fragment: SQL-layer equivalent for callers that scope at the --
 # --- DB layer (rag/query.py) instead of filtering an already-fetched --
 # --- dict (task_tools.py, task_comments_tools.py, task_queries.py) ----

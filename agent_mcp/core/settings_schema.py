@@ -125,6 +125,46 @@ SETTINGS_SCHEMA: tuple[SettingSpec, ...] = (
         widget="switch",
     ),
     SettingSpec(
+        key="config_allow_worker_view_foreign_tasks",
+        type="bool",
+        default=True,
+        tier="operator",
+        group="worker_permissions",
+        title="Allow workers to view tasks assigned to other agents",
+        description=(
+            "When on (default), a worker's view_tasks / search_tasks / "
+            "ask_project_rag calls are no longer scoped to just their "
+            "own tasks plus the unassigned pool — they can also see and "
+            "search tasks assigned to a DIFFERENT agent. When off, "
+            "cross-agent task visibility is denied (a foreign-owned "
+            "task_id resolves to the same phantom 'not found' a "
+            "nonexistent task_id does, so a worker cannot enumerate "
+            "foreign tasks). Does not affect who may edit or reassign a "
+            "task — only who can see it."
+        ),
+        widget="switch",
+    ),
+    SettingSpec(
+        key="config_allow_worker_comment_foreign_tasks",
+        type="bool",
+        default=True,
+        tier="operator",
+        group="worker_permissions",
+        title="Allow workers to comment on tasks assigned to other agents",
+        description=(
+            "When on (default, implies view), a worker may call "
+            "add_task_comment on a task assigned to a DIFFERENT agent — "
+            "the comment is authored and timestamped as normal, and "
+            "editing/deleting someone else's comment stays author-only "
+            "regardless of this setting. When off, add_task_comment on "
+            "a foreign-owned task is denied (same phantom 'not found' "
+            "as an unassigned/nonexistent task). Never affects task "
+            "status, reassignment, subtask creation, or bulk "
+            "operations — those stay owner-only."
+        ),
+        widget="switch",
+    ),
+    SettingSpec(
         key="config_auto_event_loop_global",
         type="bool",
         default=True,

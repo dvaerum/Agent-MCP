@@ -38,6 +38,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
+from . import access as _access  # Canonical home for _get_config_bool
 from ..core.authorize import requires_predicate
 from ..core.config import logger
 from ..core.principal import Principal
@@ -169,15 +170,18 @@ async def add_task_comment_tool_impl(
     """Wave 6 PR 0 demo + PR 1 family.
 
     Policy (SEC Wave-B, per-task ownership): a comment author must be
-    the target task's assignee or creator, OR a manager-tier caller
+    the target task's assignee or creator, a manager-tier caller
     (``tasks.assign`` — operator sessions, forwarding headers, and
-    manager-role agents; short-circuited by the sysadmin wildcard). A
-    worker may annotate only its own tasks; a manager / operator may
-    annotate any. Comments on a nonexistent task are rejected — task
-    comments feed other agents' / the operator's LLM context, so an
-    unrelated bearer writing into a foreign (or phantom) task's
-    comments is a cross-agent stored-injection primitive (same class
-    as the viewer project_context write already fixed).
+    manager-role agents; short-circuited by the sysadmin wildcard), or —
+    when ``config_allow_worker_comment_foreign_tasks`` is on (default
+    True) — ANY worker, on ANY task. Comments on a nonexistent task are
+    always rejected regardless of the toggle — task comments feed other
+    agents' / the operator's LLM context, so an unrelated bearer writing
+    into a phantom task's comments is a cross-agent stored-injection
+    primitive (same class as the viewer project_context write already
+    fixed); see the ADR for why foreign-but-real tasks are a
+    deliberately narrower, accepted exception (append-only, author-
+    attributed, no structural mutation).
     """
     task_id = arguments.get("task_id")
     text = arguments.get("text")
@@ -208,6 +212,13 @@ async def add_task_comment_tool_impl(
         requester_id=requester,
         can_view_all_tasks=principal.has_capability("tasks.assign"),
         include_created_by=True,
+        # config_allow_worker_comment_foreign_tasks (default True):
+        # commenting on a task assigned to a DIFFERENT agent. Never
+        # widens who may edit/delete that comment afterward — that
+        # stays author-only, unaffected by this toggle.
+        include_foreign=_access._get_config_bool(
+            "config_allow_worker_comment_foreign_tasks"
+        ),
     ):
         # SECURITY (PF-1): for a FOREIGN-owned task return the SAME
         # not-found result the phantom-task branch above returns, so
@@ -397,9 +408,11 @@ def register_task_comments_tools() -> None:
         description=(
             "Add a comment to a task via the side table (db-review PR-H). "
             "Returns the new note_id. Comments added this way can be "
-            "edited/deleted by the original author or admin. You must own "
-            "(be assigned to, or have created) the task; if it is unassigned "
-            "(in the claimable pool), claim it first with "
+            "edited/deleted by the original author or admin. By default "
+            "you may comment on any ASSIGNED task — your own or another "
+            "agent's (project policy may restrict this to tasks you own/"
+            "created). An UNASSIGNED task (in the claimable pool) always "
+            "needs claiming first, regardless of that policy — call "
             "assign_task(task_ids=[...], agent_token=<your own>)."
         ),
         input_schema={

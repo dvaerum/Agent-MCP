@@ -18,6 +18,7 @@ requirement instead of it being invisible inside the body.
 
 from typing import Any, Dict, Optional
 
+from . import access as _access  # Canonical home for _get_config_bool
 from .registry import Predicate, register_tool
 from ..core.authorize import agent_bearer_with_capability, requires_predicate
 from ..core.config import logger
@@ -73,6 +74,11 @@ async def ask_project_rag_tool_impl(
     # uses to grant the all-tasks view; a worker lacks it and is scoped
     # to its own assigned tasks.
     can_view_all_tasks = principal.has_capability("tasks.assign")
+    # config_allow_worker_view_foreign_tasks (default True): widens the
+    # scope above to also admit a task assigned to a DIFFERENT agent.
+    include_foreign = _access._get_config_bool(
+        "config_allow_worker_view_foreign_tasks"
+    )
 
     try:
         # query_rag_system handles its own errors and always returns a
@@ -90,6 +96,7 @@ async def ask_project_rag_tool_impl(
             query_text,
             requesting_agent_id=requesting_agent_id,
             can_view_all_tasks=can_view_all_tasks,
+            include_foreign=include_foreign,
         )
         if answer_text in RAG_ERROR_SENTINELS:
             logger.warning(

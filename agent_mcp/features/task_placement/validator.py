@@ -15,6 +15,7 @@ async def validate_task_placement(
     principal: Optional[Principal] = None,
     requesting_agent_id: Optional[str] = None,
     can_view_all_tasks: bool = True,
+    include_foreign: bool = False,
 ) -> Dict[str, Any]:
     """
     Advisory-only task placement analysis via the RAG system.
@@ -62,6 +63,14 @@ async def validate_task_placement(
             directly via ``view_tasks`` (R5-F1, the R4-F4 sibling on this
             RAG entry point). Defaults ``True`` (unscoped) to match the
             fallback semantics of both RAG entry points.
+        include_foreign: ``config_allow_worker_view_foreign_tasks``
+            (schema default ``True``; defaults ``False`` HERE, mirroring
+            ``query_rag_system_with_model``, so a caller that doesn't
+            pass it keeps the old exact-match-only scope). Resolved by
+            the caller (``task_tools.py``, alongside ``can_view_all_
+            tasks``) rather than read here — this module stays a
+            features-layer client of ``tools.rag_tools``/``rag.query``,
+            not a reader of the ``tools/access.py`` config store.
 
     Returns:
         Dictionary with validation results:
@@ -172,6 +181,7 @@ async def validate_task_placement(
                 # couldn't read directly via ``view_tasks``.
                 requesting_agent_id=rag_requesting_agent_id,
                 can_view_all_tasks=can_view_all_tasks,
+                include_foreign=include_foreign,
             )
             rag_response = [mcp_types.TextContent(type="text", text=response_text)]
         

@@ -83,6 +83,9 @@ def _make_validator_mock(
         # stand-in keeps the same signature as the patched target.
         requesting_agent_id: str | None = None,
         can_view_all_tasks: bool = True,
+        # PR 3/3 (cross-agent task access): the real validator also
+        # threads config_allow_worker_view_foreign_tasks. Accept it too.
+        include_foreign: bool = False,
     ) -> dict[str, Any]:
         return {
             "status": status,

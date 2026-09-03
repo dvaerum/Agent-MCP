@@ -152,11 +152,65 @@ async def test_worker_search_filter_only_includes_unassigned(tmp_path) -> None:
         )
 
 
-# --- SECURITY (must stay GREEN): foreign-owned tasks stay hidden ------
+# --- Cross-agent visibility: on by default (PR 3/3), a project can opt
+# --- back into the stricter isolation via config_allow_worker_view_
+# --- foreign_tasks=false --------------------------------------------
 
 
-async def test_worker_cannot_see_other_workers_task_via_view(tmp_path) -> None:
+async def test_worker_sees_other_workers_task_by_default_via_view(
+    tmp_path,
+) -> None:
     async with mcp_session(tmp_path) as admin:
+        alice = await admin.create_worker("alice")
+        await admin.create_worker("bob")
+        bobs_id = f"task_{secrets.token_hex(6)}"
+        _seed_task(bobs_id, "bob's secret work", assigned_to="bob")
+
+        text = _text(await alice.call("view_tasks", {}))
+        assert bobs_id in text, (
+            "config_allow_worker_view_foreign_tasks defaults True: alice "
+            f"should see bob's task via view_tasks; got: {text}"
+        )
+
+
+async def test_worker_sees_other_workers_task_by_default_via_search(
+    tmp_path,
+) -> None:
+    async with mcp_session(tmp_path) as admin:
+        alice = await admin.create_worker("alice")
+        await admin.create_worker("bob")
+        bobs_id = f"task_{secrets.token_hex(6)}"
+        _seed_task(
+            bobs_id,
+            "bob confidential migration",
+            assigned_to="bob",
+            description="bob confidential migration details",
+        )
+
+        scored = _text(
+            await alice.call(
+                "search_tasks", {"search_query": "confidential migration"}
+            )
+        )
+        assert bobs_id in scored, (
+            "config_allow_worker_view_foreign_tasks defaults True: alice "
+            f"should find bob's task via scored search; got: {scored}"
+        )
+
+        filtered = _text(
+            await alice.call("search_tasks", {"status_filter": "pending"})
+        )
+        assert bobs_id in filtered, (
+            "config_allow_worker_view_foreign_tasks defaults True: alice "
+            f"should find bob's task via filter-only search; got: {filtered}"
+        )
+
+
+async def test_worker_cannot_see_other_workers_task_via_view_when_toggle_off(
+    tmp_path,
+) -> None:
+    async with mcp_session(tmp_path) as admin:
+        admin.set_toggle("config_allow_worker_view_foreign_tasks", "false")
         alice = await admin.create_worker("alice")
         await admin.create_worker("bob")
         bobs_id = f"task_{secrets.token_hex(6)}"
@@ -169,10 +223,11 @@ async def test_worker_cannot_see_other_workers_task_via_view(tmp_path) -> None:
         )
 
 
-async def test_worker_cannot_see_other_workers_task_via_search(
+async def test_worker_cannot_see_other_workers_task_via_search_when_toggle_off(
     tmp_path,
 ) -> None:
     async with mcp_session(tmp_path) as admin:
+        admin.set_toggle("config_allow_worker_view_foreign_tasks", "false")
         alice = await admin.create_worker("alice")
         await admin.create_worker("bob")
         bobs_id = f"task_{secrets.token_hex(6)}"
