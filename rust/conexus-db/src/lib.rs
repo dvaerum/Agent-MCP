@@ -9,6 +9,7 @@ pub mod rag_repository;
 pub mod scheduled_directive_repository;
 pub mod schema;
 mod sql_util;
+pub mod task_repository;
 
 pub use agent_repository::{
     AgentField, AgentQueryFilters, AgentRepository, AgentRow, AgentSortBy, CreateAgentError,
@@ -27,3 +28,4 @@ pub use scheduled_directive_repository::{
     CollectDueError, NullableUpdate, ScheduledDirectiveFields, ScheduledDirectiveRow,
 };
 pub use schema::{init_rag_embeddings_table, init_router_schema, init_schema};
+pub use task_repository::{NewTask, TaskFields, TaskNote, TaskRow};

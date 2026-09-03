@@ -17,6 +17,10 @@ serde_json = "1"
 # chrono is used purely for ISO-8601 parsing/arithmetic/formatting in
 # scheduled_directive_repository's interval math, not Utc::now().
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+# Minimal OS-CSPRNG wrapper (the actual backbone `rand` itself builds
+# on) for generate_task_id -- we only need N random bytes to hex-encode,
+# not a full PRNG/distribution library.
+getrandom = "0.4"
 
 [dev-dependencies]
 # Only needed to register the real sqlite-vec extension for THIS
