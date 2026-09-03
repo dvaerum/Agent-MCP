@@ -105,6 +105,30 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             meta_key    TEXT PRIMARY KEY,
             meta_value  TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS agent_messages (
+            message_id          TEXT PRIMARY KEY,
+            sender_id           TEXT NOT NULL,
+            recipient_id        TEXT NOT NULL,
+            message_content     TEXT NOT NULL,
+            message_type        TEXT NOT NULL DEFAULT 'text',
+            priority            TEXT NOT NULL DEFAULT 'normal',
+            timestamp           TEXT NOT NULL,
+            delivered           INTEGER NOT NULL DEFAULT 0,
+            read                INTEGER NOT NULL DEFAULT 0,
+            subject             TEXT,
+            parent_message_id   TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_agent_messages_recipient_timestamp
+            ON agent_messages (recipient_id, timestamp);
+        CREATE INDEX IF NOT EXISTS idx_agent_messages_sender_timestamp
+            ON agent_messages (sender_id, timestamp);
+        CREATE INDEX IF NOT EXISTS idx_agent_messages_unread
+            ON agent_messages (recipient_id, read, timestamp);
+        CREATE INDEX IF NOT EXISTS idx_agent_messages_delivered
+            ON agent_messages (delivered);
+        CREATE INDEX IF NOT EXISTS idx_agent_messages_parent
+            ON agent_messages (parent_message_id);
         "#,
     )
 }
