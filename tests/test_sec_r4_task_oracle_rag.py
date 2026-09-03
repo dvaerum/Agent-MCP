@@ -211,9 +211,15 @@ async def test_bulk_task_operations_foreign_task_not_found(tmp_path):
 
 
 async def test_add_task_comment_foreign_task_indistinguishable(tmp_path):
-    """add_task_comment on a foreign existing task must match the response
-    for a nonexistent task (no owner name, no 403-vs-404 oracle)."""
+    """With config_allow_worker_comment_foreign_tasks disabled,
+    add_task_comment on a foreign existing task must match the response
+    for a nonexistent task (no owner name, no 403-vs-404 oracle). The
+    toggle defaults True (a worker CAN comment on a foreign task by
+    default, tests/test_sec_comment_ownership_rag_gate.py) — this test
+    is specifically about what happens when a project opts back into
+    the stricter policy."""
     async with mcp_session(tmp_path) as admin:
+        admin.set_toggle("config_allow_worker_comment_foreign_tasks", "false")
         _seed_task_row("foreign-task-c", assigned_to="alice")
         intruder = await admin.create_worker("bob")
 

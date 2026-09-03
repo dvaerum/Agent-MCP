@@ -387,13 +387,54 @@ async def test_vector_task_chunk_privileged_sees_all(
 
 
 @pytest.mark.asyncio
-async def test_ask_project_rag_threads_worker_scope(
+async def test_ask_project_rag_worker_sees_foreign_task_by_default(
     tmp_path, monkeypatch
 ) -> None:
-    """The whole point: a Worker A principal calling ``ask_project_rag``
-    must NOT get Worker B's task back. Proves rag_tools threads the
-    caller's agent_id + tasks.assign into query_rag_system."""
+    """config_allow_worker_view_foreign_tasks defaults True: a Worker A
+    principal calling ``ask_project_rag`` DOES get Worker B's task back
+    (the cross-agent task-access feature, PR 3/3)."""
     async with mcp_session(tmp_path):
+        _seed_task(
+            task_id="task-a-e2e",
+            title="deploy pipeline alpha",
+            description=f"own {_MARKER_A}",
+            assigned_to="worker-a",
+        )
+        _seed_task(
+            task_id="task-b-e2e",
+            title="deploy pipeline beta",
+            description=f"private {_MARKER_B}",
+            assigned_to="worker-b",
+        )
+        cap = _wire_capture(monkeypatch)
+        worker_a = make_principal(
+            kind="agent_bearer", agent_id="worker-a", agent_role="worker"
+        )
+        assert worker_a.has_capability("rag.query")
+        assert not worker_a.has_capability("tasks.assign")
+
+        await ask_project_rag_tool_impl(
+            {"query": "deploy pipeline"}, principal=worker_a
+        )
+
+        user = _user_content(cap)
+        assert _MARKER_B in user, (
+            "config_allow_worker_view_foreign_tasks defaults True: "
+            "Worker A should see Worker B's task through ask_project_rag"
+        )
+        assert _MARKER_A in user
+
+
+@pytest.mark.asyncio
+async def test_ask_project_rag_threads_worker_scope_when_toggle_off(
+    tmp_path, monkeypatch
+) -> None:
+    """With config_allow_worker_view_foreign_tasks disabled, a Worker A
+    principal calling ``ask_project_rag`` must NOT get Worker B's task
+    back. Proves rag_tools threads the caller's agent_id + tasks.assign
+    (+ the toggle) into query_rag_system."""
+    async with mcp_session(tmp_path) as admin:
+        admin.set_toggle("config_allow_worker_view_foreign_tasks", "false")
         _seed_task(
             task_id="task-a-e2e",
             title="deploy pipeline alpha",

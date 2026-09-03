@@ -31,6 +31,7 @@ and the alternatives weighed. Most recent decisions:
 - [ADR-0024](./adr/0024-sso-subject-value-type.md) — the OIDC subject key is a value type, not an f-string.
 - [ADR-0025](./adr/0025-forwarding-tier-excluded-from-confirmed-operator-tier.md) — forwarding-tier identity is excluded from confirmed-operator-tier by design.
 - [ADR-0026](./adr/0026-directive-due-delivery-trigger.md) — scheduled directives fire through the delivery-transport trigger set, closing the wait-loop-only firing gap.
+- [ADR-0027](./adr/0027-cross-agent-task-visibility-default-on.md) — cross-agent task read/comment access defaults on, and why this widening is a scoped exception rather than a new disclosure-defaults posture.
 
 ### [`proposals/`](./proposals/) — parked future improvements
 

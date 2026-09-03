@@ -280,7 +280,12 @@ async def test_worker_comment_on_unassigned_task_is_guided_to_claim(
 async def test_worker_comment_on_foreign_task_stays_phantom_not_found(
     tmp_path,
 ) -> None:
+    """With config_allow_worker_comment_foreign_tasks disabled (it
+    defaults True — see test_sec_comment_ownership_rag_gate.py's
+    test_worker_can_comment_on_foreign_task_by_default), the phantom-404
+    behavior this test exercises is unchanged."""
     async with mcp_session(tmp_path) as admin:
+        admin.set_toggle("config_allow_worker_comment_foreign_tasks", "false")
         alice = await admin.create_worker("alice")
         bob = await admin.create_worker("bob")
         bobs_id = f"task_{secrets.token_hex(6)}"

@@ -108,14 +108,35 @@ def _comments_for(task_id: str) -> list:
 # ── Finding 1: add_task_comment per-task ownership ────────────────
 
 
-async def test_worker_cannot_note_foreign_task(tmp_path) -> None:
-    """A worker that is neither creator nor assignee of a task is
-    denied — the cross-agent stored-injection primitive is closed.
+async def test_worker_can_comment_on_foreign_task_by_default(
+    tmp_path,
+) -> None:
+    """config_allow_worker_comment_foreign_tasks defaults True: a worker
+    that is neither creator nor assignee of a task may still comment on
+    it (the cross-agent task-access feature, PR 3/3)."""
+    async with mcp_session(tmp_path):
+        _insert_task("t-foreign", created_by="alice", assigned_to="alice")
+        bob = _agent(agent_id="bob", role="worker")
+        result = await add_task_comment_tool_impl(
+            {"task_id": "t-foreign", "text": "cross-agent note"},
+            principal=bob,
+        )
+        assert isinstance(result, Ok), result
+        assert len(_comments_for("t-foreign")) == 1
+
+
+async def test_worker_cannot_note_foreign_task_when_toggle_off(
+    tmp_path,
+) -> None:
+    """With config_allow_worker_comment_foreign_tasks disabled, a worker
+    that is neither creator nor assignee of a task is denied — the
+    cross-agent stored-injection primitive is closed.
 
     PF-1 (round 4): the denial is a :class:`NotFound` identical to a
     nonexistent task, so a non-owner worker can't use the 403-vs-404
     shape as a task-existence oracle and the owner's id never leaks."""
-    async with mcp_session(tmp_path):
+    async with mcp_session(tmp_path) as admin:
+        admin.set_toggle("config_allow_worker_comment_foreign_tasks", "false")
         _insert_task("t-foreign", created_by="alice", assigned_to="alice")
         bob = _agent(agent_id="bob", role="worker")
         result = await add_task_comment_tool_impl(

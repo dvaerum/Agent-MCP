@@ -394,14 +394,34 @@ async def test_view_tasks_admin_returns_ok(tmp_path) -> None:
         assert "Tasks" in text or "No tasks" in text, text
 
 
-# ── 8. view_tasks worker filtering other agent → PermissionDenied
+# ── 8. view_tasks worker filtering other agent — allowed by default,
+#      PermissionDenied when config_allow_worker_view_foreign_tasks
+#      is disabled
 # ─────────────────────────────────────────────────────────────────
 
 
-async def test_view_tasks_worker_other_agent_filter_permission_denied(
+async def test_view_tasks_worker_other_agent_filter_allowed_by_default(
+    tmp_path,
+) -> None:
+    """config_allow_worker_view_foreign_tasks defaults True: a worker
+    filtering view_tasks by ANOTHER agent's agent_id succeeds (the
+    cross-agent task-access feature, PR 3/3)."""
+    async with mcp_session(tmp_path) as admin:
+        alice = await admin.create_worker("alice")
+        bob = await admin.create_worker("bob")
+
+        result = await alice.call("view_tasks", {"agent_id": bob.agent_id})
+        text = result[0].text
+        assert not text.startswith("Unauthorized:"), (
+            f"expected the filter to succeed, got: {text!r}"
+        )
+
+
+async def test_view_tasks_worker_other_agent_filter_permission_denied_when_toggle_off(
     tmp_path,
 ) -> None:
     async with mcp_session(tmp_path) as admin:
+        admin.set_toggle("config_allow_worker_view_foreign_tasks", "false")
         alice = await admin.create_worker("alice")
         bob = await admin.create_worker("bob")
 

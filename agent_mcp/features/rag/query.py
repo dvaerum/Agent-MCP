@@ -87,13 +87,18 @@ RAG_ERROR_SENTINELS = frozenset(
 def _task_ownership_sql(
     requesting_agent_id: Optional[str],
     can_view_all_tasks: bool,
+    *,
+    include_foreign: bool = False,
 ) -> tuple[str, List[str]]:
     """Return the ``(sql_fragment, params)`` that scopes a live-task
     ``SELECT`` to the caller's ``view_tasks`` visibility. Thin wrapper
     over ``core.task_ownership.sql_fragment`` — see that function's
-    docstring for the exact semantics.
+    docstring for the exact semantics, including ``include_foreign``
+    (``config_allow_worker_view_foreign_tasks``).
     """
-    return _task_ownership_sql_fragment(requesting_agent_id, can_view_all_tasks)
+    return _task_ownership_sql_fragment(
+        requesting_agent_id, can_view_all_tasks, include_foreign=include_foreign
+    )
 
 
 def _drop_unowned_task_chunks(
@@ -102,6 +107,7 @@ def _drop_unowned_task_chunks(
     cursor: Any,
     requesting_agent_id: Optional[str],
     can_view_all_tasks: bool,
+    include_foreign: bool = False,
 ) -> List[Dict[str, Any]]:
     """Drop vector-search chunks sourced from a task the caller cannot
     read directly (R4-F4).
@@ -112,8 +118,10 @@ def _drop_unowned_task_chunks(
     project-wide and always kept. A ``tasks.assign`` caller keeps every
     chunk. For a worker, a task chunk survives iff
     ``core.task_ownership.can_access_task`` says so (exact
-    ``assigned_to`` match; unassigned/NULL tasks are NOT visible) — the
-    same rule ``view_tasks`` applies.
+    ``assigned_to`` match, widened by ``include_foreign`` —
+    ``config_allow_worker_view_foreign_tasks`` — to also admit a task
+    assigned to a DIFFERENT agent; unassigned/NULL tasks stay NOT
+    visible either way) — the same rule ``view_tasks`` applies.
     """
     if can_view_all_tasks:
         return results
@@ -141,6 +149,7 @@ def _drop_unowned_task_chunks(
                 dict(row),
                 requester_id=requesting_agent_id,
                 can_view_all_tasks=False,
+                include_foreign=include_foreign,
             )
         }
     return [
@@ -313,6 +322,7 @@ async def query_rag_system(
     *,
     requesting_agent_id: Optional[str] = None,
     can_view_all_tasks: bool = True,
+    include_foreign: bool = False,
 ) -> str:
     """
     Processes a natural language query using the RAG system.
@@ -331,6 +341,12 @@ async def query_rag_system(
             worker-facing entry point) ALWAYS threads the real value from
             the Principal, so a worker's search is scoped. See
             ``rag_tools.ask_project_rag_tool_impl``.
+        include_foreign: ``config_allow_worker_view_foreign_tasks``
+            (default ``True`` in the schema; defaults ``False`` HERE so
+            an internal caller that doesn't pass it gets the old
+            exact-match-only scope). Widens task retrieval to also
+            include tasks assigned to a DIFFERENT agent, not just the
+            caller's own — see ``core.task_ownership.can_access_task``.
 
     Returns:
         A string containing the answer or an error message.
@@ -419,7 +435,9 @@ async def query_rag_system(
                         # ``a OR b AND owner`` would bind as
                         # ``a OR (b AND owner)`` and leak on a title match.
                         ownership_sql, ownership_params = _task_ownership_sql(
-                            requesting_agent_id, can_view_all_tasks
+                            requesting_agent_id,
+                            can_view_all_tasks,
+                            include_foreign=include_foreign,
                         )
                         sql_params_tasks.extend(ownership_params)
                         task_query_sql = f"""
@@ -482,6 +500,7 @@ async def query_rag_system(
                     cursor=cursor,
                     requesting_agent_id=requesting_agent_id,
                     can_view_all_tasks=can_view_all_tasks,
+                    include_foreign=include_foreign,
                 )
             except (
                 openai.APIError
@@ -616,6 +635,7 @@ async def query_rag_system_with_model(
     *,
     requesting_agent_id: Optional[str] = None,
     can_view_all_tasks: bool = True,
+    include_foreign: bool = False,
 ) -> str:
     """
     Processes a query using the RAG system with a specific completion model.
@@ -640,6 +660,10 @@ async def query_rag_system_with_model(
             worker-reachable caller (``validate_task_placement`` on the
             ``create_self_task`` path) ALWAYS threads the real value from
             the Principal, so a worker's placement analysis is scoped.
+        include_foreign: ``config_allow_worker_view_foreign_tasks``
+            (schema default ``True``; defaults ``False`` HERE so an
+            internal caller that doesn't pass it keeps the old
+            exact-match-only scope) — see ``query_rag_system``.
 
     Returns:
         A string containing the answer or an error message.
@@ -697,7 +721,7 @@ async def query_rag_system_with_model(
         # parens before AND-ing the ownership clause so the ``AND`` binds to
         # the whole disjunction, not just the last term (no OR-leak).
         ownership_sql, ownership_params = _task_ownership_sql(
-            requesting_agent_id, can_view_all_tasks
+            requesting_agent_id, can_view_all_tasks, include_foreign=include_foreign
         )
         cursor.execute(
             f"""
@@ -738,6 +762,7 @@ async def query_rag_system_with_model(
                     cursor=cursor,
                     requesting_agent_id=requesting_agent_id,
                     can_view_all_tasks=can_view_all_tasks,
+                    include_foreign=include_foreign,
                 )
             except openai.APIError as e_openai_emb:
                 logger.error(

@@ -147,6 +147,7 @@ async def test_validate_task_placement_maps_parent_and_dependency_suggestions(
         max_tokens: int,
         requesting_agent_id: str | None = None,
         can_view_all_tasks: bool = True,
+        include_foreign: bool = False,
     ) -> str:
         return _canned_rag_response(
             recommended_parent="task_parent001",
@@ -187,6 +188,7 @@ async def test_validate_task_placement_maps_duplicate_detection(monkeypatch) -> 
         max_tokens: int,
         requesting_agent_id: str | None = None,
         can_view_all_tasks: bool = True,
+        include_foreign: bool = False,
     ) -> str:
         return _canned_rag_response(
             recommended_parent=None,
@@ -240,6 +242,7 @@ async def test_validate_task_placement_root_proposal_never_denied_by_hierarchy(
         max_tokens: int,
         requesting_agent_id: str | None = None,
         can_view_all_tasks: bool = True,
+        include_foreign: bool = False,
     ) -> str:
         return _canned_rag_response(
             recommended_parent=None,
