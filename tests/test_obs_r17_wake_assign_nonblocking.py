@@ -218,6 +218,16 @@ async def test_assign_task_to_offline_agent_returns_promptly(
     """``assign_task`` targeting an agent with NO ``wait_for_events``
     listener and NO GET-/mcp session must complete well under the bound,
     with the post-commit inbox wake fired for the offline assignee."""
+    # This test's _BOUND_SECONDS budget covers the wake mechanism, not
+    # RAG placement-analysis latency — assign_task's create-and-assign
+    # path otherwise runs a real (network-dependent) RAG call first,
+    # which can push completion past the bound under load and fail this
+    # test for a reason unrelated to wake events. Same pattern as
+    # test_sec_r3_task_cache.py.
+    monkeypatch.setattr(
+        "agent_mcp.tools.task_tools.ENABLE_TASK_PLACEMENT_RAG", False
+    )
+
     async with mcp_session(tmp_path) as admin:
         bob = await admin.create_worker("bob-offline")
         assert state.waiter_count(bob.agent_id) == 0

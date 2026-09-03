@@ -80,12 +80,24 @@ async def test_message_event_is_skinny(tmp_path: Path) -> None:
         assert data["is_reply"] is False
 
 
-async def test_task_assigned_event_is_skinny(tmp_path: Path) -> None:
+async def test_task_assigned_event_is_skinny(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """`task_assigned` / `task_changed` events are pointers too: task_id
     + title + status, NOT the full description. The agent calls
     view_tasks to read + interact."""
     from agent_mcp.tools.task_tools import assign_task_tool_impl
     from tests.harness import mcp_session
+
+    # This test's timing budget (5s wait_for below, 3s waiter poll)
+    # covers the event-payload shape, not RAG placement-analysis
+    # latency — assign_task's create-and-assign path otherwise runs a
+    # real (network-dependent) RAG call first, which can push the
+    # actual assignment past the budget under load. Same pattern as
+    # test_sec_r3_task_cache.py.
+    monkeypatch.setattr(
+        "agent_mcp.tools.task_tools.ENABLE_TASK_PLACEMENT_RAG", False
+    )
 
     async with mcp_session(tmp_path) as admin:
         worker = await admin.create_worker("worker")
