@@ -161,6 +161,54 @@ jobs:
         # nix-closure gate, not a silent --ignore.
         run: cargo audit
 
+  conexus:
+    # Phase 0 CI seam for the Python->Rust migration (see
+    # /home/dennis/.claude/plans/prancy-napping-pie.md). The CoNexus Rust
+    # workspace under rust/ — same fmt/clippy/test/audit shape as
+    # aoe-bridge's job above, cloned deliberately rather than parameterized
+    # into one job: the two crates have unrelated release cadences and a
+    # shared job would couple their caches/failures for no benefit.
+    name: conexus (Rust)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal \
+            --component rustfmt --component clippy
+          rustup default stable
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: conexus-${{ runner.os }}-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: conexus-${{ runner.os }}-
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2.86.3
+        with:
+          tool: cargo-audit
+
+      - name: Audit (cargo-audit)
+        run: cargo audit
+
   dashboard:
     # Job display name is load-bearing: branch protection matches
     # required status checks by name, so renaming it would silently stop
