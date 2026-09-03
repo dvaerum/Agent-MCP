@@ -37,6 +37,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
+from ..core.task_ownership import can_access_task
 from ..utils.pagination_cache import StableOrderCache
 
 
@@ -351,7 +352,9 @@ class TaskQueryEngine:
         if filters.assigned and task.get("assigned_to") in (None, ""):
             return False
         if filters.agent_id:
-            assignee = task.get("assigned_to")
+            is_own = can_access_task(
+                task, requester_id=filters.agent_id, can_view_all_tasks=False
+            )
             if filters.include_unassigned:
                 # Worker pool visibility: own tasks OR the CLAIMABLE
                 # (unassigned + non-terminal) pool. Own tasks stay
@@ -359,12 +362,15 @@ class TaskQueryEngine:
                 # finished work); the widened pool applies the R16-F2
                 # terminal sink so it never advertises dead-end work.
                 # Foreign-owned rows still fail the match — cross-worker
-                # isolation (AZ-R17-1 / PF-1) holds.
-                if assignee != filters.agent_id and not is_claimable_task(
-                    task
-                ):
+                # isolation (AZ-R17-1 / PF-1) holds. NOTE: this is a
+                # STRICTER "unassigned" than
+                # ``task_ownership.is_unassigned`` (excludes terminal
+                # tasks too, R16-F2), so it stays a locally-composed
+                # ``is_claimable_task`` check rather than
+                # ``can_access_task``'s own ``include_unassigned`` flag.
+                if not is_own and not is_claimable_task(task):
                     return False
-            elif assignee != filters.agent_id:
+            elif not is_own:
                 return False
         if (
             filters.parent_task_id
