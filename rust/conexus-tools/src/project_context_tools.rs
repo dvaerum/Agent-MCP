@@ -479,6 +479,422 @@ impl Tool for ValidateContextConsistencyTool {
     }
 }
 
+const VIEW_STALE_DAYS: i64 = 30;
+const VIEW_LARGE_ENTRY_CHARS: usize = 10240;
+
+fn is_older_than_days(updated_at: &str, now: DateTime<Utc>, days: i64) -> bool {
+    parse_flexible(updated_at)
+        .map(|t| (now - t).num_days() > days)
+        .unwrap_or(false)
+}
+
+/// Python's `str()` on a JSON-decoded scalar -- NOT the same as
+/// re-serializing to JSON text (`str(True)` is `"True"`, `str(None)`
+/// is `"None"`, `str("hello")` is `hello` with no quotes). Only
+/// called on a non-object/non-array `Value` (the caller branches on
+/// that first); an invalid-JSON entry's `value_parsed` is already the
+/// raw string (see [`build_view_entries`]), so this returns it
+/// unchanged in that case too.
+fn python_str(value: &Value) -> String {
+    match value {
+        Value::Null => "None".to_string(),
+        Value::Bool(true) => "True".to_string(),
+        Value::Bool(false) => "False".to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => s.clone(),
+        Value::Object(_) | Value::Array(_) => {
+            unreachable!("caller already branched on object/array")
+        }
+    }
+}
+
+/// One `view_project_context` result entry, with the same `_metadata`
+/// block Python's `entry_data` dict attaches.
+struct ViewEntry {
+    row: ProjectContextRow,
+    value_parsed: Value,
+    json_valid: bool,
+    days_old: Option<i64>,
+}
+
+fn build_view_entries(entries: Vec<ProjectContextRow>, now: DateTime<Utc>) -> Vec<ViewEntry> {
+    entries
+        .into_iter()
+        .map(|row| {
+            let (value_parsed, json_valid) = match serde_json::from_str::<Value>(&row.value) {
+                Ok(v) => (v, true),
+                Err(_) => (Value::String(row.value.clone()), false),
+            };
+            let days_old = parse_flexible(&row.updated_at)
+                .ok()
+                .map(|t| (now - t).num_days());
+            ViewEntry {
+                row,
+                value_parsed,
+                json_valid,
+                days_old,
+            }
+        })
+        .collect()
+}
+
+fn view_entry_json(entry: &ViewEntry) -> Value {
+    let entry_size = entry.row.value.chars().count();
+    let is_stale = entry.days_old.is_some_and(|d| d > VIEW_STALE_DAYS);
+    serde_json::json!({
+        "key": entry.row.context_key,
+        "value": entry.value_parsed,
+        "description": entry.row.description,
+        "updated_by": entry.row.updated_by,
+        "updated_at": entry.row.updated_at,
+        "created_by": entry.row.created_by,
+        "created_at": entry.row.created_at,
+        "_metadata": {
+            "size_bytes": entry_size,
+            "size_kb": (entry_size as f64 / 1024.0 * 100.0).round() / 100.0,
+            "json_valid": entry.json_valid,
+            "days_old": entry.days_old,
+            "is_stale": is_stale,
+            "is_large": entry_size > VIEW_LARGE_ENTRY_CHARS,
+        },
+    })
+}
+
+/// Renders the full "Smart Tips"-style message Python's
+/// `view_project_context_tool_impl` builds. `all_entries` is the
+/// UNFILTERED table (needed only for `show_health_analysis`); `view`
+/// is the already-filtered/sorted/limited result set.
+#[allow(clippy::too_many_arguments)]
+fn render_view_message(
+    view: &[ViewEntry],
+    context_key_filter: Option<&str>,
+    search_query_filter: Option<&str>,
+    show_stale_entries: bool,
+    show_health_analysis: bool,
+    include_backup_info: bool,
+    sort_by: &str,
+    all_entries: &[ProjectContextRow],
+    now: DateTime<Utc>,
+) -> String {
+    if view.is_empty() {
+        return "No project context entries found matching the criteria.".to_string();
+    }
+
+    let mut filter_info = Vec::new();
+    if let Some(k) = context_key_filter {
+        filter_info.push(format!("key='{k}'"));
+    }
+    if let Some(q) = search_query_filter {
+        filter_info.push(format!("search='{q}'"));
+    }
+    if show_stale_entries {
+        filter_info.push("stale_only=true".to_string());
+    }
+
+    let mut header = format!("Project Context ({} entries", view.len());
+    if !filter_info.is_empty() {
+        header.push_str(&format!(", filtered by: {}", filter_info.join(", ")));
+    }
+    header.push_str(&format!(", sorted by: {sort_by})"));
+
+    let mut parts = vec![format!("{header}\n")];
+
+    if show_health_analysis {
+        let health = analyze_context_health(all_entries, now);
+        let health_icon = match health.status.as_str() {
+            "excellent" => "\u{1f7e2}",
+            "good" => "\u{1f7e1}",
+            "needs_attention" => "\u{1f7e0}",
+            _ => "\u{1f534}",
+        };
+        let status_title = {
+            let mut c = health.status.chars();
+            match c.next() {
+                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                None => String::new(),
+            }
+        };
+        parts.push(format!(
+            "\u{1f4ca} **Context Health:** {health_icon} {status_title} ({}/100)",
+            health.health_score
+        ));
+        parts.push(format!("   Total: {} entries", health.total));
+        parts.push(format!(
+            "   Issues: {} JSON errors, {} stale, {} large",
+            health.json_errors, health.stale_entries, health.large_entries
+        ));
+        if let Some(first) = health.recommendations.first() {
+            parts.push(format!("   \u{1f4a1} {first}"));
+        }
+        parts.push(String::new());
+    }
+
+    if include_backup_info {
+        parts.push(
+            "\u{1f4be} **Backup Info:** Use bulk_update_project_context for backups".to_string(),
+        );
+        parts.push(String::new());
+    }
+
+    for entry in view.iter().take(20) {
+        let entry_size = entry.row.value.chars().count();
+        let is_stale = entry.days_old.is_some_and(|d| d > VIEW_STALE_DAYS);
+        let is_large = entry_size > VIEW_LARGE_ENTRY_CHARS;
+
+        let mut indicators = Vec::new();
+        if !entry.json_valid {
+            indicators.push("\u{274c} JSON_ERROR".to_string());
+        }
+        if is_stale {
+            indicators.push(format!(
+                "\u{23f0} STALE({}d)",
+                entry.days_old.unwrap_or_default()
+            ));
+        }
+        if is_large {
+            indicators.push(format!(
+                "\u{1f4e6} LARGE({:.2}KB)",
+                entry_size as f64 / 1024.0
+            ));
+        }
+        let indicator_text = if indicators.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", indicators.join(" "))
+        };
+
+        parts.push(format!("**{}**{indicator_text}", entry.row.context_key));
+        parts.push(format!(
+            "  Description: {}",
+            entry.row.description.as_deref().unwrap_or("No description")
+        ));
+        parts.push(format!(
+            "  Updated: {} by {}",
+            entry.row.updated_at, entry.row.updated_by
+        ));
+        if let Some(created_by) = &entry.row.created_by {
+            parts.push(format!(
+                "  Created: {} by {created_by}",
+                entry.row.created_at.as_deref().unwrap_or("Unknown")
+            ));
+        }
+
+        let mut value_str = if entry.value_parsed.is_object() || entry.value_parsed.is_array() {
+            serde_json::to_string_pretty(&entry.value_parsed).unwrap_or_default()
+        } else {
+            python_str(&entry.value_parsed)
+        };
+        if value_str.chars().count() > 500 {
+            value_str = value_str.chars().take(500).collect::<String>() + "... [TRUNCATED]";
+        }
+        parts.push(format!("  Value: {value_str}"));
+        parts.push(String::new());
+    }
+
+    if view.len() > 20 {
+        parts.push(format!("... and {} more entries", view.len() - 20));
+        parts.push(
+            "Use max_results parameter to see more, or add filters to narrow results".to_string(),
+        );
+    }
+
+    parts.push("\n\u{1f4a1} Smart Tips:".to_string());
+    if !show_health_analysis {
+        parts.push("\u{2022} Add show_health_analysis=true for context health metrics".to_string());
+    }
+    if !show_stale_entries {
+        parts.push(
+            "\u{2022} Add show_stale_entries=true to see entries needing updates".to_string(),
+        );
+    }
+    parts.push("\u{2022} Use sort_by=[key|size|updated_at] for different sorting".to_string());
+    parts.push("\u{2022} Use validate_context_consistency to fix JSON errors".to_string());
+
+    parts.join("\n")
+}
+
+pub struct ViewProjectContextTool;
+
+impl Tool for ViewProjectContextTool {
+    const NAME: &'static str = "view_project_context";
+    const REQUIRED: Requirement = Requirement::Cap {
+        cap: Capability::MemoriesView,
+        reason: None,
+    };
+    const DESCRIPTION: &'static str = "Smart project context viewer with health analysis, \
+        stale entry detection, and advanced filtering. Provides comprehensive insights into \
+        context quality and usage.";
+    // "maxLength": 256 mirrors conexus_core::schema_limits::IDENTIFIER_MAX_LEN
+    // -- kept as a literal (SCHEMA must be `const`-constructible) and
+    // cross-checked against that constant by this module's own test.
+    const SCHEMA: &'static str = r#"{
+        "type": "object",
+        "properties": {
+            "context_key": {
+                "type": "string",
+                "description": "Exact key to view (optional). If provided, search_query is ignored.",
+                "maxLength": 256
+            },
+            "search_query": {
+                "type": "string",
+                "description": "Keyword search query (optional). Searches keys, descriptions, and values."
+            },
+            "show_health_analysis": {
+                "type": "boolean",
+                "description": "Include comprehensive health metrics and analysis (default: false)"
+            },
+            "show_stale_entries": {
+                "type": "boolean",
+                "description": "Show only entries older than 30 days needing review (default: false)"
+            },
+            "include_backup_info": {
+                "type": "boolean",
+                "description": "Include backup recommendations and info (default: false)"
+            },
+            "max_results": {
+                "type": "integer",
+                "description": "Maximum number of entries to return (default: 50)",
+                "minimum": 1,
+                "maximum": 200
+            },
+            "sort_by": {
+                "type": "string",
+                "description": "Sort entries by specified field (default: updated_at). 'last_updated' is accepted as a deprecated alias.",
+                "enum": ["key", "updated_at", "last_updated", "size"],
+                "default": "updated_at"
+            }
+        },
+        "required": [],
+        "additionalProperties": false
+    }"#;
+
+    fn call<'a>(
+        _principal: Option<&'a Principal>,
+        arguments: &'a Value,
+        conn: &'a AsyncMutex<Connection>,
+        now: &'a str,
+        _ctx: &'a conexus_auth::ToolCallContext<'a>,
+    ) -> conexus_auth::BoxFuture<'a, ToolResult> {
+        Box::pin(async move {
+            let context_key_filter = arguments
+                .get("context_key")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty());
+            let search_query_filter = arguments
+                .get("search_query")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty());
+            let show_health_analysis = arguments
+                .get("show_health_analysis")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let show_stale_entries = arguments
+                .get("show_stale_entries")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let include_backup_info = arguments
+                .get("include_backup_info")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            // Coerce + clamp to [1, 200], matching Python's defensive
+            // re-clamp (R16-sweep sibling: schema validation alone
+            // isn't trusted to have run).
+            let max_results = arguments
+                .get("max_results")
+                .and_then(Value::as_i64)
+                .unwrap_or(50)
+                .clamp(1, 200) as usize;
+            let sort_by_raw = arguments
+                .get("sort_by")
+                .and_then(Value::as_str)
+                .unwrap_or("updated_at");
+            let sort_by = if sort_by_raw == "last_updated" {
+                "updated_at"
+            } else {
+                sort_by_raw
+            };
+
+            let guard = conn.lock().await;
+            let all_rows = match project_context_repository::list_all(&guard) {
+                Ok(rows) => rows,
+                Err(_e) => {
+                    return ToolResult::Failed {
+                        message: "A database error occurred; it has been logged. Retry, or ask \
+                            an operator to check logs."
+                            .to_string(),
+                    }
+                }
+            };
+            drop(guard);
+
+            let now_dt: DateTime<Utc> = match parse_flexible(now) {
+                Ok(dt) => dt,
+                Err(_) => {
+                    return ToolResult::Failed {
+                        message: "Internal clock error".to_string(),
+                    }
+                }
+            };
+
+            let mut filtered: Vec<ProjectContextRow> = all_rows
+                .iter()
+                .filter(|row| {
+                    if let Some(key) = context_key_filter {
+                        row.context_key == key
+                    } else if let Some(q) = search_query_filter {
+                        row.context_key.contains(q)
+                            || row.description.as_deref().unwrap_or("").contains(q)
+                            || row.value.contains(q)
+                    } else {
+                        true
+                    }
+                })
+                .filter(|row| {
+                    !show_stale_entries
+                        || is_older_than_days(&row.updated_at, now_dt, VIEW_STALE_DAYS)
+                })
+                .cloned()
+                .collect();
+
+            match sort_by {
+                "size" => filtered.sort_by_key(|row| std::cmp::Reverse(row.value.chars().count())),
+                "key" => filtered.sort_by(|a, b| a.context_key.cmp(&b.context_key)),
+                _ => filtered.sort_by(|a, b| b.updated_at.cmp(&a.updated_at)),
+            }
+            filtered.truncate(max_results);
+
+            let view = build_view_entries(filtered, now_dt);
+            let entries_json: Vec<Value> = view.iter().map(view_entry_json).collect();
+            let message = render_view_message(
+                &view,
+                context_key_filter,
+                search_query_filter,
+                show_stale_entries,
+                show_health_analysis,
+                include_backup_info,
+                sort_by,
+                &all_rows,
+                now_dt,
+            );
+
+            ToolResult::Ok {
+                data: Some(serde_json::json!({
+                    "entries": entries_json,
+                    "count": entries_json.len(),
+                    "filters": {
+                        "context_key": context_key_filter,
+                        "search_query": search_query_filter,
+                        "show_stale_entries": show_stale_entries,
+                        "sort_by": sort_by,
+                        "max_results": max_results,
+                    },
+                })),
+                message: Some(message),
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -774,5 +1190,281 @@ mod tests {
         )
         .await;
         assert!(matches!(result, ToolResult::Ok { .. }));
+    }
+
+    // ── ViewProjectContextTool ───────────────────────────────────────
+
+    async fn seed_context(conn: &AsyncMutex<Connection>, key: &str, value: &str, now: &str) {
+        let guard = conn.lock().await;
+        project_context_repository::create_new(&guard, key, value, Some("d"), "alice", now)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn view_returns_all_entries_by_default() {
+        let conn = setup().await;
+        seed_context(&conn, "a", "\"one\"", "2026-06-01T00:00:00Z").await;
+        seed_context(&conn, "b", "\"two\"", "2026-06-01T00:01:00Z").await;
+        let alice = worker();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = ViewProjectContextTool::call(
+            Some(&alice),
+            &serde_json::json!({}),
+            &conn,
+            "2026-06-01T00:02:00Z",
+            &c,
+        )
+        .await;
+        let ToolResult::Ok { data, .. } = result else {
+            panic!("expected Ok, got {result:?}");
+        };
+        assert_eq!(data.unwrap()["count"], 2);
+    }
+
+    #[tokio::test]
+    async fn view_filters_by_exact_context_key() {
+        let conn = setup().await;
+        seed_context(&conn, "a", "\"one\"", "2026-06-01T00:00:00Z").await;
+        seed_context(&conn, "b", "\"two\"", "2026-06-01T00:01:00Z").await;
+        let alice = worker();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = ViewProjectContextTool::call(
+            Some(&alice),
+            &serde_json::json!({"context_key": "a"}),
+            &conn,
+            "2026-06-01T00:02:00Z",
+            &c,
+        )
+        .await;
+        let ToolResult::Ok { data, .. } = result else {
+            panic!("expected Ok, got {result:?}");
+        };
+        let data = data.unwrap();
+        assert_eq!(data["count"], 1);
+        assert_eq!(data["entries"][0]["key"], "a");
+    }
+
+    #[tokio::test]
+    async fn view_search_query_matches_key_description_and_value() {
+        let conn = setup().await;
+        seed_context(
+            &conn,
+            "matching-key",
+            "\"irrelevant\"",
+            "2026-06-01T00:00:00Z",
+        )
+        .await;
+        seed_context(
+            &conn,
+            "other",
+            "\"has matching text\"",
+            "2026-06-01T00:01:00Z",
+        )
+        .await;
+        seed_context(&conn, "unrelated", "\"nothing\"", "2026-06-01T00:02:00Z").await;
+        let alice = worker();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = ViewProjectContextTool::call(
+            Some(&alice),
+            &serde_json::json!({"search_query": "matching"}),
+            &conn,
+            "2026-06-01T00:03:00Z",
+            &c,
+        )
+        .await;
+        let ToolResult::Ok { data, .. } = result else {
+            panic!("expected Ok, got {result:?}");
+        };
+        assert_eq!(data.unwrap()["count"], 2);
+    }
+
+    #[tokio::test]
+    async fn view_show_stale_entries_filters_to_only_stale_rows() {
+        let conn = setup().await;
+        seed_context(&conn, "fresh", "\"v\"", "2026-06-01T00:00:00Z").await;
+        seed_context(&conn, "stale", "\"v\"", "2026-01-01T00:00:00Z").await;
+        let alice = worker();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = ViewProjectContextTool::call(
+            Some(&alice),
+            &serde_json::json!({"show_stale_entries": true}),
+            &conn,
+            "2026-06-01T00:01:00Z",
+            &c,
+        )
+        .await;
+        let ToolResult::Ok { data, .. } = result else {
+            panic!("expected Ok, got {result:?}");
+        };
+        let data = data.unwrap();
+        assert_eq!(data["count"], 1);
+        assert_eq!(data["entries"][0]["key"], "stale");
+    }
+
+    #[tokio::test]
+    async fn view_sorts_by_key_ascending() {
+        let conn = setup().await;
+        seed_context(&conn, "zebra", "\"v\"", "2026-06-01T00:00:00Z").await;
+        seed_context(&conn, "alpha", "\"v\"", "2026-06-01T00:01:00Z").await;
+        let alice = worker();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = ViewProjectContextTool::call(
+            Some(&alice),
+            &serde_json::json!({"sort_by": "key"}),
+            &conn,
+            "2026-06-01T00:02:00Z",
+            &c,
+        )
+        .await;
+        let ToolResult::Ok { data, .. } = result else {
+            panic!("expected Ok, got {result:?}");
+        };
+        let entries = data.unwrap()["entries"].as_array().unwrap().clone();
+        assert_eq!(entries[0]["key"], "alpha");
+        assert_eq!(entries[1]["key"], "zebra");
+    }
+
+    #[tokio::test]
+    async fn view_last_updated_is_accepted_as_a_deprecated_alias_for_updated_at() {
+        let conn = setup().await;
+        seed_context(&conn, "older", "\"v\"", "2026-06-01T00:00:00Z").await;
+        seed_context(&conn, "newer", "\"v\"", "2026-06-01T00:05:00Z").await;
+        let alice = worker();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = ViewProjectContextTool::call(
+            Some(&alice),
+            &serde_json::json!({"sort_by": "last_updated"}),
+            &conn,
+            "2026-06-01T00:06:00Z",
+            &c,
+        )
+        .await;
+        let ToolResult::Ok { data, .. } = result else {
+            panic!("expected Ok, got {result:?}");
+        };
+        let data = data.unwrap();
+        assert_eq!(data["filters"]["sort_by"], "updated_at");
+        // updated_at descending -> newest first.
+        assert_eq!(data["entries"][0]["key"], "newer");
+    }
+
+    #[tokio::test]
+    async fn view_max_results_is_clamped_into_range() {
+        let conn = setup().await;
+        for i in 0..3 {
+            seed_context(
+                &conn,
+                &format!("k{i}"),
+                "\"v\"",
+                &format!("2026-06-01T00:0{i}:00Z"),
+            )
+            .await;
+        }
+        let alice = worker();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = ViewProjectContextTool::call(
+            Some(&alice),
+            &serde_json::json!({"max_results": 1}),
+            &conn,
+            "2026-06-01T00:10:00Z",
+            &c,
+        )
+        .await;
+        let ToolResult::Ok { data, .. } = result else {
+            panic!("expected Ok, got {result:?}");
+        };
+        assert_eq!(data.unwrap()["count"], 1);
+    }
+
+    #[tokio::test]
+    async fn view_flags_invalid_json_and_renders_it_unquoted_in_the_preview() {
+        let conn = setup().await;
+        {
+            let guard = conn.lock().await;
+            project_context_repository::create_new(
+                &guard,
+                "raw-string",
+                "not valid json",
+                Some("d"),
+                "alice",
+                "2026-06-01T00:00:00Z",
+            )
+            .unwrap();
+        }
+        let alice = worker();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = ViewProjectContextTool::call(
+            Some(&alice),
+            &serde_json::json!({}),
+            &conn,
+            "2026-06-01T00:01:00Z",
+            &c,
+        )
+        .await;
+        let ToolResult::Ok { data, message } = result else {
+            panic!("expected Ok, got {result:?}");
+        };
+        let data = data.unwrap();
+        assert_eq!(data["entries"][0]["_metadata"]["json_valid"], false);
+        assert_eq!(data["entries"][0]["value"], "not valid json");
+        assert!(message.unwrap().contains("Value: not valid json"));
+    }
+
+    #[tokio::test]
+    async fn view_health_analysis_is_included_when_requested() {
+        let conn = setup().await;
+        seed_context(&conn, "a", "\"ok\"", "2026-06-01T00:00:00Z").await;
+        let alice = worker();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = ViewProjectContextTool::call(
+            Some(&alice),
+            &serde_json::json!({"show_health_analysis": true}),
+            &conn,
+            "2026-06-01T00:01:00Z",
+            &c,
+        )
+        .await;
+        let ToolResult::Ok { message, .. } = result else {
+            panic!("expected Ok, got {result:?}");
+        };
+        assert!(message.unwrap().contains("Context Health"));
+    }
+
+    #[test]
+    fn python_str_matches_python_semantics_for_scalars() {
+        assert_eq!(python_str(&Value::Null), "None");
+        assert_eq!(python_str(&Value::Bool(true)), "True");
+        assert_eq!(python_str(&Value::Bool(false)), "False");
+        assert_eq!(python_str(&Value::String("hello".to_string())), "hello");
+    }
+
+    #[test]
+    fn view_schema_max_length_matches_the_shared_constant() {
+        let parsed: Value = serde_json::from_str(ViewProjectContextTool::SCHEMA).unwrap();
+        let max_len = parsed["properties"]["context_key"]["maxLength"]
+            .as_u64()
+            .unwrap();
+        assert_eq!(
+            max_len as usize,
+            conexus_core::schema_limits::IDENTIFIER_MAX_LEN
+        );
     }
 }
