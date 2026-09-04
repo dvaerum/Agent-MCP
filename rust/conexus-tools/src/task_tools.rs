@@ -20,7 +20,7 @@
 
 use conexus_core::tool_result::ToolResult;
 use conexus_wakeloop::event_feed::UNASSIGNED_TASK_TERMINAL_STATUSES as TERMINAL_TASK_STATUSES;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::collections::HashSet;
 
 use std::sync::LazyLock;
@@ -1203,6 +1203,320 @@ impl Tool for SearchTasksTool {
     }
 }
 
+// ======================================================================
+// create_task (Phase D4, PR 4/8)
+// ======================================================================
+//
+// The first mutating tool in this module -- the first candidate to
+// close the Phase D3-flagged `WaiterRegistry::notify()` gap
+// (`ctx.waiter_registry.notify(&assignee)` on a direct assignment).
+// Port of `create_task_tool_impl` (E1's canonical create-a-task path).
+//
+// No new `UnitOfWork` primitive per decision 1 in the migration plan's
+// Phase D4 section -- one inline `conn.unchecked_transaction()`, same
+// shape every prior mutating tool in this crate uses.
+//
+// Deliberately preserved, not "fixed": `status = "unassigned"` for a
+// task created with no assignee is Python's OWN literal value, not
+// one of `TaskQueryEngine`'s `ACTIVE_STATUSES` ("in_progress"/
+// "pending") the claimable-pool predicate (`is_claimable_task`)
+// checks -- so a task created via `create_task` with no assignee does
+// NOT currently surface in the `unassigned=true` claimable pool. This
+// looks like a genuine pre-existing Python inconsistency, not
+// something this port introduces; per this migration's "re-derive,
+// don't silently fix" discipline (matching `view_tasks`'s
+// `start_after` bug, decision 5), it is ported bit-for-bit rather than
+// quietly changed to `"pending"`.
+
+fn normalize_parent(value: Option<&Value>) -> Option<String> {
+    match value {
+        Some(Value::String(s)) => {
+            let trimmed = s.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        _ => None,
+    }
+}
+
+/// BL-2: maintain the parent's `child_tasks` back-reference mirror in
+/// the SAME transaction as the child INSERT. No-ops when
+/// `parent_task_id` is `None` or the parent row is absent (deleted
+/// mid-transaction -- vanishingly unlikely under this crate's single
+/// Mutex-guarded connection, kept for parity with Python's own
+/// defensive no-op). `child_tasks` is NOT one of the
+/// `trg_tasks_terminal_state_guard` trigger's guarded columns (only
+/// status/priority/notes/title/description/assigned_to-reassign are),
+/// so this update always succeeds regardless of the parent's status.
+fn link_child_to_parent(
+    conn: &Connection,
+    parent_task_id: Option<&str>,
+    child_task_id: &str,
+    now: &str,
+) -> Result<(), ()> {
+    let Some(parent_id) = parent_task_id else {
+        return Ok(());
+    };
+    let parent = match task_repository::get_by_id(conn, parent_id) {
+        Ok(Some(p)) => p,
+        Ok(None) => return Ok(()),
+        Err(_) => return Err(()),
+    };
+    let mut children = parent.child_tasks.unwrap_or_default();
+    if children.iter().any(|c| c == child_task_id) {
+        return Ok(());
+    }
+    children.push(child_task_id.to_string());
+    match task_repository::update_fields(
+        conn,
+        parent_id,
+        &conexus_db::task_repository::TaskFields {
+            child_tasks: conexus_db::scheduled_directive_repository::NullableUpdate::Set(children),
+            ..Default::default()
+        },
+        now,
+    ) {
+        Ok(_) => Ok(()),
+        Err(_) => Err(()),
+    }
+}
+
+pub struct CreateTaskTool;
+
+impl Tool for CreateTaskTool {
+    const NAME: &'static str = "create_task";
+    const REQUIRED: Requirement = Requirement::Cap {
+        cap: Capability::TasksCreate,
+        reason: None,
+    };
+    const DESCRIPTION: &'static str = "Create a single task, optionally assigned to an agent \
+        and/or parented under an existing task. Operator-tier task creation with assignability \
+        + capability-routing safety checks.";
+    const SCHEMA: &'static str = r#"{
+        "type": "object",
+        "properties": {
+            "task_title": {"type": "string", "description": "Title of the task to create (required)."},
+            "task_description": {"type": "string", "description": "Free-text task description."},
+            "priority": {"type": "string", "description": "Task priority (default: medium).", "enum": ["low","medium","high"], "default": "medium"},
+            "assigned_to": {"type": "string", "description": "Agent id to assign the task to. Must be a live agent. Omit for an unassigned task."},
+            "parent_task": {"type": "string", "description": "Existing task id to parent this task under. Must exist. Omit for a top-level task."}
+        },
+        "required": ["task_title"],
+        "additionalProperties": false
+    }"#;
+
+    fn call<'a>(
+        principal: Option<&'a Principal>,
+        arguments: &'a Value,
+        conn: &'a AsyncMutex<Connection>,
+        now: &'a str,
+        ctx: &'a conexus_auth::ToolCallContext<'a>,
+    ) -> conexus_auth::BoxFuture<'a, ToolResult> {
+        Box::pin(async move {
+            let principal = principal.expect("Cap-gated tool always has a resolved principal");
+
+            // SECURITY (pentest R1-F5): `tasks.create` alone is not the
+            // tier gate -- it's also in the worker capability bundle
+            // (workers use `create_self_task`). This tool is
+            // operator/manager-tier; `tasks.assign` is the same
+            // is_admin_request predicate every other worker/operator
+            // split in this module uses.
+            if !principal.has_capability(Capability::TasksAssign) {
+                return ToolResult::PermissionDenied {
+                    reason: "create_task is operator/manager-tier task creation; workers must \
+                        use create_self_task"
+                        .to_string(),
+                };
+            }
+
+            let title = arguments
+                .get("task_title")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or("");
+            if title.is_empty() {
+                return ToolResult::Invalid {
+                    field: Some("task_title".to_string()),
+                    message: "task_title is required".to_string(),
+                };
+            }
+            let description = arguments
+                .get("task_description")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let priority = arguments
+                .get("priority")
+                .and_then(Value::as_str)
+                .unwrap_or("medium")
+                .to_string();
+            if !["low", "medium", "high"].contains(&priority.as_str()) {
+                return ToolResult::Invalid {
+                    field: Some("priority".to_string()),
+                    message: format!(
+                        "Invalid priority {priority:?}: must be one of 'low', 'medium', 'high'."
+                    ),
+                };
+            }
+            let assigned_to = arguments
+                .get("assigned_to")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let parent_task = normalize_parent(arguments.get("parent_task"));
+
+            let requesting_admin_id = principal.actor_label().to_string();
+            // Preserved bit-for-bit -- see this section's own module
+            // doc on the "unassigned" status quirk.
+            let status = if assigned_to.is_some() {
+                "pending"
+            } else {
+                "unassigned"
+            };
+
+            let conn = conn.lock().await;
+            let tx = match conn.unchecked_transaction() {
+                Ok(tx) => tx,
+                Err(_) => {
+                    return ToolResult::Failed {
+                        message: "Database error creating task".to_string(),
+                    }
+                }
+            };
+
+            // PF-R32-1b: pre-validate parent existence BEFORE the
+            // INSERT -- a well-formed but nonexistent parent would
+            // otherwise trip the self-FK at INSERT.
+            if let Some(parent_id) = &parent_task {
+                let exists: bool = tx
+                    .query_row(
+                        "SELECT 1 FROM tasks WHERE task_id = ?1",
+                        [parent_id.as_str()],
+                        |_| Ok(true),
+                    )
+                    .optional()
+                    .unwrap_or(None)
+                    .unwrap_or(false);
+                if !exists {
+                    return ToolResult::NotFound {
+                        resource: "task".to_string(),
+                        identifier: parent_id.clone(),
+                        hint: None,
+                    };
+                }
+            }
+
+            // BL-R13-1: a directly-assigned task must target a LIVE
+            // agent.
+            if let Some(assignee) = &assigned_to {
+                if !agent_assignable(&tx, assignee) {
+                    return ToolResult::Invalid {
+                        field: None,
+                        message: format!(
+                            "Cannot assign task to '{assignee}': agent does not exist or is \
+                             terminated."
+                        ),
+                    };
+                }
+            }
+
+            // R15-BL-1: single-root-task invariant, same guard every
+            // other create path in this module runs.
+            if parent_task.is_none() {
+                if let Some(conflict) = single_root_conflict(&tx) {
+                    return conflict;
+                }
+            }
+
+            let new_task = conexus_db::task_repository::NewTask {
+                task_id: None,
+                title,
+                description: Some(&description),
+                assigned_to: assigned_to.as_deref(),
+                created_by: &requesting_admin_id,
+                status,
+                priority: &priority,
+                parent_task: parent_task.as_deref(),
+                child_tasks: None,
+                depends_on_tasks: None,
+                notes: None,
+                now,
+            };
+            let fresh = match task_repository::create(&tx, new_task) {
+                Ok(row) => row,
+                Err(_) => {
+                    return ToolResult::Failed {
+                        message: "Database error creating task".to_string(),
+                    }
+                }
+            };
+            let task_id = fresh.task_id.clone();
+
+            // BL-R30-1: set the gaining agent's `current_task` on a
+            // create-with-assignee (prior=None -> SETs only when idle).
+            if let Some(assignee) = &assigned_to {
+                if conexus_db::agent_repository::AgentRepository::reconcile_current_task_on_reassign(
+                    &tx,
+                    &task_id,
+                    None,
+                    Some(assignee.as_str()),
+                    now,
+                )
+                .is_err()
+                {
+                    return ToolResult::Failed {
+                        message: "Database error creating task".to_string(),
+                    };
+                }
+            }
+
+            if let Err(_e) = agent_action_repository::log_agent_action(
+                &tx,
+                &requesting_admin_id,
+                "created_task",
+                Some(&task_id),
+                Some(&serde_json::json!({"title": title, "assigned_to": assigned_to})),
+                now,
+            ) {
+                // Best-effort audit log -- matches Python's own
+                // fire-and-forget semantics, same rationale as
+                // view_tasks/search_tasks above.
+            }
+
+            if link_child_to_parent(&tx, parent_task.as_deref(), &task_id, now).is_err() {
+                return ToolResult::Failed {
+                    message: "Database error creating task".to_string(),
+                };
+            }
+
+            if tx.commit().is_err() {
+                return ToolResult::Failed {
+                    message: "Database error creating task".to_string(),
+                };
+            }
+
+            // Emit-iff-commit: the wake fires only after the write is
+            // durable. A direct assignee gets a targeted wake; an
+            // unassigned task broadcasts to every active agent
+            // (`notify()` is a no-op for an agent with no in-flight
+            // waiter, matching Python's `notify_unassigned_task_appeared`
+            // fan-out-to-everyone-active semantics).
+            if let Some(assignee) = &assigned_to {
+                ctx.waiter_registry.notify(assignee);
+            } else if let Ok(active) =
+                conexus_db::agent_repository::AgentRepository::list_active(&conn)
+            {
+                for agent in active {
+                    ctx.waiter_registry.notify(&agent.agent_id);
+                }
+            }
+
+            ToolResult::Ok {
+                data: Some(serde_json::json!({"task_id": task_id})),
+                message: Some(format!("Task '{title}' created successfully")),
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1957,5 +2271,345 @@ mod view_search_tests {
         let msg = message_of(&result);
         assert!(msg.contains("ID: mine"));
         assert!(!msg.contains("ID: foreign"));
+    }
+}
+
+#[cfg(test)]
+mod create_task_tests {
+    use super::*;
+    use conexus_core::capability::Capabilities;
+    use conexus_core::principal::PrincipalKind;
+    use conexus_db::schema::init_schema;
+    use conexus_db::task_repository::NewTask;
+    use conexus_wakeloop::waiter_registry::{WaiterRegistry, WakeSignal};
+
+    const NOW: &str = "2026-01-20T00:00:00Z";
+
+    fn test_conn() -> AsyncMutex<Connection> {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        AsyncMutex::new(conn)
+    }
+
+    fn worker(agent_id: &str) -> Principal {
+        Principal {
+            kind: PrincipalKind::AgentBearer,
+            user_id: None,
+            agent_id: Some(agent_id.to_string()),
+            project_name: None,
+            project_role: None,
+            agent_role: None,
+            can_wake_loop: true,
+            source_token: None,
+            capabilities: Capabilities::from_iter([Capability::TasksCreate]),
+        }
+    }
+
+    fn manager(agent_id: &str) -> Principal {
+        Principal {
+            kind: PrincipalKind::AgentBearer,
+            user_id: None,
+            agent_id: Some(agent_id.to_string()),
+            project_name: None,
+            project_role: None,
+            agent_role: None,
+            can_wake_loop: true,
+            source_token: None,
+            capabilities: Capabilities::from_iter([
+                Capability::TasksCreate,
+                Capability::TasksAssign,
+            ]),
+        }
+    }
+
+    async fn seed_agent(conn: &AsyncMutex<Connection>, agent_id: &str) {
+        let guard = conn.lock().await;
+        conexus_db::agent_repository::AgentRepository::create(
+            &guard,
+            conexus_db::agent_repository::NewAgent {
+                token: &format!("tok-{agent_id}"),
+                agent_id,
+                created_at: NOW,
+                status: "active",
+                current_task: None,
+                working_directory: "/tmp",
+                color: None,
+                agent_role: "worker",
+            },
+        )
+        .unwrap();
+    }
+
+    fn seed_task(conn: &Connection, id: &str, parent: Option<&str>) {
+        task_repository::create(
+            conn,
+            NewTask {
+                task_id: Some(id),
+                title: &format!("Task {id}"),
+                description: None,
+                assigned_to: None,
+                created_by: "bob",
+                status: "pending",
+                priority: "medium",
+                parent_task: parent,
+                child_tasks: None,
+                depends_on_tasks: None,
+                notes: None,
+                now: NOW,
+            },
+        )
+        .unwrap();
+    }
+
+    fn task_id_of(result: &ToolResult) -> String {
+        match result {
+            ToolResult::Ok {
+                data: Some(data), ..
+            } => data["task_id"].as_str().unwrap().to_string(),
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_task_denies_a_plain_worker() {
+        let conn = test_conn();
+        let registry = WaiterRegistry::new();
+        let ctx = conexus_auth::ToolCallContext::off_wire(&registry);
+        let result = CreateTaskTool::call(
+            Some(&worker("bob")),
+            &serde_json::json!({"task_title": "x"}),
+            &conn,
+            NOW,
+            &ctx,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::PermissionDenied { .. }));
+    }
+
+    #[tokio::test]
+    async fn create_task_requires_a_non_blank_title() {
+        let conn = test_conn();
+        let registry = WaiterRegistry::new();
+        let ctx = conexus_auth::ToolCallContext::off_wire(&registry);
+        let result = CreateTaskTool::call(
+            Some(&manager("alice")),
+            &serde_json::json!({"task_title": "   "}),
+            &conn,
+            NOW,
+            &ctx,
+        )
+        .await;
+        assert!(
+            matches!(result, ToolResult::Invalid { field, .. } if field.as_deref() == Some("task_title"))
+        );
+    }
+
+    #[tokio::test]
+    async fn create_task_rejects_an_invalid_priority() {
+        let conn = test_conn();
+        let registry = WaiterRegistry::new();
+        let ctx = conexus_auth::ToolCallContext::off_wire(&registry);
+        let result = CreateTaskTool::call(
+            Some(&manager("alice")),
+            &serde_json::json!({"task_title": "x", "priority": "urgent"}),
+            &conn,
+            NOW,
+            &ctx,
+        )
+        .await;
+        assert!(
+            matches!(result, ToolResult::Invalid { field, .. } if field.as_deref() == Some("priority"))
+        );
+    }
+
+    #[tokio::test]
+    async fn create_task_rejects_a_nonexistent_parent() {
+        let conn = test_conn();
+        let registry = WaiterRegistry::new();
+        let ctx = conexus_auth::ToolCallContext::off_wire(&registry);
+        let result = CreateTaskTool::call(
+            Some(&manager("alice")),
+            &serde_json::json!({"task_title": "x", "parent_task": "ghost"}),
+            &conn,
+            NOW,
+            &ctx,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::NotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn create_task_rejects_assignment_to_a_dead_agent() {
+        let conn = test_conn();
+        let registry = WaiterRegistry::new();
+        let ctx = conexus_auth::ToolCallContext::off_wire(&registry);
+        let result = CreateTaskTool::call(
+            Some(&manager("alice")),
+            &serde_json::json!({"task_title": "x", "assigned_to": "ghost-agent"}),
+            &conn,
+            NOW,
+            &ctx,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Invalid { field: None, .. }));
+    }
+
+    #[tokio::test]
+    async fn create_task_a_second_root_conflicts_with_the_existing_one() {
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "root1", None);
+        }
+        let registry = WaiterRegistry::new();
+        let ctx = conexus_auth::ToolCallContext::off_wire(&registry);
+        let result = CreateTaskTool::call(
+            Some(&manager("alice")),
+            &serde_json::json!({"task_title": "second root"}),
+            &conn,
+            NOW,
+            &ctx,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Conflict { .. }));
+    }
+
+    #[tokio::test]
+    async fn create_task_unassigned_gets_the_preserved_unassigned_status() {
+        // Pins the documented Python quirk: an unassigned task's status
+        // is literally "unassigned", not "pending" -- ported as-is,
+        // see this section's own module doc.
+        let conn = test_conn();
+        let registry = WaiterRegistry::new();
+        let ctx = conexus_auth::ToolCallContext::off_wire(&registry);
+        let result = CreateTaskTool::call(
+            Some(&manager("alice")),
+            &serde_json::json!({"task_title": "unassigned work"}),
+            &conn,
+            NOW,
+            &ctx,
+        )
+        .await;
+        let task_id = task_id_of(&result);
+        let guard = conn.lock().await;
+        let row = task_repository::get_by_id(&guard, &task_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "unassigned");
+    }
+
+    #[tokio::test]
+    async fn create_task_assigned_gets_pending_status_and_sets_current_task() {
+        let conn = test_conn();
+        seed_agent(&conn, "carol").await;
+        let registry = WaiterRegistry::new();
+        let ctx = conexus_auth::ToolCallContext::off_wire(&registry);
+        let result = CreateTaskTool::call(
+            Some(&manager("alice")),
+            &serde_json::json!({"task_title": "for carol", "assigned_to": "carol"}),
+            &conn,
+            NOW,
+            &ctx,
+        )
+        .await;
+        let task_id = task_id_of(&result);
+        let guard = conn.lock().await;
+        let row = task_repository::get_by_id(&guard, &task_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "pending");
+        let agent = conexus_db::agent_repository::AgentRepository::get_by_id(&guard, "carol")
+            .unwrap()
+            .unwrap();
+        assert_eq!(agent.current_task.as_deref(), Some(task_id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn create_task_links_the_new_task_into_the_parents_child_tasks() {
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "root1", None);
+        }
+        let registry = WaiterRegistry::new();
+        let ctx = conexus_auth::ToolCallContext::off_wire(&registry);
+        let result = CreateTaskTool::call(
+            Some(&manager("alice")),
+            &serde_json::json!({"task_title": "child", "parent_task": "root1"}),
+            &conn,
+            NOW,
+            &ctx,
+        )
+        .await;
+        let task_id = task_id_of(&result);
+        let guard = conn.lock().await;
+        let parent = task_repository::get_by_id(&guard, "root1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(parent.child_tasks, Some(vec![task_id]));
+    }
+
+    #[tokio::test]
+    async fn create_task_writes_a_durable_audit_row() {
+        let conn = test_conn();
+        let registry = WaiterRegistry::new();
+        let ctx = conexus_auth::ToolCallContext::off_wire(&registry);
+        let result = CreateTaskTool::call(
+            Some(&manager("alice")),
+            &serde_json::json!({"task_title": "audited"}),
+            &conn,
+            NOW,
+            &ctx,
+        )
+        .await;
+        let task_id = task_id_of(&result);
+        let guard = conn.lock().await;
+        let count: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM agent_actions WHERE action_type = 'created_task' AND \
+                 task_id = ?1",
+                [task_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn create_task_wakes_the_assignees_registered_waiter() {
+        let conn = test_conn();
+        seed_agent(&conn, "carol").await;
+        let registry = WaiterRegistry::new();
+        let (_tx, mut rx) = registry.register("carol");
+        let ctx = conexus_auth::ToolCallContext::off_wire(&registry);
+        let result = CreateTaskTool::call(
+            Some(&manager("alice")),
+            &serde_json::json!({"task_title": "for carol", "assigned_to": "carol"}),
+            &conn,
+            NOW,
+            &ctx,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        assert_eq!(rx.try_recv(), Ok(WakeSignal::Wake));
+    }
+
+    #[tokio::test]
+    async fn create_task_unassigned_wakes_every_active_agents_waiter() {
+        let conn = test_conn();
+        seed_agent(&conn, "dave").await;
+        let registry = WaiterRegistry::new();
+        let (_tx, mut rx) = registry.register("dave");
+        let ctx = conexus_auth::ToolCallContext::off_wire(&registry);
+        let result = CreateTaskTool::call(
+            Some(&manager("alice")),
+            &serde_json::json!({"task_title": "pool work"}),
+            &conn,
+            NOW,
+            &ctx,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        assert_eq!(rx.try_recv(), Ok(WakeSignal::Wake));
     }
 }
