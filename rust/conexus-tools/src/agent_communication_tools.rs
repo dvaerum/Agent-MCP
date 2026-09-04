@@ -877,6 +877,212 @@ impl conexus_auth::Tool for FetchEventsSinceTool {
     }
 }
 
+const SEND_DENIED: &str = "Unauthorized: Valid token or operator session required";
+
+/// Any resolvable identity. Port of `_is_authenticated_caller` --
+/// deliberately weak: the real authorization for a send is argument-
+/// dependent (recipient, message_type, the worker-to-worker toggle)
+/// and lives in `check_send_message_permission`, which can't run
+/// before the arguments are known. This entry gate only buys the
+/// pre-schema denial for a caller with no identity at all.
+fn is_authenticated_caller(principal: Option<&Principal>) -> bool {
+    principal.is_some()
+}
+
+static RE_SUBJECT_RE: OnceLock<regex::Regex> = OnceLock::new();
+
+fn re_subject_regex() -> &'static regex::Regex {
+    RE_SUBJECT_RE.get_or_init(|| regex::Regex::new(r"(?i)^\s*re\s*:").unwrap())
+}
+
+const REPLY_HINT_TEXT: &str = "This looks like a reply — to thread it correctly, use the reply \
+    function by passing `parent_message_id` (the message you're replying to) instead of putting \
+    'RE:' in the subject.";
+
+/// Send a message from one agent to another, with permission checks.
+/// Port of `send_agent_message_tool_impl`.
+pub struct SendAgentMessageTool;
+
+impl conexus_auth::Tool for SendAgentMessageTool {
+    const NAME: &'static str = "send_agent_message";
+    const REQUIRED: conexus_auth::Requirement = conexus_auth::Requirement::Predicate {
+        check: is_authenticated_caller,
+        reason: SEND_DENIED,
+    };
+    const DESCRIPTION: &'static str =
+        "Send a message to another agent with permission checks and delivery options.";
+    const SCHEMA: &'static str = r#"{
+        "type": "object",
+        "properties": {
+            "recipient_id": {"type": "string", "description": "ID of the agent to send message to", "maxLength": 256},
+            "message": {"type": "string", "description": "Message content (max 4000 characters)"},
+            "message_type": {"type": "string", "description": "Type of message", "enum": ["text", "assistance_request", "task_update", "notification", "stop_command"], "default": "text"},
+            "priority": {"type": "string", "description": "Message priority", "enum": ["low", "normal", "high", "urgent"], "default": "normal"},
+            "deliver_method": {"type": "string", "description": "Vestigial since Wave 7 (coordinator transition). Every message is stored in the DB and surfaced via wait_for_events / get_agent_messages -- agent-mcp no longer pushes to a tmux session. Accepted for back-compat; the value is ignored.", "enum": ["tmux", "store", "both"], "default": "store"},
+            "subject": {"type": ["string", "null"], "description": "Optional one-line subject for root messages. For a reply, use parent_message_id rather than an 'RE:' subject -- replies are threaded, not subject-bearing (subject is ignored / forced NULL when parent_message_id is set)."},
+            "parent_message_id": {"type": ["string", "null"], "description": "How you reply / thread a message: set this to the message_id you are replying to and this message is linked as a reply under that thread. Prefer this over typing 'RE:' into the subject. Replies always have subject = NULL (the thread shows the root's subject as the conversation title)."}
+        },
+        "required": ["recipient_id", "message"],
+        "additionalProperties": false
+    }"#;
+
+    fn call<'a>(
+        principal: Option<&'a Principal>,
+        arguments: &'a Value,
+        conn: &'a AsyncMutex<Connection>,
+        now: &'a str,
+        ctx: &'a ToolCallContext<'a>,
+    ) -> conexus_auth::BoxFuture<'a, ToolResult> {
+        Box::pin(async move {
+            let principal =
+                principal.expect("Requirement::Predicate already enforced Some(principal)");
+
+            let recipient_id = arguments.get("recipient_id").and_then(Value::as_str);
+            let message_content = arguments.get("message").and_then(Value::as_str);
+            let message_type = arguments
+                .get("message_type")
+                .and_then(Value::as_str)
+                .unwrap_or("text");
+            let priority = arguments
+                .get("priority")
+                .and_then(Value::as_str)
+                .unwrap_or("normal");
+            let explicit_subject = arguments.get("subject").and_then(Value::as_str);
+            let parent_message_id = arguments.get("parent_message_id").and_then(Value::as_str);
+
+            let Some(recipient_id) = recipient_id.filter(|s| !s.is_empty()) else {
+                return ToolResult::Invalid {
+                    field: Some("recipient_id".to_string()),
+                    message: "recipient_id is required".to_string(),
+                };
+            };
+            let Some(message_content) = message_content.filter(|s| !s.is_empty()) else {
+                return ToolResult::Invalid {
+                    field: Some("message".to_string()),
+                    message: "message is required".to_string(),
+                };
+            };
+
+            let outcome = {
+                let guard = conn.lock().await;
+                crate::agent_messaging::send_agent_message(
+                    &guard,
+                    principal,
+                    crate::agent_messaging::SendMessageArgs {
+                        recipient_id,
+                        message_content,
+                        message_type,
+                        priority,
+                        subject: explicit_subject,
+                        parent_message_id,
+                        now,
+                    },
+                )
+            };
+            let outcome = match outcome {
+                Ok(o) => o,
+                Err(e) => {
+                    return ToolResult::Failed {
+                        message: format!("Database error sending message: {e}"),
+                    }
+                }
+            };
+
+            let message_id = match outcome {
+                crate::agent_messaging::SendOutcome::Denied(denial) => return denial,
+                crate::agent_messaging::SendOutcome::RecipientNotFound(_) => {
+                    return ToolResult::NotFound {
+                        resource: "agent".to_string(),
+                        identifier: recipient_id.to_string(),
+                        hint: None,
+                    };
+                }
+                crate::agent_messaging::SendOutcome::ParentMessageNotFound(id) => {
+                    return ToolResult::NotFound {
+                        resource: "parent message".to_string(),
+                        identifier: id,
+                        hint: None,
+                    };
+                }
+                crate::agent_messaging::SendOutcome::Sent { message_id } => message_id,
+            };
+
+            // Durable audit row -- Python's unified `u.audit(...)` call,
+            // registered to fire only after the message commit (already
+            // happened above, since `send_agent_message` writes directly
+            // on `conn`, not a caller-managed transaction here).
+            {
+                let guard = conn.lock().await;
+                let _ = conexus_db::agent_action_repository::log_agent_action(
+                    &guard,
+                    &crate::agent_messaging::sender_label(principal),
+                    "send_message",
+                    None,
+                    Some(&serde_json::json!({
+                        "recipient": recipient_id,
+                        "message_type": message_type,
+                        "priority": priority,
+                        "delivery_status": "stored",
+                        "message_id": message_id,
+                    })),
+                    now,
+                );
+            }
+
+            // Wake the recipient's `wait_for_events` waiter (and, via
+            // the same registry, any future per-recipient stream fan-
+            // out) -- post-commit, matching Python's `u.on_commit(...)`.
+            ctx.waiter_registry.notify(recipient_id);
+
+            let mut response_text = format!(
+                "Message sent to {recipient_id}. Message stored for recipient (Message ID: \
+                 {message_id})"
+            );
+
+            let (display_subject, subject_is_placeholder) = if parent_message_id.is_some() {
+                (None, false)
+            } else {
+                conexus_db::message_repository::message_subject_view(
+                    explicit_subject,
+                    message_content,
+                )
+            };
+
+            let mut data = serde_json::json!({
+                "message_id": message_id,
+                "sender": crate::agent_messaging::sender_label(principal),
+                "recipient_id": recipient_id,
+                "message_type": message_type,
+                "priority": priority,
+                "delivery_status": "stored",
+                "subject": display_subject,
+                "subject_is_placeholder": subject_is_placeholder,
+                "parent_message_id": parent_message_id,
+            });
+
+            // Reply-nudge (advisory only): an EXPLICIT subject that
+            // looks like a reply ("RE:", case-/whitespace-insensitive)
+            // on a message that is NOT already a reply gets a gentle
+            // hint toward parent_message_id threading. The send already
+            // succeeded; this never blocks or rewrites it.
+            if parent_message_id.is_none() {
+                if let Some(subj) = explicit_subject {
+                    if re_subject_regex().is_match(subj) {
+                        data["reply_hint"] = serde_json::json!(REPLY_HINT_TEXT);
+                        response_text.push(' ');
+                        response_text.push_str(REPLY_HINT_TEXT);
+                    }
+                }
+            }
+
+            ToolResult::Ok {
+                data: Some(data),
+                message: Some(response_text),
+            }
+        })
+    }
+}
+
 const READ_MESSAGES_DENIED: &str =
     "Unauthorized: Valid agent token with the messages.view capability required to retrieve \
      messages";
@@ -1948,5 +2154,235 @@ mod tests {
         )
         .await;
         assert!(matches!(result, ToolResult::PermissionDenied { .. }));
+    }
+
+    // -- send_agent_message -------------------------------------------
+
+    #[tokio::test]
+    async fn send_agent_message_requires_recipient_id() {
+        use conexus_auth::Tool;
+        let conn = test_conn();
+        seed_agent(&conn, "alice").await;
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let principal = agent_bearer("alice");
+
+        let result = SendAgentMessageTool::call(
+            Some(&principal),
+            &json!({"message": "hi"}),
+            &conn,
+            NOW,
+            &ctx,
+        )
+        .await;
+        assert!(
+            matches!(result, ToolResult::Invalid { field, .. } if field.as_deref() == Some("recipient_id"))
+        );
+    }
+
+    #[tokio::test]
+    async fn send_agent_message_requires_message() {
+        use conexus_auth::Tool;
+        let conn = test_conn();
+        seed_agent(&conn, "alice").await;
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let principal = agent_bearer("alice");
+
+        let result = SendAgentMessageTool::call(
+            Some(&principal),
+            &json!({"recipient_id": "admin"}),
+            &conn,
+            NOW,
+            &ctx,
+        )
+        .await;
+        assert!(
+            matches!(result, ToolResult::Invalid { field, .. } if field.as_deref() == Some("message"))
+        );
+    }
+
+    #[tokio::test]
+    async fn send_agent_message_succeeds_and_wakes_the_recipients_waiter() {
+        use conexus_auth::Tool;
+        let conn = test_conn();
+        seed_agent(&conn, "alice").await;
+        seed_agent(&conn, "bob").await;
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let principal = agent_bearer("alice");
+        let (_sender, mut receiver) = registry.register("bob");
+
+        let result = SendAgentMessageTool::call(
+            Some(&principal),
+            &json!({"recipient_id": "bob", "message": "hello bob"}),
+            &conn,
+            NOW,
+            &ctx,
+        )
+        .await;
+        let ToolResult::Ok { message, data } = result else {
+            panic!("expected Ok, got {result:?}");
+        };
+        assert!(message.unwrap().contains("Message sent to bob"));
+        assert_eq!(data.unwrap()["recipient_id"], "bob");
+
+        // The recipient's waiter must have been woken post-commit.
+        assert!(
+            receiver.try_recv().is_ok(),
+            "bob's wait_for_events waiter must be notified"
+        );
+
+        let guard = conn.lock().await;
+        let count: i64 = guard
+            .query_row("SELECT COUNT(*) FROM agent_messages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+
+        // Durable audit row confirmed.
+        let action_count: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM agent_actions WHERE action_type = 'send_message'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(action_count, 1);
+    }
+
+    #[tokio::test]
+    async fn send_agent_message_denied_by_permission_check_returns_the_denial_verbatim() {
+        use conexus_auth::Tool;
+        let conn = test_conn();
+        seed_agent(&conn, "alice").await;
+        seed_agent(&conn, "bob").await;
+        {
+            let guard = conn.lock().await;
+            project_settings_repository::upsert(
+                &guard,
+                "config_allow_worker_to_worker",
+                "false",
+                None,
+                false,
+                "test",
+                NOW,
+            )
+            .unwrap();
+        }
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let principal = agent_bearer("alice");
+
+        let result = SendAgentMessageTool::call(
+            Some(&principal),
+            &json!({"recipient_id": "bob", "message": "hello bob"}),
+            &conn,
+            NOW,
+            &ctx,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::PermissionDenied { .. }));
+        assert_eq!(registry.waiter_count("bob"), 0);
+    }
+
+    #[tokio::test]
+    async fn send_agent_message_unknown_recipient_is_not_found() {
+        use conexus_auth::Tool;
+        let conn = test_conn();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        // Admin sender bypasses the active-recipient check, reaching the
+        // repository's own unknown-recipient rejection.
+        let mut admin = agent_bearer("admin");
+        admin.capabilities = Capabilities::from_iter([]);
+
+        let result = SendAgentMessageTool::call(
+            Some(&admin),
+            &json!({"recipient_id": "ghost", "message": "hi"}),
+            &conn,
+            NOW,
+            &ctx,
+        )
+        .await;
+        assert!(
+            matches!(result, ToolResult::NotFound { resource, identifier, .. } if resource == "agent" && identifier == "ghost")
+        );
+    }
+
+    #[tokio::test]
+    async fn send_agent_message_reply_nudge_fires_only_on_a_re_subject_that_is_not_already_a_reply()
+    {
+        use conexus_auth::Tool;
+        let conn = test_conn();
+        seed_agent(&conn, "alice").await;
+        seed_agent(&conn, "bob").await;
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let principal = agent_bearer("alice");
+
+        let result = SendAgentMessageTool::call(
+            Some(&principal),
+            &json!({"recipient_id": "bob", "message": "following up", "subject": "RE: last week"}),
+            &conn,
+            NOW,
+            &ctx,
+        )
+        .await;
+        let ToolResult::Ok { message, data } = result else {
+            panic!("expected Ok, got {result:?}");
+        };
+        assert!(message.unwrap().contains("parent_message_id"));
+        assert!(data.unwrap()["reply_hint"].is_string());
+    }
+
+    #[tokio::test]
+    async fn send_agent_message_a_reply_never_gets_the_reply_nudge_even_with_an_re_subject() {
+        use conexus_auth::Tool;
+        let conn = test_conn();
+        seed_agent(&conn, "alice").await;
+        seed_agent(&conn, "bob").await;
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let principal = agent_bearer("alice");
+
+        let root = SendAgentMessageTool::call(
+            Some(&principal),
+            &json!({"recipient_id": "bob", "message": "root"}),
+            &conn,
+            NOW,
+            &ctx,
+        )
+        .await;
+        let ToolResult::Ok { data, .. } = root else {
+            panic!("expected Ok");
+        };
+        let root_id = data.unwrap()["message_id"].as_str().unwrap().to_string();
+
+        let reply = SendAgentMessageTool::call(
+            Some(&principal),
+            &json!({
+                "recipient_id": "bob",
+                "message": "a reply",
+                "subject": "RE: doesn't matter, replies force subject null",
+                "parent_message_id": root_id,
+            }),
+            &conn,
+            NOW,
+            &ctx,
+        )
+        .await;
+        let ToolResult::Ok { data, .. } = reply else {
+            panic!("expected Ok");
+        };
+        let data = data.unwrap();
+        assert!(data.get("reply_hint").is_none());
+        assert_eq!(data["subject"], serde_json::Value::Null);
     }
 }

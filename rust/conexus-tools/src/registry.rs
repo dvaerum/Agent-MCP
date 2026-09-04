@@ -13,7 +13,7 @@ use crate::admin_tools::{
     RotateAgentTokenTool, TerminateAgentTool, ViewAuditLogTool, ViewStatusTool,
 };
 use crate::agent_communication_tools::{
-    FetchEventsSinceTool, GetAgentMessagesTool, WaitForEventsTool,
+    FetchEventsSinceTool, GetAgentMessagesTool, SendAgentMessageTool, WaitForEventsTool,
 };
 use crate::agent_roster_tools::ViewAgentsTool;
 use crate::agent_tools::GetSystemPromptTool;
@@ -44,13 +44,14 @@ use crate::utility_tools::TestTool;
 // compile-time `static` array (needs a named `static`, not an inline
 // `&[...]` literal, since the array's elements aren't const-promotable
 // through a non-const fn body).
-static ALL_TOOLS: [ToolDescriptor; 47] = [
+static ALL_TOOLS: [ToolDescriptor; 48] = [
     ToolDescriptor::of::<ViewProjectSettingsTool>(),
     ToolDescriptor::of::<UpdateProjectSettingsTool>(),
     ToolDescriptor::of::<DeleteProjectSettingsTool>(),
     ToolDescriptor::of::<AskProjectRagTool>(),
     ToolDescriptor::of::<WaitForEventsTool>(),
     ToolDescriptor::of::<FetchEventsSinceTool>(),
+    ToolDescriptor::of::<SendAgentMessageTool>(),
     ToolDescriptor::of::<GetAgentMessagesTool>(),
     ToolDescriptor::of::<ViewTasksTool>(),
     ToolDescriptor::of::<SearchTasksTool>(),
@@ -257,6 +258,7 @@ mod tests {
                 "ask_project_rag",
                 "wait_for_events",
                 "fetch_events_since",
+                "send_agent_message",
                 "get_agent_messages",
                 "view_tasks",
                 "search_tasks",
