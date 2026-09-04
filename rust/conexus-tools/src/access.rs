@@ -55,13 +55,14 @@ pub enum AccessTier {
 /// reading `agent_mcp/tools/*.py` directly, not assumed.
 ///
 /// Every OTHER Predicate-gated tool in this catalogue (`ask_project_
-/// rag`, `wait_for_events`, `fetch_events_since`, `add_task_comment`/
-/// `edit_task_comment`/`delete_task_comment`, `view_file_metadata`,
-/// `validate_context_consistency`, `create_project_context`/
-/// `update_project_context`/`bulk_update_project_context`/
-/// `delete_project_context`, `check_file_status`/`update_file_status`)
-/// was confirmed to carry NO `visibility=` kwarg in Python -- all
-/// default to `Any`, which needs no entry here.
+/// rag`, `wait_for_events`, `fetch_events_since`, `get_agent_messages`,
+/// `add_task_comment`/`edit_task_comment`/`delete_task_comment`,
+/// `view_file_metadata`, `validate_context_consistency`,
+/// `create_project_context`/`update_project_context`/
+/// `bulk_update_project_context`/`delete_project_context`,
+/// `check_file_status`/`update_file_status`) was confirmed to carry NO
+/// `visibility=` kwarg in Python -- all default to `Any`, which needs
+/// no entry here.
 ///
 /// NOT included (verified redundant): `update_task` (`Cap("tasks.
 /// assign")`, a manager-bundle-only capability that already derives to
@@ -83,6 +84,15 @@ const TIER_OVERRIDES: &[(&str, AccessTier)] = &[
     // override is load-bearing here, not an echo.
     ("create_task", AccessTier::Operator),
     ("bulk_task_operations", AccessTier::Operator),
+    // Predicate-gated (`_is_authenticated_caller`, no derivable cap);
+    // Python: `visibility="worker-if-toggled:config_allow_worker_to_
+    // worker"` -- the SAME setting `check_send_message_permission`'s
+    // own call-time gate reads (`get_bool(..., true)`), so the `true`
+    // default here can't drift from it.
+    (
+        "send_agent_message",
+        AccessTier::WorkerIfToggled(&["config_allow_worker_to_worker"], true),
+    ),
 ];
 
 /// Map a required capability to its visibility tier. Port of

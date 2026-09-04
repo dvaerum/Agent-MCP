@@ -1,13 +1,15 @@
-//! Minimal port of `agent_communication_tools.py`'s outgoing-message
-//! machinery (Phase D4, PR 8/8, decision 3): `_sender_label`,
-//! `_can_agents_communicate`, `check_send_message_permission`, and
-//! `send_agent_message_tool_impl`'s core (the write itself). NOT
-//! registered as a standalone MCP `Tool` -- per decision 3, this is
-//! "a minimal send_message port, just enough for request_assistance
-//! to call", mirroring how Python's `request_assistance_tool_impl`
-//! calls `send_agent_message_tool_impl` as a plain function, never
-//! through the dispatcher. `RequestAssistanceTool` (`task_tools.rs`)
-//! is the one caller.
+//! Port of `agent_communication_tools.py`'s outgoing-message machinery:
+//! `_sender_label`, `_can_agents_communicate`,
+//! `check_send_message_permission`, and
+//! `send_agent_message_tool_impl`'s write core. Originally landed
+//! (Phase D4, PR 8/8, decision 3) as a MINIMAL, unregistered helper
+//! for `request_assistance_tool_impl`'s internal call (mirroring
+//! Python's own plain-function call, never through the dispatcher) --
+//! now ALSO the write core `SendAgentMessageTool`
+//! (`agent_communication_tools.rs`) uses as the real, registered
+//! `send_agent_message` MCP tool. Both callers share this one
+//! permission-gate + INSERT implementation; only the post-send
+//! niceties (wake, reply-nudge, response text) differ per caller.
 //!
 //! ## Re-derivation, documented: "both agents are active"
 //!
@@ -25,15 +27,13 @@
 //!
 //! This is a genuine, documented WIDENING, not a neutral swap: a
 //! registered-but-currently-disconnected agent can now be messaged,
-//! where Python would refuse (no open connection to wake). Accepted
-//! because (a) the one real call site in THIS PR's scope
-//! (`request_assistance`, always targeting the literal `"admin"`
-//! recipient) never reaches this branch at all -- `admin` hits the
-//! unconditional-allow clause above it -- so the gap has zero live
-//! behavioral surface today; and (b) `send_agent_message` is
-//! deliberately NOT exposed as its own MCP tool yet, so no external
-//! caller can exercise the widened path either. Revisit when a future
-//! phase exposes `send_message` as a real standalone tool.
+//! where Python would refuse (no open connection to wake). Now that
+//! `send_agent_message` IS a real, externally-callable MCP tool, this
+//! widening has real live surface (previously it did not, since the
+//! only call site always targeted the literal `"admin"` recipient,
+//! which hits the unconditional-allow clause above this branch) --
+//! tracked here, not silently inherited, in case a future pentest
+//! pass wants to re-examine it.
 
 use conexus_core::principal::{is_operator_tier, Principal, PrincipalKind};
 use conexus_core::tool_result::ToolResult;
@@ -151,41 +151,95 @@ pub fn check_send_message_permission(
     None
 }
 
+/// The outcome of [`send_agent_message`]. A closed enum replacing
+/// Python's mix of a returned `ToolResult` (permission denials) and
+/// raised exceptions (`LookupError`/`ParentMessageNotFound`) -- every
+/// caller matches exhaustively rather than string-sniffing a denial
+/// reason, matching this migration's own `UpdateSingleTaskOutcome`/
+/// `EditCommentError` precedent.
+pub enum SendOutcome {
+    Sent {
+        message_id: String,
+    },
+    /// The exact `ToolResult` `check_send_message_permission` built
+    /// (`PermissionDenied` or `Invalid` -- e.g. the 4000-char cap) --
+    /// propagated verbatim so a caller that wants to return it
+    /// directly (the real `send_agent_message` MCP tool) doesn't need
+    /// to re-derive which variant it was.
+    Denied(ToolResult),
+    RecipientNotFound(String),
+    ParentMessageNotFound(String),
+    // No `StoreFailed` variant: Python's `_MessageStoreFailed` exists
+    // because `send()` can swallow an internal error and return `None`
+    // without raising (PF-R32-1's "never report a false success"
+    // guard against that). `message_repository::send` has no such
+    // silent-`None` path -- every failure is a typed `SendMessageError`
+    // (`RecipientNotFound`/`ParentMessageNotFound`/`Db`), so that whole
+    // failure class is structurally impossible here, not merely
+    // unencountered.
+}
+
+/// Arguments for [`send_agent_message`] -- grouped into one struct
+/// (matching this crate's own `NewMessage`/`NewTask` convention)
+/// rather than a long positional parameter list.
+pub struct SendMessageArgs<'a> {
+    pub recipient_id: &'a str,
+    pub message_content: &'a str,
+    pub message_type: &'a str,
+    pub priority: &'a str,
+    pub subject: Option<&'a str>,
+    pub parent_message_id: Option<&'a str>,
+    pub now: &'a str,
+}
+
 /// Port of the write core of `send_agent_message_tool_impl` -- the
-/// permission gate + the DB INSERT + post-commit wake, minus the
-/// dashboard-facing niceties this port's one caller
-/// (`request_assistance`) doesn't need: `deliver_method` (already a
-/// documented Python no-op -- every message is DB-stored, delivered
-/// via `wait_for_events`), the reply-nudge subject hint, and
-/// `parent_message_id` threading (request_assistance never replies).
+/// permission gate + the effective-subject computation + the DB
+/// INSERT. Minus the dashboard-facing niceties no caller of this
+/// function needs yet: `deliver_method` (already a documented Python
+/// no-op -- every message is DB-stored, delivered via
+/// `wait_for_events`) and the post-send recipient wake / reply-nudge
+/// hint / response-text formatting, which are each caller's own
+/// responsibility (`request_assistance` fires its own
+/// `ctx.waiter_registry.notify`; `SendAgentMessageTool` does the same
+/// plus the reply-nudge text).
 ///
 /// Runs on the CALLER's own transaction (`tx`) so the message INSERT
-/// and the caller's own writes (child task, parent notes/audit) commit
-/// or roll back together -- matches Python's own emit-iff-commit
-/// framing for this call site (the uow that
-/// `request_assistance_tool_impl` opens is the SAME one this function
-/// writes into).
+/// and the caller's own writes commit or roll back together --
+/// matches Python's own emit-iff-commit framing (a single
+/// `unit_of_work()` covering the whole call).
 pub fn send_agent_message(
     tx: &Connection,
     principal: &Principal,
-    recipient_id: &str,
-    message_content: &str,
-    message_type: &str,
-    priority: &str,
-    now: &str,
-) -> Result<Option<String>, rusqlite::Error> {
+    args: SendMessageArgs<'_>,
+) -> Result<SendOutcome, rusqlite::Error> {
+    let SendMessageArgs {
+        recipient_id,
+        message_content,
+        message_type,
+        priority,
+        subject,
+        parent_message_id,
+        now,
+    } = args;
+
     if let Some(denial) =
         check_send_message_permission(tx, principal, recipient_id, message_content, message_type)
     {
-        return Ok(match denial {
-            ToolResult::PermissionDenied { reason } => Some(reason),
-            ToolResult::Invalid { message, .. } => Some(message),
-            _ => Some("send denied".to_string()),
-        });
+        return Ok(SendOutcome::Denied(denial));
     }
 
     let sender_id = sender_label(principal);
     let message_id = format!("msg_{:016x}", rand_u64());
+
+    // A reply (parent_message_id set) always stores subject: NULL --
+    // the dashboard surfaces the root's subject as the thread label;
+    // replies don't carry their own. Matches Python's own
+    // `effective_subject` branch exactly.
+    let effective_subject = if parent_message_id.is_some() {
+        None
+    } else {
+        subject
+    };
 
     match message_repository::send(
         tx,
@@ -199,16 +253,14 @@ pub fn send_agent_message(
             timestamp: now,
             delivered: false,
             read: false,
-            subject: None,
-            parent_message_id: None,
+            subject: effective_subject,
+            parent_message_id,
         },
     ) {
-        Ok(_) => Ok(None),
-        Err(SendMessageError::RecipientNotFound(id)) => {
-            Ok(Some(format!("recipient '{id}' not found")))
-        }
+        Ok(_) => Ok(SendOutcome::Sent { message_id }),
+        Err(SendMessageError::RecipientNotFound(id)) => Ok(SendOutcome::RecipientNotFound(id)),
         Err(SendMessageError::ParentMessageNotFound(id)) => {
-            Ok(Some(format!("parent message '{id}' not found")))
+            Ok(SendOutcome::ParentMessageNotFound(id))
         }
         Err(SendMessageError::Db(e)) => Err(e),
     }
@@ -358,20 +410,24 @@ mod tests {
         assert!(denial.is_none());
     }
 
+    fn send_args<'a>(recipient_id: &'a str, message_content: &'a str) -> SendMessageArgs<'a> {
+        SendMessageArgs {
+            recipient_id,
+            message_content,
+            message_type: "text",
+            priority: "normal",
+            subject: None,
+            parent_message_id: None,
+            now: NOW,
+        }
+    }
+
     #[test]
-    fn send_agent_message_persists_a_row_and_returns_no_denial() {
+    fn send_agent_message_persists_a_row_and_reports_sent() {
         let conn = test_conn();
-        let denial = send_agent_message(
-            &conn,
-            &worker("bob"),
-            "admin",
-            "help please",
-            "text",
-            "normal",
-            NOW,
-        )
-        .unwrap();
-        assert_eq!(denial, None);
+        let outcome =
+            send_agent_message(&conn, &worker("bob"), send_args("admin", "help please")).unwrap();
+        assert!(matches!(outcome, SendOutcome::Sent { .. }));
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM agent_messages", [], |row| row.get(0))
             .unwrap();
@@ -391,20 +447,89 @@ mod tests {
             NOW,
         )
         .unwrap();
-        let denial = send_agent_message(
-            &conn,
-            &worker("bob"),
-            "admin",
-            "help please",
-            "text",
-            "normal",
-            NOW,
-        )
-        .unwrap();
-        assert!(denial.is_some());
+        let outcome =
+            send_agent_message(&conn, &worker("bob"), send_args("admin", "help please")).unwrap();
+        assert!(matches!(outcome, SendOutcome::Denied(_)));
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM agent_messages", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn send_agent_message_a_reply_stores_null_subject_regardless_of_explicit_subject() {
+        let conn = test_conn();
+        seed_agent(&conn, "bob");
+        let root_outcome =
+            send_agent_message(&conn, &worker("bob"), send_args("admin", "root message")).unwrap();
+        let SendOutcome::Sent {
+            message_id: root_id,
+        } = root_outcome
+        else {
+            panic!("expected the root send to succeed");
+        };
+        let reply_outcome = send_agent_message(
+            &conn,
+            &worker("bob"),
+            SendMessageArgs {
+                subject: Some("this subject must be dropped"),
+                parent_message_id: Some(&root_id),
+                ..send_args("admin", "a reply")
+            },
+        )
+        .unwrap();
+        let SendOutcome::Sent {
+            message_id: reply_id,
+        } = reply_outcome
+        else {
+            panic!("expected the reply to succeed");
+        };
+        let row = message_repository::get_by_id(&conn, &reply_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.subject, None, "a reply must never persist a subject");
+        assert_eq!(row.parent_message_id.as_deref(), Some(root_id.as_str()));
+    }
+
+    #[test]
+    fn send_agent_message_a_root_message_persists_its_explicit_subject() {
+        let conn = test_conn();
+        let outcome = send_agent_message(
+            &conn,
+            &worker("bob"),
+            SendMessageArgs {
+                subject: Some("a real subject"),
+                ..send_args("admin", "hello")
+            },
+        )
+        .unwrap();
+        let SendOutcome::Sent { message_id } = outcome else {
+            panic!("expected the send to succeed");
+        };
+        let row = message_repository::get_by_id(&conn, &message_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.subject.as_deref(), Some("a real subject"));
+    }
+
+    #[test]
+    fn send_agent_message_unknown_recipient_is_reported_distinctly() {
+        let conn = test_conn();
+        // Admin sender bypasses the active-recipient check
+        // (`can_agents_communicate`'s admin-bypass clause), reaching
+        // the repository's own unknown-recipient rejection.
+        let admin = Principal {
+            kind: PrincipalKind::AgentBearer,
+            user_id: None,
+            agent_id: Some("admin".to_string()),
+            project_name: None,
+            project_role: None,
+            agent_role: None,
+            can_wake_loop: false,
+            source_token: None,
+            capabilities: Capabilities::from_iter([]),
+        };
+        let outcome = send_agent_message(&conn, &admin, send_args("ghost", "hi")).unwrap();
+        assert!(matches!(outcome, SendOutcome::RecipientNotFound(id) if id == "ghost"));
     }
 }

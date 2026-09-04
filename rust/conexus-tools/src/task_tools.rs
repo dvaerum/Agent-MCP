@@ -3140,17 +3140,22 @@ impl Tool for RequestAssistanceTool {
                  created: {child_task_id}",
                 parent.title
             );
-            let message_sent = crate::agent_messaging::send_agent_message(
-                &tx,
-                principal,
-                "admin",
-                &admin_message,
-                "assistance_request",
-                "high",
-                now,
-            )
-            .unwrap_or(Some("send failed".to_string()))
-            .is_none();
+            let message_sent = matches!(
+                crate::agent_messaging::send_agent_message(
+                    &tx,
+                    principal,
+                    crate::agent_messaging::SendMessageArgs {
+                        recipient_id: "admin",
+                        message_content: &admin_message,
+                        message_type: "assistance_request",
+                        priority: "high",
+                        subject: None,
+                        parent_message_id: None,
+                        now,
+                    },
+                ),
+                Ok(crate::agent_messaging::SendOutcome::Sent { .. })
+            );
 
             if tx.commit().is_err() {
                 return ToolResult::Failed {
