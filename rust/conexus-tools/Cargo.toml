@@ -17,8 +17,21 @@ regex = "1"
 # conexus_auth::tool's module doc) -- every impl here locks it as the
 # first step of its own async body.
 tokio = { version = "1", features = ["sync"] }
+serde = { version = "1", features = ["derive"] }
+# RAG's embedding/completion/context-window HTTP calls (Phase D2). Same
+# feature set as this repo's own aoe-bridge/Cargo.toml (rustls-tls:
+# AoE deliberately avoids an OpenSSL system dependency; that reasoning
+# applies here too).
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+    "charset",
+] }
 
 [dev-dependencies]
-# Tests need a runtime to actually DRIVE an async Tool::call/dispatch,
-# beyond the bare Mutex type already in [dependencies].
-tokio = { version = "1", features = ["rt", "macros"] }
+# Union of both features sets that need a runtime in tests: driving an
+# async Tool::call/dispatch ("rt", "macros") and the embedding/
+# completion/context-window probe tests' real bound TCP listeners
+# ("rt-multi-thread", "net", "io-util") -- "rt-multi-thread" is a
+# superset of "rt" so only one is listed.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
