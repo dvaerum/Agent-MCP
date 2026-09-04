@@ -1284,6 +1284,138 @@ impl Tool for EditAgentTool {
     }
 }
 
+pub struct TerminateAgentTool;
+
+impl Tool for TerminateAgentTool {
+    const NAME: &'static str = "terminate_agent";
+    const REQUIRED: Requirement = Requirement::Cap {
+        cap: Capability::AgentsTerminate,
+        reason: None,
+    };
+    const DESCRIPTION: &'static str = "Soft-terminate an agent: revoke its token and flip its \
+        status. Operator-only.";
+    const SCHEMA: &'static str = r#"{
+        "type": "object",
+        "properties": {"agent_id": {"type": "string"}},
+        "required": ["agent_id"],
+        "additionalProperties": false
+    }"#;
+
+    fn call<'a>(
+        _principal: Option<&'a Principal>,
+        arguments: &'a Value,
+        conn: &'a AsyncMutex<Connection>,
+        now: &'a str,
+        ctx: &'a conexus_auth::ToolCallContext<'a>,
+    ) -> conexus_auth::BoxFuture<'a, ToolResult> {
+        Box::pin(async move {
+            let Some(agent_id) = arguments.get("agent_id").and_then(Value::as_str) else {
+                return ToolResult::Invalid {
+                    field: Some("agent_id".to_string()),
+                    message: "`agent_id` to terminate is required.".to_string(),
+                };
+            };
+
+            use conexus_db::agent_repository::AgentRepository;
+            use conexus_wakeloop::event_feed::UNASSIGNED_TASK_TERMINAL_STATUSES as TERMINAL_TASK_STATUSES;
+
+            let guard = conn.lock().await;
+            // `terminate()`'s own NOT_TERMINAL_SQL guard covers BOTH
+            // "no such agent" and "already terminal" with the same
+            // `false` -- matches Python's own combined outcome here
+            // (no in-memory cache to distinguish the two cases either,
+            // and no separate Conflict branch exists for terminate,
+            // unlike rotate_agent_token's explicit check).
+            match AgentRepository::terminate(&guard, agent_id, now) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return ToolResult::NotFound {
+                        resource: "agent".to_string(),
+                        identifier: agent_id.to_string(),
+                        hint: None,
+                    }
+                }
+                Err(_e) => {
+                    return ToolResult::Failed {
+                        message: "A database error occurred; it has been logged. Retry, or ask \
+                            an operator to check logs."
+                            .to_string(),
+                    }
+                }
+            }
+
+            // Wave-B: reconcile tasks so no ACTIVE task is stranded on
+            // the now-terminated agent. Terminal tasks keep their
+            // attribution -- terminate is a soft-delete, and reverting
+            // a completed task would destroy completion history.
+            let reassigned: Vec<String> =
+                match conexus_db::task_repository::list_by_agent(&guard, agent_id, None, None) {
+                    Ok(rows) => rows
+                        .into_iter()
+                        .filter(|t| !TERMINAL_TASK_STATUSES.contains(&t.status.as_str()))
+                        .map(|t| t.task_id)
+                        .collect(),
+                    Err(_e) => Vec::new(),
+                };
+            for task_id in &reassigned {
+                let _ = conexus_db::task_repository::update_fields(
+                    &guard,
+                    task_id,
+                    &conexus_db::task_repository::TaskFields {
+                        assigned_to:
+                            conexus_db::scheduled_directive_repository::NullableUpdate::Clear,
+                        status: Some("unassigned"),
+                        ..Default::default()
+                    },
+                    now,
+                );
+            }
+
+            // Found, documented (not silently reconciled): Python's DB
+            // audit row for this action hardcodes the actor as
+            // `"admin"` rather than the real caller's actor_label --
+            // unlike every sibling lifecycle tool in this file, which
+            // logs the real principal. Preserved as-is (this migration's
+            // "re-derive documented behavior, don't smuggle in a fix"
+            // discipline) since it's an audit-completeness quirk, not a
+            // security-relevant one -- the capability gate above already
+            // requires agents.terminate regardless of who is logged.
+            let _ = agent_action_repository::log_agent_action(
+                &guard,
+                "admin",
+                "terminated_agent",
+                None,
+                Some(&serde_json::json!({"agent_id": agent_id})),
+                now,
+            );
+            drop(guard);
+
+            // BL-R10-2: wake every worker so a live wait_for_events
+            // waiter picks up the newly-unassigned task(s) immediately
+            // -- same broadcast-to-every-active-agent pattern
+            // create_task's own unassigned-task path already
+            // establishes (task_tools.rs).
+            if !reassigned.is_empty() {
+                let guard = conn.lock().await;
+                if let Ok(active) = AgentRepository::list_active(&guard) {
+                    for agent in active {
+                        ctx.waiter_registry.notify(&agent.agent_id);
+                    }
+                }
+            }
+
+            ToolResult::Ok {
+                data: Some(serde_json::json!({"agent_id": agent_id, "status": "terminated"})),
+                message: Some(format!(
+                    "Agent '{agent_id}' terminated. The token is revoked, but your local \
+                     claude session is still running — close it manually if you want it to \
+                     stop."
+                )),
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2593,5 +2725,233 @@ mod tests {
         )
         .await;
         assert!(matches!(result, ToolResult::NotFound { .. }));
+    }
+
+    // ── TerminateAgentTool ───────────────────────────────────────────
+
+    async fn seed_task(
+        conn: &AsyncMutex<Connection>,
+        task_id: &str,
+        assigned_to: Option<&str>,
+        status: &str,
+        created_at: &str,
+    ) {
+        seed_task_with_parent(conn, task_id, None, assigned_to, status, created_at).await;
+    }
+
+    async fn seed_task_with_parent(
+        conn: &AsyncMutex<Connection>,
+        task_id: &str,
+        parent_task: Option<&str>,
+        assigned_to: Option<&str>,
+        status: &str,
+        created_at: &str,
+    ) {
+        let guard = conn.lock().await;
+        conexus_db::task_repository::create(
+            &guard,
+            conexus_db::task_repository::NewTask {
+                task_id: Some(task_id),
+                title: "a task",
+                description: None,
+                assigned_to,
+                created_by: "alice",
+                status,
+                priority: "medium",
+                parent_task,
+                child_tasks: None,
+                depends_on_tasks: None,
+                notes: None,
+                now: created_at,
+            },
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn terminate_agent_denies_a_plain_worker() {
+        let alice = worker();
+        let denied =
+            TerminateAgentTool::REQUIRED.check(Some(&alice), &conexus_auth::NoPolicyOverrides);
+        assert!(denied.is_err());
+    }
+
+    #[tokio::test]
+    async fn terminate_agent_flips_status_and_revokes_the_token() {
+        let conn = setup().await;
+        seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
+        let op = operator_with(&[Capability::AgentsTerminate]);
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = TerminateAgentTool::call(
+            Some(&op),
+            &serde_json::json!({"agent_id": "alice"}),
+            &conn,
+            "2026-06-01T00:01:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        let guard = conn.lock().await;
+        let row = conexus_db::agent_repository::AgentRepository::get_by_id(&guard, "alice")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "terminated");
+        assert!(row.terminated_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn terminate_agent_missing_agent_is_not_found() {
+        let conn = setup().await;
+        let op = operator_with(&[Capability::AgentsTerminate]);
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = TerminateAgentTool::call(
+            Some(&op),
+            &serde_json::json!({"agent_id": "ghost"}),
+            &conn,
+            "2026-06-01T00:00:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::NotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn terminate_agent_on_an_already_terminated_agent_is_not_found_not_conflict() {
+        // Matches Python's real combined outcome: no separate Conflict
+        // branch exists for terminate (unlike rotate_agent_token).
+        let conn = setup().await;
+        seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
+        {
+            let guard = conn.lock().await;
+            conexus_db::agent_repository::AgentRepository::terminate(
+                &guard,
+                "alice",
+                "2026-06-01T00:00:01Z",
+            )
+            .unwrap();
+        }
+        let op = operator_with(&[Capability::AgentsTerminate]);
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = TerminateAgentTool::call(
+            Some(&op),
+            &serde_json::json!({"agent_id": "alice"}),
+            &conn,
+            "2026-06-01T00:02:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::NotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn terminate_agent_reassigns_active_tasks_but_preserves_terminal_ones() {
+        let conn = setup().await;
+        seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
+        seed_task(
+            &conn,
+            "task-active",
+            Some("alice"),
+            "in_progress",
+            "2026-06-01T00:00:00Z",
+        )
+        .await;
+        seed_task_with_parent(
+            &conn,
+            "task-done",
+            Some("task-active"),
+            Some("alice"),
+            "completed",
+            "2026-06-01T00:00:00Z",
+        )
+        .await;
+        let op = operator_with(&[Capability::AgentsTerminate]);
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = TerminateAgentTool::call(
+            Some(&op),
+            &serde_json::json!({"agent_id": "alice"}),
+            &conn,
+            "2026-06-01T00:01:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        let guard = conn.lock().await;
+        let active = conexus_db::task_repository::get_by_id(&guard, "task-active")
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.status, "unassigned");
+        assert_eq!(active.assigned_to, None);
+        let done = conexus_db::task_repository::get_by_id(&guard, "task-done")
+            .unwrap()
+            .unwrap();
+        assert_eq!(done.status, "completed");
+        assert_eq!(done.assigned_to.as_deref(), Some("alice"));
+    }
+
+    #[tokio::test]
+    async fn terminate_agent_wakes_every_active_agent_when_a_task_is_reassigned() {
+        let conn = setup().await;
+        seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
+        seed_agent(&conn, "bob", "tok-b", "2026-06-01T00:00:00Z").await;
+        seed_task(
+            &conn,
+            "task-active",
+            Some("alice"),
+            "in_progress",
+            "2026-06-01T00:00:00Z",
+        )
+        .await;
+        let op = operator_with(&[Capability::AgentsTerminate]);
+        let registry = WaiterRegistry::new();
+        let (_sender, mut receiver) = registry.register("bob");
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = TerminateAgentTool::call(
+            Some(&op),
+            &serde_json::json!({"agent_id": "alice"}),
+            &conn,
+            "2026-06-01T00:01:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        assert!(receiver.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn terminate_agent_writes_a_durable_audit_row_attributed_to_admin() {
+        let conn = setup().await;
+        seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
+        let op = operator_with(&[Capability::AgentsTerminate]);
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = TerminateAgentTool::call(
+            Some(&op),
+            &serde_json::json!({"agent_id": "alice"}),
+            &conn,
+            "2026-06-01T00:01:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        let guard = conn.lock().await;
+        let row: (String, String) = guard
+            .query_row(
+                "SELECT agent_id, action_type FROM agent_actions WHERE action_type = 'terminated_agent'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0, "admin");
+        assert_eq!(row.1, "terminated_agent");
     }
 }
