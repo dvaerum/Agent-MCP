@@ -22,8 +22,9 @@ use std::sync::Arc;
 
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
-    ListToolsResult, PaginatedRequestParams, ProgressNotificationParam, ProgressToken,
-    ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
+    InitializeRequestParams, InitializeResult, ListToolsResult, PaginatedRequestParams,
+    ProgressNotificationParam, ProgressToken, ProtocolVersion, ServerCapabilities, ServerInfo,
+    Tool,
 };
 use rmcp::service::{Peer, RequestContext};
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
@@ -184,6 +185,40 @@ impl ServerHandler for ConexusServer {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_protocol_version(ProtocolVersion::LATEST)
+    }
+
+    // Overrides `ServerHandler`'s provided default (which just calls
+    // `get_info()`) so per-request `instructions` can be appended --
+    // `get_info(&self)` has no `RequestContext` parameter, so it can
+    // never see the caller's resolved `Principal`. This duplicates
+    // rmcp 3.1.4's own tiny protocol-negotiation fallback
+    // (`service::server::negotiate_protocol_version`, `pub(crate)` in
+    // the SDK and therefore uncallable from here) rather than
+    // reimplementing the rest of `initialize` -- see this fn's own
+    // regression test pinning that echo-or-fallback behavior.
+    async fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<InitializeResult, McpError> {
+        context.peer.set_peer_info(request.clone());
+        let mut info = self.get_info();
+        info.protocol_version = if self
+            .supported_protocol_versions()
+            .contains(&request.protocol_version)
+        {
+            request.protocol_version
+        } else {
+            info.protocol_version
+        };
+        if let Some(extra) =
+            crate::instructions::render_all(principal_from_context(&context).as_ref())
+        {
+            let mut text = info.instructions.take().unwrap_or_default();
+            text.push_str(extra);
+            info.instructions = Some(text);
+        }
+        Ok(info)
     }
 
     async fn list_tools(

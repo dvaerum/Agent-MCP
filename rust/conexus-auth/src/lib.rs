@@ -16,6 +16,7 @@ pub mod capabilities;
 pub mod forwarding_header;
 pub mod requirement;
 pub mod tool;
+pub mod wake_loop_eligibility;
 
 pub use capabilities::{resolve_capabilities, ResolveCapabilitiesInput};
 pub use forwarding_header::{
@@ -25,3 +26,4 @@ pub use requirement::{AuthRejected, NoPolicyOverrides, PolicySource, Requirement
 pub use tool::{
     dispatch, BoxFuture, ProgressSink, Tool, ToolCallContext, ToolCallFn, ToolDescriptor,
 };
+pub use wake_loop_eligibility::resolve_can_wake_loop;

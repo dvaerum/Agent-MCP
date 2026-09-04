@@ -153,6 +153,14 @@ pub fn resolve_principal(
         reason: "Unauthorized: failed to resolve capabilities".to_string(),
     })?;
 
+    // Wake-loop eligibility (Python's `resolve_wake_loop=True` path,
+    // the one MCP-wire seam that opts in) -- see
+    // `conexus_auth::resolve_can_wake_loop`'s own doc for why this is
+    // a distinct function from the wake loop's own per-iteration
+    // `check_auto_event_loop_flags` recheck. Resolved before the
+    // struct literal below moves `row.agent_id`.
+    let can_wake_loop = conexus_auth::resolve_can_wake_loop(conn, &row.agent_id);
+
     Ok(Principal {
         kind: PrincipalKind::AgentBearer,
         user_id: None,
@@ -160,13 +168,7 @@ pub fn resolve_principal(
         project_name: None,
         project_role: None,
         agent_role,
-        // Wake-loop eligibility resolution (Python's
-        // `resolve_wake_loop=True` path) is Phase D3 territory -- not
-        // yet ported. Every other Python call site of this builder
-        // also leaves this at its historical `False` default, so this
-        // isn't a regression versus most of Python's own call sites,
-        // only versus the one MCP-wire seam that opts in.
-        can_wake_loop: false,
+        can_wake_loop,
         source_token: Some(token.to_string()),
         capabilities: caps,
     })
@@ -208,6 +210,28 @@ mod tests {
         assert_eq!(principal.kind, PrincipalKind::AgentBearer);
         assert_eq!(principal.agent_id.as_deref(), Some("agent-1"));
         assert_eq!(principal.agent_role, Some(AgentRole::Worker));
+    }
+
+    #[test]
+    fn a_normal_workers_bearer_resolves_wake_loop_eligible_by_default() {
+        // Both `agents.auto_event_loop` and `config_auto_event_loop_
+        // global` default ON with no explicit configuration, so a
+        // freshly-registered worker's very first `/mcp` request already
+        // sees the wake-loop bootstrap instructions (PR A wires this
+        // through `conexus-tools::instructions::render_all`).
+        let conn = test_conn();
+        seed_agent(&conn, "tok123", "agent-1", "worker");
+        let principal = resolve_principal(&conn, Some("Bearer tok123"), None, None, 1000).unwrap();
+        assert!(principal.can_wake_loop);
+    }
+
+    #[test]
+    fn the_admin_pseudo_agents_bearer_never_resolves_wake_loop_eligible() {
+        let conn = test_conn();
+        seed_agent(&conn, "tokadmin", "admin", "manager");
+        let principal =
+            resolve_principal(&conn, Some("Bearer tokadmin"), None, None, 1000).unwrap();
+        assert!(!principal.can_wake_loop);
     }
 
     #[test]
