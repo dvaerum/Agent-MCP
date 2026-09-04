@@ -63,6 +63,46 @@ fn row_to_setting(row: &Row) -> rusqlite::Result<ProjectSettingRow> {
     })
 }
 
+/// Read a boolean toggle. Port of `agent_mcp/tools/access.py::
+/// _get_config_bool`, minus its ADR-0018 "resolve the default from the
+/// settings-schema registry when omitted" branch — that registry
+/// (`core/settings_schema.py`) is not ported to Rust yet, so `default`
+/// is a required explicit parameter here (matching the module's OWN
+/// pre-ADR-0018 shape: every real call site already knows its default,
+/// it's the registry indirection that's out of scope for now, not the
+/// value itself).
+///
+/// A missing row, an unreadable value, or any DB error all fall back to
+/// `default` — same "unreachable settings store during early bootstrap
+/// degrades to the default" contract as Python.
+pub fn get_bool(conn: &Connection, context_key: &str, default: bool) -> bool {
+    let Ok(Some(row)) = get(conn, context_key) else {
+        return default;
+    };
+    match row.value.trim().trim_matches('"').to_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => true,
+        "false" | "0" | "no" | "off" => false,
+        _ => default,
+    }
+}
+
+/// Read an integer knob. Port of `agent_mcp/tools/access.py::
+/// _get_config_int` (same scope note as [`get_bool`] re: the
+/// settings-schema default registry).
+///
+/// `value` is JSON-encoded on write, but parse liberally — JSON first,
+/// then a bare integer string — since tests / external tools may push
+/// a raw (non-JSON) value.
+pub fn get_int(conn: &Connection, context_key: &str, default: i64) -> i64 {
+    let Ok(Some(row)) = get(conn, context_key) else {
+        return default;
+    };
+    if let Ok(v) = serde_json::from_str::<i64>(&row.value) {
+        return v;
+    }
+    row.value.trim().parse().unwrap_or(default)
+}
+
 /// Single-key lookup. Reads through the caller's own open connection
 /// (typically mid-transaction), so an uncommitted write earlier in
 /// the same transaction is visible here — load-bearing for
@@ -467,5 +507,119 @@ mod tests {
                 .value,
             "context-value"
         );
+    }
+
+    // -- get_bool ----------------------------------------------------------
+
+    #[test]
+    fn get_bool_missing_key_returns_the_default() {
+        let conn = test_conn();
+        assert!(get_bool(&conn, "config_nope", true));
+        assert!(!get_bool(&conn, "config_nope", false));
+    }
+
+    #[test]
+    fn get_bool_parses_common_truthy_and_falsy_strings() {
+        let conn = test_conn();
+        for (raw, expected) in [
+            ("true", true),
+            ("\"true\"", true),
+            ("1", true),
+            ("yes", true),
+            ("on", true),
+            ("false", false),
+            ("0", false),
+            ("no", false),
+            ("off", false),
+            ("TRUE", true), // case-insensitive
+        ] {
+            upsert(
+                &conn,
+                "k",
+                raw,
+                None,
+                false,
+                "tester",
+                "2026-01-01T00:00:00Z",
+            )
+            .unwrap();
+            assert_eq!(get_bool(&conn, "k", !expected), expected, "raw={raw:?}");
+        }
+    }
+
+    #[test]
+    fn get_bool_unparseable_value_falls_back_to_default() {
+        let conn = test_conn();
+        upsert(
+            &conn,
+            "k",
+            "not-a-bool",
+            None,
+            false,
+            "tester",
+            "2026-01-01T00:00:00Z",
+        )
+        .unwrap();
+        assert!(get_bool(&conn, "k", true));
+        assert!(!get_bool(&conn, "k", false));
+    }
+
+    // -- get_int -------------------------------------------------------------
+
+    #[test]
+    fn get_int_missing_key_returns_the_default() {
+        let conn = test_conn();
+        assert_eq!(get_int(&conn, "config_nope", 604800), 604800);
+    }
+
+    #[test]
+    fn get_int_parses_a_json_encoded_integer() {
+        let conn = test_conn();
+        upsert(
+            &conn,
+            "k",
+            "3600",
+            None,
+            false,
+            "tester",
+            "2026-01-01T00:00:00Z",
+        )
+        .unwrap();
+        assert_eq!(get_int(&conn, "k", 0), 3600);
+    }
+
+    #[test]
+    fn get_int_parses_a_bare_non_json_integer_string() {
+        let conn = test_conn();
+        // Not JSON (no surrounding quotes on what would be a string, and
+        // this raw value itself isn't valid JSON) -- falls back to a
+        // plain parse, matching Python's liberal coercion.
+        upsert(
+            &conn,
+            "k",
+            "  42  ",
+            None,
+            false,
+            "tester",
+            "2026-01-01T00:00:00Z",
+        )
+        .unwrap();
+        assert_eq!(get_int(&conn, "k", 0), 42);
+    }
+
+    #[test]
+    fn get_int_unparseable_value_falls_back_to_default() {
+        let conn = test_conn();
+        upsert(
+            &conn,
+            "k",
+            "not-an-int",
+            None,
+            false,
+            "tester",
+            "2026-01-01T00:00:00Z",
+        )
+        .unwrap();
+        assert_eq!(get_int(&conn, "k", 604800), 604800);
     }
 }
