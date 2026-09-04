@@ -54,13 +54,18 @@
 //!   don't).
 
 use chrono::{DateTime, Utc};
+use conexus_auth::{Requirement, Tool};
 use conexus_core::capability::Capability;
 use conexus_core::principal::{Principal, PrincipalKind};
-use conexus_db::project_context_repository::ProjectContextRow;
+use conexus_core::tool_result::ToolResult;
+use conexus_db::project_context_repository::{self, ProjectContextRow};
 use conexus_db::scheduled_directive_repository::parse_flexible;
 use regex::Regex;
+use rusqlite::Connection;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::LazyLock;
+use tokio::sync::Mutex as AsyncMutex;
 
 static MEMORY_KEY_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[A-Za-z0-9._/-]+$").unwrap());
@@ -365,6 +370,115 @@ pub fn check_context_consistency(
     }
 }
 
+const AUTHENTICATED_DENIED_REASON: &str = "Unauthorized: Valid token or operator session required";
+
+/// Renders a [`ConsistencyReport`] as Python's
+/// `validate_context_consistency_tool_impl` renders its
+/// `response_parts` list -- one message string, `\n`-joined.
+fn render_consistency_message(report: &ConsistencyReport) -> String {
+    let mut parts = vec![
+        "Context Consistency Validation Results".to_string(),
+        format!("Total entries: {}", report.total_entries),
+    ];
+
+    if report.issues.is_empty() && report.warnings.is_empty() {
+        parts.push("\n\u{2705} No issues found! Context appears consistent.".to_string());
+    } else {
+        if !report.issues.is_empty() {
+            parts.push(format!(
+                "\n\u{1f6a8} Critical Issues ({}):",
+                report.issues.len()
+            ));
+            parts.extend(report.issues.iter().map(|issue| format!("  {issue}")));
+        }
+        if !report.warnings.is_empty() {
+            parts.push(format!(
+                "\n\u{26a0}\u{fe0f}  Warnings ({}):",
+                report.warnings.len()
+            ));
+            parts.extend(report.warnings.iter().map(|warning| format!("  {warning}")));
+        }
+        parts.push("\nRecommendations:".to_string());
+        if !report.issues.is_empty() {
+            parts.push("- Fix critical issues immediately".to_string());
+            parts.push("- Use bulk_update_project_context for corrections".to_string());
+        }
+        if !report.warnings.is_empty() {
+            parts.push("- Review warnings for potential cleanup".to_string());
+            parts.push("- Consider using delete_project_context for unused entries".to_string());
+        }
+    }
+
+    parts.join("\n")
+}
+
+pub struct ValidateContextConsistencyTool;
+
+impl Tool for ValidateContextConsistencyTool {
+    const NAME: &'static str = "validate_context_consistency";
+    const REQUIRED: Requirement = Requirement::Predicate {
+        check: is_authenticated_caller,
+        reason: AUTHENTICATED_DENIED_REASON,
+    };
+    const DESCRIPTION: &'static str = "Check for inconsistencies, conflicts, and quality \
+        issues in project context. Critical for preventing context poisoning.";
+    const SCHEMA: &'static str =
+        r#"{"type":"object","properties":{},"required":[],"additionalProperties":false}"#;
+
+    fn call<'a>(
+        _principal: Option<&'a Principal>,
+        _arguments: &'a Value,
+        conn: &'a AsyncMutex<Connection>,
+        now: &'a str,
+        _ctx: &'a conexus_auth::ToolCallContext<'a>,
+    ) -> conexus_auth::BoxFuture<'a, ToolResult> {
+        Box::pin(async move {
+            let guard = conn.lock().await;
+            let entries = match project_context_repository::list_all(&guard) {
+                Ok(rows) => rows,
+                Err(_e) => {
+                    return ToolResult::Failed {
+                        message: "A database error occurred; it has been logged. Retry, or ask \
+                            an operator to check logs."
+                            .to_string(),
+                    }
+                }
+            };
+
+            if entries.is_empty() {
+                return ToolResult::Ok {
+                    data: Some(serde_json::json!({
+                        "total_entries": 0,
+                        "issues": Vec::<String>::new(),
+                        "warnings": Vec::<String>::new(),
+                    })),
+                    message: Some("No project context entries found.".to_string()),
+                };
+            }
+
+            let now_dt: DateTime<Utc> = match parse_flexible(now) {
+                Ok(dt) => dt,
+                Err(_) => {
+                    return ToolResult::Failed {
+                        message: "Internal clock error".to_string(),
+                    }
+                }
+            };
+            let report = check_context_consistency(&entries, now_dt);
+            let message = render_consistency_message(&report);
+
+            ToolResult::Ok {
+                data: Some(serde_json::json!({
+                    "total_entries": report.total_entries,
+                    "issues": report.issues,
+                    "warnings": report.warnings,
+                })),
+                message: Some(message),
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -563,5 +677,102 @@ mod tests {
         let report = check_context_consistency(&entries, now);
         assert!(report.issues.is_empty());
         assert!(report.warnings.is_empty());
+    }
+
+    // ── ValidateContextConsistencyTool ──────────────────────────────
+
+    use conexus_auth::ToolCallContext;
+    use conexus_db::schema::init_schema;
+    use conexus_wakeloop::file_map::FileMap;
+    use conexus_wakeloop::waiter_registry::WaiterRegistry;
+
+    async fn setup() -> AsyncMutex<Connection> {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        AsyncMutex::new(conn)
+    }
+
+    fn ctx<'a>(registry: &'a WaiterRegistry, file_map: &'a FileMap) -> ToolCallContext<'a> {
+        ToolCallContext::off_wire(registry, file_map)
+    }
+
+    #[tokio::test]
+    async fn an_empty_context_is_a_benign_ok_not_an_error() {
+        let conn = setup().await;
+        let alice = worker();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = ValidateContextConsistencyTool::call(
+            Some(&alice),
+            &Value::Null,
+            &conn,
+            "2026-06-01T00:00:00Z",
+            &c,
+        )
+        .await;
+        let ToolResult::Ok { data, message } = result else {
+            panic!("expected Ok, got {result:?}");
+        };
+        assert_eq!(data.unwrap()["total_entries"], 0);
+        assert_eq!(message.unwrap(), "No project context entries found.");
+    }
+
+    #[tokio::test]
+    async fn a_clean_populated_context_reports_no_issues() {
+        let conn = setup().await;
+        {
+            let guard = conn.lock().await;
+            project_context_repository::create_new(
+                &guard,
+                "a.key",
+                "\"value\"",
+                Some("a description"),
+                "alice",
+                "2026-06-01T00:00:00Z",
+            )
+            .unwrap();
+        }
+        let alice = worker();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = ValidateContextConsistencyTool::call(
+            Some(&alice),
+            &Value::Null,
+            &conn,
+            "2026-06-01T00:00:00Z",
+            &c,
+        )
+        .await;
+        let ToolResult::Ok { data, message } = result else {
+            panic!("expected Ok, got {result:?}");
+        };
+        assert_eq!(data.unwrap()["total_entries"], 1);
+        assert!(message.unwrap().contains("No issues found"));
+    }
+
+    #[tokio::test]
+    async fn an_unauthenticated_caller_is_denied() {
+        let conn = setup().await;
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let denied =
+            ValidateContextConsistencyTool::REQUIRED.check(None, &conexus_auth::NoPolicyOverrides);
+        assert!(denied.is_err());
+        // Sanity: the tool itself still runs fine if somehow reached
+        // with no principal (dispatch would never allow this in
+        // practice -- this is defense-in-depth, matching the tool's
+        // own principal-independent body).
+        let result = ValidateContextConsistencyTool::call(
+            None,
+            &Value::Null,
+            &conn,
+            "2026-06-01T00:00:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
     }
 }
