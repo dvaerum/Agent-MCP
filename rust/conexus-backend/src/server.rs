@@ -162,15 +162,21 @@ impl ServerHandler for ConexusServer {
             .unwrap_or(serde_json::Value::Null);
 
         let now = chrono::Utc::now().to_rfc3339();
-        let conn = self.shared.conn.lock().await;
+        // `dispatch`/`Tool::call` now lock `shared.conn` themselves
+        // (see `conexus_auth::tool`'s module doc for why they take
+        // `&Mutex<Connection>`, not an already-locked guard) -- don't
+        // pre-lock here, or a tool needing the connection AND an
+        // internal `.await` (Phase D2's `ask_project_rag`) would
+        // deadlock against its own already-held guard.
         let result = conexus_auth::dispatch(
             descriptor,
             Some(&principal),
             &conexus_auth::NoPolicyOverrides,
             &arguments,
-            &conn,
+            &self.shared.conn,
             &now,
-        );
+        )
+        .await;
         Ok(tool_result_to_call_tool_result(&result).into())
     }
 }

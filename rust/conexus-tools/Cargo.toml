@@ -13,3 +13,12 @@ conexus-auth = { path = "../conexus-auth" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde_json = "1"
 regex = "1"
+# Tool::call takes `&tokio::sync::Mutex<Connection>` (see
+# conexus_auth::tool's module doc) -- every impl here locks it as the
+# first step of its own async body.
+tokio = { version = "1", features = ["sync"] }
+
+[dev-dependencies]
+# Tests need a runtime to actually DRIVE an async Tool::call/dispatch,
+# beyond the bare Mutex type already in [dependencies].
+tokio = { version = "1", features = ["rt", "macros"] }

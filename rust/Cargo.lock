@@ -293,6 +293,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "subtle",
+ "tokio",
 ]
 
 [[package]]
@@ -347,6 +348,7 @@ dependencies = [
  "regex",
  "rusqlite",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

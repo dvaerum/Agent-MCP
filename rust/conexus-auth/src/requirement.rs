@@ -67,7 +67,16 @@ impl std::error::Error for AuthRejected {}
 /// tool needs it — the same "explicit input, not a hidden lookup"
 /// discipline as `conexus-auth::capabilities::resolve_capabilities`'s
 /// `router_conn: Option<&Connection>`.
-pub trait PolicySource {
+/// `: Sync` (added when `dispatch` became async, Phase D2): a `&dyn
+/// PolicySource` is captured into `dispatch`'s own generated future
+/// across its tail `.await`, and a trait object reference is only
+/// `Send` when the trait itself is `Sync` — same root cause as
+/// `conexus_auth::tool::BoxFuture`'s `Connection`-vs-`Mutex<Connection>`
+/// story. In practice this is free: every real/fake impl here only
+/// ever reads plain owned data (a `bool`, a snapshot map), never holds
+/// a live `&Connection` — the "explicit input over hidden lookup"
+/// note above already steers a real future impl away from that shape.
+pub trait PolicySource: Sync {
     fn get_bool(&self, key: &str) -> Option<bool>;
 }
 

@@ -19,3 +19,13 @@ hex = "0.4"
 # Python's `hmac.compare_digest` would silently reopen a timing
 # side-channel no functional test catches.
 subtle = "2"
+# `tool::Tool::call` takes `&tokio::sync::Mutex<Connection>`, not a bare
+# `&Connection` -- see tool.rs's module doc for why (Send-ness of the
+# boxed async future). Only the `sync` feature: this crate has no
+# other reason to depend on a runtime.
+tokio = { version = "1", features = ["sync"] }
+
+[dev-dependencies]
+# Tests need a runtime to actually DRIVE an async Tool::call/dispatch,
+# beyond the bare Mutex type already in [dependencies].
+tokio = { version = "1", features = ["rt", "macros"] }
