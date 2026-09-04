@@ -106,6 +106,34 @@ pub fn deliver(
     wakes
 }
 
+/// Bulk sibling of [`deliver`] (Python: `emit_context_write_wakes_bulk`).
+/// A batch write touches N keys in one call; each wake fires AT MOST
+/// ONCE for the whole batch if ANY key matches, using the same
+/// [`wakes_for`] classification -- so a batch containing even one
+/// wake-eligible key can't under-fire relative to the single-key seam.
+pub fn deliver_bulk<'a>(
+    conn: &Connection,
+    waiter_registry: &WaiterRegistry,
+    context_keys: impl IntoIterator<Item = &'a str>,
+) -> Vec<Wake> {
+    let mut wakes: Vec<Wake> = Vec::new();
+    for key in context_keys {
+        for wake in wakes_for(key) {
+            if !wakes.contains(&wake) {
+                wakes.push(wake);
+            }
+        }
+    }
+    if wakes.contains(&Wake::WakeAllForFlagRecheck) {
+        if let Ok(agents) = AgentRepository::list_active(conn) {
+            for agent in agents {
+                waiter_registry.notify(&agent.agent_id);
+            }
+        }
+    }
+    wakes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
