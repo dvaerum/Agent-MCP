@@ -17,3 +17,4 @@ pub mod client_hold_strategy;
 pub mod hold_ladder;
 pub mod idle_reminder;
 pub mod stream_gates;
+pub mod waiter_registry;
