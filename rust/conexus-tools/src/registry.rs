@@ -14,6 +14,7 @@ use crate::agent_tools::GetSystemPromptTool;
 use crate::assign_task_tools::{AssignTaskTool, CreateSelfTaskTool};
 use crate::file_management_tools::{CheckFileStatusTool, UpdateFileStatusTool};
 use crate::file_metadata_tools::{UpdateFileMetadataTool, ViewFileMetadataTool};
+use crate::project_context_tools::ValidateContextConsistencyTool;
 use crate::project_settings_tools::{
     DeleteProjectSettingsTool, UpdateProjectSettingsTool, ViewProjectSettingsTool,
 };
@@ -33,7 +34,7 @@ use crate::utility_tools::TestTool;
 // compile-time `static` array (needs a named `static`, not an inline
 // `&[...]` literal, since the array's elements aren't const-promotable
 // through a non-const fn body).
-static ALL_TOOLS: [ToolDescriptor; 30] = [
+static ALL_TOOLS: [ToolDescriptor; 31] = [
     ToolDescriptor::of::<ViewProjectSettingsTool>(),
     ToolDescriptor::of::<UpdateProjectSettingsTool>(),
     ToolDescriptor::of::<DeleteProjectSettingsTool>(),
@@ -64,6 +65,7 @@ static ALL_TOOLS: [ToolDescriptor; 30] = [
     ToolDescriptor::of::<ListScheduledDirectivesTool>(),
     ToolDescriptor::of::<UpdateScheduledDirectiveTool>(),
     ToolDescriptor::of::<DeleteScheduledDirectiveTool>(),
+    ToolDescriptor::of::<ValidateContextConsistencyTool>(),
 ];
 
 pub fn all_tools() -> &'static [ToolDescriptor] {
@@ -215,6 +217,7 @@ mod tests {
                 "list_scheduled_directives",
                 "update_scheduled_directive",
                 "delete_scheduled_directive",
+                "validate_context_consistency",
             ])
         );
     }
