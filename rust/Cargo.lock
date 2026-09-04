@@ -361,6 +361,8 @@ dependencies = [
  "conexus-core",
  "conexus-db",
  "conexus-wakeloop",
+ "getrandom 0.4.3",
+ "hex",
  "regex",
  "reqwest",
  "rusqlite",

@@ -5,6 +5,7 @@
 //! is the crate that actually knows tool implementations exist).
 //! See `/home/dennis/.claude/plans/prancy-napping-pie.md`.
 
+pub mod admin_tools;
 pub mod agent_communication_tools;
 pub mod agent_messaging;
 pub mod agent_roster_tools;
