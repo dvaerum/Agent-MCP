@@ -299,6 +299,7 @@ version = "0.1.0"
 dependencies = [
  "conexus-core",
  "conexus-db",
+ "conexus-wakeloop",
  "hex",
  "hmac",
  "rusqlite",
@@ -320,6 +321,7 @@ dependencies = [
  "conexus-core",
  "conexus-db",
  "conexus-tools",
+ "conexus-wakeloop",
  "hyper",
  "hyper-util",
  "rmcp",
@@ -357,6 +359,7 @@ dependencies = [
  "conexus-auth",
  "conexus-core",
  "conexus-db",
+ "conexus-wakeloop",
  "regex",
  "reqwest",
  "rusqlite",

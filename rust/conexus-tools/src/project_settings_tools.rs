@@ -106,6 +106,7 @@ impl conexus_auth::Tool for ViewProjectSettingsTool {
         _arguments: &'a Value,
         conn: &'a AsyncMutex<Connection>,
         _now: &'a str,
+        _ctx: &'a conexus_auth::ToolCallContext<'a>,
     ) -> conexus_auth::BoxFuture<'a, ToolResult> {
         Box::pin(async move {
             let conn = conn.lock().await;
@@ -205,6 +206,7 @@ impl conexus_auth::Tool for UpdateProjectSettingsTool {
         arguments: &'a Value,
         conn: &'a AsyncMutex<Connection>,
         now: &'a str,
+        _ctx: &'a conexus_auth::ToolCallContext<'a>,
     ) -> conexus_auth::BoxFuture<'a, ToolResult> {
         Box::pin(async move {
             let conn = conn.lock().await;
@@ -361,6 +363,7 @@ impl conexus_auth::Tool for DeleteProjectSettingsTool {
         arguments: &'a Value,
         conn: &'a AsyncMutex<Connection>,
         now: &'a str,
+        _ctx: &'a conexus_auth::ToolCallContext<'a>,
     ) -> conexus_auth::BoxFuture<'a, ToolResult> {
         Box::pin(async move {
             let conn = conn.lock().await;
@@ -482,9 +485,16 @@ mod tests {
     #[tokio::test]
     async fn view_reports_no_settings_when_store_is_empty() {
         let conn = test_conn();
-        let result =
-            ViewProjectSettingsTool::call(Some(&operator_principal()), &Value::Null, &conn, NOW)
-                .await;
+        let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
+        let ctx = conexus_auth::ToolCallContext::off_wire(&registry);
+        let result = ViewProjectSettingsTool::call(
+            Some(&operator_principal()),
+            &Value::Null,
+            &conn,
+            NOW,
+            &ctx,
+        )
+        .await;
         assert_eq!(
             result,
             ToolResult::Ok {
@@ -497,11 +507,14 @@ mod tests {
     #[tokio::test]
     async fn update_rejects_a_missing_context_key() {
         let conn = test_conn();
+        let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
+        let ctx = conexus_auth::ToolCallContext::off_wire(&registry);
         let result = UpdateProjectSettingsTool::call(
             Some(&operator_principal()),
             &serde_json::json!({"context_value": true}),
             &conn,
             NOW,
+            &ctx,
         )
         .await;
         assert!(
@@ -512,11 +525,14 @@ mod tests {
     #[tokio::test]
     async fn update_rejects_a_key_outside_the_config_namespace() {
         let conn = test_conn();
+        let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
+        let ctx = conexus_auth::ToolCallContext::off_wire(&registry);
         let result = UpdateProjectSettingsTool::call(
             Some(&operator_principal()),
             &serde_json::json!({"context_key": "not_config_shaped", "context_value": true}),
             &conn,
             NOW,
+            &ctx,
         )
         .await;
         assert!(
@@ -527,11 +543,14 @@ mod tests {
     #[tokio::test]
     async fn update_rejects_a_missing_context_value() {
         let conn = test_conn();
+        let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
+        let ctx = conexus_auth::ToolCallContext::off_wire(&registry);
         let result = UpdateProjectSettingsTool::call(
             Some(&operator_principal()),
             &serde_json::json!({"context_key": "config_x"}),
             &conn,
             NOW,
+            &ctx,
         )
         .await;
         assert!(
@@ -542,11 +561,14 @@ mod tests {
     #[tokio::test]
     async fn update_creates_a_new_row_and_reports_created_true() {
         let conn = test_conn();
+        let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
+        let ctx = conexus_auth::ToolCallContext::off_wire(&registry);
         let result = UpdateProjectSettingsTool::call(
             Some(&operator_principal()),
             &serde_json::json!({"context_key": "config_max_agents", "context_value": 10}),
             &conn,
             NOW,
+            &ctx,
         )
         .await;
         let ToolResult::Ok { data, .. } = result else {
@@ -565,11 +587,14 @@ mod tests {
     #[tokio::test]
     async fn update_on_existing_key_reports_created_false() {
         let conn = test_conn();
+        let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
+        let ctx = conexus_auth::ToolCallContext::off_wire(&registry);
         UpdateProjectSettingsTool::call(
             Some(&operator_principal()),
             &serde_json::json!({"context_key": "config_x", "context_value": 1}),
             &conn,
             NOW,
+            &ctx,
         )
         .await;
         let result = UpdateProjectSettingsTool::call(
@@ -577,6 +602,7 @@ mod tests {
             &serde_json::json!({"context_key": "config_x", "context_value": 2}),
             &conn,
             NOW,
+            &ctx,
         )
         .await;
         let ToolResult::Ok { data, .. } = result else {
@@ -588,11 +614,14 @@ mod tests {
     #[tokio::test]
     async fn update_writes_an_audit_row_in_the_same_transaction() {
         let conn = test_conn();
+        let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
+        let ctx = conexus_auth::ToolCallContext::off_wire(&registry);
         UpdateProjectSettingsTool::call(
             Some(&operator_principal()),
             &serde_json::json!({"context_key": "config_x", "context_value": 1}),
             &conn,
             NOW,
+            &ctx,
         )
         .await;
         let (action_type, agent_id): (String, String) = conn
@@ -609,11 +638,14 @@ mod tests {
     #[tokio::test]
     async fn update_embeds_the_worker_policy_wake_for_a_matching_key() {
         let conn = test_conn();
+        let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
+        let ctx = conexus_auth::ToolCallContext::off_wire(&registry);
         let result = UpdateProjectSettingsTool::call(
             Some(&operator_principal()),
             &serde_json::json!({"context_key": "config_allow_worker_to_worker", "context_value": true}),
             &conn,
             NOW,
+        &ctx,
         ).await;
         let ToolResult::Ok { data, .. } = result else {
             panic!("expected Ok, got {result:?}")
@@ -627,11 +659,14 @@ mod tests {
     #[tokio::test]
     async fn update_embeds_no_wakes_for_an_unrelated_key() {
         let conn = test_conn();
+        let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
+        let ctx = conexus_auth::ToolCallContext::off_wire(&registry);
         let result = UpdateProjectSettingsTool::call(
             Some(&operator_principal()),
             &serde_json::json!({"context_key": "config_max_agents", "context_value": 1}),
             &conn,
             NOW,
+            &ctx,
         )
         .await;
         let ToolResult::Ok { data, .. } = result else {
@@ -643,11 +678,14 @@ mod tests {
     #[tokio::test]
     async fn delete_rejects_a_missing_context_key() {
         let conn = test_conn();
+        let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
+        let ctx = conexus_auth::ToolCallContext::off_wire(&registry);
         let result = DeleteProjectSettingsTool::call(
             Some(&operator_principal()),
             &serde_json::json!({}),
             &conn,
             NOW,
+            &ctx,
         )
         .await;
         assert!(
@@ -658,11 +696,14 @@ mod tests {
     #[tokio::test]
     async fn delete_reports_not_found_for_a_missing_key() {
         let conn = test_conn();
+        let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
+        let ctx = conexus_auth::ToolCallContext::off_wire(&registry);
         let result = DeleteProjectSettingsTool::call(
             Some(&operator_principal()),
             &serde_json::json!({"context_key": "config_does_not_exist"}),
             &conn,
             NOW,
+            &ctx,
         )
         .await;
         assert_eq!(
@@ -678,11 +719,14 @@ mod tests {
     #[tokio::test]
     async fn delete_removes_an_existing_row_and_writes_an_audit_row() {
         let conn = test_conn();
+        let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
+        let ctx = conexus_auth::ToolCallContext::off_wire(&registry);
         UpdateProjectSettingsTool::call(
             Some(&operator_principal()),
             &serde_json::json!({"context_key": "config_x", "context_value": 1}),
             &conn,
             NOW,
+            &ctx,
         )
         .await;
         let result = DeleteProjectSettingsTool::call(
@@ -690,6 +734,7 @@ mod tests {
             &serde_json::json!({"context_key": "config_x"}),
             &conn,
             NOW,
+            &ctx,
         )
         .await;
         assert_eq!(

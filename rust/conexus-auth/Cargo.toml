@@ -24,6 +24,11 @@ subtle = "2"
 # boxed async future). Only the `sync` feature: this crate has no
 # other reason to depend on a runtime.
 tokio = { version = "1", features = ["sync"] }
+# ToolCallContext::waiter_registry -- see tool.rs's module doc on why
+# this crate now depends on conexus-wakeloop (the previously-vacant
+# "auth -> wakeloop -> tools" edge conexus-wakeloop's own doc already
+# anticipated).
+conexus-wakeloop = { path = "../conexus-wakeloop" }
 
 [dev-dependencies]
 # Tests need a runtime to actually DRIVE an async Tool::call/dispatch,

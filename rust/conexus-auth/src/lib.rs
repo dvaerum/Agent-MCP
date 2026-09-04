@@ -22,4 +22,6 @@ pub use forwarding_header::{
     sign as sign_forwarding_header, verify as verify_forwarding_header, ForwardedRole,
 };
 pub use requirement::{AuthRejected, NoPolicyOverrides, PolicySource, Requirement};
-pub use tool::{dispatch, BoxFuture, Tool, ToolDescriptor};
+pub use tool::{
+    dispatch, BoxFuture, ProgressSink, Tool, ToolCallContext, ToolCallFn, ToolDescriptor,
+};
