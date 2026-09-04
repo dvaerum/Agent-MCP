@@ -1,9 +1,10 @@
 //! Port of `agent_mcp/tools/agent_communication_tools.py`'s
-//! `wait_for_events_tool_impl`: the entry section
-//! ([`wait_for_events_entry`], PR 2/4) and the slow-path loop
-//! ([`wait_for_events_slow_path`], PR 3/4) -- the real `Tool` impl
-//! wiring both together (plus registration in `all_tools()`) lands in
-//! a later PR.
+//! `wait_for_events_tool_impl` (entry section, [`wait_for_events_entry`],
+//! PR 2/4; slow-path loop, [`wait_for_events_slow_path`], PR 3/4; the
+//! real [`WaitForEventsTool`] wiring both together, PR 4/4) and
+//! `fetch_events_since_tool_impl` ([`FetchEventsSinceTool`], PR 4/4 --
+//! the pure-DB catch-up sibling, sharing `assemble_event_feed` but
+//! registering no waiter and never holding).
 //!
 //! ## Timing: real wall clock + tokio virtual time, deliberately NOT
 //! this crate's usual "explicit input, never read the clock" rule
@@ -693,6 +694,189 @@ fn event_feed_parse(
 /// needs updating.
 fn receiver_drain<T>(_gate: &mut RevalidatingStream<'_, T>) {}
 
+/// A `Principal` that names an agent (`agent_id` set and non-empty).
+/// Port of `_is_identified_agent`. The event tools are per-agent by
+/// construction -- the cursor, the waiter registry, and the wake
+/// signal all key on `agent_id` -- so an operator/forwarding
+/// `Principal` (`agent_id` `None`) has nothing to poll for. Kept as an
+/// `agent_id` test rather than a capability, matching Python's own
+/// reasoning: the admitted set must be byte-identical to the in-body
+/// check, which deliberately does not require a capability either.
+fn is_identified_agent(principal: Option<&Principal>) -> bool {
+    principal.is_some_and(|p| p.agent_id.as_deref().is_some_and(|id| !id.is_empty()))
+}
+
+const WAIT_DENIED: &str = "Unauthorized: Valid agent token required to long-poll events";
+const FETCH_DENIED: &str = "Unauthorized: Valid agent token required to fetch events";
+
+/// Long-poll for new events addressed to the calling agent. Wires
+/// [`wait_for_events_entry`] and [`wait_for_events_slow_path`]
+/// together -- the actual `Tool` impl the migration plan's Phase D3
+/// design-research pass called for.
+pub struct WaitForEventsTool;
+
+impl conexus_auth::Tool for WaitForEventsTool {
+    const NAME: &'static str = "wait_for_events";
+    const REQUIRED: conexus_auth::Requirement = conexus_auth::Requirement::Predicate {
+        check: is_identified_agent,
+        reason: WAIT_DENIED,
+    };
+    const DESCRIPTION: &'static str = "Long-poll for new events addressed to the calling agent \
+        (direct messages, broadcasts, task assignments / changes). Returns immediately if events \
+        are already pending; otherwise blocks server-side until something arrives or the timeout \
+        elapses. Response is a JSON envelope {\"events\": [{type, timestamp, data}, ...], \
+        \"next_cursor\": \"<iso-ts>\"} \u{2014} pass `next_cursor` as `since` on the next call to \
+        advance through the timeline.";
+    const SCHEMA: &'static str = r#"{
+        "type": "object",
+        "properties": {
+            "since": {
+                "type": "string",
+                "description": "ISO-UTC timestamp; only events with timestamp > since are returned. Pass the previous response's `next_cursor` to advance."
+            },
+            "timeout_seconds": {
+                "type": "integer",
+                "description": "Optional cap (seconds) on how long this call may block before returning an empty envelope. Normally OMIT this -- the server picks a client-appropriate hold (heartbeat long-hold for capable clients, a short silent hold otherwise). When provided it only SHORTENS the server's hold, never extends it.",
+                "minimum": 1
+            }
+        },
+        "required": [],
+        "additionalProperties": false
+    }"#;
+
+    fn call<'a>(
+        principal: Option<&'a Principal>,
+        arguments: &'a Value,
+        conn: &'a AsyncMutex<Connection>,
+        now: &'a str,
+        ctx: &'a ToolCallContext<'a>,
+    ) -> conexus_auth::BoxFuture<'a, ToolResult> {
+        Box::pin(async move {
+            let principal =
+                principal.expect("Requirement::Predicate already enforced Some(principal)");
+            match wait_for_events_entry(principal, arguments, conn, now, ctx).await {
+                EntryOutcome::Done(result) => result,
+                EntryOutcome::EnterSlowPath(setup) => {
+                    wait_for_events_slow_path(setup, conn, ctx).await
+                }
+            }
+        })
+    }
+}
+
+/// Pure-DB catch-up: return events newer than `cursor` without
+/// blocking. Port of `fetch_events_since_tool_impl`. Shares
+/// [`event_feed::assemble_event_feed`] with `wait_for_events` but
+/// never registers a waiter and never holds -- a single DB read.
+///
+/// Response shape is `{"events", "cursor"}` -- NOT `{"events",
+/// "next_cursor"}` like `wait_for_events`'s envelope. This is a real
+/// difference in Python's own source (`fetch_events_since_tool_impl`
+/// builds its body dict directly rather than calling `_envelope`), so
+/// this impl does the same rather than reusing [`event_feed::envelope`].
+pub struct FetchEventsSinceTool;
+
+impl conexus_auth::Tool for FetchEventsSinceTool {
+    const NAME: &'static str = "fetch_events_since";
+    const REQUIRED: conexus_auth::Requirement = conexus_auth::Requirement::Predicate {
+        check: is_identified_agent,
+        reason: FETCH_DENIED,
+    };
+    const DESCRIPTION: &'static str = "Pure-DB catch-up: return events addressed to the calling \
+        agent that are newer than `cursor`, without blocking. Use this on session start (and \
+        after recovery from any wait_for_events error) to drain anything missed while \
+        disconnected. When `cursor` is omitted/null, falls back to the agent's persisted \
+        `last_event_seen_at`. Response is a JSON envelope {\"events\": [...], \"cursor\": \
+        \"<iso-ts>\"}; pass the returned `cursor` as the next `cursor` (or to wait_for_events as \
+        `since`) to advance through the timeline.";
+    const SCHEMA: &'static str = r#"{
+        "type": "object",
+        "properties": {
+            "cursor": {
+                "type": ["string", "null"],
+                "description": "ISO-UTC timestamp; only events with timestamp > cursor are returned. Null/absent means start from the agent's persisted last_event_seen_at."
+            }
+        },
+        "required": [],
+        "additionalProperties": false
+    }"#;
+
+    fn call<'a>(
+        principal: Option<&'a Principal>,
+        arguments: &'a Value,
+        conn: &'a AsyncMutex<Connection>,
+        now: &'a str,
+        _ctx: &'a ToolCallContext<'a>,
+    ) -> conexus_auth::BoxFuture<'a, ToolResult> {
+        Box::pin(async move {
+            let principal =
+                principal.expect("Requirement::Predicate already enforced Some(principal)");
+            let agent_id = principal
+                .agent_id
+                .as_deref()
+                .expect("is_identified_agent already enforced agent_id is set");
+
+            let cursor_arg = match arguments.get("cursor") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(s)) => Some(s.clone()),
+                Some(_) => {
+                    return ToolResult::Invalid {
+                        field: Some("cursor".to_string()),
+                        message: "cursor must be an ISO-UTC timestamp string or null".to_string(),
+                    };
+                }
+            };
+            let cursor = match cursor_arg {
+                Some(c) => Some(c),
+                None => {
+                    let guard = conn.lock().await;
+                    AgentRepository::get_by_id(&guard, agent_id)
+                        .ok()
+                        .flatten()
+                        .and_then(|a| a.last_event_seen_at)
+                }
+            };
+
+            let assembled = {
+                let guard = conn.lock().await;
+                event_feed::assemble_event_feed(
+                    &guard,
+                    agent_id,
+                    cursor.as_deref(),
+                    now,
+                    Vec::new(),
+                    true,
+                    process_env,
+                )
+            };
+            let Ok(assembled) = assembled else {
+                return ToolResult::Failed {
+                    message: "fetch_events_since: event assembly failed".to_string(),
+                };
+            };
+            if !assembled.events.is_empty() {
+                let guard = conn.lock().await;
+                let _ = AgentRepository::advance_event_cursor(
+                    &guard,
+                    agent_id,
+                    &assembled.next_cursor,
+                    now,
+                );
+            }
+
+            let body =
+                serde_json::json!({"events": assembled.events, "cursor": assembled.next_cursor});
+            ToolResult::Ok {
+                message: Some(
+                    serde_json::to_string(&body)
+                        .expect("fetch_events_since body is always valid JSON"),
+                ),
+                data: Some(body),
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1174,5 +1358,156 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["type"], "hold_advisory");
         hold_ladder::clear();
+    }
+
+    // -- is_identified_agent --------------------------------------------
+
+    #[test]
+    fn is_identified_agent_admits_an_agent_bearer_with_an_id() {
+        assert!(is_identified_agent(Some(&agent_bearer("alice"))));
+    }
+
+    #[test]
+    fn is_identified_agent_denies_a_missing_principal() {
+        assert!(!is_identified_agent(None));
+    }
+
+    #[test]
+    fn is_identified_agent_denies_a_principal_with_no_agent_id() {
+        let mut operator = agent_bearer("alice");
+        operator.agent_id = None;
+        assert!(!is_identified_agent(Some(&operator)));
+    }
+
+    // -- WaitForEventsTool (through the real Tool trait) ---------------------
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_events_tool_delivers_a_fast_path_event_through_the_real_trait_call() {
+        use conexus_auth::Tool;
+
+        let conn = test_conn();
+        seed_agent(&conn, "kate").await;
+        send_message(&conn, "m1", "kate", &now_iso(), "text").await;
+        let registry = WaiterRegistry::new();
+        let ctx = ToolCallContext::off_wire(&registry);
+        let principal = agent_bearer("kate");
+
+        let result =
+            WaitForEventsTool::call(Some(&principal), &json!({}), &conn, &now_iso(), &ctx).await;
+        let ToolResult::Ok { data, .. } = result else {
+            panic!("expected Ok, got {result:?}");
+        };
+        assert_eq!(data.unwrap()["events"].as_array().unwrap().len(), 1);
+    }
+
+    async fn send_message(
+        conn: &AsyncMutex<Connection>,
+        message_id: &str,
+        recipient_id: &str,
+        timestamp: &str,
+        message_type: &str,
+    ) {
+        let guard = conn.lock().await;
+        conexus_db::message_repository::send(
+            &guard,
+            conexus_db::message_repository::NewMessage {
+                message_id,
+                sender_id: "sender",
+                recipient_id,
+                message_content: "hello",
+                message_type,
+                priority: "normal",
+                timestamp,
+                delivered: true,
+                read: false,
+                subject: Some("a subject"),
+                parent_message_id: None,
+            },
+        )
+        .unwrap();
+    }
+
+    // -- FetchEventsSinceTool ----------------------------------------------
+
+    #[tokio::test]
+    async fn fetch_events_since_response_uses_the_cursor_key_not_next_cursor() {
+        use conexus_auth::Tool;
+
+        let conn = test_conn();
+        seed_agent(&conn, "leo").await;
+        send_message(&conn, "m1", "leo", &now_iso(), "text").await;
+        let registry = WaiterRegistry::new();
+        let ctx = ToolCallContext::off_wire(&registry);
+        let principal = agent_bearer("leo");
+
+        let result =
+            FetchEventsSinceTool::call(Some(&principal), &json!({}), &conn, &now_iso(), &ctx).await;
+        let ToolResult::Ok { data, .. } = result else {
+            panic!("expected Ok, got {result:?}");
+        };
+        let data = data.unwrap();
+        assert!(data.get("cursor").is_some());
+        assert!(data.get("next_cursor").is_none());
+        assert_eq!(data["events"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn fetch_events_since_rejects_a_non_string_cursor() {
+        use conexus_auth::Tool;
+
+        let conn = test_conn();
+        seed_agent(&conn, "mia").await;
+        let registry = WaiterRegistry::new();
+        let ctx = ToolCallContext::off_wire(&registry);
+        let principal = agent_bearer("mia");
+
+        let result = FetchEventsSinceTool::call(
+            Some(&principal),
+            &json!({"cursor": 12345}),
+            &conn,
+            &now_iso(),
+            &ctx,
+        )
+        .await;
+        assert!(
+            matches!(result, ToolResult::Invalid { field, .. } if field.as_deref() == Some("cursor"))
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_events_since_never_blocks_and_never_registers_a_waiter() {
+        use conexus_auth::Tool;
+
+        let conn = test_conn();
+        seed_agent(&conn, "nora").await;
+        let registry = WaiterRegistry::new();
+        let ctx = ToolCallContext::off_wire(&registry);
+        let principal = agent_bearer("nora");
+
+        let result =
+            FetchEventsSinceTool::call(Some(&principal), &json!({}), &conn, &now_iso(), &ctx).await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        assert_eq!(registry.waiter_count("nora"), 0);
+    }
+
+    #[tokio::test]
+    async fn dispatch_denies_wait_for_events_for_a_non_agent_principal() {
+        let conn = test_conn();
+        let registry = WaiterRegistry::new();
+        let ctx = ToolCallContext::off_wire(&registry);
+        let mut operator = agent_bearer("alice");
+        operator.agent_id = None;
+        let descriptor = conexus_auth::ToolDescriptor::of::<WaitForEventsTool>();
+        let result = conexus_auth::dispatch(
+            &descriptor,
+            Some(&operator),
+            &conexus_auth::NoPolicyOverrides,
+            &json!({}),
+            &conn,
+            &now_iso(),
+            &ctx,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::PermissionDenied { .. }));
     }
 }
