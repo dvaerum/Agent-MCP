@@ -12,3 +12,6 @@
 /// Short identifier / single-token fields: `context_key`, agent_id,
 /// task_id, color, hostnames, project/backup names, session ids.
 pub const IDENTIFIER_MAX_LEN: usize = 256;
+
+/// Human-authored title fields: task titles, project display names.
+pub const TITLE_MAX_LEN: usize = 512;
