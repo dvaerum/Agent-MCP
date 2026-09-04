@@ -1416,6 +1416,250 @@ impl Tool for TerminateAgentTool {
     }
 }
 
+/// Tombstone literal rewritten into every reference a purge cascades
+/// through. Port of `_purge_tombstone`. `[`/`]` are reserved
+/// characters `register_agent` refuses in a real agent_id (see
+/// `contains_reserved_bracket`), so this can never collide with a
+/// genuine identity.
+fn purge_tombstone(agent_id: &str) -> String {
+    format!("[deleted-{agent_id}]")
+}
+
+pub struct PurgeAgentTool;
+
+impl Tool for PurgeAgentTool {
+    const NAME: &'static str = "purge_agent";
+    const REQUIRED: Requirement = Requirement::Cap {
+        // No agents.purge verb exists in the capability vocabulary --
+        // gated on agents.terminate, the same agents.* write cap
+        // restore_agent/edit_agent use, matching Python's own
+        // documented rationale (auth-equivalent, no privilege change).
+        cap: Capability::AgentsTerminate,
+        reason: None,
+    };
+    const DESCRIPTION: &'static str = "Hard-delete an agent and cascade-tombstone every \
+        reference. Irreversible. Operator-only.";
+    const SCHEMA: &'static str = r#"{
+        "type": "object",
+        "properties": {"agent_id": {"type": "string"}},
+        "required": ["agent_id"],
+        "additionalProperties": false
+    }"#;
+
+    fn call<'a>(
+        principal: Option<&'a Principal>,
+        arguments: &'a Value,
+        conn: &'a AsyncMutex<Connection>,
+        now: &'a str,
+        ctx: &'a conexus_auth::ToolCallContext<'a>,
+    ) -> conexus_auth::BoxFuture<'a, ToolResult> {
+        Box::pin(async move {
+            let Some(agent_id) = arguments.get("agent_id").and_then(Value::as_str) else {
+                return ToolResult::Invalid {
+                    field: Some("agent_id".to_string()),
+                    message: "`agent_id` is required.".to_string(),
+                };
+            };
+
+            use conexus_db::agent_repository::AgentRepository;
+            use conexus_db::message_repository::{MessageQueryFilters, MessageRepository};
+            use conexus_db::scheduled_directive_repository::NullableUpdate;
+            use conexus_db::task_repository::{self, TaskFields};
+            use conexus_wakeloop::event_feed::UNASSIGNED_TASK_TERMINAL_STATUSES as TERMINAL_TASK_STATUSES;
+
+            let guard = conn.lock().await;
+
+            if AgentRepository::get_by_id(&guard, agent_id)
+                .ok()
+                .flatten()
+                .is_none()
+            {
+                return ToolResult::NotFound {
+                    resource: "agent".to_string(),
+                    identifier: agent_id.to_string(),
+                    hint: None,
+                };
+            }
+
+            // Snapshot counts before tombstoning so the response
+            // reflects what was actually rewritten. A fresh
+            // MessageRepository instance is fine here (not a
+            // process-wide static like GET_AGENT_TOKENS_REPO): this is
+            // a one-shot count, never paginated across repeat calls,
+            // so there's no cross-call anchoring to preserve.
+            let message_repo = MessageRepository::new();
+            let messages_sent = message_repo
+                .count_query(
+                    &guard,
+                    &MessageQueryFilters {
+                        from: Some(agent_id),
+                        ..Default::default()
+                    },
+                )
+                .unwrap_or(0);
+            let messages_received = message_repo
+                .count_query(
+                    &guard,
+                    &MessageQueryFilters {
+                        to: Some(agent_id),
+                        ..Default::default()
+                    },
+                )
+                .unwrap_or(0);
+            let tasks_created: i64 = guard
+                .query_row(
+                    "SELECT COUNT(*) FROM tasks WHERE created_by = ?1",
+                    [agent_id],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            let tasks_assigned: i64 = guard
+                .query_row(
+                    "SELECT COUNT(*) FROM tasks WHERE assigned_to = ?1",
+                    [agent_id],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            let agent_actions_count: i64 = guard
+                .query_row(
+                    "SELECT COUNT(*) FROM agent_actions WHERE agent_id = ?1",
+                    [agent_id],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            let counts = serde_json::json!({
+                "messages_sent": messages_sent,
+                "messages_received": messages_received,
+                "tasks_created": tasks_created,
+                "tasks_assigned": tasks_assigned,
+                "agent_actions": agent_actions_count,
+            });
+
+            let tombstone = purge_tombstone(agent_id);
+
+            // PR-G1: agent_messages FKs to agents.agent_id, so the
+            // tombstone must exist as an agents row before any rewrite.
+            // INSERT OR IGNORE makes a re-purge a no-op.
+            if AgentRepository::insert_tombstone(
+                &guard,
+                &format!("__tombstone_{agent_id}"),
+                &tombstone,
+                now,
+            )
+            .is_err()
+            {
+                return ToolResult::Failed {
+                    message: "A database error occurred; it has been logged. Retry, or ask an \
+                        operator to check logs."
+                        .to_string(),
+                };
+            }
+            let _ =
+                conexus_db::message_repository::rename_participant(&guard, agent_id, &tombstone);
+            let _ = guard.execute(
+                "UPDATE tasks SET created_by = ?1 WHERE created_by = ?2",
+                (&tombstone, agent_id),
+            );
+
+            // BL-R17-2: ACTIVE tasks become unassigned (operator
+            // reassigns); TERMINAL tasks get assigned_to cleared
+            // (dangling-FK-safe for the DELETE below) WITHOUT a status
+            // change -- reverting a finished task's status would
+            // resurrect completed/cancelled/failed work.
+            let assigned_tasks =
+                task_repository::list_by_agent(&guard, agent_id, None, None).unwrap_or_default();
+            let mut reassigned_tasks: Vec<String> = Vec::new();
+            for task in &assigned_tasks {
+                if TERMINAL_TASK_STATUSES.contains(&task.status.as_str()) {
+                    let _ = task_repository::update_fields(
+                        &guard,
+                        &task.task_id,
+                        &TaskFields {
+                            assigned_to: NullableUpdate::Clear,
+                            ..Default::default()
+                        },
+                        now,
+                    );
+                } else {
+                    let _ = task_repository::update_fields(
+                        &guard,
+                        &task.task_id,
+                        &TaskFields {
+                            assigned_to: NullableUpdate::Clear,
+                            status: Some("unassigned"),
+                            ..Default::default()
+                        },
+                        now,
+                    );
+                    reassigned_tasks.push(task.task_id.clone());
+                }
+            }
+
+            let _ = guard.execute(
+                "UPDATE agent_actions SET agent_id = ?1 WHERE agent_id = ?2",
+                (&tombstone, agent_id),
+            );
+
+            // Note: Python also deletes any mcp_sessions/
+            // claude_code_sessions rows FK'd to this agent here, and
+            // separately snapshots+signals its open MCP push streams
+            // for immediate teardown (AC-R29-1 symmetry with
+            // terminate_agent). Neither has a Rust equivalent yet --
+            // no session-registry table/mechanism exists in this
+            // workspace (see the plan's "Phase D5 (admin_tools.py)"
+            // decision 2, the same deferral terminate_agent documents).
+
+            let requesting_agent_id = principal.map(Principal::actor_label).unwrap_or("operator");
+            // Audit BEFORE the DELETE below, matching Python's own
+            // ordering ("so the action log has a non-tombstoned
+            // 'purged_agent' entry").
+            let _ = agent_action_repository::log_agent_action(
+                &guard,
+                requesting_agent_id,
+                "purged_agent",
+                None,
+                Some(&serde_json::json!({
+                    "agent_id": agent_id,
+                    "tombstone": tombstone,
+                    "counts": counts,
+                })),
+                now,
+            );
+
+            if AgentRepository::delete(&guard, agent_id).is_err() {
+                return ToolResult::Failed {
+                    message: "A database error occurred; it has been logged. Retry, or ask an \
+                        operator to check logs."
+                        .to_string(),
+                };
+            }
+            drop(guard);
+
+            // BL-R10-1/2: wake every worker so a live wait_for_events
+            // waiter picks up the newly-unassigned task(s) immediately
+            // -- same broadcast pattern terminate_agent/create_task
+            // already establish.
+            if !reassigned_tasks.is_empty() {
+                let guard = conn.lock().await;
+                if let Ok(active) = AgentRepository::list_active(&guard) {
+                    for agent in active {
+                        ctx.waiter_registry.notify(&agent.agent_id);
+                    }
+                }
+            }
+
+            ToolResult::Ok {
+                data: Some(serde_json::json!({
+                    "agent_id": agent_id,
+                    "tombstone": tombstone,
+                    "counts": counts,
+                })),
+                message: Some(format!("Agent '{agent_id}' purged")),
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2953,5 +3197,356 @@ mod tests {
             .unwrap();
         assert_eq!(row.0, "admin");
         assert_eq!(row.1, "terminated_agent");
+    }
+
+    // ── PurgeAgentTool ───────────────────────────────────────────────
+
+    async fn seed_message(conn: &AsyncMutex<Connection>, id: &str, from: &str, to: &str) {
+        let guard = conn.lock().await;
+        conexus_db::message_repository::send(
+            &guard,
+            conexus_db::message_repository::NewMessage {
+                message_id: id,
+                sender_id: from,
+                recipient_id: to,
+                message_content: "hello",
+                message_type: "chat",
+                priority: "normal",
+                timestamp: "2026-06-01T00:00:00Z",
+                delivered: true,
+                read: false,
+                subject: None,
+                parent_message_id: None,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn purge_tombstone_matches_the_deleted_bracket_format() {
+        assert_eq!(purge_tombstone("alice"), "[deleted-alice]");
+    }
+
+    #[tokio::test]
+    async fn purge_agent_denies_a_plain_worker() {
+        let alice = worker();
+        let denied = PurgeAgentTool::REQUIRED.check(Some(&alice), &conexus_auth::NoPolicyOverrides);
+        assert!(denied.is_err());
+    }
+
+    #[tokio::test]
+    async fn purge_agent_missing_agent_is_not_found() {
+        let conn = setup().await;
+        let op = operator_with(&[Capability::AgentsTerminate]);
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = PurgeAgentTool::call(
+            Some(&op),
+            &serde_json::json!({"agent_id": "ghost"}),
+            &conn,
+            "2026-06-01T00:00:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::NotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn purge_agent_hard_deletes_the_row() {
+        let conn = setup().await;
+        seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
+        let op = operator_with(&[Capability::AgentsTerminate]);
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = PurgeAgentTool::call(
+            Some(&op),
+            &serde_json::json!({"agent_id": "alice"}),
+            &conn,
+            "2026-06-01T00:01:00Z",
+            &c,
+        )
+        .await;
+        let ToolResult::Ok { data, message } = result else {
+            panic!("expected Ok, got {result:?}");
+        };
+        assert_eq!(data.unwrap()["tombstone"], "[deleted-alice]");
+        assert!(message.unwrap().contains("purged"));
+        let guard = conn.lock().await;
+        assert!(
+            conexus_db::agent_repository::AgentRepository::get_by_id(&guard, "alice")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn purge_agent_inserts_a_tombstone_row() {
+        let conn = setup().await;
+        seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
+        let op = operator_with(&[Capability::AgentsTerminate]);
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = PurgeAgentTool::call(
+            Some(&op),
+            &serde_json::json!({"agent_id": "alice"}),
+            &conn,
+            "2026-06-01T00:01:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        let guard = conn.lock().await;
+        let row =
+            conexus_db::agent_repository::AgentRepository::get_by_id(&guard, "[deleted-alice]")
+                .unwrap()
+                .unwrap();
+        assert_eq!(row.status, "tombstone");
+    }
+
+    #[tokio::test]
+    async fn purge_agent_tombstones_sent_and_received_messages() {
+        let conn = setup().await;
+        seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
+        seed_agent(&conn, "bob", "tok-b", "2026-06-01T00:00:00Z").await;
+        seed_message(&conn, "msg-1", "alice", "bob").await;
+        seed_message(&conn, "msg-2", "bob", "alice").await;
+        let op = operator_with(&[Capability::AgentsTerminate]);
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = PurgeAgentTool::call(
+            Some(&op),
+            &serde_json::json!({"agent_id": "alice"}),
+            &conn,
+            "2026-06-01T00:01:00Z",
+            &c,
+        )
+        .await;
+        let ToolResult::Ok { data, .. } = result else {
+            panic!("expected Ok, got {result:?}");
+        };
+        let data = data.unwrap();
+        assert_eq!(data["counts"]["messages_sent"], 1);
+        assert_eq!(data["counts"]["messages_received"], 1);
+        let guard = conn.lock().await;
+        let (sender, recipient): (String, String) = guard
+            .query_row(
+                "SELECT sender_id, recipient_id FROM agent_messages WHERE message_id = 'msg-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(sender, "[deleted-alice]");
+        assert_eq!(recipient, "bob");
+        let recipient_2: String = guard
+            .query_row(
+                "SELECT recipient_id FROM agent_messages WHERE message_id = 'msg-2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(recipient_2, "[deleted-alice]");
+    }
+
+    #[tokio::test]
+    async fn purge_agent_reassigns_active_tasks_and_clears_but_preserves_terminal_ones() {
+        let conn = setup().await;
+        seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
+        seed_task(
+            &conn,
+            "task-active",
+            Some("alice"),
+            "in_progress",
+            "2026-06-01T00:00:00Z",
+        )
+        .await;
+        seed_task_with_parent(
+            &conn,
+            "task-done",
+            Some("task-active"),
+            Some("alice"),
+            "completed",
+            "2026-06-01T00:00:00Z",
+        )
+        .await;
+        let op = operator_with(&[Capability::AgentsTerminate]);
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = PurgeAgentTool::call(
+            Some(&op),
+            &serde_json::json!({"agent_id": "alice"}),
+            &conn,
+            "2026-06-01T00:01:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        let guard = conn.lock().await;
+        let active = conexus_db::task_repository::get_by_id(&guard, "task-active")
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.status, "unassigned");
+        assert_eq!(active.assigned_to, None);
+        let done = conexus_db::task_repository::get_by_id(&guard, "task-done")
+            .unwrap()
+            .unwrap();
+        // Terminal: assigned_to cleared (FK-safe for the DELETE) but
+        // status untouched -- no resurrection.
+        assert_eq!(done.status, "completed");
+        assert_eq!(done.assigned_to, None);
+    }
+
+    #[tokio::test]
+    async fn purge_agent_tombstones_created_tasks_and_audit_rows() {
+        let conn = setup().await;
+        seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
+        seed_task(&conn, "task-1", None, "unassigned", "2026-06-01T00:00:00Z").await;
+        {
+            let guard = conn.lock().await;
+            agent_action_repository::log_agent_action(
+                &guard,
+                "alice",
+                "did_something",
+                None,
+                None,
+                "2026-06-01T00:00:00Z",
+            )
+            .unwrap();
+        }
+        let op = operator_with(&[Capability::AgentsTerminate]);
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = PurgeAgentTool::call(
+            Some(&op),
+            &serde_json::json!({"agent_id": "alice"}),
+            &conn,
+            "2026-06-01T00:01:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        let guard = conn.lock().await;
+        let task = conexus_db::task_repository::get_by_id(&guard, "task-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.created_by, "[deleted-alice]");
+        let old_action_agent: String = guard
+            .query_row(
+                "SELECT agent_id FROM agent_actions WHERE action_type = 'did_something'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_action_agent, "[deleted-alice]");
+        // The purge audit row itself is attributed to the real caller,
+        // not tombstoned (it's logged with the operator's own actor
+        // label, then the UPDATE only touches rows matching the
+        // PURGED agent_id, which the operator's own row never had).
+        let purge_action_agent: String = guard
+            .query_row(
+                "SELECT agent_id FROM agent_actions WHERE action_type = 'purged_agent'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_ne!(purge_action_agent, "[deleted-alice]");
+    }
+
+    #[tokio::test]
+    async fn purge_agent_wakes_every_active_agent_when_a_task_is_reassigned() {
+        let conn = setup().await;
+        seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
+        seed_agent(&conn, "bob", "tok-b", "2026-06-01T00:00:00Z").await;
+        seed_task(
+            &conn,
+            "task-active",
+            Some("alice"),
+            "in_progress",
+            "2026-06-01T00:00:00Z",
+        )
+        .await;
+        let op = operator_with(&[Capability::AgentsTerminate]);
+        let registry = WaiterRegistry::new();
+        let (_sender, mut receiver) = registry.register("bob");
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = PurgeAgentTool::call(
+            Some(&op),
+            &serde_json::json!({"agent_id": "alice"}),
+            &conn,
+            "2026-06-01T00:01:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        assert!(receiver.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn purge_agent_re_purging_an_already_purged_identity_is_not_found() {
+        // Matches Python's own real outcome: once an agent row is
+        // deleted, a second purge attempt on the same agent_id can't
+        // find it either -- there is no separate idempotent-no-op path
+        // at the tool level (INSERT OR IGNORE on the tombstone row
+        // only guards a hypothetical duplicate-insert race, not a
+        // genuine "re-purge succeeds silently" contract).
+        let conn = setup().await;
+        seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
+        let op = operator_with(&[Capability::AgentsTerminate]);
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let first = PurgeAgentTool::call(
+            Some(&op),
+            &serde_json::json!({"agent_id": "alice"}),
+            &conn,
+            "2026-06-01T00:01:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(first, ToolResult::Ok { .. }));
+        let second = PurgeAgentTool::call(
+            Some(&op),
+            &serde_json::json!({"agent_id": "alice"}),
+            &conn,
+            "2026-06-01T00:02:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(second, ToolResult::NotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn purge_agent_purging_two_distinct_agents_never_conflicts() {
+        let conn = setup().await;
+        seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
+        seed_agent(&conn, "bob", "tok-b", "2026-06-01T00:00:00Z").await;
+        let op = operator_with(&[Capability::AgentsTerminate]);
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let first = PurgeAgentTool::call(
+            Some(&op),
+            &serde_json::json!({"agent_id": "alice"}),
+            &conn,
+            "2026-06-01T00:01:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(first, ToolResult::Ok { .. }));
+        let second = PurgeAgentTool::call(
+            Some(&op),
+            &serde_json::json!({"agent_id": "bob"}),
+            &conn,
+            "2026-06-01T00:02:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(second, ToolResult::Ok { .. }));
     }
 }
