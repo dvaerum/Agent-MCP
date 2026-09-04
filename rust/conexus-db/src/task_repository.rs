@@ -263,6 +263,30 @@ pub fn list_unassigned_active_updated_since(
     rows.collect()
 }
 
+/// Count of tasks assigned to `agent_id` NOT in `excluded_statuses`.
+/// Port of `resources/status.py::render_status`'s `unfinished_tasks`
+/// counter. `excluded_statuses` is a caller-supplied slice, same
+/// discipline as [`list_unassigned_active_updated_since`] -- this
+/// query's own Python source hardcodes its own local
+/// `_TERMINAL_TASK_STATUSES = ("completed", "cancelled", "failed")`,
+/// a separate tuple from every other terminal-status constant in this
+/// codebase, not a shared import.
+pub fn count_active_by_assignee(
+    conn: &Connection,
+    agent_id: &str,
+    excluded_statuses: &[&str],
+) -> Result<i64> {
+    let placeholders = std::iter::repeat_n("?", excluded_statuses.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT COUNT(*) FROM tasks WHERE assigned_to = ? AND status NOT IN ({placeholders})"
+    );
+    let mut params: Vec<&dyn ToSql> = vec![&agent_id];
+    params.extend(excluded_statuses.iter().map(|s| s as &dyn ToSql));
+    conn.query_row(&sql, params.as_slice(), |row| row.get(0))
+}
+
 /// Parameters for [`create`]. Unlike every other repository's
 /// `create()` in this crate (which all require the caller to supply
 /// the primary id), `task_id` is genuinely optional here — matching
@@ -1231,6 +1255,51 @@ mod tests {
         .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].task_id, "task_1");
+    }
+
+    // -- count_active_by_assignee -----------------------------------
+
+    #[test]
+    fn count_active_by_assignee_counts_only_this_agents_non_terminal_tasks() {
+        let conn = test_conn();
+        let mut t1 = new_task(Some("task_1"), "active for alice");
+        t1.assigned_to = Some("alice");
+        create(&conn, t1).unwrap();
+        let mut t2 = new_task(Some("task_2"), "active for bob");
+        t2.assigned_to = Some("bob");
+        t2.parent_task = Some("task_1");
+        create(&conn, t2).unwrap();
+
+        assert_eq!(
+            count_active_by_assignee(&conn, "alice", &["completed", "cancelled", "failed"])
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn count_active_by_assignee_excludes_the_given_terminal_statuses() {
+        let conn = test_conn();
+        let mut t = new_task(Some("task_1"), "done");
+        t.assigned_to = Some("alice");
+        t.status = "completed";
+        create(&conn, t).unwrap();
+
+        assert_eq!(
+            count_active_by_assignee(&conn, "alice", &["completed", "cancelled", "failed"])
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn count_active_by_assignee_is_zero_for_an_agent_with_no_tasks() {
+        let conn = test_conn();
+        assert_eq!(
+            count_active_by_assignee(&conn, "nobody", &["completed", "cancelled", "failed"])
+                .unwrap(),
+            0
+        );
     }
 
     #[test]

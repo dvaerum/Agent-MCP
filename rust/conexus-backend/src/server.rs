@@ -21,10 +21,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
-    InitializeRequestParams, InitializeResult, ListToolsResult, PaginatedRequestParams,
-    ProgressNotificationParam, ProgressToken, ProtocolVersion, ServerCapabilities, ServerInfo,
-    Tool,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, GetPromptRequestParams,
+    GetPromptResponse, GetPromptResult, Implementation, InitializeRequestParams, InitializeResult,
+    ListPromptsResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
+    ProgressNotificationParam, ProgressToken, Prompt, PromptArgument, PromptMessage,
+    ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
+    ResourceContents, Role, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::{Peer, RequestContext};
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
@@ -179,12 +181,18 @@ fn tool_result_to_call_tool_result(result: &ToolResult) -> CallToolResult {
 
 impl ServerHandler for ConexusServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new(
-                "conexus-backend",
-                env!("CARGO_PKG_VERSION"),
-            ))
-            .with_protocol_version(ProtocolVersion::LATEST)
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_prompts()
+                .enable_resources()
+                .build(),
+        )
+        .with_server_info(Implementation::new(
+            "conexus-backend",
+            env!("CARGO_PKG_VERSION"),
+        ))
+        .with_protocol_version(ProtocolVersion::LATEST)
     }
 
     // Overrides `ServerHandler`'s provided default (which just calls
@@ -331,6 +339,142 @@ impl ServerHandler for ConexusServer {
         )
         .await;
         Ok(tool_result_to_call_tool_result(&result).into())
+    }
+
+    // Port of `mcp_list_prompts_handler` (Phase E1 PR B1) -- the
+    // Prompt Book catalogue, filtered to what `role` may see.
+    async fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListPromptsResult, McpError> {
+        let role = conexus_core::principal::catalog_role(principal_from_context(&context).as_ref());
+        let prompts = conexus_tools::prompts::list_visible(role)
+            .into_iter()
+            .map(|entry| {
+                // Python always passes `arguments=args` as a (possibly
+                // empty) list, never `None` -- match that on the wire
+                // rather than omitting the field for a zero-variable
+                // prompt.
+                let arguments = entry
+                    .variables
+                    .iter()
+                    .map(|v| {
+                        PromptArgument::new(v.name.clone())
+                            .with_description(v.description.clone())
+                            .with_required(v.required)
+                    })
+                    .collect();
+                Prompt::new(
+                    entry.id.clone(),
+                    Some(entry.description.clone()),
+                    Some(arguments),
+                )
+                .with_title(entry.title.clone())
+            })
+            .collect();
+        Ok(ListPromptsResult {
+            prompts,
+            ..Default::default()
+        })
+    }
+
+    // Port of `mcp_get_prompt_handler` (Phase E1 PR B1). Error codes
+    // match Python's `_PromptValueError`/`_PromptPermissionError`
+    // exactly: an unknown id is INVALID_PARAMS, a visibility denial is
+    // INTERNAL_ERROR (FLAG-R17-1 -- an `McpError` is the only way a
+    // handler's error carries a spec-valid JSON-RPC code through the
+    // SDK's dispatcher, in Python and here alike).
+    async fn get_prompt(
+        &self,
+        request: GetPromptRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<GetPromptResponse, McpError> {
+        let role = conexus_core::principal::catalog_role(principal_from_context(&context).as_ref());
+        let entry = conexus_tools::prompts::get(&request.name).ok_or_else(|| {
+            McpError::invalid_params(format!("Unknown prompt: {}", request.name), None)
+        })?;
+        let arguments: std::collections::HashMap<String, serde_json::Value> = request
+            .arguments
+            .map(|obj| obj.into_iter().collect())
+            .unwrap_or_default();
+        let rendered = conexus_tools::prompts::render(entry, &arguments, role).map_err(|_| {
+            McpError::internal_error(
+                format!(
+                    "Prompt {:?} is not visible to role {:?}",
+                    entry.id,
+                    role.as_str()
+                ),
+                None,
+            )
+        })?;
+        Ok(
+            GetPromptResult::new(vec![PromptMessage::new_text(Role::User, rendered)])
+                .with_description(entry.description.clone())
+                .into(),
+        )
+    }
+
+    // Port of `mcp_list_resources_handler` (Phase E1 PR B2) -- the two
+    // per-agent ambient-state resources, scoped to the caller's own
+    // agent_id (empty for an unauthenticated caller or an
+    // operator/forwarding-header Principal, which carries none).
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, McpError> {
+        let principal = principal_from_context(&context);
+        let agent_id = principal.as_ref().and_then(|p| p.agent_id.as_deref());
+        let resources = conexus_tools::resources::list_for(agent_id)
+            .into_iter()
+            .map(|entry| {
+                Resource::new(entry.uri, entry.name)
+                    .with_description(entry.description)
+                    .with_mime_type(entry.mime_type)
+            })
+            .collect();
+        Ok(ListResourcesResult {
+            resources,
+            ..Default::default()
+        })
+    }
+
+    // Port of `mcp_read_resource_handler` (Phase E1 PR B2). Error
+    // codes match `ResourceReadError`'s contract exactly: an unknown
+    // URI is INVALID_PARAMS, every denial kind (not-visible /
+    // unauthenticated / out-of-scope) is INTERNAL_ERROR.
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, McpError> {
+        let principal = principal_from_context(&context);
+        let now = chrono::Utc::now().to_rfc3339();
+        let outcome = {
+            let guard = self.shared.conn.lock().await;
+            conexus_tools::resources::read(&guard, &request.uri, principal.as_ref(), &now)
+        }
+        .map_err(|_| {
+            McpError::internal_error(format!("failed to read resource {:?}", request.uri), None)
+        })?;
+        match outcome {
+            conexus_tools::resources::ReadOutcome::Ok { body, mime_type } => {
+                Ok(ReadResourceResult::new(vec![
+                    ResourceContents::text(body, request.uri).with_mime_type(mime_type)
+                ])
+                .into())
+            }
+            conexus_tools::resources::ReadOutcome::UnknownUri => Err(McpError::invalid_params(
+                format!("Unknown resource URI: {}", request.uri),
+                None,
+            )),
+            conexus_tools::resources::ReadOutcome::Denied(_) => Err(McpError::internal_error(
+                "Unauthorized: callers may only read their own inbox / status resources"
+                    .to_string(),
+                None,
+            )),
+        }
     }
 }
 

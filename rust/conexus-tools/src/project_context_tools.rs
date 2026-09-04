@@ -68,6 +68,7 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 use tokio::sync::Mutex as AsyncMutex;
 
+use crate::python_compat::python_str;
 use crate::wake_notify;
 
 static MEMORY_KEY_RE: LazyLock<Regex> =
@@ -503,26 +504,6 @@ fn is_older_than_days(updated_at: &str, now: DateTime<Utc>, days: i64) -> bool {
     parse_flexible(updated_at)
         .map(|t| (now - t).num_days() > days)
         .unwrap_or(false)
-}
-
-/// Python's `str()` on a JSON-decoded scalar -- NOT the same as
-/// re-serializing to JSON text (`str(True)` is `"True"`, `str(None)`
-/// is `"None"`, `str("hello")` is `hello` with no quotes). Only
-/// called on a non-object/non-array `Value` (the caller branches on
-/// that first); an invalid-JSON entry's `value_parsed` is already the
-/// raw string (see [`build_view_entries`]), so this returns it
-/// unchanged in that case too.
-fn python_str(value: &Value) -> String {
-    match value {
-        Value::Null => "None".to_string(),
-        Value::Bool(true) => "True".to_string(),
-        Value::Bool(false) => "False".to_string(),
-        Value::Number(n) => n.to_string(),
-        Value::String(s) => s.clone(),
-        Value::Object(_) | Value::Array(_) => {
-            unreachable!("caller already branched on object/array")
-        }
-    }
 }
 
 /// Python's `str.title()`: uppercase the first letter of every
@@ -2673,14 +2654,6 @@ mod tests {
             panic!("expected Ok, got {result:?}");
         };
         assert!(message.unwrap().contains("Context Health"));
-    }
-
-    #[test]
-    fn python_str_matches_python_semantics_for_scalars() {
-        assert_eq!(python_str(&Value::Null), "None");
-        assert_eq!(python_str(&Value::Bool(true)), "True");
-        assert_eq!(python_str(&Value::Bool(false)), "False");
-        assert_eq!(python_str(&Value::String("hello".to_string())), "hello");
     }
 
     #[test]
