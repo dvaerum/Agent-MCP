@@ -58,6 +58,7 @@ use conexus_auth::{Requirement, Tool};
 use conexus_core::capability::Capability;
 use conexus_core::principal::{Principal, PrincipalKind};
 use conexus_core::tool_result::ToolResult;
+use conexus_db::agent_action_repository;
 use conexus_db::project_context_repository::{self, ProjectContextRow};
 use conexus_db::scheduled_directive_repository::parse_flexible;
 use regex::Regex;
@@ -67,8 +68,21 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 use tokio::sync::Mutex as AsyncMutex;
 
+use crate::wake_notify;
+
 static MEMORY_KEY_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[A-Za-z0-9._/-]+$").unwrap());
+
+/// ADR-0016: the `config_*` namespace lives in the `project_settings`
+/// store, NOT `project_context` -- backs the write/delete rejection
+/// only (every caller, admin included).
+static CONFIG_KEY_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^config_").unwrap());
+
+/// One `AuthRejected` message covering both arms of the composed
+/// write gate (`Requirement::Predicate`'s `reason` is static) --
+/// names both the identity requirement and the viewer-tier carve-out.
+pub const WRITE_DENIED_REASON: &str = "Unauthorized: Valid token or operator session required, \
+    and viewer-tier operators cannot mutate project context (read-only project membership)";
 
 /// Port of `utils/string_utils.py::is_valid_memory_key` — non-empty,
 /// `A-Z a-z 0-9 . _ / -` only.
@@ -895,6 +909,220 @@ impl Tool for ViewProjectContextTool {
     }
 }
 
+fn config_key_error() -> ToolResult {
+    // ADR-0016: the config_* namespace lives in the dedicated
+    // project_settings store -- the knowledge write path rejects it
+    // for EVERYONE (admin included). Invalid, not PermissionDenied
+    // (worker-message clarity): PermissionDenied reads as an auth
+    // failure the caller can't fix; Invalid steers them to pick a
+    // different key or escalate.
+    ToolResult::Invalid {
+        field: Some("context_key".to_string()),
+        message: "'config_*' keys are not stored in project memory -- they live in the \
+            operator-managed project settings store. Choose a non-config_* key for memory, \
+            or ask a project operator to set this via project settings."
+            .to_string(),
+    }
+}
+
+/// Port of `_check_write_authorization` -- the per-key creator-
+/// ownership matrix every mutating tool in this module funnels
+/// through. `None` = the caller may write/delete `context_key`.
+fn check_write_authorization(
+    conn: &Connection,
+    requesting_agent_id: &str,
+    context_key: &str,
+    is_admin: bool,
+) -> Option<ToolResult> {
+    // FLAG-R17-2: length bound, checked before the admin early-return
+    // so it applies to every caller.
+    if context_key.chars().count() > conexus_core::schema_limits::IDENTIFIER_MAX_LEN {
+        return Some(ToolResult::Invalid {
+            field: Some("context_key".to_string()),
+            message: format!(
+                "context_key exceeds the maximum length of {} characters.",
+                conexus_core::schema_limits::IDENTIFIER_MAX_LEN
+            ),
+        });
+    }
+    // ADR-0016: checked before the admin early-return -- config_* is
+    // rejected for every caller on the knowledge write path.
+    if CONFIG_KEY_RE.is_match(context_key) {
+        return Some(config_key_error());
+    }
+    if is_admin {
+        return None;
+    }
+    let existing = match project_context_repository::get(conn, context_key) {
+        Ok(row) => row,
+        Err(_e) => {
+            return Some(ToolResult::Failed {
+                message: "A database error occurred; it has been logged. Retry, or ask an \
+                    operator to check logs."
+                    .to_string(),
+            })
+        }
+    };
+    let existing = existing?;
+    let creator_label = match existing.created_by.as_deref() {
+        // Legacy rows where created_by is NULL (pre-migration backfill
+        // edge case) cannot be safely attributed -- treat as
+        // admin-only so workers can't claim them.
+        None => "(unknown -- legacy entry)".to_string(),
+        Some(creator) if creator == requesting_agent_id => return None,
+        Some(creator) => creator.to_string(),
+    };
+    Some(ToolResult::PermissionDenied {
+        reason: format!(
+            "key '{context_key}' was created by '{creator_label}'; only its creator or admin \
+             can modify it"
+        ),
+    })
+}
+
+pub struct CreateProjectContextTool;
+
+impl Tool for CreateProjectContextTool {
+    const NAME: &'static str = "create_project_context";
+    const REQUIRED: Requirement = Requirement::Predicate {
+        check: can_create_project_context,
+        reason: WRITE_DENIED_REASON,
+    };
+    const DESCRIPTION: &'static str = "Create a NEW project context entry (insert-only; \
+        fails if the key already exists -- use update_project_context to change an existing \
+        key's value).";
+    // "maxLength": 256 mirrors conexus_core::schema_limits::IDENTIFIER_MAX_LEN
+    // -- kept as a literal (SCHEMA must be `const`-constructible) and
+    // cross-checked against that constant by this module's own test.
+    const SCHEMA: &'static str = r#"{
+        "type": "object",
+        "properties": {
+            "context_key": {
+                "type": "string",
+                "description": "The key for this context entry (letters, digits, and . _ / - only).",
+                "maxLength": 256
+            },
+            "context_value": {
+                "description": "The value to store (any JSON type)."
+            },
+            "description": {
+                "type": "string",
+                "description": "Optional human-readable description of this entry."
+            }
+        },
+        "required": ["context_key", "context_value"],
+        "additionalProperties": false
+    }"#;
+
+    fn call<'a>(
+        principal: Option<&'a Principal>,
+        arguments: &'a Value,
+        conn: &'a AsyncMutex<Connection>,
+        now: &'a str,
+        ctx: &'a conexus_auth::ToolCallContext<'a>,
+    ) -> conexus_auth::BoxFuture<'a, ToolResult> {
+        Box::pin(async move {
+            let Some(context_key) = arguments
+                .get("context_key")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            else {
+                return ToolResult::Invalid {
+                    field: Some("context_key".to_string()),
+                    message: "context_key is required".to_string(),
+                };
+            };
+            if !is_valid_memory_key(context_key) {
+                return ToolResult::Invalid {
+                    field: Some("context_key".to_string()),
+                    message: "context_key may contain only letters, digits, and . _ / - \
+                        (A-Z a-z 0-9 . _ / -)."
+                        .to_string(),
+                };
+            }
+            let Some(context_value) = arguments.get("context_value") else {
+                return ToolResult::Invalid {
+                    field: Some("context_value".to_string()),
+                    message: "context_value is required".to_string(),
+                };
+            };
+            let description = arguments.get("description").and_then(Value::as_str);
+
+            // Value serialization is infallible for an already-parsed
+            // serde_json::Value (unlike Python's json.dumps, which can
+            // raise TypeError on a non-JSON-serializable Python object
+            // -- not reachable here since context_value only ever
+            // arrives as already-decoded JSON).
+            let value_json_str = context_value.to_string();
+
+            let requesting_agent_id = principal.map(Principal::actor_label).unwrap_or("unknown");
+            let is_admin = principal.is_some_and(conexus_core::principal::is_operator_tier);
+
+            let guard = conn.lock().await;
+            if let Some(denial) =
+                check_write_authorization(&guard, requesting_agent_id, context_key, is_admin)
+            {
+                return denial;
+            }
+
+            let created = project_context_repository::create_new(
+                &guard,
+                context_key,
+                &value_json_str,
+                description,
+                requesting_agent_id,
+                now,
+            );
+            match created {
+                Ok(Some(_row)) => {}
+                Ok(None) => {
+                    return ToolResult::Conflict {
+                        reason: format!(
+                            "Memory key '{context_key}' already exists. \
+                             create_project_context is insert-only -- use \
+                             update_project_context to change an existing key's value."
+                        ),
+                    }
+                }
+                Err(_e) => {
+                    return ToolResult::Failed {
+                        message: "A database error occurred; it has been logged. Retry, or \
+                            ask an operator to check logs."
+                            .to_string(),
+                    }
+                }
+            };
+            let _ = agent_action_repository::log_agent_action(
+                &guard,
+                requesting_agent_id,
+                "created_memory",
+                None,
+                Some(&serde_json::json!({"context_key": context_key})),
+                now,
+            );
+            drop(guard);
+
+            // BL-R14-1: fire the full post-write wake set this key
+            // requires. The write already committed above (rusqlite
+            // has no separate commit step for a non-transaction
+            // execute); a fresh short lock here is fine, matching
+            // every other tool's own commit-then-notify sequencing.
+            let wakes: Vec<&str> = {
+                let guard = conn.lock().await;
+                wake_notify::deliver(&guard, ctx.waiter_registry, context_key)
+            }
+            .into_iter()
+            .map(|w| w.as_str())
+            .collect();
+
+            ToolResult::Ok {
+                data: Some(serde_json::json!({"context_key": context_key, "wakes": wakes})),
+                message: Some(format!("Memory '{context_key}' created successfully")),
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1459,6 +1687,145 @@ mod tests {
     #[test]
     fn view_schema_max_length_matches_the_shared_constant() {
         let parsed: Value = serde_json::from_str(ViewProjectContextTool::SCHEMA).unwrap();
+        let max_len = parsed["properties"]["context_key"]["maxLength"]
+            .as_u64()
+            .unwrap();
+        assert_eq!(
+            max_len as usize,
+            conexus_core::schema_limits::IDENTIFIER_MAX_LEN
+        );
+    }
+
+    // ── CreateProjectContextTool ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_worker_can_create_a_new_key() {
+        let conn = setup().await;
+        let alice = worker();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = CreateProjectContextTool::call(
+            Some(&alice),
+            &serde_json::json!({"context_key": "a.new.key", "context_value": "hello"}),
+            &conn,
+            "2026-06-01T00:00:00Z",
+            &c,
+        )
+        .await;
+        let ToolResult::Ok { data, .. } = result else {
+            panic!("expected Ok, got {result:?}");
+        };
+        assert_eq!(data.unwrap()["context_key"], "a.new.key");
+    }
+
+    #[tokio::test]
+    async fn creating_an_existing_key_is_a_conflict_not_an_overwrite() {
+        let conn = setup().await;
+        seed_context(&conn, "dup", "\"v1\"", "2026-06-01T00:00:00Z").await;
+        let alice = worker();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = CreateProjectContextTool::call(
+            Some(&alice),
+            &serde_json::json!({"context_key": "dup", "context_value": "v2"}),
+            &conn,
+            "2026-06-01T00:00:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Conflict { .. }));
+    }
+
+    #[tokio::test]
+    async fn an_invalid_charset_key_is_invalid() {
+        let conn = setup().await;
+        let alice = worker();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = CreateProjectContextTool::call(
+            Some(&alice),
+            &serde_json::json!({"context_key": "has spaces", "context_value": "v"}),
+            &conn,
+            "2026-06-01T00:00:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Invalid { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_config_namespaced_key_is_rejected_for_everyone_including_admin() {
+        let conn = setup().await;
+        let op = write_operator();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = CreateProjectContextTool::call(
+            Some(&op),
+            &serde_json::json!({"context_key": "config_x", "context_value": "v"}),
+            &conn,
+            "2026-06-01T00:00:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Invalid { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_viewer_tier_operator_cannot_create_a_key() {
+        let conn = setup().await;
+        let viewer = viewer_operator();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let denied = CreateProjectContextTool::REQUIRED
+            .check(Some(&viewer), &conexus_auth::NoPolicyOverrides);
+        assert!(denied.is_err());
+        let _ = (conn, c);
+    }
+
+    #[tokio::test]
+    async fn a_wake_eligible_key_is_unreachable_here_because_config_rejection_wins_first() {
+        // Both of wakes_for()'s classified patterns
+        // (`config_allow_worker_*` / `config_auto_event_loop_global`)
+        // are themselves config_*-namespaced, and this file's own
+        // check_write_authorization unconditionally rejects EVERY
+        // config_* key before a write ever reaches wake_notify::deliver
+        // -- exactly matching Python's own control flow (`_check_write_
+        // authorization` runs, and returns early, before
+        // `emit_context_write_wakes` is ever called). Real, deliberate
+        // consequence: wake delivery is correctly wired here (per this
+        // module's own decision -- see wake_notify::deliver's doc) but
+        // is dead code IN PRACTICE for every write tool in THIS file --
+        // never actually reachable, not a bug. wake_notify::deliver's
+        // own test module exercises the broadcast behavior directly
+        // against a non-namespace-restricted caller instead.
+        let conn = setup().await;
+        let alice = worker();
+        let registry = WaiterRegistry::new();
+        let (_sender, mut receiver) = registry.register("alice");
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = CreateProjectContextTool::call(
+            Some(&alice),
+            &serde_json::json!({
+                "context_key": "config_auto_event_loop_global", "context_value": true
+            }),
+            &conn,
+            "2026-06-01T00:00:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Invalid { .. }));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn create_schema_max_length_matches_the_shared_constant() {
+        let parsed: Value = serde_json::from_str(CreateProjectContextTool::SCHEMA).unwrap();
         let max_len = parsed["properties"]["context_key"]["maxLength"]
             .as_u64()
             .unwrap();
