@@ -2290,6 +2290,421 @@ impl Tool for UpdateTaskTool {
     }
 }
 
+// ======================================================================
+// delete_task (Phase D4, PR 6/8)
+// ======================================================================
+//
+// Operator-only, comprehensive-safety-check task deletion: refuses (as
+// a Conflict) a task with live children/dependents/current-task
+// pointers unless `force_delete` cascades through all three. Every
+// cascade write lands in the SAME transaction as the root DELETE, so
+// a mid-cascade failure rolls the whole thing back -- Rust gets this
+// for free from `Transaction`'s own `Drop` (an un-committed
+// transaction rolls back), which is why there's no Rust equivalent of
+// Python's `_DeleteRolledBack` exception-for-control-flow class: just
+// `return` before calling `.commit()`.
+
+fn dependents_of(conn: &Connection, task_id: &str) -> rusqlite::Result<Vec<(String, Vec<String>)>> {
+    let pattern = format!("%\"{task_id}\"%");
+    let mut stmt = conn.prepare(
+        "SELECT task_id, depends_on_tasks FROM tasks \
+         WHERE json_extract(depends_on_tasks, '$') LIKE ?1",
+    )?;
+    let rows = stmt.query_map([pattern.as_str()], |row| {
+        let deps_json: Option<String> = row.get(1)?;
+        Ok((row.get::<_, String>(0)?, deps_json))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, deps_json) = row?;
+        let deps: Vec<String> = deps_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+        out.push((id, deps));
+    }
+    Ok(out)
+}
+
+pub struct DeleteTaskTool;
+
+impl Tool for DeleteTaskTool {
+    const NAME: &'static str = "delete_task";
+    const REQUIRED: Requirement = Requirement::Cap {
+        cap: Capability::TasksDelete,
+        reason: None,
+    };
+    const DESCRIPTION: &'static str = "Delete a task permanently with cascade handling for \
+        related tasks. Operator-only operation with comprehensive safety checks.";
+    const SCHEMA: &'static str = r#"{
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": "ID of the task to delete."},
+            "force_delete": {"type": "boolean", "description": "Cascade delete children, dependents, and current-task pointers instead of refusing (default: false).", "default": false}
+        },
+        "required": ["task_id"],
+        "additionalProperties": false
+    }"#;
+
+    fn call<'a>(
+        _principal: Option<&'a Principal>,
+        arguments: &'a Value,
+        conn: &'a AsyncMutex<Connection>,
+        now: &'a str,
+        ctx: &'a conexus_auth::ToolCallContext<'a>,
+    ) -> conexus_auth::BoxFuture<'a, ToolResult> {
+        Box::pin(async move {
+            use crate::task_mutation_engine::{
+                update_single_task, TaskEdit, UpdateSingleTaskOutcome,
+            };
+
+            let Some(task_id) = str_arg(arguments, "task_id") else {
+                return ToolResult::Invalid {
+                    field: Some("task_id".to_string()),
+                    message: "task_id is required".to_string(),
+                };
+            };
+            let force_delete = arguments
+                .get("force_delete")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+
+            let conn = conn.lock().await;
+            let tx = match conn.unchecked_transaction() {
+                Ok(tx) => tx,
+                Err(_) => {
+                    return ToolResult::Failed {
+                        message: "Database error deleting task".to_string(),
+                    }
+                }
+            };
+
+            let task_data = match task_repository::get_by_id(&tx, &task_id) {
+                Ok(Some(row)) => row,
+                Ok(None) => {
+                    return ToolResult::NotFound {
+                        resource: "task".to_string(),
+                        identifier: task_id,
+                        hint: None,
+                    }
+                }
+                Err(_) => {
+                    return ToolResult::Failed {
+                        message: "Database error deleting task".to_string(),
+                    }
+                }
+            };
+
+            // BL-2: enumerate children authoritatively from the
+            // `parent_task` FK column -- the source of truth, not the
+            // `child_tasks` JSON mirror (which can drift).
+            let direct_child_ids: Vec<String> = match tx
+                .prepare("SELECT task_id FROM tasks WHERE parent_task = ?1")
+                .and_then(|mut stmt| {
+                    stmt.query_map([task_id.as_str()], |row| row.get(0))?
+                        .collect()
+                }) {
+                Ok(ids) => ids,
+                Err(_) => {
+                    return ToolResult::Failed {
+                        message: "Database error deleting task".to_string(),
+                    }
+                }
+            };
+            if !direct_child_ids.is_empty() && !force_delete {
+                return ToolResult::Conflict {
+                    reason: format!(
+                        "Task '{task_id}' has {} child tasks: {direct_child_ids:?}. Use \
+                         force_delete=true to cascade delete.",
+                        direct_child_ids.len()
+                    ),
+                };
+            }
+
+            let dependent_tasks = match dependents_of(&tx, &task_id) {
+                Ok(rows) => rows,
+                Err(_) => {
+                    return ToolResult::Failed {
+                        message: "Database error deleting task".to_string(),
+                    }
+                }
+            };
+            if !dependent_tasks.is_empty() && !force_delete {
+                let dependent_list: Vec<String> = dependent_tasks
+                    .iter()
+                    .map(|(id, _)| {
+                        let title = task_repository::get_by_id(&tx, id)
+                            .ok()
+                            .flatten()
+                            .map(|t| t.title)
+                            .unwrap_or_default();
+                        format!("{id} ({title})")
+                    })
+                    .collect();
+                return ToolResult::Conflict {
+                    reason: format!(
+                        "{} tasks depend on '{task_id}': {dependent_list:?}. Use \
+                         force_delete=true to cascade delete.",
+                        dependent_tasks.len()
+                    ),
+                };
+            }
+
+            // BL-3: the `agents.current_task -> tasks.task_id` FK.
+            let agents_on_task: Vec<String> = match tx
+                .prepare("SELECT agent_id FROM agents WHERE current_task = ?1")
+                .and_then(|mut stmt| {
+                    stmt.query_map([task_id.as_str()], |row| row.get(0))?
+                        .collect()
+                }) {
+                Ok(ids) => ids,
+                Err(_) => {
+                    return ToolResult::Failed {
+                        message: "Database error deleting task".to_string(),
+                    }
+                }
+            };
+            if !agents_on_task.is_empty() && !force_delete {
+                return ToolResult::Conflict {
+                    reason: format!(
+                        "Task '{task_id}' is the current task of {} agent(s): \
+                         {agents_on_task:?}. Use force_delete=true to clear it and cascade \
+                         delete.",
+                        agents_on_task.len()
+                    ),
+                };
+            }
+
+            let mut cascade_operations: Vec<String> = Vec::new();
+            let mut deleted_events: Vec<(String, Option<String>)> =
+                vec![(task_id.clone(), task_data.assigned_to.clone())];
+
+            // Parent mirror upkeep.
+            if let Some(parent_id) = &task_data.parent_task {
+                if let Ok(Some(parent)) = task_repository::get_by_id(&tx, parent_id) {
+                    let mut children = parent.child_tasks.unwrap_or_default();
+                    if let Some(pos) = children.iter().position(|c| c == &task_id) {
+                        children.remove(pos);
+                        let _ = task_repository::update_fields(
+                            &tx,
+                            parent_id,
+                            &conexus_db::task_repository::TaskFields {
+                                child_tasks:
+                                    conexus_db::scheduled_directive_repository::NullableUpdate::Set(
+                                        children,
+                                    ),
+                                ..Default::default()
+                            },
+                            now,
+                        );
+                        cascade_operations.push(format!(
+                            "Updated parent task '{parent_id}' to remove child reference"
+                        ));
+                    }
+                }
+            }
+
+            // Force-cascade the whole subtree, deepest descendant
+            // first (the authoritative FK order).
+            let mut delete_set_ids: Vec<String> = vec![task_id.clone()];
+            if force_delete {
+                let descendants = match collect_task_descendants(&tx, &task_id) {
+                    Ok(d) => d,
+                    Err(_) => {
+                        return ToolResult::Failed {
+                            message: "Database error deleting task".to_string(),
+                        }
+                    }
+                };
+                delete_set_ids.extend(descendants.iter().map(|(id, _)| id.clone()));
+                let delete_set_refs: Vec<&str> =
+                    delete_set_ids.iter().map(String::as_str).collect();
+                // BL-3: NULL every agent's current_task pointer anywhere
+                // in the delete set BEFORE the DELETEs, or the FK aborts
+                // the DELETE and force_delete fails to force.
+                let _ = conexus_db::agent_repository::AgentRepository::clear_current_task_for_many(
+                    &tx,
+                    &delete_set_refs,
+                    now,
+                );
+                for (descendant_id, descendant_assignee) in &descendants {
+                    if task_repository::delete(&tx, descendant_id).unwrap_or(false) {
+                        deleted_events.push((descendant_id.clone(), descendant_assignee.clone()));
+                        cascade_operations.push(format!("Deleted child task '{descendant_id}'"));
+                    }
+                }
+            }
+
+            // BL-R19-1: reconcile dangling depends_on_tasks references
+            // across the WHOLE deleted set (root + every cascade-deleted
+            // descendant) -- not just the root, or an OUTSIDE task
+            // depending on a cascade-deleted descendant keeps a
+            // reference to a now-absent id and stalls forever.
+            let mut deps_to_refresh: HashSet<String> = HashSet::new();
+            if force_delete {
+                let deleted_id_set: HashSet<&str> =
+                    delete_set_ids.iter().map(String::as_str).collect();
+                let mut affected_deps: std::collections::HashMap<String, Vec<String>> =
+                    std::collections::HashMap::new();
+                for deleted_id in &delete_set_ids {
+                    let rows = match dependents_of(&tx, deleted_id) {
+                        Ok(r) => r,
+                        Err(_) => {
+                            return ToolResult::Failed {
+                                message: "Database error deleting task".to_string(),
+                            }
+                        }
+                    };
+                    for (dep_id, deps) in rows {
+                        if deleted_id_set.contains(dep_id.as_str()) {
+                            continue;
+                        }
+                        affected_deps.entry(dep_id).or_insert(deps);
+                    }
+                }
+                let mut reeval_candidates: HashSet<String> = HashSet::new();
+                for (dep_id, dep_dependencies) in &affected_deps {
+                    let pruned: Vec<String> = dep_dependencies
+                        .iter()
+                        .filter(|d| !deleted_id_set.contains(d.as_str()))
+                        .cloned()
+                        .collect();
+                    if &pruned != dep_dependencies {
+                        let _ = task_repository::update_fields(
+                            &tx,
+                            dep_id,
+                            &conexus_db::task_repository::TaskFields {
+                                depends_on_tasks:
+                                    conexus_db::scheduled_directive_repository::NullableUpdate::Set(
+                                        pruned,
+                                    ),
+                                ..Default::default()
+                            },
+                            now,
+                        );
+                        deps_to_refresh.insert(dep_id.clone());
+                        reeval_candidates.insert(dep_id.clone());
+                        cascade_operations.push(format!(
+                            "Updated task '{dep_id}' to remove dependency on deleted task(s) \
+                             in the '{task_id}' cascade"
+                        ));
+                    }
+                }
+
+                // BL-R19-1: re-evaluate each unblocked task -- deletion,
+                // unlike completion, never triggers the auto-advance,
+                // so a task whose last blocking dependency was deleted
+                // would otherwise never progress on its own.
+                for dep_id in &reeval_candidates {
+                    let Ok(Some(row)) = task_repository::get_by_id(&tx, dep_id) else {
+                        continue;
+                    };
+                    if row.status != "pending" {
+                        continue;
+                    }
+                    let remaining = row.depends_on_tasks.unwrap_or_default();
+                    let all_completed = remaining.iter().all(|rid| {
+                        task_repository::get_by_id(&tx, rid)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|r| r.status == "completed")
+                    });
+                    if all_completed {
+                        let edit = TaskEdit::status_only(Some(
+                            "Auto-advanced: blocking dependency deleted",
+                        ));
+                        if let Ok(UpdateSingleTaskOutcome::Applied(_)) = update_single_task(
+                            &tx,
+                            dep_id,
+                            "in_progress",
+                            "admin",
+                            true,
+                            &edit,
+                            now,
+                        ) {
+                            cascade_operations.push(format!(
+                                "Auto-advanced task '{dep_id}' to in_progress (blocking \
+                                 dependency deleted)"
+                            ));
+                        }
+                    }
+                }
+            }
+            let _ = deps_to_refresh; // no in-memory cache to refresh in this port
+
+            match task_repository::delete(&tx, &task_id) {
+                Ok(true) => {}
+                Ok(false) => {
+                    // The transaction drops here without a commit --
+                    // every cascade write above rolls back with it.
+                    return ToolResult::Failed {
+                        message: format!("Failed to delete task '{task_id}'"),
+                    };
+                }
+                Err(_) => {
+                    return ToolResult::Failed {
+                        message: "Database error deleting task".to_string(),
+                    }
+                }
+            }
+
+            // BL-R4-1: prune each deleted task's RAG chunk in the SAME
+            // transaction as the row delete -- the incremental indexer
+            // never sweeps orphans, so a deleted task's chunk would
+            // otherwise stay queryable via ask_project_rag forever.
+            for (deleted_id, _) in &deleted_events {
+                let _ = conexus_db::rag_repository::purge_source(&tx, "task", deleted_id);
+            }
+
+            if let Err(_e) = agent_action_repository::log_agent_action(
+                &tx,
+                "admin",
+                "deleted_task",
+                Some(&task_id),
+                Some(&serde_json::json!({
+                    "task_title": task_data.title,
+                    "force_delete": force_delete,
+                    "cascade_operations": cascade_operations,
+                })),
+                now,
+            ) {
+                // Best-effort audit log, same rationale as every other
+                // mutating tool in this module.
+            }
+
+            if tx.commit().is_err() {
+                return ToolResult::Failed {
+                    message: "Database error deleting task".to_string(),
+                };
+            }
+
+            // Post-commit: wake every deleted task's assignee.
+            for (_, assignee) in &deleted_events {
+                if let Some(a) = assignee.as_deref().filter(|a| !a.is_empty()) {
+                    ctx.waiter_registry.notify(a);
+                }
+            }
+
+            let mut response_parts = vec![format!(
+                "Task '{task_id}' ({}) deleted successfully.",
+                task_data.title
+            )];
+            if !cascade_operations.is_empty() {
+                response_parts.push("\nCascade Operations:".to_string());
+                for op in &cascade_operations {
+                    response_parts.push(format!("  \u{2022} {op}"));
+                }
+            }
+            response_parts.push(format!("\nDeletion completed at: {now}"));
+
+            ToolResult::Ok {
+                data: None,
+                message: Some(response_parts.join("\n")),
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3970,5 +4385,362 @@ mod update_task_tests {
         assert!(matches!(result, ToolResult::Ok { .. }));
         assert_eq!(rx_bob.try_recv(), Ok(WakeSignal::Wake));
         assert_eq!(rx_carol.try_recv(), Ok(WakeSignal::Wake));
+    }
+}
+
+#[cfg(test)]
+mod delete_task_tests {
+    use super::*;
+    use conexus_db::agent_repository::{AgentRepository, NewAgent};
+    use conexus_db::scheduled_directive_repository::NullableUpdate;
+    use conexus_db::schema::init_schema;
+    use conexus_db::task_repository::{NewTask, TaskFields};
+    use conexus_wakeloop::waiter_registry::{WaiterRegistry, WakeSignal};
+
+    const NOW: &str = "2026-03-10T00:00:00Z";
+
+    fn test_conn() -> AsyncMutex<Connection> {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        AsyncMutex::new(conn)
+    }
+
+    async fn seed_agent(conn: &AsyncMutex<Connection>, agent_id: &str) {
+        let guard = conn.lock().await;
+        AgentRepository::create(
+            &guard,
+            NewAgent {
+                token: &format!("tok-{agent_id}"),
+                agent_id,
+                created_at: NOW,
+                status: "active",
+                current_task: None,
+                working_directory: "/tmp",
+                color: None,
+                agent_role: "worker",
+            },
+        )
+        .unwrap();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn seed_task(
+        conn: &Connection,
+        id: &str,
+        status: &str,
+        assigned_to: Option<&str>,
+        parent: Option<&str>,
+        deps: Option<&[String]>,
+    ) {
+        task_repository::create(
+            conn,
+            NewTask {
+                task_id: Some(id),
+                title: &format!("Task {id}"),
+                description: None,
+                assigned_to,
+                created_by: "alice",
+                status,
+                priority: "medium",
+                parent_task: parent,
+                child_tasks: None,
+                depends_on_tasks: deps,
+                notes: None,
+                now: NOW,
+            },
+        )
+        .unwrap();
+    }
+
+    async fn call(args: Value, conn: &AsyncMutex<Connection>) -> ToolResult {
+        let registry = WaiterRegistry::new();
+        let ctx = conexus_auth::ToolCallContext::off_wire(&registry);
+        DeleteTaskTool::call(None, &args, conn, NOW, &ctx).await
+    }
+
+    #[tokio::test]
+    async fn requires_task_id() {
+        let conn = test_conn();
+        let result = call(serde_json::json!({}), &conn).await;
+        assert!(
+            matches!(result, ToolResult::Invalid { field, .. } if field.as_deref() == Some("task_id"))
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_a_missing_task() {
+        let conn = test_conn();
+        let result = call(serde_json::json!({"task_id": "ghost"}), &conn).await;
+        assert!(matches!(result, ToolResult::NotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn deletes_a_leaf_task_with_no_relations() {
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "t1", "pending", None, None, None);
+        }
+        let result = call(serde_json::json!({"task_id": "t1"}), &conn).await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        let guard = conn.lock().await;
+        assert!(task_repository::get_by_id(&guard, "t1").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn refuses_a_task_with_children_without_force() {
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "root1", "pending", None, None, None);
+            seed_task(&guard, "child1", "pending", None, Some("root1"), None);
+        }
+        let result = call(serde_json::json!({"task_id": "root1"}), &conn).await;
+        assert!(matches!(result, ToolResult::Conflict { .. }));
+        let guard = conn.lock().await;
+        assert!(task_repository::get_by_id(&guard, "root1")
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn refuses_a_task_with_dependents_without_force() {
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "t1", "pending", None, None, None);
+            seed_task(
+                &guard,
+                "t2",
+                "pending",
+                None,
+                Some("t1"),
+                Some(&["t1".to_string()]),
+            );
+        }
+        let result = call(serde_json::json!({"task_id": "t1"}), &conn).await;
+        assert!(matches!(result, ToolResult::Conflict { .. }));
+    }
+
+    #[tokio::test]
+    async fn refuses_a_task_that_is_an_agents_current_task_without_force() {
+        let conn = test_conn();
+        seed_agent(&conn, "bob").await;
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "t1", "pending", Some("bob"), None, None);
+            AgentRepository::reconcile_current_task_on_reassign(
+                &guard,
+                "t1",
+                None,
+                Some("bob"),
+                NOW,
+            )
+            .unwrap();
+        }
+        let result = call(serde_json::json!({"task_id": "t1"}), &conn).await;
+        assert!(matches!(result, ToolResult::Conflict { .. }));
+    }
+
+    #[tokio::test]
+    async fn force_delete_cascades_the_whole_subtree() {
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "root1", "pending", None, None, None);
+            seed_task(&guard, "child1", "pending", None, Some("root1"), None);
+            seed_task(&guard, "grandchild1", "pending", None, Some("child1"), None);
+        }
+        let result = call(
+            serde_json::json!({"task_id": "root1", "force_delete": true}),
+            &conn,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        let guard = conn.lock().await;
+        assert!(task_repository::get_by_id(&guard, "root1")
+            .unwrap()
+            .is_none());
+        assert!(task_repository::get_by_id(&guard, "child1")
+            .unwrap()
+            .is_none());
+        assert!(task_repository::get_by_id(&guard, "grandchild1")
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn force_delete_clears_an_agents_current_task_pointer() {
+        let conn = test_conn();
+        seed_agent(&conn, "bob").await;
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "t1", "pending", Some("bob"), None, None);
+            AgentRepository::reconcile_current_task_on_reassign(
+                &guard,
+                "t1",
+                None,
+                Some("bob"),
+                NOW,
+            )
+            .unwrap();
+        }
+        let result = call(
+            serde_json::json!({"task_id": "t1", "force_delete": true}),
+            &conn,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        let guard = conn.lock().await;
+        let agent = AgentRepository::get_by_id(&guard, "bob").unwrap().unwrap();
+        assert_eq!(agent.current_task, None);
+    }
+
+    #[tokio::test]
+    async fn force_delete_removes_the_parents_child_tasks_mirror_entry() {
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "root1", "pending", None, None, None);
+            seed_task(&guard, "keeper", "pending", None, Some("root1"), None);
+            seed_task(&guard, "goner", "pending", None, Some("root1"), None);
+            task_repository::update_fields(
+                &guard,
+                "root1",
+                &TaskFields {
+                    child_tasks: NullableUpdate::Set(vec![
+                        "keeper".to_string(),
+                        "goner".to_string(),
+                    ]),
+                    ..Default::default()
+                },
+                NOW,
+            )
+            .unwrap();
+        }
+        let result = call(
+            serde_json::json!({"task_id": "goner", "force_delete": true}),
+            &conn,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        let guard = conn.lock().await;
+        let parent = task_repository::get_by_id(&guard, "root1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(parent.child_tasks, Some(vec!["keeper".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn force_delete_prunes_a_dangling_dependency_reference() {
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            // "outside" is a SIBLING of "t1" under a shared root, not a
+            // child of "t1" -- parent_task and depends_on_tasks are
+            // independent relations, and conflating them would sweep
+            // "outside" into t1's own descendant-cascade delete instead
+            // of exercising the dangling-dependency-prune path.
+            seed_task(&guard, "root1", "pending", None, None, None);
+            seed_task(&guard, "t1", "pending", None, Some("root1"), None);
+            seed_task(
+                &guard,
+                "outside",
+                "pending",
+                None,
+                Some("root1"),
+                Some(&["t1".to_string()]),
+            );
+        }
+        let result = call(
+            serde_json::json!({"task_id": "t1", "force_delete": true}),
+            &conn,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        let guard = conn.lock().await;
+        let outside = task_repository::get_by_id(&guard, "outside")
+            .unwrap()
+            .unwrap();
+        assert_eq!(outside.depends_on_tasks, Some(vec![]));
+    }
+
+    #[tokio::test]
+    async fn force_delete_auto_advances_a_dependent_left_with_no_remaining_deps() {
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            // Same independence-of-relations note as the dangling-
+            // reference test above: "dependent" is a sibling of
+            // "blocker" under a shared root, not its child.
+            seed_task(&guard, "root1", "pending", None, None, None);
+            seed_task(&guard, "blocker", "pending", None, Some("root1"), None);
+            seed_task(
+                &guard,
+                "dependent",
+                "pending",
+                None,
+                Some("root1"),
+                Some(&["blocker".to_string()]),
+            );
+        }
+        let result = call(
+            serde_json::json!({"task_id": "blocker", "force_delete": true}),
+            &conn,
+        )
+        .await;
+        let msg = match &result {
+            ToolResult::Ok { message, .. } => message.clone().unwrap_or_default(),
+            other => panic!("expected Ok, got {other:?}"),
+        };
+        assert!(msg.contains("Auto-advanced task 'dependent' to in_progress"));
+        let guard = conn.lock().await;
+        let dependent = task_repository::get_by_id(&guard, "dependent")
+            .unwrap()
+            .unwrap();
+        assert_eq!(dependent.status, "in_progress");
+    }
+
+    #[tokio::test]
+    async fn writes_a_durable_audit_row() {
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "t1", "pending", None, None, None);
+        }
+        call(serde_json::json!({"task_id": "t1"}), &conn).await;
+        let guard = conn.lock().await;
+        let count: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM agent_actions WHERE action_type = 'deleted_task' AND \
+                 task_id = 't1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn wakes_the_deleted_tasks_assignees_waiter() {
+        let conn = test_conn();
+        seed_agent(&conn, "bob").await;
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "t1", "pending", Some("bob"), None, None);
+        }
+        let registry = WaiterRegistry::new();
+        let (_tx, mut rx) = registry.register("bob");
+        let ctx = conexus_auth::ToolCallContext::off_wire(&registry);
+        let result = DeleteTaskTool::call(
+            None,
+            &serde_json::json!({"task_id": "t1"}),
+            &conn,
+            NOW,
+            &ctx,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        assert_eq!(rx.try_recv(), Ok(WakeSignal::Wake));
     }
 }
