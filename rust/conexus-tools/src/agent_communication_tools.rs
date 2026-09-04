@@ -877,6 +877,229 @@ impl conexus_auth::Tool for FetchEventsSinceTool {
     }
 }
 
+const READ_MESSAGES_DENIED: &str =
+    "Unauthorized: Valid agent token with the messages.view capability required to retrieve \
+     messages";
+
+/// `_is_identified_agent` AND `messages.view`. Port of
+/// `_can_read_own_messages` -- composes the two in-body gates Python's
+/// `get_agent_messages_tool_impl` ran in order: the identity check,
+/// then the cap check that closes the empty-bundle-bearer class (an
+/// `agent_bearer` with `agent_role: None` named an `agent_id` yet held
+/// zero caps).
+fn can_read_own_messages(principal: Option<&Principal>) -> bool {
+    is_identified_agent(principal)
+        && principal
+            .is_some_and(|p| p.has_capability(conexus_core::capability::Capability::MessagesView))
+}
+
+const PRIORITY_ICON_DEFAULT: &str = "\u{26aa}"; // ⚪
+
+fn priority_icon(priority: &str) -> &'static str {
+    match priority {
+        "low" => "\u{1f535}",    // 🔵
+        "normal" => "\u{26aa}",  // ⚪
+        "high" => "\u{1f7e1}",   // 🟡
+        "urgent" => "\u{1f534}", // 🔴
+        _ => PRIORITY_ICON_DEFAULT,
+    }
+}
+
+/// Retrieve messages for the calling agent (sent and/or received),
+/// marking received ones read by default. Port of
+/// `get_agent_messages_tool_impl`.
+pub struct GetAgentMessagesTool;
+
+impl conexus_auth::Tool for GetAgentMessagesTool {
+    const NAME: &'static str = "get_agent_messages";
+    const REQUIRED: conexus_auth::Requirement = conexus_auth::Requirement::Predicate {
+        check: can_read_own_messages,
+        reason: READ_MESSAGES_DENIED,
+    };
+    const DESCRIPTION: &'static str = "Retrieve messages for the current agent.";
+    const SCHEMA: &'static str = r#"{
+        "type": "object",
+        "properties": {
+            "include_sent": {"type": "boolean", "description": "Include messages sent by this agent", "default": false},
+            "include_received": {"type": "boolean", "description": "Include messages received by this agent", "default": true},
+            "mark_as_read": {"type": "boolean", "description": "Mark retrieved messages as read", "default": true},
+            "limit": {"type": "integer", "description": "Maximum number of messages to retrieve", "default": 20, "minimum": 1, "maximum": 100},
+            "message_type": {"type": "string", "description": "Filter by message type", "enum": ["text", "assistance_request", "task_update", "notification", "stop_command"]},
+            "unread_only": {"type": "boolean", "description": "Only show unread messages", "default": false}
+        },
+        "required": [],
+        "additionalProperties": false
+    }"#;
+
+    fn call<'a>(
+        principal: Option<&'a Principal>,
+        arguments: &'a Value,
+        conn: &'a AsyncMutex<Connection>,
+        _now: &'a str,
+        _ctx: &'a ToolCallContext<'a>,
+    ) -> conexus_auth::BoxFuture<'a, ToolResult> {
+        Box::pin(async move {
+            let principal =
+                principal.expect("Requirement::Predicate already enforced Some(principal)");
+            let agent_id = principal
+                .agent_id
+                .as_deref()
+                .expect("can_read_own_messages already enforced an identified agent");
+
+            let include_sent = arguments
+                .get("include_sent")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let include_received = arguments
+                .get("include_received")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let mark_as_read = arguments
+                .get("mark_as_read")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let limit = match arguments.get("limit").and_then(Value::as_i64) {
+                Some(n) if (1..=100).contains(&n) => n,
+                _ => 20,
+            };
+            let message_type = arguments.get("message_type").and_then(Value::as_str);
+            let unread_only = arguments
+                .get("unread_only")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+
+            if !include_sent && !include_received {
+                return ToolResult::Invalid {
+                    field: None,
+                    message: "Must include sent or received messages".to_string(),
+                };
+            }
+
+            let guard = conn.lock().await;
+            let messages = match conexus_db::message_repository::list_recent_for_agent(
+                &guard,
+                agent_id,
+                &conexus_db::message_repository::RecentMessagesFilters {
+                    include_sent,
+                    include_received,
+                    message_type,
+                    unread_only,
+                    limit,
+                },
+            ) {
+                Ok(rows) => rows,
+                Err(e) => {
+                    return ToolResult::Failed {
+                        message: format!("Database error retrieving messages: {e}"),
+                    }
+                }
+            };
+
+            if mark_as_read && include_received {
+                let received_ids: Vec<&str> = messages
+                    .iter()
+                    .filter(|m| m.recipient_id == agent_id && !m.read)
+                    .map(|m| m.message_id.as_str())
+                    .collect();
+                if !received_ids.is_empty() {
+                    let _ = conexus_db::message_repository::mark_read_by_ids(
+                        &guard,
+                        &received_ids,
+                        Some(agent_id),
+                    );
+                }
+            }
+            drop(guard);
+
+            if messages.is_empty() {
+                return ToolResult::Ok {
+                    data: Some(serde_json::json!({
+                        "agent_id": agent_id, "messages": [], "count": 0
+                    })),
+                    message: Some("No messages found".to_string()),
+                };
+            }
+
+            let mut response_lines = vec![format!(
+                "Messages for {agent_id} (showing {} of max {limit}):",
+                messages.len()
+            )];
+            response_lines.push(String::new());
+
+            let mut rows_for_payload = Vec::with_capacity(messages.len());
+            for msg in &messages {
+                let direction = if msg.sender_id == agent_id {
+                    "\u{27a1}\u{fe0f}" // ➡️
+                } else {
+                    "\u{2b05}\u{fe0f}" // ⬅️
+                };
+                let other_agent = if msg.sender_id == agent_id {
+                    &msg.recipient_id
+                } else {
+                    &msg.sender_id
+                };
+                let read_status = if msg.read { "\u{1f4d6}" } else { "\u{1f4e9}" }; // 📖 / 📩
+                let icon = priority_icon(&msg.priority);
+
+                response_lines.push(format!(
+                    "{direction} {read_status} {icon} [{}] {other_agent}",
+                    msg.message_type
+                ));
+                response_lines.push(format!("   {}", msg.timestamp));
+
+                let (display_subject, subject_is_placeholder) = if msg.parent_message_id.is_some() {
+                    (None, false)
+                } else {
+                    conexus_db::message_repository::message_subject_view(
+                        msg.subject.as_deref(),
+                        &msg.message_content,
+                    )
+                };
+                match (&display_subject, subject_is_placeholder) {
+                    (Some(s), false) => response_lines.push(format!("   Subject: {s}")),
+                    (Some(s), true) => response_lines.push(format!("   Subject (auto): {s}")),
+                    (None, _) => {
+                        if let Some(parent_id) = &msg.parent_message_id {
+                            response_lines.push(format!("   \u{21b3} reply to: {parent_id}"));
+                        }
+                    }
+                }
+                response_lines.push(format!("   {}", msg.message_content));
+                response_lines.push(String::new());
+
+                rows_for_payload.push(serde_json::json!({
+                    "message_id": msg.message_id,
+                    "sender_id": msg.sender_id,
+                    "recipient_id": msg.recipient_id,
+                    "message_content": msg.message_content,
+                    "message_type": msg.message_type,
+                    "priority": msg.priority,
+                    "timestamp": msg.timestamp,
+                    "delivered": msg.delivered,
+                    "read": msg.read,
+                    "subject": display_subject,
+                    "subject_is_placeholder": subject_is_placeholder,
+                    "parent_message_id": msg.parent_message_id,
+                }));
+            }
+
+            // Deliberately NOT ported: `log_audit`'s in-memory trail --
+            // same precedent as every prior tool port this migration
+            // (no Rust reader for it, and no durable `agent_actions`
+            // row exists here either since Python's own call writes
+            // only to the transient trail).
+            ToolResult::Ok {
+                data: Some(serde_json::json!({
+                    "agent_id": agent_id,
+                    "count": rows_for_payload.len(),
+                    "messages": rows_for_payload,
+                })),
+                message: Some(response_lines.join("\n")),
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1530,6 +1753,197 @@ mod tests {
             &json!({}),
             &conn,
             &now_iso(),
+            &ctx,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::PermissionDenied { .. }));
+    }
+
+    // -- get_agent_messages -------------------------------------------
+
+    fn agent_bearer_with_messages_view(agent_id: &str) -> Principal {
+        let mut p = agent_bearer(agent_id);
+        p.capabilities =
+            Capabilities::from_iter([conexus_core::capability::Capability::MessagesView]);
+        p
+    }
+
+    #[test]
+    fn can_read_own_messages_denies_an_empty_bundle_bearer() {
+        // The exact class Python's own docstring names: an agent_bearer
+        // with agent_role None named an agent_id yet holding zero caps.
+        let p = agent_bearer("alice");
+        assert!(!can_read_own_messages(Some(&p)));
+    }
+
+    #[test]
+    fn can_read_own_messages_admits_a_bearer_with_the_capability() {
+        let p = agent_bearer_with_messages_view("alice");
+        assert!(can_read_own_messages(Some(&p)));
+    }
+
+    #[test]
+    fn can_read_own_messages_denies_no_principal() {
+        assert!(!can_read_own_messages(None));
+    }
+
+    #[tokio::test]
+    async fn get_agent_messages_requires_sent_or_received() {
+        use conexus_auth::Tool;
+        let conn = test_conn();
+        seed_agent(&conn, "bob").await;
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let principal = agent_bearer_with_messages_view("bob");
+
+        let result = GetAgentMessagesTool::call(
+            Some(&principal),
+            &json!({"include_sent": false, "include_received": false}),
+            &conn,
+            NOW,
+            &ctx,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Invalid { .. }));
+    }
+
+    #[tokio::test]
+    async fn get_agent_messages_returns_no_messages_found_when_empty() {
+        use conexus_auth::Tool;
+        let conn = test_conn();
+        seed_agent(&conn, "bob").await;
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let principal = agent_bearer_with_messages_view("bob");
+
+        let result =
+            GetAgentMessagesTool::call(Some(&principal), &json!({}), &conn, NOW, &ctx).await;
+        let ToolResult::Ok { message, data } = result else {
+            panic!("expected Ok, got a denial/error");
+        };
+        assert_eq!(message.as_deref(), Some("No messages found"));
+        assert_eq!(data.unwrap()["count"], 0);
+    }
+
+    #[tokio::test]
+    async fn get_agent_messages_returns_and_marks_received_messages_read() {
+        use conexus_auth::Tool;
+        let conn = test_conn();
+        seed_agent(&conn, "alice").await;
+        seed_agent(&conn, "bob").await;
+        {
+            let guard = conn.lock().await;
+            conexus_db::message_repository::send(
+                &guard,
+                conexus_db::message_repository::NewMessage {
+                    message_id: "m1",
+                    sender_id: "alice",
+                    recipient_id: "bob",
+                    message_content: "hi bob",
+                    message_type: "text",
+                    priority: "normal",
+                    timestamp: "2026-01-01T00:00:00Z",
+                    delivered: false,
+                    read: false,
+                    subject: None,
+                    parent_message_id: None,
+                },
+            )
+            .unwrap();
+        }
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let principal = agent_bearer_with_messages_view("bob");
+
+        let result =
+            GetAgentMessagesTool::call(Some(&principal), &json!({}), &conn, NOW, &ctx).await;
+        let ToolResult::Ok { message, data } = result else {
+            panic!("expected Ok, got a denial/error");
+        };
+        let data = data.unwrap();
+        assert_eq!(data["count"], 1);
+        assert_eq!(data["messages"][0]["message_id"], "m1");
+        assert!(message.unwrap().contains("hi bob"));
+
+        // Read status must actually be persisted, not just reflected
+        // in the response.
+        let guard = conn.lock().await;
+        let row = conexus_db::message_repository::get_by_id(&guard, "m1")
+            .unwrap()
+            .unwrap();
+        assert!(
+            row.read,
+            "get_agent_messages must mark received messages read by default"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_agent_messages_mark_as_read_false_leaves_messages_unread() {
+        use conexus_auth::Tool;
+        let conn = test_conn();
+        seed_agent(&conn, "alice").await;
+        seed_agent(&conn, "bob").await;
+        {
+            let guard = conn.lock().await;
+            conexus_db::message_repository::send(
+                &guard,
+                conexus_db::message_repository::NewMessage {
+                    message_id: "m1",
+                    sender_id: "alice",
+                    recipient_id: "bob",
+                    message_content: "hi bob",
+                    message_type: "text",
+                    priority: "normal",
+                    timestamp: "2026-01-01T00:00:00Z",
+                    delivered: false,
+                    read: false,
+                    subject: None,
+                    parent_message_id: None,
+                },
+            )
+            .unwrap();
+        }
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let principal = agent_bearer_with_messages_view("bob");
+
+        let _ = GetAgentMessagesTool::call(
+            Some(&principal),
+            &json!({"mark_as_read": false}),
+            &conn,
+            NOW,
+            &ctx,
+        )
+        .await;
+
+        let guard = conn.lock().await;
+        let row = conexus_db::message_repository::get_by_id(&guard, "m1")
+            .unwrap()
+            .unwrap();
+        assert!(!row.read, "mark_as_read=false must not flip the row");
+    }
+
+    #[tokio::test]
+    async fn get_agent_messages_denies_a_worker_with_no_messages_view_capability() {
+        let conn = test_conn();
+        seed_agent(&conn, "bob").await;
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let principal = agent_bearer("bob"); // no messages.view capability
+        let descriptor = conexus_auth::ToolDescriptor::of::<GetAgentMessagesTool>();
+
+        let result = conexus_auth::dispatch(
+            &descriptor,
+            Some(&principal),
+            &conexus_auth::NoPolicyOverrides,
+            &json!({}),
+            &conn,
+            NOW,
             &ctx,
         )
         .await;
