@@ -1123,6 +1123,475 @@ impl Tool for CreateProjectContextTool {
     }
 }
 
+/// Port of `_single_update_inline` -- upsert one key, gated by
+/// [`check_write_authorization`]. `Ok(true)` if the key was newly
+/// created (matches `upsert`'s own `created` flag; unused by the
+/// caller's response shape today but kept for parity/future use).
+fn single_update_project_context(
+    conn: &Connection,
+    requesting_agent_id: &str,
+    context_key: &str,
+    value_json_str: &str,
+    description: Option<&str>,
+    is_admin: bool,
+    now: &str,
+) -> Result<bool, ToolResult> {
+    if let Some(denial) =
+        check_write_authorization(conn, requesting_agent_id, context_key, is_admin)
+    {
+        return Err(denial);
+    }
+    let (_, created) = project_context_repository::upsert(
+        conn,
+        context_key,
+        value_json_str,
+        description,
+        description.is_some(),
+        requesting_agent_id,
+        now,
+    )
+    .map_err(|_e| ToolResult::Failed {
+        message: "A database error occurred; it has been logged. Retry, or ask an operator to \
+            check logs."
+            .to_string(),
+    })?;
+    let _ = agent_action_repository::log_agent_action(
+        conn,
+        requesting_agent_id,
+        "updated_context",
+        None,
+        Some(&serde_json::json!({"context_key": context_key, "action": "set/update"})),
+        now,
+    );
+    Ok(created)
+}
+
+/// One item's outcome in a bulk update -- Python's `results`/
+/// `failed_updates` string-accumulation, made structural instead of a
+/// pair of parallel `Vec<String>`s (matches this migration's own
+/// closed-enum-over-substring-formatting precedent, e.g.
+/// `UpdateSingleTaskOutcome`).
+enum BulkUpdateOutcome {
+    Updated { context_key: String },
+    Failed { context_key: String, reason: String },
+}
+
+/// Port of `_bulk_update_inline`. Phase 1 authorizes every key up
+/// front -- ANY denial aborts the WHOLE batch (returns `Err`), no
+/// writes land. Phase 2 applies each update; a per-item failure (only
+/// a genuine DB error is possible here -- context_value serialization
+/// is infallible for an already-parsed JSON `Value`, unlike Python's
+/// `json.dumps`) is recorded and does NOT abort the batch, matching
+/// Python's "atomic on authorization, not on per-item success"
+/// design.
+fn bulk_update_project_context_entries(
+    conn: &Connection,
+    requesting_agent_id: &str,
+    updates: &[Value],
+    is_admin: bool,
+    now: &str,
+) -> Result<Vec<BulkUpdateOutcome>, ToolResult> {
+    // Phase 1: authorize every key up front.
+    for update in updates {
+        let Some(key) = update.get("context_key").and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some(denial) = check_write_authorization(conn, requesting_agent_id, key, is_admin) {
+            return Err(denial);
+        }
+    }
+
+    // Phase 2: apply each update.
+    let mut outcomes = Vec::with_capacity(updates.len());
+    for (i, update) in updates.iter().enumerate() {
+        let context_key = update
+            .get("context_key")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let Some(context_value) = update.get("context_value") else {
+            outcomes.push(BulkUpdateOutcome::Failed {
+                context_key: context_key.to_string(),
+                reason: "context_value is required".to_string(),
+            });
+            continue;
+        };
+        // BL-R22-1: `description_provided` is true iff the caller's
+        // item literally HAS a `description` key (Python: `"description"
+        // in update`), regardless of its value -- an explicit
+        // `"description": null` counts as provided (clears the field)
+        // and must NOT fall through to the junk default text below,
+        // which exists only to seed a brand-new key's first CREATE.
+        let description_provided = update.get("description").is_some();
+        let description: Option<String> = match update.get("description") {
+            None => Some(format!("Bulk update operation {}", i + 1)),
+            Some(Value::Null) => None,
+            Some(Value::String(s)) => Some(s.clone()),
+            Some(other) => Some(other.to_string()),
+        };
+
+        let value_json_str = context_value.to_string();
+        let result = project_context_repository::upsert(
+            conn,
+            context_key,
+            &value_json_str,
+            description.as_deref(),
+            description_provided,
+            requesting_agent_id,
+            now,
+        );
+        match result {
+            Ok(_) => {
+                outcomes.push(BulkUpdateOutcome::Updated {
+                    context_key: context_key.to_string(),
+                });
+                let _ = agent_action_repository::log_agent_action(
+                    conn,
+                    requesting_agent_id,
+                    "bulk_updated_context",
+                    None,
+                    Some(&serde_json::json!({
+                        "context_key": context_key,
+                        "operation": format!("bulk_update_{}", i + 1),
+                    })),
+                    now,
+                );
+            }
+            Err(_e) => outcomes.push(BulkUpdateOutcome::Failed {
+                context_key: context_key.to_string(),
+                reason: "database error".to_string(),
+            }),
+        }
+    }
+    Ok(outcomes)
+}
+
+fn render_bulk_summary(outcomes: &[BulkUpdateOutcome]) -> Vec<String> {
+    let successful: Vec<&str> = outcomes
+        .iter()
+        .filter_map(|o| match o {
+            BulkUpdateOutcome::Updated { context_key } => Some(context_key.as_str()),
+            BulkUpdateOutcome::Failed { .. } => None,
+        })
+        .collect();
+    let failed: Vec<(&str, &str)> = outcomes
+        .iter()
+        .filter_map(|o| match o {
+            BulkUpdateOutcome::Failed {
+                context_key,
+                reason,
+            } => Some((context_key.as_str(), reason.as_str())),
+            BulkUpdateOutcome::Updated { .. } => None,
+        })
+        .collect();
+
+    let mut parts = vec![format!(
+        "Bulk update completed: {} successful, {} failed",
+        successful.len(),
+        failed.len()
+    )];
+    if !successful.is_empty() {
+        parts.push("\nSuccessful updates:".to_string());
+        parts.extend(successful.iter().map(|k| format!("\u{2713} Updated '{k}'")));
+    }
+    if !failed.is_empty() {
+        parts.push("\nFailed updates:".to_string());
+        parts.extend(
+            failed
+                .iter()
+                .map(|(k, reason)| format!("\u{2717} Failed '{k}': {reason}")),
+        );
+    }
+    parts
+}
+
+pub struct UpdateProjectContextTool;
+
+impl Tool for UpdateProjectContextTool {
+    const NAME: &'static str = "update_project_context";
+    const REQUIRED: Requirement = Requirement::Predicate {
+        check: can_update_project_context,
+        reason: WRITE_DENIED_REASON,
+    };
+    const DESCRIPTION: &'static str = "Add or update a project context entry with a specific \
+        key. The value can be any JSON-serializable type.";
+    const SCHEMA: &'static str = r#"{
+        "type": "object",
+        "properties": {
+            "context_key": {
+                "type": "string",
+                "description": "The exact key for the context entry (e.g., 'api.service_x.url')."
+            },
+            "context_value": {
+                "description": "The JSON-serializable value to set (e.g., string, number, list, dict).",
+                "anyOf": [
+                    {"type": "string"},
+                    {"type": "number"},
+                    {"type": "boolean"},
+                    {"type": "null"},
+                    {"type": "object", "additionalProperties": true},
+                    {"type": "array"}
+                ]
+            },
+            "description": {
+                "type": "string",
+                "description": "Optional description of this context entry."
+            }
+        },
+        "required": ["context_key", "context_value"],
+        "additionalProperties": false
+    }"#;
+
+    fn call<'a>(
+        principal: Option<&'a Principal>,
+        arguments: &'a Value,
+        conn: &'a AsyncMutex<Connection>,
+        now: &'a str,
+        ctx: &'a conexus_auth::ToolCallContext<'a>,
+    ) -> conexus_auth::BoxFuture<'a, ToolResult> {
+        Box::pin(async move {
+            let requesting_agent_id = principal.map(Principal::actor_label).unwrap_or("unknown");
+            let is_admin = principal.is_some_and(conexus_core::principal::is_operator_tier);
+
+            // Support both single and bulk operations, matching
+            // Python's own dispatch-by-argument-shape (the JSON schema
+            // above doesn't declare `updates` at all -- this crate's
+            // dispatcher doesn't enforce JSON-schema validation on
+            // `tools/call` arguments either, matching Python's own
+            // real behavior, so this branch is genuinely reachable).
+            if let Some(updates_value) = arguments.get("updates") {
+                let Some(updates) = updates_value.as_array().filter(|a| !a.is_empty()) else {
+                    return ToolResult::Invalid {
+                        field: Some("updates".to_string()),
+                        message: "updates must be a non-empty list for bulk operations."
+                            .to_string(),
+                    };
+                };
+
+                let guard = conn.lock().await;
+                let outcomes = match bulk_update_project_context_entries(
+                    &guard,
+                    requesting_agent_id,
+                    updates,
+                    is_admin,
+                    now,
+                ) {
+                    Ok(o) => o,
+                    Err(denial) => return denial,
+                };
+                drop(guard);
+
+                let keys: Vec<&str> = updates
+                    .iter()
+                    .filter_map(|u| u.get("context_key").and_then(Value::as_str))
+                    .collect();
+                let wakes: Vec<&str> = {
+                    let guard = conn.lock().await;
+                    wake_notify::deliver_bulk(&guard, ctx.waiter_registry, keys)
+                }
+                .into_iter()
+                .map(|w| w.as_str())
+                .collect();
+
+                let summary = render_bulk_summary(&outcomes);
+                return ToolResult::Ok {
+                    data: Some(serde_json::json!({
+                        "updates_attempted": updates.len(),
+                        "summary_lines": summary,
+                        "wakes": wakes,
+                    })),
+                    message: Some(summary.join("\n")),
+                };
+            }
+
+            let Some(context_key) = arguments
+                .get("context_key")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            else {
+                return ToolResult::Invalid {
+                    field: Some("context_key".to_string()),
+                    message: "context_key and context_value are required for single updates."
+                        .to_string(),
+                };
+            };
+            let Some(context_value) = arguments.get("context_value") else {
+                return ToolResult::Invalid {
+                    field: Some("context_value".to_string()),
+                    message: "context_key and context_value are required for single updates."
+                        .to_string(),
+                };
+            };
+            let description = arguments.get("description").and_then(Value::as_str);
+            let value_json_str = context_value.to_string();
+
+            let guard = conn.lock().await;
+            if let Err(denial) = single_update_project_context(
+                &guard,
+                requesting_agent_id,
+                context_key,
+                &value_json_str,
+                description,
+                is_admin,
+                now,
+            ) {
+                return denial;
+            }
+            drop(guard);
+
+            let wakes: Vec<&str> = {
+                let guard = conn.lock().await;
+                wake_notify::deliver(&guard, ctx.waiter_registry, context_key)
+            }
+            .into_iter()
+            .map(|w| w.as_str())
+            .collect();
+
+            ToolResult::Ok {
+                data: Some(serde_json::json!({"context_key": context_key, "wakes": wakes})),
+                message: Some(format!(
+                    "Project context updated successfully for key '{context_key}'."
+                )),
+            }
+        })
+    }
+}
+
+pub struct BulkUpdateProjectContextTool;
+
+impl Tool for BulkUpdateProjectContextTool {
+    const NAME: &'static str = "bulk_update_project_context";
+    const REQUIRED: Requirement = Requirement::Predicate {
+        check: can_update_project_context,
+        reason: WRITE_DENIED_REASON,
+    };
+    const DESCRIPTION: &'static str = "Update multiple project context entries atomically. \
+        Essential for large-scale context corrections.";
+    const SCHEMA: &'static str = r#"{
+        "type": "object",
+        "properties": {
+            "updates": {
+                "type": "array",
+                "description": "Array of update operations",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "context_key": {
+                            "type": "string",
+                            "description": "The context key to update"
+                        },
+                        "context_value": {
+                            "description": "The new value (any JSON-serializable type)",
+                            "anyOf": [
+                                {"type": "string"},
+                                {"type": "number"},
+                                {"type": "boolean"},
+                                {"type": "null"},
+                                {"type": "object"},
+                                {"type": "array"}
+                            ]
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "Optional description for this update"
+                        }
+                    },
+                    "required": ["context_key", "context_value"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["updates"],
+        "additionalProperties": false
+    }"#;
+
+    fn call<'a>(
+        principal: Option<&'a Principal>,
+        arguments: &'a Value,
+        conn: &'a AsyncMutex<Connection>,
+        now: &'a str,
+        ctx: &'a conexus_auth::ToolCallContext<'a>,
+    ) -> conexus_auth::BoxFuture<'a, ToolResult> {
+        Box::pin(async move {
+            let Some(updates) = arguments.get("updates").and_then(Value::as_array) else {
+                return ToolResult::Invalid {
+                    field: Some("updates".to_string()),
+                    message: "updates array is required.".to_string(),
+                };
+            };
+            if updates.is_empty() {
+                return ToolResult::Invalid {
+                    field: Some("updates".to_string()),
+                    message: "updates array is required.".to_string(),
+                };
+            }
+            // This standalone tool validates every item's SHAPE up
+            // front (a genuine, documented difference from
+            // update_project_context's bulk arm, which tolerates a
+            // malformed item by failing just that item during Phase 2
+            // -- ported as-is, not reconciled, per this migration's
+            // "re-derive the documented behavior" discipline).
+            for (i, update) in updates.iter().enumerate() {
+                if !update.is_object() {
+                    return ToolResult::Invalid {
+                        field: Some(format!("updates[{i}]")),
+                        message: format!("Update {i} must be an object."),
+                    };
+                }
+                if update.get("context_key").is_none() {
+                    return ToolResult::Invalid {
+                        field: Some(format!("updates[{i}].context_key")),
+                        message: format!("Update {i} missing required 'context_key'."),
+                    };
+                }
+                if update.get("context_value").is_none() {
+                    return ToolResult::Invalid {
+                        field: Some(format!("updates[{i}].context_value")),
+                        message: format!("Update {i} missing required 'context_value'."),
+                    };
+                }
+            }
+
+            let requesting_agent_id = principal.map(Principal::actor_label).unwrap_or("unknown");
+            let is_admin = principal.is_some_and(conexus_core::principal::is_operator_tier);
+
+            let guard = conn.lock().await;
+            let outcomes = match bulk_update_project_context_entries(
+                &guard,
+                requesting_agent_id,
+                updates,
+                is_admin,
+                now,
+            ) {
+                Ok(o) => o,
+                Err(denial) => return denial,
+            };
+            drop(guard);
+
+            let keys: Vec<&str> = updates
+                .iter()
+                .filter_map(|u| u.get("context_key").and_then(Value::as_str))
+                .collect();
+            let wakes: Vec<&str> = {
+                let guard = conn.lock().await;
+                wake_notify::deliver_bulk(&guard, ctx.waiter_registry, keys)
+            }
+            .into_iter()
+            .map(|w| w.as_str())
+            .collect();
+
+            let summary = render_bulk_summary(&outcomes);
+            ToolResult::Ok {
+                data: Some(serde_json::json!({
+                    "updates_attempted": updates.len(),
+                    "summary_lines": summary,
+                    "wakes": wakes,
+                })),
+                message: Some(summary.join("\n")),
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1833,5 +2302,384 @@ mod tests {
             max_len as usize,
             conexus_core::schema_limits::IDENTIFIER_MAX_LEN
         );
+    }
+
+    // ── UpdateProjectContextTool ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn single_update_creates_a_new_key_when_it_does_not_exist() {
+        let conn = setup().await;
+        let alice = worker();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = UpdateProjectContextTool::call(
+            Some(&alice),
+            &serde_json::json!({"context_key": "fresh.key", "context_value": "v1"}),
+            &conn,
+            "2026-06-01T00:00:00Z",
+            &c,
+        )
+        .await;
+        let ToolResult::Ok { data, .. } = result else {
+            panic!("expected Ok, got {result:?}");
+        };
+        assert_eq!(data.unwrap()["context_key"], "fresh.key");
+    }
+
+    #[tokio::test]
+    async fn single_update_without_description_preserves_the_existing_one() {
+        let conn = setup().await;
+        {
+            let guard = conn.lock().await;
+            project_context_repository::create_new(
+                &guard,
+                "k",
+                "\"v1\"",
+                Some("original description"),
+                "alice",
+                "2026-06-01T00:00:00Z",
+            )
+            .unwrap();
+        }
+        let alice = worker();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = UpdateProjectContextTool::call(
+            Some(&alice),
+            &serde_json::json!({"context_key": "k", "context_value": "v2"}),
+            &conn,
+            "2026-06-01T00:01:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        let guard = conn.lock().await;
+        let row = project_context_repository::get(&guard, "k")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.value, "\"v2\"");
+        assert_eq!(row.description.as_deref(), Some("original description"));
+    }
+
+    #[tokio::test]
+    async fn single_update_denies_a_foreign_key_for_a_non_admin() {
+        let conn = setup().await;
+        seed_context(&conn, "k", "\"v1\"", "2026-06-01T00:00:00Z").await;
+        let bob = Principal {
+            agent_id: Some("bob".to_string()),
+            ..worker()
+        };
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = UpdateProjectContextTool::call(
+            Some(&bob),
+            &serde_json::json!({"context_key": "k", "context_value": "v2"}),
+            &conn,
+            "2026-06-01T00:01:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::PermissionDenied { .. }));
+    }
+
+    #[tokio::test]
+    async fn update_tool_schema_does_not_declare_updates_matching_pythons_own_inconsistency() {
+        let parsed: Value = serde_json::from_str(UpdateProjectContextTool::SCHEMA).unwrap();
+        assert!(parsed["properties"].get("updates").is_none());
+    }
+
+    #[tokio::test]
+    async fn update_tools_bulk_arm_dispatches_on_updates_presence_even_though_schema_omits_it() {
+        let conn = setup().await;
+        let alice = worker();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = UpdateProjectContextTool::call(
+            Some(&alice),
+            &serde_json::json!({"updates": [
+                {"context_key": "a", "context_value": "1"},
+                {"context_key": "b", "context_value": "2"},
+            ]}),
+            &conn,
+            "2026-06-01T00:00:00Z",
+            &c,
+        )
+        .await;
+        let ToolResult::Ok { data, .. } = result else {
+            panic!("expected Ok, got {result:?}");
+        };
+        assert_eq!(data.unwrap()["updates_attempted"], 2);
+    }
+
+    #[tokio::test]
+    async fn update_tools_bulk_arm_tolerates_a_malformed_item_matching_pythons_lax_validation() {
+        // A genuine, documented Python behavioral asymmetry: this
+        // surface's bulk arm does NOT validate item shape up front --
+        // a malformed item fails only that item during Phase 2, the
+        // batch is not aborted. Contrast with
+        // `bulk_tools_own_strict_validation_rejects_the_whole_batch_
+        // upfront` below.
+        let conn = setup().await;
+        let alice = worker();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = UpdateProjectContextTool::call(
+            Some(&alice),
+            &serde_json::json!({"updates": [
+                {"context_key": "good"},
+                {"context_key": "also_good", "context_value": "1"},
+            ]}),
+            &conn,
+            "2026-06-01T00:00:00Z",
+            &c,
+        )
+        .await;
+        let ToolResult::Ok { data, .. } = result else {
+            panic!("expected Ok (batch not aborted), got {result:?}");
+        };
+        let data = data.unwrap();
+        assert_eq!(data["updates_attempted"], 2);
+        let lines: Vec<&str> = data["summary_lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(lines.iter().any(|l| l.contains("1 successful")));
+        assert!(lines.iter().any(|l| l.contains("1 failed")));
+    }
+
+    #[tokio::test]
+    async fn bulk_update_authorizes_every_key_up_front_aborting_the_whole_batch_on_denial() {
+        let conn = setup().await;
+        {
+            let guard = conn.lock().await;
+            project_context_repository::create_new(
+                &guard,
+                "owned-by-bob",
+                "\"v\"",
+                Some("d"),
+                "bob",
+                "2026-06-01T00:00:00Z",
+            )
+            .unwrap();
+        }
+        let alice = worker();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = UpdateProjectContextTool::call(
+            Some(&alice),
+            &serde_json::json!({"updates": [
+                {"context_key": "alice-owned-new", "context_value": "1"},
+                {"context_key": "owned-by-bob", "context_value": "2"},
+            ]}),
+            &conn,
+            "2026-06-01T00:01:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::PermissionDenied { .. }));
+        // Zero writes landed -- the whole batch aborted, including the
+        // key that would otherwise have been perfectly fine.
+        let guard = conn.lock().await;
+        assert!(project_context_repository::get(&guard, "alice-owned-new")
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn bulk_update_delivers_wake_all_for_flag_recheck_only_once_per_batch() {
+        // config_* keys are always rejected by check_write_authorization
+        // (same real finding as CreateProjectContextTool's own test) --
+        // this proves deliver_bulk's dedup logic directly via a
+        // non-namespaced pseudo-key is not reachable through THIS
+        // tool either, matching the sibling test's documented finding.
+        let conn = setup().await;
+        let alice = worker();
+        let registry = WaiterRegistry::new();
+        let (_sender, mut receiver) = registry.register("alice");
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = UpdateProjectContextTool::call(
+            Some(&alice),
+            &serde_json::json!({"updates": [
+                {"context_key": "config_auto_event_loop_global", "context_value": true},
+            ]}),
+            &conn,
+            "2026-06-01T00:00:00Z",
+            &c,
+        )
+        .await;
+        // config_* rejection is Invalid, not PermissionDenied --
+        // config_key_error()'s own documented worker-message-clarity
+        // choice (see this file's check_write_authorization).
+        assert!(matches!(result, ToolResult::Invalid { .. }));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    // ── BulkUpdateProjectContextTool ─────────────────────────────────
+
+    #[tokio::test]
+    async fn bulk_tools_own_strict_validation_rejects_the_whole_batch_upfront() {
+        // The genuine, documented Python asymmetry from the other
+        // direction: THIS standalone tool validates every item's shape
+        // BEFORE any write, so a malformed item hard-fails the call
+        // instead of just failing that one item.
+        let conn = setup().await;
+        let alice = worker();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = BulkUpdateProjectContextTool::call(
+            Some(&alice),
+            &serde_json::json!({"updates": [
+                {"context_key": "good", "context_value": "1"},
+                {"context_key": "missing_value"},
+            ]}),
+            &conn,
+            "2026-06-01T00:00:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Invalid { .. }));
+        // Zero writes landed -- the shape check happens before Phase 1
+        // authorization even starts.
+        let guard = conn.lock().await;
+        assert!(project_context_repository::get(&guard, "good")
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn bulk_tool_happy_path_updates_every_item() {
+        let conn = setup().await;
+        let alice = worker();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = BulkUpdateProjectContextTool::call(
+            Some(&alice),
+            &serde_json::json!({"updates": [
+                {"context_key": "a", "context_value": "1"},
+                {"context_key": "b", "context_value": "2", "description": "desc-b"},
+            ]}),
+            &conn,
+            "2026-06-01T00:00:00Z",
+            &c,
+        )
+        .await;
+        let ToolResult::Ok { data, .. } = result else {
+            panic!("expected Ok, got {result:?}");
+        };
+        assert_eq!(data.unwrap()["updates_attempted"], 2);
+        let guard = conn.lock().await;
+        let a = project_context_repository::get(&guard, "a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.value, "\"1\"");
+        let b = project_context_repository::get(&guard, "b")
+            .unwrap()
+            .unwrap();
+        assert_eq!(b.description.as_deref(), Some("desc-b"));
+    }
+
+    #[tokio::test]
+    async fn bulk_tool_an_explicit_null_description_clears_an_existing_one() {
+        let conn = setup().await;
+        {
+            let guard = conn.lock().await;
+            project_context_repository::create_new(
+                &guard,
+                "k",
+                "\"v1\"",
+                Some("original"),
+                "alice",
+                "2026-06-01T00:00:00Z",
+            )
+            .unwrap();
+        }
+        let alice = worker();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = BulkUpdateProjectContextTool::call(
+            Some(&alice),
+            &serde_json::json!({"updates": [
+                {"context_key": "k", "context_value": "v2", "description": null},
+            ]}),
+            &conn,
+            "2026-06-01T00:01:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        let guard = conn.lock().await;
+        let row = project_context_repository::get(&guard, "k")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.description, None);
+    }
+
+    #[tokio::test]
+    async fn bulk_tool_applies_every_authorized_item_in_the_batch() {
+        // Phase 2 applies each authorized item independently -- with
+        // both items passing Phase 1 authorization (new, non-config_*
+        // keys), both must land, including a non-string JSON value.
+        let conn = setup().await;
+        let alice = worker();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = BulkUpdateProjectContextTool::call(
+            Some(&alice),
+            &serde_json::json!({"updates": [
+                {"context_key": "x", "context_value": 1},
+                {"context_key": "y", "context_value": {"nested": true}},
+            ]}),
+            &conn,
+            "2026-06-01T00:00:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        let guard = conn.lock().await;
+        assert!(project_context_repository::get(&guard, "x")
+            .unwrap()
+            .is_some());
+        assert!(project_context_repository::get(&guard, "y")
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn bulk_tool_empty_updates_array_is_invalid() {
+        let conn = setup().await;
+        let alice = worker();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = BulkUpdateProjectContextTool::call(
+            Some(&alice),
+            &serde_json::json!({"updates": []}),
+            &conn,
+            "2026-06-01T00:00:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Invalid { .. }));
+    }
+
+    #[tokio::test]
+    async fn bulk_tool_denies_a_viewer_tier_operator() {
+        let viewer = viewer_operator();
+        let denied = BulkUpdateProjectContextTool::REQUIRED
+            .check(Some(&viewer), &conexus_auth::NoPolicyOverrides);
+        assert!(denied.is_err());
     }
 }

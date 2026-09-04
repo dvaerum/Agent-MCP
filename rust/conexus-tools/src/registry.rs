@@ -15,7 +15,8 @@ use crate::assign_task_tools::{AssignTaskTool, CreateSelfTaskTool};
 use crate::file_management_tools::{CheckFileStatusTool, UpdateFileStatusTool};
 use crate::file_metadata_tools::{UpdateFileMetadataTool, ViewFileMetadataTool};
 use crate::project_context_tools::{
-    CreateProjectContextTool, ValidateContextConsistencyTool, ViewProjectContextTool,
+    BulkUpdateProjectContextTool, CreateProjectContextTool, UpdateProjectContextTool,
+    ValidateContextConsistencyTool, ViewProjectContextTool,
 };
 use crate::project_settings_tools::{
     DeleteProjectSettingsTool, UpdateProjectSettingsTool, ViewProjectSettingsTool,
@@ -36,7 +37,7 @@ use crate::utility_tools::TestTool;
 // compile-time `static` array (needs a named `static`, not an inline
 // `&[...]` literal, since the array's elements aren't const-promotable
 // through a non-const fn body).
-static ALL_TOOLS: [ToolDescriptor; 33] = [
+static ALL_TOOLS: [ToolDescriptor; 35] = [
     ToolDescriptor::of::<ViewProjectSettingsTool>(),
     ToolDescriptor::of::<UpdateProjectSettingsTool>(),
     ToolDescriptor::of::<DeleteProjectSettingsTool>(),
@@ -70,6 +71,8 @@ static ALL_TOOLS: [ToolDescriptor; 33] = [
     ToolDescriptor::of::<ValidateContextConsistencyTool>(),
     ToolDescriptor::of::<ViewProjectContextTool>(),
     ToolDescriptor::of::<CreateProjectContextTool>(),
+    ToolDescriptor::of::<UpdateProjectContextTool>(),
+    ToolDescriptor::of::<BulkUpdateProjectContextTool>(),
 ];
 
 pub fn all_tools() -> &'static [ToolDescriptor] {
@@ -224,6 +227,8 @@ mod tests {
                 "validate_context_consistency",
                 "view_project_context",
                 "create_project_context",
+                "update_project_context",
+                "bulk_update_project_context",
             ])
         );
     }
