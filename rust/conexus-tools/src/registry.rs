@@ -14,14 +14,15 @@ use crate::project_settings_tools::{
 };
 use crate::rag_tools::AskProjectRagTool;
 use crate::task_tools::{
-    CreateTaskTool, SearchTasksTool, UpdateTaskStatusTool, UpdateTaskTool, ViewTasksTool,
+    CreateTaskTool, DeleteTaskTool, SearchTasksTool, UpdateTaskStatusTool, UpdateTaskTool,
+    ViewTasksTool,
 };
 
 // `ToolDescriptor::of` is `const fn`, so the whole registry is a
 // compile-time `static` array (needs a named `static`, not an inline
 // `&[...]` literal, since the array's elements aren't const-promotable
 // through a non-const fn body).
-static ALL_TOOLS: [ToolDescriptor; 11] = [
+static ALL_TOOLS: [ToolDescriptor; 12] = [
     ToolDescriptor::of::<ViewProjectSettingsTool>(),
     ToolDescriptor::of::<UpdateProjectSettingsTool>(),
     ToolDescriptor::of::<DeleteProjectSettingsTool>(),
@@ -33,6 +34,7 @@ static ALL_TOOLS: [ToolDescriptor; 11] = [
     ToolDescriptor::of::<CreateTaskTool>(),
     ToolDescriptor::of::<UpdateTaskStatusTool>(),
     ToolDescriptor::of::<UpdateTaskTool>(),
+    ToolDescriptor::of::<DeleteTaskTool>(),
 ];
 
 pub fn all_tools() -> &'static [ToolDescriptor] {
@@ -159,6 +161,7 @@ mod tests {
                 "create_task",
                 "update_task_status",
                 "update_task",
+                "delete_task",
             ])
         );
     }
