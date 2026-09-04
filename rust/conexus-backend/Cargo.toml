@@ -1,0 +1,54 @@
+[package]
+name = "conexus-backend"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "CoNexus per-project MCP backend binary (Phase D1). See /home/dennis/.claude/plans/prancy-napping-pie.md."
+
+[[bin]]
+name = "conexus-backend"
+path = "src/main.rs"
+
+[dependencies]
+conexus-core = { path = "../conexus-core" }
+conexus-db = { path = "../conexus-db" }
+conexus-auth = { path = "../conexus-auth" }
+conexus-tools = { path = "../conexus-tools" }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# CLI flag parsing -- matches the real invocation contract
+# nix/packages.nix's wrapper generates (--uds/--project-dir/
+# --forwarding-hmac-in/--no-tui/--transport). New dependency for this
+# repo's Rust workspace, but the standard/idiomatic choice -- both
+# sibling repos (pikvm_mcp_server, m365-bridge) already use it for
+# their own MCP binaries' CLI surface.
+clap = { version = "4", features = ["derive"] }
+# Top-level error handling for the binary -- matches aoe-bridge's own
+# convention elsewhere in this repo (`anyhow` at the binary boundary;
+# the library crates below it keep their own targeted Result types).
+anyhow = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+# rmcp EXACTLY 3.1.4, not "3.1" (which would float up to 3.2.0):
+# 3.2.0 changed several APIs this crate uses (CallToolResponse return
+# shape, deprecated the Logging notification family, several structs
+# went #[non_exhaustive]) -- confirmed by this migration's own Phase 0
+# transport spike (docs/learnings/rust-migration-mcp-transport-spike.md).
+# Matches what pikvm_mcp_server/m365-bridge already ship in production.
+# "server" + "transport-streamable-http-server" only -- no "macros"
+# feature, since Tool registration is hand-written
+# (conexus-tools::all_tools()) per the migration plan's explicit
+# rejection of proc-macro/inventory::submit! auto-collection.
+rmcp = { version = "=3.1.4", features = ["server", "transport-streamable-http-server"] }
+axum = "0.8"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "service"] }
+
+[dev-dependencies]
+tempfile = "3"
+# "client" -- integration tests drive requests over a real UnixStream
+# via hyper's own client, the only realistic way to exercise the UDS
+# accept loop end-to-end without an extra Unix-socket connector crate.
+hyper = { version = "1", features = ["http1", "server", "client"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util", "process"] }
