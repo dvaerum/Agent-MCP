@@ -8,7 +8,7 @@
 
 use conexus_auth::ToolDescriptor;
 
-use crate::admin_tools::{GetAgentTokensTool, ViewAuditLogTool, ViewStatusTool};
+use crate::admin_tools::{GetAgentTokensTool, RegisterAgentTool, ViewAuditLogTool, ViewStatusTool};
 use crate::agent_communication_tools::{FetchEventsSinceTool, WaitForEventsTool};
 use crate::agent_roster_tools::ViewAgentsTool;
 use crate::agent_tools::GetSystemPromptTool;
@@ -39,7 +39,7 @@ use crate::utility_tools::TestTool;
 // compile-time `static` array (needs a named `static`, not an inline
 // `&[...]` literal, since the array's elements aren't const-promotable
 // through a non-const fn body).
-static ALL_TOOLS: [ToolDescriptor; 40] = [
+static ALL_TOOLS: [ToolDescriptor; 41] = [
     ToolDescriptor::of::<ViewProjectSettingsTool>(),
     ToolDescriptor::of::<UpdateProjectSettingsTool>(),
     ToolDescriptor::of::<DeleteProjectSettingsTool>(),
@@ -80,6 +80,7 @@ static ALL_TOOLS: [ToolDescriptor; 40] = [
     ToolDescriptor::of::<ViewAuditLogTool>(),
     ToolDescriptor::of::<GetAgentTokensTool>(),
     ToolDescriptor::of::<ViewStatusTool>(),
+    ToolDescriptor::of::<RegisterAgentTool>(),
 ];
 
 pub fn all_tools() -> &'static [ToolDescriptor] {
@@ -241,6 +242,7 @@ mod tests {
                 "view_audit_log",
                 "get_agent_tokens",
                 "view_status",
+                "register_agent",
             ])
         );
     }
