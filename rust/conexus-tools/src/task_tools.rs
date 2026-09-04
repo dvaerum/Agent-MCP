@@ -390,14 +390,14 @@ fn parse_sort_by(s: &str) -> SortBy {
     }
 }
 
-fn str_arg(arguments: &Value, key: &str) -> Option<String> {
+pub(crate) fn str_arg(arguments: &Value, key: &str) -> Option<String> {
     arguments
         .get(key)
         .and_then(Value::as_str)
         .map(str::to_string)
 }
 
-fn bool_arg(arguments: &Value, key: &str) -> bool {
+pub(crate) fn bool_arg(arguments: &Value, key: &str) -> bool {
     arguments.get(key).and_then(Value::as_bool).unwrap_or(false)
 }
 
@@ -1228,7 +1228,7 @@ impl Tool for SearchTasksTool {
 // `start_after` bug, decision 5), it is ported bit-for-bit rather than
 // quietly changed to `"pending"`.
 
-fn normalize_parent(value: Option<&Value>) -> Option<String> {
+pub(crate) fn normalize_parent(value: Option<&Value>) -> Option<String> {
     match value {
         Some(Value::String(s)) => {
             let trimmed = s.trim();
@@ -1247,7 +1247,7 @@ fn normalize_parent(value: Option<&Value>) -> Option<String> {
 /// `trg_tasks_terminal_state_guard` trigger's guarded columns (only
 /// status/priority/notes/title/description/assigned_to-reassign are),
 /// so this update always succeeds regardless of the parent's status.
-fn link_child_to_parent(
+pub(crate) fn link_child_to_parent(
     conn: &Connection,
     parent_task_id: Option<&str>,
     child_task_id: &str,
@@ -1552,7 +1552,7 @@ fn outcome_error_message(
     }
 }
 
-fn str_array_arg(arguments: &Value, key: &str) -> Option<Vec<String>> {
+pub(crate) fn str_array_arg(arguments: &Value, key: &str) -> Option<Vec<String>> {
     arguments.get(key).and_then(Value::as_array).map(|items| {
         items
             .iter()

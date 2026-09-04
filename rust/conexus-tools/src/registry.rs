@@ -9,6 +9,7 @@
 use conexus_auth::ToolDescriptor;
 
 use crate::agent_communication_tools::{FetchEventsSinceTool, WaitForEventsTool};
+use crate::assign_task_tools::{AssignTaskTool, CreateSelfTaskTool};
 use crate::project_settings_tools::{
     DeleteProjectSettingsTool, UpdateProjectSettingsTool, ViewProjectSettingsTool,
 };
@@ -22,7 +23,7 @@ use crate::task_tools::{
 // compile-time `static` array (needs a named `static`, not an inline
 // `&[...]` literal, since the array's elements aren't const-promotable
 // through a non-const fn body).
-static ALL_TOOLS: [ToolDescriptor; 12] = [
+static ALL_TOOLS: [ToolDescriptor; 14] = [
     ToolDescriptor::of::<ViewProjectSettingsTool>(),
     ToolDescriptor::of::<UpdateProjectSettingsTool>(),
     ToolDescriptor::of::<DeleteProjectSettingsTool>(),
@@ -35,6 +36,8 @@ static ALL_TOOLS: [ToolDescriptor; 12] = [
     ToolDescriptor::of::<UpdateTaskStatusTool>(),
     ToolDescriptor::of::<UpdateTaskTool>(),
     ToolDescriptor::of::<DeleteTaskTool>(),
+    ToolDescriptor::of::<AssignTaskTool>(),
+    ToolDescriptor::of::<CreateSelfTaskTool>(),
 ];
 
 pub fn all_tools() -> &'static [ToolDescriptor] {
@@ -162,6 +165,8 @@ mod tests {
                 "update_task_status",
                 "update_task",
                 "delete_task",
+                "assign_task",
+                "create_self_task",
             ])
         );
     }
