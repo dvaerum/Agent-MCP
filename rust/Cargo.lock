@@ -387,6 +387,7 @@ dependencies = [
  "conexus-core",
  "conexus-db",
  "rusqlite",
+ "serde",
  "serde_json",
  "tokio",
 ]

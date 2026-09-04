@@ -19,7 +19,7 @@ use std::sync::Mutex;
 
 /// One claim record. Mirrors Python's `g.file_map[path]` dict shape
 /// (`{"agent_id", "timestamp", "status"}`) as a real struct.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct FileMapEntry {
     pub agent_id: String,
     pub timestamp: String,
@@ -74,6 +74,33 @@ impl FileMap {
     pub fn release(&self, resolved_path: &str) -> bool {
         self.entries.lock().unwrap().remove(resolved_path).is_some()
     }
+
+    /// The current number of claimed paths. Port of Python's
+    /// `len(g.file_map)` (`view_status`'s `file_map_size` field).
+    pub fn len(&self) -> usize {
+        self.entries.lock().unwrap().len()
+    }
+
+    /// True iff no path is currently claimed.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The first `n` claimed paths (arbitrary order -- `HashMap`
+    /// carries no ordering guarantee, matching Python's own
+    /// insertion-order-agnostic `dict.items()` slice in practice
+    /// since CPython's ordering isn't a documented contract this
+    /// preview relies on either). Port of `view_status`'s
+    /// `file_map_preview` field.
+    pub fn preview(&self, n: usize) -> Vec<(String, FileMapEntry)> {
+        self.entries
+            .lock()
+            .unwrap()
+            .iter()
+            .take(n)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -120,5 +147,30 @@ mod tests {
     fn releasing_an_untracked_path_reports_it_was_not_present() {
         let map = FileMap::new();
         assert!(!map.release("/tmp/never-claimed.txt"));
+    }
+
+    #[test]
+    fn len_and_is_empty_reflect_the_current_claim_count() {
+        let map = FileMap::new();
+        assert_eq!(map.len(), 0);
+        assert!(map.is_empty());
+        map.claim("/tmp/a.txt", "worker-1", "editing", "2026-06-01T00:00:00Z");
+        assert_eq!(map.len(), 1);
+        assert!(!map.is_empty());
+    }
+
+    #[test]
+    fn preview_caps_at_n_entries() {
+        let map = FileMap::new();
+        for i in 0..10 {
+            map.claim(
+                &format!("/tmp/{i}.txt"),
+                "worker-1",
+                "editing",
+                "2026-06-01T00:00:00Z",
+            );
+        }
+        assert_eq!(map.preview(5).len(), 5);
+        assert_eq!(map.preview(100).len(), 10);
     }
 }
