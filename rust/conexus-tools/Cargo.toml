@@ -40,6 +40,13 @@ reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
     "charset",
 ] }
+# admin_tools' register_agent/rotate_agent_token bearer-token generator
+# (Phase D5, PR 9.1) -- Python's `secrets.token_hex(16)` reads straight
+# from `os.urandom`; `getrandom` IS that same OS-CSPRNG call (it's the
+# crate `rand`'s own `OsRng` is built on), used directly instead of
+# pulling in the rest of `rand`'s API surface for one 16-byte fill.
+getrandom = "0.4"
+hex = "0.4"
 
 [dev-dependencies]
 # Union of both features sets that need a runtime in tests: driving an
