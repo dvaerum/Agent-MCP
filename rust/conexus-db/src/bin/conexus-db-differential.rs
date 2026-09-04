@@ -127,6 +127,7 @@ fn agent_field(name: &str) -> Option<AgentField> {
         "last_activity_at" => AgentField::LastActivityAt,
         "last_event_seen_at" => AgentField::LastEventSeenAt,
         "agent_role" => AgentField::AgentRole,
+        "aoe_session_id" => AgentField::AoeSessionId,
         _ => return None,
     })
 }
