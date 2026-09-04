@@ -12,6 +12,7 @@ pub mod embedding_client;
 pub mod project_settings_tools;
 pub mod rag_tools;
 pub mod registry;
+pub mod task_mutation_engine;
 pub mod task_query_engine;
 pub mod task_tools;
 pub mod wake_notify;

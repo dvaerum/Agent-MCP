@@ -81,6 +81,52 @@ impl ProgressSink for PeerProgressSink {
     }
 }
 
+/// A per-request [`conexus_auth::PolicySource`] snapshot: the real
+/// `config_*` overrides a `Requirement::Policy`-gated tool's OWN
+/// declared `keys` resolve to in `project_settings`, read through one
+/// short-lived lock BEFORE `dispatch` runs (never held across it --
+/// see `call_tool`'s own comment on why).
+///
+/// Closes a gap flagged repeatedly through Phase D ("`PolicySource`
+/// stays deferred... no real `Policy`-gated tool exists yet to need
+/// it") and left as `NoPolicyOverrides` until now: `update_task_status`/
+/// `update_task` (Phase D4, PR 5) are the first real `Policy`-gated
+/// tools, so a project operator's `config_allow_worker_update_own_status`
+/// toggle must actually be read, not silently ignored in favor of the
+/// `Requirement`'s hardcoded `default` forever.
+struct SnapshotPolicySource(std::collections::HashMap<&'static str, bool>);
+
+impl SnapshotPolicySource {
+    async fn resolve(
+        conn: &AsyncMutex<rusqlite::Connection>,
+        required: &conexus_auth::Requirement,
+    ) -> Self {
+        let conexus_auth::Requirement::Policy { keys, .. } = required else {
+            // Every other Requirement variant never calls
+            // `PolicySource::get_bool` at all (see `Requirement::check`) --
+            // no point paying for a lock on a tool that isn't
+            // Policy-gated.
+            return SnapshotPolicySource(std::collections::HashMap::new());
+        };
+        let guard = conn.lock().await;
+        let mut map = std::collections::HashMap::new();
+        for key in *keys {
+            if let Some(value) =
+                conexus_db::project_settings_repository::get_bool_override(&guard, key)
+            {
+                map.insert(*key, value);
+            }
+        }
+        SnapshotPolicySource(map)
+    }
+}
+
+impl conexus_auth::PolicySource for SnapshotPolicySource {
+    fn get_bool(&self, key: &str) -> Option<bool> {
+        self.0.get(key).copied()
+    }
+}
+
 #[derive(Clone)]
 pub struct ConexusServer {
     shared: Arc<SharedState>,
@@ -220,11 +266,17 @@ impl ServerHandler for ConexusServer {
         // `&Mutex<Connection>`, not an already-locked guard) -- don't
         // pre-lock here, or a tool needing the connection AND an
         // internal `.await` (Phase D2's `ask_project_rag`) would
-        // deadlock against its own already-held guard.
+        // deadlock against its own already-held guard. The
+        // `SnapshotPolicySource` build below is the ONE exception: it
+        // takes and releases its own short-lived lock BEFORE calling
+        // `dispatch`, specifically so it never overlaps the tool's own
+        // lock (seq: lock+read+unlock, THEN dispatch).
+        let policy_source =
+            SnapshotPolicySource::resolve(&self.shared.conn, &descriptor.required).await;
         let result = conexus_auth::dispatch(
             descriptor,
             Some(&principal),
-            &conexus_auth::NoPolicyOverrides,
+            &policy_source,
             &arguments,
             &self.shared.conn,
             &now,
@@ -271,5 +323,66 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         assert!(!rendered.contains("leaked path"));
+    }
+
+    fn test_conn() -> AsyncMutex<rusqlite::Connection> {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conexus_db::schema::init_schema(&conn).unwrap();
+        AsyncMutex::new(conn)
+    }
+
+    #[tokio::test]
+    async fn snapshot_policy_source_is_empty_for_a_non_policy_requirement() {
+        let conn = test_conn();
+        let required = conexus_auth::Requirement::Cap {
+            cap: conexus_core::capability::Capability::TasksView,
+            reason: None,
+        };
+        let source = SnapshotPolicySource::resolve(&conn, &required).await;
+        assert_eq!(
+            conexus_auth::PolicySource::get_bool(&source, "config_allow_worker_update_own_status"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_policy_source_reads_a_real_project_settings_override() {
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            conexus_db::project_settings_repository::upsert(
+                &guard,
+                "config_allow_worker_update_own_status",
+                "false",
+                None,
+                false,
+                "operator",
+                "2026-01-01T00:00:00Z",
+            )
+            .unwrap();
+        }
+        let required = conexus_auth::Requirement::Policy {
+            keys: &["config_allow_worker_update_own_status"],
+            default: true,
+        };
+        let source = SnapshotPolicySource::resolve(&conn, &required).await;
+        assert_eq!(
+            conexus_auth::PolicySource::get_bool(&source, "config_allow_worker_update_own_status"),
+            Some(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_policy_source_has_no_override_when_no_row_exists() {
+        let conn = test_conn();
+        let required = conexus_auth::Requirement::Policy {
+            keys: &["config_allow_worker_update_own_status"],
+            default: true,
+        };
+        let source = SnapshotPolicySource::resolve(&conn, &required).await;
+        assert_eq!(
+            conexus_auth::PolicySource::get_bool(&source, "config_allow_worker_update_own_status"),
+            None
+        );
     }
 }
