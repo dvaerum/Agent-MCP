@@ -330,6 +330,73 @@ pub fn delete(conn: &Connection, message_id: &str) -> Result<bool> {
     Ok(changed > 0)
 }
 
+/// Filters for [`list_recent_for_agent`] -- port of
+/// `get_agent_messages_tool_impl`'s own simple `WHERE`-clause builder.
+/// Deliberately a SEPARATE, simpler shape from [`MessageQueryFilters`]
+/// (the `StableOrderCache`-backed REST pagination query): this tool
+/// has no cursor/anchor concept at all, just "the most recent N
+/// matching rows", matching Python's own `ORDER BY timestamp DESC
+/// LIMIT ?` with no pagination beyond that.
+pub struct RecentMessagesFilters<'a> {
+    pub include_sent: bool,
+    pub include_received: bool,
+    pub message_type: Option<&'a str>,
+    pub unread_only: bool,
+    pub limit: i64,
+}
+
+/// The `agent_id`'s most recent messages (sent and/or received, per
+/// `filters`), newest first. Port of `get_agent_messages_tool_impl`'s
+/// query. Returns `Err` only on a genuine DB error -- the caller
+/// (`GetAgentMessagesTool`) is responsible for the
+/// `!include_sent && !include_received` `Invalid` case, which never
+/// reaches this function at all (matching Python's own early return
+/// before the query is built).
+pub fn list_recent_for_agent(
+    conn: &Connection,
+    agent_id: &str,
+    filters: &RecentMessagesFilters,
+) -> Result<Vec<MessageRow>> {
+    let mut conditions: Vec<String> = Vec::new();
+    let mut params: Vec<String> = Vec::new();
+
+    match (filters.include_received, filters.include_sent) {
+        (true, true) => {
+            conditions.push("(recipient_id = ? OR sender_id = ?)".to_string());
+            params.push(agent_id.to_string());
+            params.push(agent_id.to_string());
+        }
+        (true, false) => {
+            conditions.push("recipient_id = ?".to_string());
+            params.push(agent_id.to_string());
+        }
+        (false, true) => {
+            conditions.push("sender_id = ?".to_string());
+            params.push(agent_id.to_string());
+        }
+        (false, false) => return Ok(Vec::new()),
+    }
+
+    if let Some(mt) = filters.message_type {
+        conditions.push("message_type = ?".to_string());
+        params.push(mt.to_string());
+    }
+    if filters.unread_only {
+        conditions.push("read = 0".to_string());
+    }
+
+    let where_clause = conditions.join(" AND ");
+    let sql = format!(
+        "SELECT {COLUMNS} FROM agent_messages WHERE {where_clause} \
+         ORDER BY timestamp DESC LIMIT ?"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut bind_params = to_sql_refs(&params);
+    bind_params.push(&filters.limit);
+    let rows = stmt.query_map(bind_params.as_slice(), row_to_message)?;
+    rows.collect()
+}
+
 /// Filters accepted by [`MessageRepository::query`]/
 /// [`MessageRepository::count_query`] — a typed port of Python's
 /// `_apply_query_filters` dict, following `AgentQueryFilters`'s
@@ -1107,6 +1174,120 @@ mod tests {
         let mut msg = new_msg(id, sender, recipient, "content");
         msg.timestamp = timestamp;
         send(conn, msg).unwrap();
+    }
+
+    fn default_filters() -> RecentMessagesFilters<'static> {
+        RecentMessagesFilters {
+            include_sent: false,
+            include_received: true,
+            message_type: None,
+            unread_only: false,
+            limit: 20,
+        }
+    }
+
+    #[test]
+    fn list_recent_for_agent_neither_direction_returns_empty_without_querying() {
+        let conn = test_conn();
+        let filters = RecentMessagesFilters {
+            include_sent: false,
+            include_received: false,
+            ..default_filters()
+        };
+        assert!(list_recent_for_agent(&conn, "bob", &filters)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn list_recent_for_agent_received_only_excludes_sent_messages() {
+        let conn = test_conn();
+        seed_agent(&conn, "alice");
+        seed_agent(&conn, "bob");
+        seed_msg(&conn, "m1", "alice", "bob", "2026-01-01T00:00:01Z");
+        seed_msg(&conn, "m2", "bob", "alice", "2026-01-01T00:00:02Z");
+
+        let rows = list_recent_for_agent(&conn, "bob", &default_filters()).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].message_id, "m1");
+    }
+
+    #[test]
+    fn list_recent_for_agent_both_directions_returns_newest_first() {
+        let conn = test_conn();
+        seed_agent(&conn, "alice");
+        seed_agent(&conn, "bob");
+        seed_msg(&conn, "m1", "alice", "bob", "2026-01-01T00:00:01Z");
+        seed_msg(&conn, "m2", "bob", "alice", "2026-01-01T00:00:02Z");
+
+        let filters = RecentMessagesFilters {
+            include_sent: true,
+            include_received: true,
+            ..default_filters()
+        };
+        let rows = list_recent_for_agent(&conn, "bob", &filters).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].message_id, "m2", "newest first");
+        assert_eq!(rows[1].message_id, "m1");
+    }
+
+    #[test]
+    fn list_recent_for_agent_filters_by_message_type() {
+        let conn = test_conn();
+        seed_agent(&conn, "alice");
+        seed_agent(&conn, "bob");
+        let mut m1 = new_msg("m1", "alice", "bob", "x");
+        m1.message_type = "assistance_request";
+        send(&conn, m1).unwrap();
+        seed_msg(&conn, "m2", "alice", "bob", "2026-01-01T00:00:02Z");
+
+        let filters = RecentMessagesFilters {
+            message_type: Some("assistance_request"),
+            ..default_filters()
+        };
+        let rows = list_recent_for_agent(&conn, "bob", &filters).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].message_id, "m1");
+    }
+
+    #[test]
+    fn list_recent_for_agent_unread_only_excludes_read_messages() {
+        let conn = test_conn();
+        seed_agent(&conn, "alice");
+        seed_agent(&conn, "bob");
+        seed_msg(&conn, "m1", "alice", "bob", "2026-01-01T00:00:01Z");
+        seed_msg(&conn, "m2", "alice", "bob", "2026-01-01T00:00:02Z");
+        mark_read_by_ids(&conn, &["m1"], None).unwrap();
+
+        let filters = RecentMessagesFilters {
+            unread_only: true,
+            ..default_filters()
+        };
+        let rows = list_recent_for_agent(&conn, "bob", &filters).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].message_id, "m2");
+    }
+
+    #[test]
+    fn list_recent_for_agent_respects_the_limit() {
+        let conn = test_conn();
+        seed_agent(&conn, "alice");
+        seed_agent(&conn, "bob");
+        for i in 0..5 {
+            seed_msg(
+                &conn,
+                &format!("m{i}"),
+                "alice",
+                "bob",
+                &format!("2026-01-01T00:00:0{i}Z"),
+            );
+        }
+        let filters = RecentMessagesFilters {
+            limit: 2,
+            ..default_filters()
+        };
+        let rows = list_recent_for_agent(&conn, "bob", &filters).unwrap();
+        assert_eq!(rows.len(), 2);
     }
 
     fn ids(rows: &[MessageRow]) -> Vec<&str> {
