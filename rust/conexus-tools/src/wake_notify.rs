@@ -1,30 +1,39 @@
 //! Classifies which post-write "wake" a `project_context`/
 //! `project_settings` write on a given `context_key` requires.
 //!
-//! Port of the CLASSIFICATION half of `agent_mcp/tools/
-//! project_context_tools.py::emit_context_write_wakes` (`_is_worker_
-//! policy_toggle` / `_is_loop_toggle`) — deliberately NOT the delivery
-//! half. Python's helper both classifies AND fires the wake in the
-//! same function, because Python already has the live MCP session
-//! registry (`_emit_tools_list_changed`) and the wake-loop's global
-//! flag-recheck call (`g.wake_all_for_flag_recheck()`) sitting right
-//! there to call into. Neither exists yet on the Rust side: the MCP
-//! `Peer` registry is Phase D1 step 3 (the `conexus` binary, not yet
-//! built) and the wake-loop actor system is Phase D3 (explicitly
-//! deferred, XL-sized). Porting the delivery half now would mean
-//! either inventing throwaway stand-ins for both, or silently
-//! dropping the wake — this crate's tools instead surface WHICH
-//! wake(s) a write requires as data
-//! (`ToolResult::Ok.data["wakes"]`, see `project_settings_tools`), so
-//! whichever future layer owns a live `Peer` registry and wake-loop
-//! can read that array and actually fire them. This function is the
-//! single source of truth both that future MCP call path and a future
-//! `project_context_tools` port will consult — the same "one
-//! classifier, every write surface uses it" design BL-R14-1 exists to
-//! enforce in Python, just split across a phase boundary instead of a
-//! module boundary.
+//! Port of `agent_mcp/tools/project_context_tools.py::
+//! emit_context_write_wakes` (`_is_worker_policy_toggle`/
+//! `_is_loop_toggle` classification, plus real delivery for the half
+//! that's now buildable).
+//!
+//! ## Classification vs. delivery — history and current split
+//!
+//! When this module was first written (Phase D1), NEITHER of Python's
+//! two delivery targets existed on the Rust side yet: the MCP `Peer`
+//! registry was still unbuilt, and the wake-loop actor system was
+//! Phase D3's own explicitly-deferred, XL-sized scope. [`wakes_for`]
+//! alone shipped as the classification half; every write tool
+//! surfaced the result as data (`ToolResult::Ok.data["wakes"]`, see
+//! `project_settings_tools`) for a future layer to act on.
+//!
+//! Phase D3/D4 have since built the `WaiterRegistry` (`conexus-
+//! wakeloop`) and closed the `WaiterRegistry::notify()` gap
+//! (`task_tools.rs`'s broadcast-to-every-live-agent pattern). That
+//! means `Wake::WakeAllForFlagRecheck` is now REALLY deliverable —
+//! [`deliver`] does so, matching Python's `g.wake_all_for_flag_
+//! recheck()` exactly (every live agent's parked `wait_for_events`
+//! waiter, if any, is woken to re-evaluate its flags immediately).
+//! `Wake::ToolsListChanged` stays data-only: no live MCP `Peer`/
+//! session registry exists yet to push
+//! `notifications/tools/list_changed` through, so that half is
+//! unchanged from the original design. [`deliver`] still returns the
+//! full wake-label array either way, so a caller's `data["wakes"]`
+//! response shape doesn't change based on which half got delivered.
 
+use conexus_db::agent_repository::AgentRepository;
+use conexus_wakeloop::waiter_registry::WaiterRegistry;
 use regex::Regex;
+use rusqlite::Connection;
 use std::sync::LazyLock;
 
 static WORKER_POLICY_TOGGLE_RE: LazyLock<Regex> =
@@ -69,6 +78,30 @@ pub fn wakes_for(context_key: &str) -> Vec<Wake> {
     }
     if context_key == LOOP_TOGGLE_KEY {
         wakes.push(Wake::WakeAllForFlagRecheck);
+    }
+    wakes
+}
+
+/// Classifies `context_key`'s wake(s) via [`wakes_for`] and delivers
+/// whichever half is real (see module doc): a `WakeAllForFlagRecheck`
+/// broadcasts to every live agent's parked waiter; `ToolsListChanged`
+/// stays classification-only. Returns the wake label array either
+/// way, for the caller's own `data["wakes"]` response field. A DB
+/// error listing live agents degrades to skipping the broadcast
+/// (matching this crate's own "never let a best-effort side wake fail
+/// the tool's real write" convention) rather than failing the call.
+pub fn deliver(
+    conn: &Connection,
+    waiter_registry: &WaiterRegistry,
+    context_key: &str,
+) -> Vec<Wake> {
+    let wakes = wakes_for(context_key);
+    if wakes.contains(&Wake::WakeAllForFlagRecheck) {
+        if let Ok(agents) = AgentRepository::list_active(conn) {
+            for agent in agents {
+                waiter_registry.notify(&agent.agent_id);
+            }
+        }
     }
     wakes
 }
@@ -123,5 +156,41 @@ mod tests {
             Wake::WakeAllForFlagRecheck.as_str(),
             "wake_all_for_flag_recheck"
         );
+    }
+
+    #[test]
+    fn deliver_broadcasts_wake_all_for_flag_recheck_to_every_live_agent() {
+        let conn = Connection::open_in_memory().unwrap();
+        conexus_db::schema::init_schema(&conn).unwrap();
+        conexus_db::agent_repository::AgentRepository::create(
+            &conn,
+            conexus_db::agent_repository::NewAgent {
+                token: "tok",
+                agent_id: "alice",
+                created_at: "2026-06-01T00:00:00Z",
+                status: "active",
+                current_task: None,
+                working_directory: "/tmp",
+                color: None,
+                agent_role: "worker",
+            },
+        )
+        .unwrap();
+        let registry = WaiterRegistry::new();
+        let (_sender, mut receiver) = registry.register("alice");
+
+        let wakes = deliver(&conn, &registry, "config_auto_event_loop_global");
+
+        assert_eq!(wakes, vec![Wake::WakeAllForFlagRecheck]);
+        assert!(receiver.try_recv().is_ok());
+    }
+
+    #[test]
+    fn deliver_does_not_broadcast_for_a_tools_list_changed_only_key() {
+        let conn = Connection::open_in_memory().unwrap();
+        conexus_db::schema::init_schema(&conn).unwrap();
+        let registry = WaiterRegistry::new();
+        let wakes = deliver(&conn, &registry, "config_allow_worker_to_worker");
+        assert_eq!(wakes, vec![Wake::ToolsListChanged]);
     }
 }
