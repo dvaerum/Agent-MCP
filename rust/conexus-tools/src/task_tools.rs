@@ -1517,6 +1517,779 @@ impl Tool for CreateTaskTool {
     }
 }
 
+// ======================================================================
+// update_task_status / update_task (Phase D4, PR 5/8 pt.2)
+// ======================================================================
+//
+// Both tools route every mutation through `task_mutation_engine::
+// update_single_task` -- the single source of truth that keeps them
+// (and, later, `bulk_task_operations`, PR 8) from drifting apart, per
+// Python's own BL-R26-1 rationale. `update_task_status` additionally
+// supports bulk operation (task_ids), cascade-to-children, and
+// dependency auto-advance; `update_task` is the thinner admin
+// field-editor with its own `assigned_to`-clearing carve-out
+// (SECURITY R12-F5, see `UpdateTaskTool` below).
+//
+// Post-commit wake: unlike Python's cache-then-DB-fallback
+// `_wake_task_assignees`, this port always re-reads each mutated
+// task's CURRENT `assigned_to` fresh from the DB after commit --
+// there is no in-memory cache to prefer here, so there's also no
+// staleness risk to guard against.
+
+fn outcome_error_message(
+    outcome: &crate::task_mutation_engine::UpdateSingleTaskOutcome,
+    task_id: &str,
+) -> String {
+    use crate::task_mutation_engine::UpdateSingleTaskOutcome as Outcome;
+    match outcome {
+        Outcome::Applied(_) => unreachable!("callers only call this for a non-Applied outcome"),
+        Outcome::NotFound => format!("Task '{task_id}' not found"),
+        Outcome::Unauthorized(msg)
+        | Outcome::InvalidTransition(msg)
+        | Outcome::AssigneeInvalid(msg)
+        | Outcome::DependencyCycle(msg)
+        | Outcome::DependencyIncomplete(msg) => msg.clone(),
+    }
+}
+
+fn str_array_arg(arguments: &Value, key: &str) -> Option<Vec<String>> {
+    arguments.get(key).and_then(Value::as_array).map(|items| {
+        items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect()
+    })
+}
+
+const VALID_TASK_STATUSES: [&str; 5] =
+    ["pending", "in_progress", "completed", "cancelled", "failed"];
+
+/// One task's outcome from an `update_task_status` sweep -- the Rust
+/// equivalent of Python's per-task `{"success": bool, ...}` dict,
+/// flattened to what the response-building/wake code actually needs.
+struct SingleTaskResult {
+    task_id: String,
+    applied: Option<crate::task_mutation_engine::TaskUpdateApplied>,
+    error: Option<String>,
+}
+
+pub struct UpdateTaskStatusTool;
+
+impl Tool for UpdateTaskStatusTool {
+    const NAME: &'static str = "update_task_status";
+    const REQUIRED: Requirement = Requirement::Policy {
+        keys: &["config_allow_worker_update_own_status"],
+        default: true,
+    };
+    const DESCRIPTION: &'static str = "Smart task status update tool with bulk operations, \
+        dependency management, and cascade features. Supports single task or bulk updates \
+        with intelligent automation. You must own (be assigned) the task to change its \
+        status. If the task is unassigned (in the claimable pool), claim it first with \
+        assign_task(task_ids=[...], agent_token=<your own token>), then retry the status \
+        update.";
+    const SCHEMA: &'static str = r#"{
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": "ID of the task to update (for single task operations)."},
+            "task_ids": {"type": "array", "description": "List of task IDs for bulk operations (alternative to task_id).", "items": {"type": "string"}},
+            "status": {"type": "string", "description": "New status for the task(s).", "enum": ["pending","in_progress","completed","cancelled","failed"]},
+            "notes": {"type": "string", "description": "Optional notes about the status update to be appended."},
+            "title": {"type": "string", "description": "(Admin Only) New title for the task."},
+            "description": {"type": "string", "description": "(Admin Only) New description for the task."},
+            "priority": {"type": "string", "description": "(Admin Only) New priority.", "enum": ["low","medium","high"]},
+            "assigned_to": {"type": "string", "description": "(Admin Only) New agent ID to assign the task to."},
+            "depends_on_tasks": {"type": "array", "description": "(Admin Only) New list of task IDs this task depends on.", "items": {"type": "string"}},
+            "auto_update_dependencies": {"type": "boolean", "description": "Automatically advance dependent tasks when their dependencies are completed (default: true).", "default": true},
+            "cascade_to_children": {"type": "boolean", "description": "Cascade status changes to child tasks (only for failed/cancelled states, default: false).", "default": false},
+            "validate_dependencies": {"type": "boolean", "description": "Validate dependency constraints before updating (default: true).", "default": true}
+        },
+        "required": ["status"],
+        "additionalProperties": false
+    }"#;
+
+    fn call<'a>(
+        principal: Option<&'a Principal>,
+        arguments: &'a Value,
+        conn: &'a AsyncMutex<Connection>,
+        now: &'a str,
+        ctx: &'a conexus_auth::ToolCallContext<'a>,
+    ) -> conexus_auth::BoxFuture<'a, ToolResult> {
+        Box::pin(async move {
+            use crate::task_mutation_engine::{
+                advance_dependents_after_completion, update_single_task, TaskEdit,
+                UpdateSingleTaskOutcome,
+            };
+
+            let principal = principal.expect("Policy-gated tool always has a resolved principal");
+
+            let task_id_single = str_arg(arguments, "task_id");
+            let task_ids_bulk = str_array_arg(arguments, "task_ids").unwrap_or_default();
+            let notes_content = str_arg(arguments, "notes");
+            let new_title = str_arg(arguments, "title");
+            let new_description = str_arg(arguments, "description");
+            let new_priority = str_arg(arguments, "priority");
+            let new_assigned_to = str_arg(arguments, "assigned_to");
+            let new_depends_on_tasks = str_array_arg(arguments, "depends_on_tasks");
+            let auto_update_dependencies = arguments
+                .get("auto_update_dependencies")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let cascade_to_children = arguments
+                .get("cascade_to_children")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let validate_dependencies = arguments
+                .get("validate_dependencies")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+
+            let task_ids_to_process: Vec<String> = if !task_ids_bulk.is_empty() {
+                task_ids_bulk
+            } else if let Some(id) = &task_id_single {
+                vec![id.clone()]
+            } else {
+                return ToolResult::Invalid {
+                    field: None,
+                    message: "Either task_id or task_ids is required.".to_string(),
+                };
+            };
+
+            let Some(new_status) = str_arg(arguments, "status") else {
+                return ToolResult::Invalid {
+                    field: Some("status".to_string()),
+                    message: "status is required.".to_string(),
+                };
+            };
+            if !VALID_TASK_STATUSES.contains(&new_status.as_str()) {
+                return ToolResult::Invalid {
+                    field: Some("status".to_string()),
+                    message: format!(
+                        "Invalid status: {new_status}. Valid: {}",
+                        VALID_TASK_STATUSES.join(", ")
+                    ),
+                };
+            }
+
+            let is_admin_request = principal.has_capability(Capability::TasksAssign);
+            let requesting_agent_id = principal
+                .agent_id
+                .clone()
+                .or_else(|| principal.user_id.clone())
+                .unwrap_or_else(|| "admin".to_string());
+
+            let conn = conn.lock().await;
+            let tx = match conn.unchecked_transaction() {
+                Ok(tx) => tx,
+                Err(_) => {
+                    return ToolResult::Failed {
+                        message: "Database error updating tasks".to_string(),
+                    }
+                }
+            };
+
+            let mut results: Vec<SingleTaskResult> = Vec::new();
+            let mut tasks_to_cascade: Vec<String> = Vec::new();
+
+            for task_id in &task_ids_to_process {
+                let edit = TaskEdit {
+                    notes_content: notes_content.as_deref(),
+                    new_title: new_title.as_deref(),
+                    new_description: new_description.as_deref(),
+                    new_priority: new_priority.as_deref(),
+                    new_assigned_to: new_assigned_to.as_deref(),
+                    new_depends_on_tasks: new_depends_on_tasks.as_deref(),
+                    system_transition: false,
+                    validate_dependencies,
+                };
+                let outcome = match update_single_task(
+                    &tx,
+                    task_id,
+                    &new_status,
+                    &requesting_agent_id,
+                    is_admin_request,
+                    &edit,
+                    now,
+                ) {
+                    Ok(o) => o,
+                    Err(_) => {
+                        return ToolResult::Failed {
+                            message: "Database error updating tasks".to_string(),
+                        }
+                    }
+                };
+                match outcome {
+                    UpdateSingleTaskOutcome::Applied(applied) => {
+                        if cascade_to_children {
+                            tasks_to_cascade.extend(applied.child_tasks.clone());
+                        }
+                        let mut log_details = serde_json::json!({
+                            "status": new_status,
+                            "old_status": applied.old_status,
+                        });
+                        if notes_content.is_some() {
+                            log_details["notes_added"] = serde_json::json!(true);
+                        }
+                        if let Err(_e) = agent_action_repository::log_agent_action(
+                            &tx,
+                            &requesting_agent_id,
+                            "update_task_status",
+                            Some(task_id),
+                            Some(&log_details),
+                            now,
+                        ) {
+                            // Best-effort audit log -- same rationale as
+                            // every other mutating tool in this module.
+                        }
+                        results.push(SingleTaskResult {
+                            task_id: task_id.clone(),
+                            applied: Some(applied),
+                            error: None,
+                        });
+                    }
+                    other => {
+                        let error = outcome_error_message(&other, task_id);
+                        results.push(SingleTaskResult {
+                            task_id: task_id.clone(),
+                            applied: None,
+                            error: Some(error),
+                        });
+                    }
+                }
+            }
+
+            // Phase 2: smart cascade to children -- only for the
+            // blocking terminal states, only when the caller opted in.
+            let mut cascade_results: Vec<SingleTaskResult> = Vec::new();
+            if cascade_to_children
+                && !tasks_to_cascade.is_empty()
+                && matches!(new_status.as_str(), "cancelled" | "failed")
+            {
+                for child_id in &tasks_to_cascade {
+                    let edit =
+                        TaskEdit::status_only(Some("Auto-cascaded from parent task status change"));
+                    match update_single_task(
+                        &tx,
+                        child_id,
+                        &new_status,
+                        &requesting_agent_id,
+                        is_admin_request,
+                        &edit,
+                        now,
+                    ) {
+                        Ok(UpdateSingleTaskOutcome::Applied(applied)) => {
+                            cascade_results.push(SingleTaskResult {
+                                task_id: child_id.clone(),
+                                applied: Some(applied),
+                                error: None,
+                            });
+                        }
+                        Ok(other) => {
+                            let error = outcome_error_message(&other, child_id);
+                            cascade_results.push(SingleTaskResult {
+                                task_id: child_id.clone(),
+                                applied: None,
+                                error: Some(error),
+                            });
+                        }
+                        Err(_) => {
+                            return ToolResult::Failed {
+                                message: "Database error updating tasks".to_string(),
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Phase 3: dependency auto-advance -- shared with the
+            // (future, PR 8) bulk path via the same engine function.
+            let mut dependency_updates: Vec<crate::task_mutation_engine::TaskUpdateApplied> =
+                Vec::new();
+            if auto_update_dependencies && new_status == "completed" {
+                for result in &results {
+                    if let Some(applied) = &result.applied {
+                        match advance_dependents_after_completion(
+                            &tx,
+                            &applied.task_id,
+                            &requesting_agent_id,
+                            is_admin_request,
+                            now,
+                        ) {
+                            Ok(advanced) => dependency_updates.extend(advanced),
+                            Err(_) => {
+                                return ToolResult::Failed {
+                                    message: "Database error updating tasks".to_string(),
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if tx.commit().is_err() {
+                return ToolResult::Failed {
+                    message: "Database error updating tasks".to_string(),
+                };
+            }
+
+            // Post-commit: wake every mutated task's CURRENT assignee.
+            let mut mutated_ids: Vec<String> = results
+                .iter()
+                .chain(cascade_results.iter())
+                .filter_map(|r| r.applied.as_ref().map(|a| a.task_id.clone()))
+                .collect();
+            mutated_ids.extend(dependency_updates.iter().map(|a| a.task_id.clone()));
+            mutated_ids.sort();
+            mutated_ids.dedup();
+            let mut woken: HashSet<String> = HashSet::new();
+            for tid in &mutated_ids {
+                if let Ok(Some(row)) = task_repository::get_by_id(&conn, tid) {
+                    if let Some(assignee) = row.assigned_to.filter(|a| !a.is_empty()) {
+                        if woken.insert(assignee.clone()) {
+                            ctx.waiter_registry.notify(&assignee);
+                        }
+                    }
+                }
+            }
+
+            let successful: Vec<&SingleTaskResult> =
+                results.iter().filter(|r| r.applied.is_some()).collect();
+            let failed: Vec<&SingleTaskResult> =
+                results.iter().filter(|r| r.applied.is_none()).collect();
+
+            let mut response_parts: Vec<String> = Vec::new();
+            if task_ids_to_process.len() == 1 {
+                if let Some(first) = successful.first() {
+                    response_parts.push(format!(
+                        "Task {} status updated to {new_status}.",
+                        first.task_id
+                    ));
+                } else if let Some(first_fail) = failed.first() {
+                    response_parts.push(format!(
+                        "Failed to update task: {}",
+                        first_fail.error.as_deref().unwrap_or("unknown error")
+                    ));
+                }
+            } else {
+                response_parts.push(format!(
+                    "Bulk update completed: {}/{} tasks updated.",
+                    successful.len(),
+                    task_ids_to_process.len()
+                ));
+                if !failed.is_empty() {
+                    response_parts.push("Failed updates:".to_string());
+                    for fail in failed.iter().take(3) {
+                        response_parts.push(format!(
+                            "  - {}",
+                            fail.error.as_deref().unwrap_or("unknown error")
+                        ));
+                    }
+                    if failed.len() > 3 {
+                        response_parts
+                            .push(format!("  ... and {} more failures", failed.len() - 3));
+                    }
+                }
+            }
+            if !cascade_results.is_empty() {
+                let successful_cascades = cascade_results
+                    .iter()
+                    .filter(|r| r.applied.is_some())
+                    .count();
+                response_parts.push(format!("Cascaded to {successful_cascades} child tasks."));
+            }
+            if !dependency_updates.is_empty() {
+                response_parts.push(format!(
+                    "Auto-advanced {} dependent tasks.",
+                    dependency_updates.len()
+                ));
+            }
+
+            // Single-task case: an unauthorized-only failure surfaces
+            // as PermissionDenied (wire text starts with "Unauthorized:");
+            // bulk callers keep the aggregated response shape.
+            if task_ids_to_process.len() == 1 && !failed.is_empty() && successful.is_empty() {
+                let error_text = failed[0].error.as_deref().unwrap_or_default();
+                let lower = error_text.to_lowercase();
+                if lower.starts_with("unauthorized") {
+                    return ToolResult::PermissionDenied {
+                        reason: error_text
+                            .strip_prefix("Unauthorized: ")
+                            .unwrap_or(error_text)
+                            .to_string(),
+                    };
+                }
+                if lower.contains("not found") {
+                    return ToolResult::NotFound {
+                        resource: "task".to_string(),
+                        identifier: task_ids_to_process[0].clone(),
+                        hint: None,
+                    };
+                }
+            }
+
+            ToolResult::Ok {
+                data: None,
+                message: Some(response_parts.join("\n")),
+            }
+        })
+    }
+}
+
+pub struct UpdateTaskTool;
+
+impl Tool for UpdateTaskTool {
+    const NAME: &'static str = "update_task";
+    const REQUIRED: Requirement = Requirement::Cap {
+        cap: Capability::TasksAssign,
+        reason: None,
+    };
+    const DESCRIPTION: &'static str = "Admin/manager task-field editor: mutate title, \
+        description, priority, assigned_to, and/or append a note, with status OPTIONAL \
+        (unlike update_task_status, where it's required). Enforces the same terminal-sink / \
+        assignability / capability-routing invariants update_task_status does.";
+    const SCHEMA: &'static str = r#"{
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": "ID of the task to update."},
+            "status": {"type": "string", "description": "New status (optional -- omit to leave unchanged).", "enum": ["pending","in_progress","completed","cancelled","failed"]},
+            "title": {"type": "string", "description": "New title for the task."},
+            "description": {"type": "string", "description": "New description for the task."},
+            "priority": {"type": "string", "description": "New priority.", "enum": ["low","medium","high"]},
+            "assigned_to": {"type": "string", "description": "New agent id to assign the task to, or 'unassigned' (or an empty string) to clear the assignment."},
+            "notes": {"type": "string", "description": "A new note to append (append-only; blank is ignored)."}
+        },
+        "required": ["task_id"],
+        "additionalProperties": false
+    }"#;
+
+    fn call<'a>(
+        principal: Option<&'a Principal>,
+        arguments: &'a Value,
+        conn: &'a AsyncMutex<Connection>,
+        now: &'a str,
+        ctx: &'a conexus_auth::ToolCallContext<'a>,
+    ) -> conexus_auth::BoxFuture<'a, ToolResult> {
+        Box::pin(async move {
+            use crate::task_mutation_engine::{
+                update_single_task, TaskEdit, UpdateSingleTaskOutcome,
+            };
+
+            let principal = principal.expect("Cap-gated tool always has a resolved principal");
+
+            let Some(task_id) = str_arg(arguments, "task_id") else {
+                return ToolResult::Invalid {
+                    field: Some("task_id".to_string()),
+                    message: "task_id is a required field.".to_string(),
+                };
+            };
+
+            let requesting_agent_id = principal
+                .agent_id
+                .clone()
+                .or_else(|| principal.user_id.clone())
+                .unwrap_or_else(|| "admin".to_string());
+
+            let explicit_status = str_arg(arguments, "status");
+            if let Some(status) = &explicit_status {
+                if !VALID_TASK_STATUSES.contains(&status.as_str()) {
+                    return ToolResult::Invalid {
+                        field: Some("status".to_string()),
+                        message: format!(
+                            "Invalid status: {status}. Valid: {}",
+                            VALID_TASK_STATUSES.join(", ")
+                        ),
+                    };
+                }
+            }
+
+            // title/description accept an explicit empty string
+            // (clears the field); priority/notes require a truthy
+            // value (a blank Save is a no-op, not an error) -- mirrors
+            // the pre-refactor REST route exactly.
+            let new_title = arguments.get("title").and_then(Value::as_str);
+            let new_description = arguments.get("description").and_then(Value::as_str);
+            let new_priority = str_arg(arguments, "priority").filter(|p| !p.is_empty());
+            let notes_content = str_arg(arguments, "notes")
+                .map(|n| n.trim().to_string())
+                .filter(|n| !n.is_empty());
+
+            let assigned_to_present = arguments
+                .as_object()
+                .is_some_and(|o| o.contains_key("assigned_to"));
+            let raw_assigned = arguments.get("assigned_to").and_then(Value::as_str);
+            let clearing = assigned_to_present
+                && raw_assigned.is_none_or(|v| matches!(v.trim(), "" | "unassigned"));
+            let reassign_target = if assigned_to_present && !clearing {
+                raw_assigned.map(str::trim).map(str::to_string)
+            } else {
+                None
+            };
+
+            let admin_fields_requested = explicit_status.is_some()
+                || new_title.is_some()
+                || new_description.is_some()
+                || new_priority.is_some()
+                || notes_content.is_some()
+                || reassign_target.is_some();
+
+            let conn = conn.lock().await;
+            let tx = match conn.unchecked_transaction() {
+                Ok(tx) => tx,
+                Err(_) => {
+                    return ToolResult::Failed {
+                        message: "Database error updating task".to_string(),
+                    }
+                }
+            };
+
+            let Some(prior) = (match task_repository::get_by_id(&tx, &task_id) {
+                Ok(row) => row,
+                Err(_) => {
+                    return ToolResult::Failed {
+                        message: "Database error updating task".to_string(),
+                    }
+                }
+            }) else {
+                return ToolResult::NotFound {
+                    resource: "task".to_string(),
+                    identifier: task_id,
+                    hint: None,
+                };
+            };
+            let prior_status = prior.status.clone();
+            let prior_assignee = prior.assigned_to.clone();
+
+            let mut log_details = serde_json::json!({});
+            let mut changed_fields: Vec<&str> = Vec::new();
+
+            if admin_fields_requested {
+                // No explicit status -> thread the CURRENT status
+                // through unchanged so the terminal-sink guard still
+                // gates every other admin field.
+                let final_status = explicit_status.clone().unwrap_or(prior_status.clone());
+                let edit = TaskEdit {
+                    notes_content: notes_content.as_deref(),
+                    new_title,
+                    new_description,
+                    new_priority: new_priority.as_deref(),
+                    new_assigned_to: reassign_target.as_deref(),
+                    new_depends_on_tasks: None,
+                    system_transition: false,
+                    validate_dependencies: true,
+                };
+                let outcome = match update_single_task(
+                    &tx,
+                    &task_id,
+                    &final_status,
+                    &requesting_agent_id,
+                    true,
+                    &edit,
+                    now,
+                ) {
+                    Ok(o) => o,
+                    Err(_) => {
+                        return ToolResult::Failed {
+                            message: "Database error updating task".to_string(),
+                        }
+                    }
+                };
+                match outcome {
+                    UpdateSingleTaskOutcome::Applied(_) => {}
+                    UpdateSingleTaskOutcome::NotFound => {
+                        return ToolResult::NotFound {
+                            resource: "task".to_string(),
+                            identifier: task_id,
+                            hint: None,
+                        };
+                    }
+                    UpdateSingleTaskOutcome::InvalidTransition(msg) => {
+                        return ToolResult::Conflict { reason: msg };
+                    }
+                    UpdateSingleTaskOutcome::AssigneeInvalid(msg) => {
+                        return ToolResult::Invalid {
+                            field: Some("assigned_to".to_string()),
+                            message: msg,
+                        };
+                    }
+                    UpdateSingleTaskOutcome::Unauthorized(msg)
+                    | UpdateSingleTaskOutcome::DependencyCycle(msg)
+                    | UpdateSingleTaskOutcome::DependencyIncomplete(msg) => {
+                        return ToolResult::Failed { message: msg };
+                    }
+                }
+
+                if let Some(status) = &explicit_status {
+                    log_details["status_updated_to"] = serde_json::json!(status);
+                    changed_fields.push("status");
+                }
+                if new_title.is_some() {
+                    log_details["title_changed"] = serde_json::json!(true);
+                    changed_fields.push("title");
+                }
+                if new_description.is_some() {
+                    log_details["description_changed"] = serde_json::json!(true);
+                    changed_fields.push("description");
+                }
+                if new_priority.is_some() {
+                    log_details["priority_changed"] = serde_json::json!(true);
+                    changed_fields.push("priority");
+                }
+                if notes_content.is_some() {
+                    log_details["notes_added"] = serde_json::json!(true);
+                    changed_fields.push("notes");
+                }
+                if let Some(target) = &reassign_target {
+                    log_details["assigned_to_changed"] = serde_json::json!(target);
+                    changed_fields.push("assigned_to");
+                }
+            }
+
+            let mut clearing_fanout_needed = false;
+            if clearing {
+                // SECURITY (R12-F5): a bare `assigned_to: null` clear
+                // never routes through `update_single_task` above
+                // (admin_fields_requested is false for a clear-only
+                // call), so it needs the SAME terminal-sink guard
+                // applied explicitly here.
+                if TERMINAL_TASK_STATUSES.contains(&prior_status.as_str()) {
+                    return ToolResult::Conflict {
+                        reason: format!(
+                            "Cannot clear assignment for task '{task_id}': status \
+                             '{prior_status}' is terminal (completed/cancelled/failed) and \
+                             its assignment is frozen."
+                        ),
+                    };
+                }
+                let effective_status = explicit_status.clone().unwrap_or(prior_status.clone());
+                let mut clear_fields = conexus_db::task_repository::TaskFields {
+                    assigned_to: conexus_db::scheduled_directive_repository::NullableUpdate::Clear,
+                    ..Default::default()
+                };
+                if !TERMINAL_TASK_STATUSES.contains(&effective_status.as_str()) {
+                    clearing_fanout_needed = true;
+                    if explicit_status.is_none() {
+                        clear_fields.status = Some("unassigned");
+                    }
+                }
+                if let Err(e) = task_repository::update_fields(&tx, &task_id, &clear_fields, now) {
+                    return match e {
+                        conexus_db::task_repository::UpdateTaskError::TerminalTaskWriteBlocked(
+                            _,
+                        ) => ToolResult::Conflict {
+                            reason: format!(
+                                "Cannot clear assignment for task '{task_id}': status \
+                                     '{prior_status}' is terminal (completed/cancelled/failed) \
+                                     and its assignment is frozen."
+                            ),
+                        },
+                        conexus_db::task_repository::UpdateTaskError::Db(_) => ToolResult::Failed {
+                            message: "Database error updating task".to_string(),
+                        },
+                    };
+                }
+                // BL-R30-1: `update_single_task` only reconciles on the
+                // REASSIGN branch; clearing never reaches it.
+                if let Err(_e) =
+                    conexus_db::agent_repository::AgentRepository::reconcile_current_task_on_reassign(
+                        &tx,
+                        &task_id,
+                        prior_assignee.as_deref(),
+                        None,
+                        now,
+                    )
+                {
+                    return ToolResult::Failed {
+                        message: "Database error updating task".to_string(),
+                    };
+                }
+                log_details["assigned_to_changed"] = serde_json::Value::Null;
+                changed_fields.push("assigned_to");
+            }
+
+            // Mirror the pre-refactor route: audit unconditionally
+            // (even a request whose only supplied field was itself a
+            // no-op), then only register write-observable effects when
+            // something actually landed.
+            if let Err(_e) = agent_action_repository::log_agent_action(
+                &tx,
+                &requesting_agent_id,
+                "updated_task_dashboard",
+                Some(&task_id),
+                Some(&log_details),
+                now,
+            ) {
+                // Best-effort audit log, same rationale as above.
+            }
+
+            if !(admin_fields_requested || clearing) {
+                if tx.commit().is_err() {
+                    return ToolResult::Failed {
+                        message: "Database error updating task".to_string(),
+                    };
+                }
+                return ToolResult::Ok {
+                    data: None,
+                    message: Some("Task updated successfully.".to_string()),
+                };
+            }
+
+            if tx.commit().is_err() {
+                return ToolResult::Failed {
+                    message: "Database error updating task".to_string(),
+                };
+            }
+
+            // Post-commit: wake the touched assignee(s). A reassign/
+            // clear wakes both the new AND prior assignee; a pure
+            // field edit (no assignment change) wakes only the
+            // current assignee.
+            let reassigned = reassign_target.is_some() || clearing;
+            let current_assignee: Option<String> = if let Some(target) = &reassign_target {
+                Some(target.clone())
+            } else if clearing {
+                None
+            } else {
+                prior_assignee.clone()
+            };
+            let mut to_wake: Vec<String> = Vec::new();
+            if let Some(a) = &current_assignee {
+                to_wake.push(a.clone());
+            }
+            if reassigned {
+                if let Some(prior) = &prior_assignee {
+                    if Some(prior) != current_assignee.as_ref() {
+                        to_wake.push(prior.clone());
+                    }
+                }
+            }
+            let mut woken: HashSet<String> = HashSet::new();
+            for agent_id in to_wake {
+                if !agent_id.is_empty() && woken.insert(agent_id.clone()) {
+                    ctx.waiter_registry.notify(&agent_id);
+                }
+            }
+
+            // BL-R16-1/BL-R17-1: unassigned-fanout parity -- only when
+            // clearing landed a non-terminal task back to
+            // 'unassigned'.
+            if clearing_fanout_needed {
+                if let Ok(active) =
+                    conexus_db::agent_repository::AgentRepository::list_active(&conn)
+                {
+                    for agent in active {
+                        ctx.waiter_registry.notify(&agent.agent_id);
+                    }
+                }
+            }
+
+            ToolResult::Ok {
+                data: None,
+                message: Some("Task updated successfully.".to_string()),
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2611,5 +3384,591 @@ mod create_task_tests {
         .await;
         assert!(matches!(result, ToolResult::Ok { .. }));
         assert_eq!(rx.try_recv(), Ok(WakeSignal::Wake));
+    }
+}
+
+#[cfg(test)]
+mod update_task_status_tests {
+    use super::*;
+    use conexus_core::capability::Capabilities;
+    use conexus_core::principal::PrincipalKind;
+    use conexus_db::agent_repository::{AgentRepository, NewAgent};
+    use conexus_db::scheduled_directive_repository::NullableUpdate;
+    use conexus_db::schema::init_schema;
+    use conexus_db::task_repository::{NewTask, TaskFields};
+    use conexus_wakeloop::waiter_registry::{WaiterRegistry, WakeSignal};
+
+    const NOW: &str = "2026-03-01T00:00:00Z";
+
+    fn test_conn() -> AsyncMutex<Connection> {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        AsyncMutex::new(conn)
+    }
+
+    fn worker(agent_id: &str) -> Principal {
+        Principal {
+            kind: PrincipalKind::AgentBearer,
+            user_id: None,
+            agent_id: Some(agent_id.to_string()),
+            project_name: None,
+            project_role: None,
+            agent_role: None,
+            can_wake_loop: true,
+            source_token: None,
+            capabilities: Capabilities::from_iter([]),
+        }
+    }
+
+    fn admin(agent_id: &str) -> Principal {
+        Principal {
+            kind: PrincipalKind::AgentBearer,
+            user_id: None,
+            agent_id: Some(agent_id.to_string()),
+            project_name: None,
+            project_role: None,
+            agent_role: None,
+            can_wake_loop: true,
+            source_token: None,
+            capabilities: Capabilities::from_iter([Capability::TasksAssign]),
+        }
+    }
+
+    async fn seed_agent(conn: &AsyncMutex<Connection>, agent_id: &str) {
+        let guard = conn.lock().await;
+        AgentRepository::create(
+            &guard,
+            NewAgent {
+                token: &format!("tok-{agent_id}"),
+                agent_id,
+                created_at: NOW,
+                status: "active",
+                current_task: None,
+                working_directory: "/tmp",
+                color: None,
+                agent_role: "worker",
+            },
+        )
+        .unwrap();
+    }
+
+    fn seed_task(
+        conn: &Connection,
+        id: &str,
+        status: &str,
+        assigned_to: Option<&str>,
+        parent: Option<&str>,
+    ) {
+        task_repository::create(
+            conn,
+            NewTask {
+                task_id: Some(id),
+                title: &format!("Task {id}"),
+                description: None,
+                assigned_to,
+                created_by: "alice",
+                status,
+                priority: "medium",
+                parent_task: parent,
+                child_tasks: None,
+                depends_on_tasks: None,
+                notes: None,
+                now: NOW,
+            },
+        )
+        .unwrap();
+    }
+
+    async fn call(principal: &Principal, args: Value, conn: &AsyncMutex<Connection>) -> ToolResult {
+        let registry = WaiterRegistry::new();
+        let ctx = conexus_auth::ToolCallContext::off_wire(&registry);
+        UpdateTaskStatusTool::call(Some(principal), &args, conn, NOW, &ctx).await
+    }
+
+    fn message_of(result: &ToolResult) -> String {
+        match result {
+            ToolResult::Ok { message, .. } => message.clone().unwrap_or_default(),
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn requires_task_id_or_task_ids() {
+        let conn = test_conn();
+        let result = call(&admin("a"), serde_json::json!({"status": "pending"}), &conn).await;
+        assert!(matches!(result, ToolResult::Invalid { field: None, .. }));
+    }
+
+    #[tokio::test]
+    async fn requires_status() {
+        let conn = test_conn();
+        let result = call(&admin("a"), serde_json::json!({"task_id": "t1"}), &conn).await;
+        assert!(
+            matches!(result, ToolResult::Invalid { field, .. } if field.as_deref() == Some("status"))
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_an_invalid_status() {
+        let conn = test_conn();
+        let result = call(
+            &admin("a"),
+            serde_json::json!({"task_id": "t1", "status": "urgent"}),
+            &conn,
+        )
+        .await;
+        assert!(
+            matches!(result, ToolResult::Invalid { field, .. } if field.as_deref() == Some("status"))
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_updates_own_task_status() {
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "t1", "pending", Some("bob"), None);
+        }
+        let result = call(
+            &worker("bob"),
+            serde_json::json!({"task_id": "t1", "status": "in_progress"}),
+            &conn,
+        )
+        .await;
+        assert_eq!(
+            message_of(&result),
+            "Task t1 status updated to in_progress."
+        );
+        let guard = conn.lock().await;
+        let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+        assert_eq!(row.status, "in_progress");
+    }
+
+    #[tokio::test]
+    async fn worker_on_a_foreign_task_gets_the_phantom_not_found() {
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "t1", "pending", Some("carol"), None);
+        }
+        let result = call(
+            &worker("bob"),
+            serde_json::json!({"task_id": "t1", "status": "in_progress"}),
+            &conn,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::NotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn worker_on_an_unassigned_task_gets_permission_denied() {
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "t1", "pending", None, None);
+        }
+        let result = call(
+            &worker("bob"),
+            serde_json::json!({"task_id": "t1", "status": "in_progress"}),
+            &conn,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::PermissionDenied { .. }));
+    }
+
+    #[tokio::test]
+    async fn bulk_update_reports_partial_success() {
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "t1", "pending", None, None);
+            seed_task(&guard, "t2", "completed", None, Some("t1"));
+        }
+        let result = call(
+            &admin("a"),
+            serde_json::json!({"task_ids": ["t1", "t2"], "status": "in_progress"}),
+            &conn,
+        )
+        .await;
+        let msg = message_of(&result);
+        assert!(msg.contains("Bulk update completed: 1/2 tasks updated."));
+        assert!(msg.contains("Failed updates:"));
+    }
+
+    #[tokio::test]
+    async fn cascades_a_failed_status_to_children() {
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "root1", "in_progress", None, None);
+            seed_task(&guard, "child1", "in_progress", None, Some("root1"));
+            // `seed_task` doesn't maintain the BL-2 child_tasks mirror
+            // the real create_task tool writes -- set it explicitly so
+            // this test reflects a realistic post-create_task state.
+            task_repository::update_fields(
+                &guard,
+                "root1",
+                &TaskFields {
+                    child_tasks: NullableUpdate::Set(vec!["child1".to_string()]),
+                    ..Default::default()
+                },
+                NOW,
+            )
+            .unwrap();
+        }
+        let result = call(
+            &admin("a"),
+            serde_json::json!({
+                "task_id": "root1",
+                "status": "failed",
+                "cascade_to_children": true
+            }),
+            &conn,
+        )
+        .await;
+        let msg = message_of(&result);
+        assert!(msg.contains("Cascaded to 1 child tasks."));
+        let guard = conn.lock().await;
+        let child = task_repository::get_by_id(&guard, "child1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(child.status, "failed");
+    }
+
+    #[tokio::test]
+    async fn auto_advances_a_now_unblocked_dependent() {
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "root1", "in_progress", None, None);
+            seed_task(&guard, "dependent", "pending", None, Some("root1"));
+            task_repository::update_fields(
+                &guard,
+                "dependent",
+                &TaskFields {
+                    depends_on_tasks: NullableUpdate::Set(vec!["root1".to_string()]),
+                    ..Default::default()
+                },
+                NOW,
+            )
+            .unwrap();
+        }
+        let result = call(
+            &admin("a"),
+            serde_json::json!({"task_id": "root1", "status": "completed"}),
+            &conn,
+        )
+        .await;
+        let msg = message_of(&result);
+        assert!(msg.contains("Auto-advanced 1 dependent tasks."));
+        let guard = conn.lock().await;
+        let dependent = task_repository::get_by_id(&guard, "dependent")
+            .unwrap()
+            .unwrap();
+        assert_eq!(dependent.status, "in_progress");
+    }
+
+    #[tokio::test]
+    async fn writes_a_per_task_audit_row() {
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "t1", "pending", None, None);
+        }
+        call(
+            &admin("a"),
+            serde_json::json!({"task_id": "t1", "status": "in_progress"}),
+            &conn,
+        )
+        .await;
+        let guard = conn.lock().await;
+        let count: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM agent_actions WHERE action_type = 'update_task_status' \
+                 AND task_id = 't1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn wakes_the_assignees_registered_waiter() {
+        let conn = test_conn();
+        seed_agent(&conn, "bob").await;
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "t1", "pending", Some("bob"), None);
+        }
+        let registry = WaiterRegistry::new();
+        let (_tx, mut rx) = registry.register("bob");
+        let ctx = conexus_auth::ToolCallContext::off_wire(&registry);
+        let result = UpdateTaskStatusTool::call(
+            Some(&worker("bob")),
+            &serde_json::json!({"task_id": "t1", "status": "in_progress"}),
+            &conn,
+            NOW,
+            &ctx,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        assert_eq!(rx.try_recv(), Ok(WakeSignal::Wake));
+    }
+}
+
+#[cfg(test)]
+mod update_task_tests {
+    use super::*;
+    use conexus_core::capability::Capabilities;
+    use conexus_core::principal::PrincipalKind;
+    use conexus_db::agent_repository::{AgentRepository, NewAgent};
+    use conexus_db::schema::init_schema;
+    use conexus_db::task_repository::NewTask;
+    use conexus_wakeloop::waiter_registry::{WaiterRegistry, WakeSignal};
+
+    const NOW: &str = "2026-03-05T00:00:00Z";
+
+    fn test_conn() -> AsyncMutex<Connection> {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        AsyncMutex::new(conn)
+    }
+
+    fn admin(agent_id: &str) -> Principal {
+        Principal {
+            kind: PrincipalKind::AgentBearer,
+            user_id: None,
+            agent_id: Some(agent_id.to_string()),
+            project_name: None,
+            project_role: None,
+            agent_role: None,
+            can_wake_loop: true,
+            source_token: None,
+            capabilities: Capabilities::from_iter([Capability::TasksAssign]),
+        }
+    }
+
+    async fn seed_agent(conn: &AsyncMutex<Connection>, agent_id: &str) {
+        let guard = conn.lock().await;
+        AgentRepository::create(
+            &guard,
+            NewAgent {
+                token: &format!("tok-{agent_id}"),
+                agent_id,
+                created_at: NOW,
+                status: "active",
+                current_task: None,
+                working_directory: "/tmp",
+                color: None,
+                agent_role: "worker",
+            },
+        )
+        .unwrap();
+    }
+
+    fn seed_task(conn: &Connection, id: &str, status: &str, assigned_to: Option<&str>) {
+        task_repository::create(
+            conn,
+            NewTask {
+                task_id: Some(id),
+                title: &format!("Task {id}"),
+                description: None,
+                assigned_to,
+                created_by: "alice",
+                status,
+                priority: "medium",
+                parent_task: None,
+                child_tasks: None,
+                depends_on_tasks: None,
+                notes: None,
+                now: NOW,
+            },
+        )
+        .unwrap();
+    }
+
+    async fn call(args: Value, conn: &AsyncMutex<Connection>) -> ToolResult {
+        let registry = WaiterRegistry::new();
+        let ctx = conexus_auth::ToolCallContext::off_wire(&registry);
+        UpdateTaskTool::call(Some(&admin("alice")), &args, conn, NOW, &ctx).await
+    }
+
+    fn message_of(result: &ToolResult) -> String {
+        match result {
+            ToolResult::Ok { message, .. } => message.clone().unwrap_or_default(),
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn requires_task_id() {
+        let conn = test_conn();
+        let result = call(serde_json::json!({}), &conn).await;
+        assert!(
+            matches!(result, ToolResult::Invalid { field, .. } if field.as_deref() == Some("task_id"))
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_a_missing_task() {
+        let conn = test_conn();
+        let result = call(serde_json::json!({"task_id": "ghost"}), &conn).await;
+        assert!(matches!(result, ToolResult::NotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn updates_title_description_and_priority() {
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "t1", "pending", None);
+        }
+        let result = call(
+            serde_json::json!({
+                "task_id": "t1",
+                "title": "new title",
+                "description": "new description",
+                "priority": "high"
+            }),
+            &conn,
+        )
+        .await;
+        assert_eq!(message_of(&result), "Task updated successfully.");
+        let guard = conn.lock().await;
+        let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+        assert_eq!(row.title, "new title");
+        assert_eq!(row.description.as_deref(), Some("new description"));
+        assert_eq!(row.priority, "high");
+    }
+
+    #[tokio::test]
+    async fn appends_a_note() {
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "t1", "pending", None);
+        }
+        call(
+            serde_json::json!({"task_id": "t1", "notes": "  a note  "}),
+            &conn,
+        )
+        .await;
+        let guard = conn.lock().await;
+        let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+        let notes = row.notes.unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].content, "a note");
+    }
+
+    #[tokio::test]
+    async fn reassigning_sets_assigned_to_and_reconciles_current_task() {
+        let conn = test_conn();
+        seed_agent(&conn, "carol").await;
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "t1", "pending", None);
+        }
+        call(
+            serde_json::json!({"task_id": "t1", "assigned_to": "carol"}),
+            &conn,
+        )
+        .await;
+        let guard = conn.lock().await;
+        let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+        assert_eq!(row.assigned_to.as_deref(), Some("carol"));
+        let agent = AgentRepository::get_by_id(&guard, "carol")
+            .unwrap()
+            .unwrap();
+        assert_eq!(agent.current_task.as_deref(), Some("t1"));
+    }
+
+    #[tokio::test]
+    async fn clearing_assignment_sets_status_unassigned_and_clears_current_task() {
+        let conn = test_conn();
+        seed_agent(&conn, "bob").await;
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "t1", "pending", Some("bob"));
+            AgentRepository::reconcile_current_task_on_reassign(
+                &guard,
+                "t1",
+                None,
+                Some("bob"),
+                NOW,
+            )
+            .unwrap();
+        }
+        call(
+            serde_json::json!({"task_id": "t1", "assigned_to": "unassigned"}),
+            &conn,
+        )
+        .await;
+        let guard = conn.lock().await;
+        let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+        assert_eq!(row.assigned_to, None);
+        assert_eq!(row.status, "unassigned");
+        let agent = AgentRepository::get_by_id(&guard, "bob").unwrap().unwrap();
+        assert_eq!(agent.current_task, None);
+    }
+
+    #[tokio::test]
+    async fn clearing_a_terminal_tasks_assignment_is_a_conflict() {
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "t1", "completed", Some("bob"));
+        }
+        let result = call(
+            serde_json::json!({"task_id": "t1", "assigned_to": ""}),
+            &conn,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Conflict { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_call_with_nothing_to_change_is_a_no_op() {
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "t1", "pending", None);
+        }
+        let result = call(serde_json::json!({"task_id": "t1"}), &conn).await;
+        assert_eq!(message_of(&result), "Task updated successfully.");
+        let guard = conn.lock().await;
+        let count: i64 = guard
+            .query_row("SELECT COUNT(*) FROM agent_actions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "still audited unconditionally, per the pre-refactor route"
+        );
+    }
+
+    #[tokio::test]
+    async fn reassigning_wakes_both_the_new_and_prior_assignees_waiters() {
+        let conn = test_conn();
+        seed_agent(&conn, "bob").await;
+        seed_agent(&conn, "carol").await;
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "t1", "pending", Some("bob"));
+        }
+        let registry = WaiterRegistry::new();
+        let (_tx_bob, mut rx_bob) = registry.register("bob");
+        let (_tx_carol, mut rx_carol) = registry.register("carol");
+        let ctx = conexus_auth::ToolCallContext::off_wire(&registry);
+        let result = UpdateTaskTool::call(
+            Some(&admin("alice")),
+            &serde_json::json!({"task_id": "t1", "assigned_to": "carol"}),
+            &conn,
+            NOW,
+            &ctx,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        assert_eq!(rx_bob.try_recv(), Ok(WakeSignal::Wake));
+        assert_eq!(rx_carol.try_recv(), Ok(WakeSignal::Wake));
     }
 }
