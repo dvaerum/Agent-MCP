@@ -13,18 +13,21 @@ use crate::project_settings_tools::{
     DeleteProjectSettingsTool, UpdateProjectSettingsTool, ViewProjectSettingsTool,
 };
 use crate::rag_tools::AskProjectRagTool;
+use crate::task_tools::{SearchTasksTool, ViewTasksTool};
 
 // `ToolDescriptor::of` is `const fn`, so the whole registry is a
 // compile-time `static` array (needs a named `static`, not an inline
 // `&[...]` literal, since the array's elements aren't const-promotable
 // through a non-const fn body).
-static ALL_TOOLS: [ToolDescriptor; 6] = [
+static ALL_TOOLS: [ToolDescriptor; 8] = [
     ToolDescriptor::of::<ViewProjectSettingsTool>(),
     ToolDescriptor::of::<UpdateProjectSettingsTool>(),
     ToolDescriptor::of::<DeleteProjectSettingsTool>(),
     ToolDescriptor::of::<AskProjectRagTool>(),
     ToolDescriptor::of::<WaitForEventsTool>(),
     ToolDescriptor::of::<FetchEventsSinceTool>(),
+    ToolDescriptor::of::<ViewTasksTool>(),
+    ToolDescriptor::of::<SearchTasksTool>(),
 ];
 
 pub fn all_tools() -> &'static [ToolDescriptor] {
@@ -135,7 +138,7 @@ mod tests {
     }
 
     #[test]
-    fn all_tools_holds_the_project_settings_rag_and_event_tools() {
+    fn all_tools_holds_the_project_settings_rag_event_and_task_query_tools() {
         let names: BTreeSet<&str> = all_tools().iter().map(|t| t.name).collect();
         assert_eq!(
             names,
@@ -146,6 +149,8 @@ mod tests {
                 "ask_project_rag",
                 "wait_for_events",
                 "fetch_events_since",
+                "view_tasks",
+                "search_tasks",
             ])
         );
     }

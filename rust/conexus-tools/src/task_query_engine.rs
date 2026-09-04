@@ -357,15 +357,32 @@ impl TaskQueryEngine {
         offset: i64,
         limit: Option<i64>,
     ) -> rusqlite::Result<QueryResult> {
-        let snapshot: HashMap<String, TaskRow> = task_repository::list_all(conn, None)?
-            .into_iter()
-            .map(|t| (t.task_id.clone(), t))
+        // Two representations of the same read on purpose: `task_list`
+        // is the deterministic SQL-ordered `Vec` `list_all` returns,
+        // walked below to build `matched` -- the base order a stable
+        // sort ties against. `snapshot` (a `HashMap`, for O(1) lookups
+        // `matches`/`health_of` need) MUST NOT be walked for that same
+        // purpose: `HashMap::values()`'s iteration order depends on
+        // the collection's randomized per-instance hasher state, so it
+        // can differ between two `query()` calls against perfectly
+        // unchanged data -- silently reordering tied sort keys (e.g.
+        // two tasks created in the same request) between an anchoring
+        // call and a later replay, which is exactly the drift
+        // `StableOrderCache`/R17-F2 exists to prevent. Caught by a
+        // flaky `start_after` test: the same two-task, same-timestamp
+        // fixture returned tasks in a different relative order on a
+        // second `query()` call within one test, with no write between
+        // the two calls.
+        let task_list: Vec<TaskRow> = task_repository::list_all(conn, None)?;
+        let snapshot: HashMap<String, TaskRow> = task_list
+            .iter()
+            .map(|t| (t.task_id.clone(), t.clone()))
             .collect();
 
         let key = (filters.clone(), *sort);
         let ordered_ids = self.pagination_cache.get_or_anchor(key, offset, || {
-            let mut matched: Vec<TaskRow> = snapshot
-                .values()
+            let mut matched: Vec<TaskRow> = task_list
+                .iter()
                 .filter(|t| matches(t, filters, &snapshot))
                 .cloned()
                 .collect();
@@ -969,6 +986,69 @@ mod tests {
             .unwrap();
         let ids: Vec<&str> = result.tasks.iter().map(|t| t.task_id.as_str()).collect();
         assert_eq!(ids, vec!["t2", "t3", "t1"]); // high, medium, low
+    }
+
+    #[test]
+    fn query_ties_sort_the_same_way_on_every_call() {
+        // Regression: `matched` used to be built from
+        // `snapshot.values()` (a `HashMap`), whose iteration order is
+        // randomized per-instance and can differ between two `query()`
+        // calls against perfectly unchanged data -- silently
+        // reordering tasks that tie on the sort key (identical
+        // `created_at` here) between an anchoring call and a later
+        // replay. `matched` must instead derive from `list_all`'s own
+        // deterministic `Vec` order so repeated calls agree.
+        let conn = test_conn();
+        create(
+            &conn,
+            new_task(
+                "t1",
+                "a",
+                "pending",
+                None,
+                None,
+                "bob",
+                "medium",
+                "2026-01-01T00:00:00Z",
+            ),
+        )
+        .unwrap();
+        create(
+            &conn,
+            new_task(
+                "t2",
+                "b",
+                "pending",
+                None,
+                Some("t1"),
+                "bob",
+                "medium",
+                "2026-01-01T00:00:00Z",
+            ),
+        )
+        .unwrap();
+
+        let engine = TaskQueryEngine::new();
+        let sort = TaskSortSpec {
+            by: SortBy::CreatedAt,
+        };
+        let first: Vec<String> = engine
+            .query(&conn, &TaskFilterSpec::default(), &sort, 0, None)
+            .unwrap()
+            .tasks
+            .into_iter()
+            .map(|t| t.task_id)
+            .collect();
+        for _ in 0..20 {
+            let again: Vec<String> = engine
+                .query(&conn, &TaskFilterSpec::default(), &sort, 0, None)
+                .unwrap()
+                .tasks
+                .into_iter()
+                .map(|t| t.task_id)
+                .collect();
+            assert_eq!(again, first, "tie order must not vary between calls");
+        }
     }
 
     #[test]
