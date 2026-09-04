@@ -14,6 +14,7 @@
 //! modules are ported from.
 
 pub mod client_hold_strategy;
+pub mod event_feed;
 pub mod hold_ladder;
 pub mod idle_reminder;
 pub mod stream_gates;
