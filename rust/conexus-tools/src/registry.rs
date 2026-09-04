@@ -18,6 +18,10 @@ use crate::project_settings_tools::{
     DeleteProjectSettingsTool, UpdateProjectSettingsTool, ViewProjectSettingsTool,
 };
 use crate::rag_tools::AskProjectRagTool;
+use crate::scheduled_directive_tools::{
+    CreateScheduledDirectiveTool, DeleteScheduledDirectiveTool, ListScheduledDirectivesTool,
+    UpdateScheduledDirectiveTool,
+};
 use crate::task_comments_tools::{AddTaskCommentTool, DeleteTaskCommentTool, EditTaskCommentTool};
 use crate::task_tools::{
     BulkTaskOperationsTool, CreateTaskTool, DeleteTaskTool, RequestAssistanceTool, SearchTasksTool,
@@ -29,7 +33,7 @@ use crate::utility_tools::TestTool;
 // compile-time `static` array (needs a named `static`, not an inline
 // `&[...]` literal, since the array's elements aren't const-promotable
 // through a non-const fn body).
-static ALL_TOOLS: [ToolDescriptor; 26] = [
+static ALL_TOOLS: [ToolDescriptor; 30] = [
     ToolDescriptor::of::<ViewProjectSettingsTool>(),
     ToolDescriptor::of::<UpdateProjectSettingsTool>(),
     ToolDescriptor::of::<DeleteProjectSettingsTool>(),
@@ -56,6 +60,10 @@ static ALL_TOOLS: [ToolDescriptor; 26] = [
     ToolDescriptor::of::<AddTaskCommentTool>(),
     ToolDescriptor::of::<EditTaskCommentTool>(),
     ToolDescriptor::of::<DeleteTaskCommentTool>(),
+    ToolDescriptor::of::<CreateScheduledDirectiveTool>(),
+    ToolDescriptor::of::<ListScheduledDirectivesTool>(),
+    ToolDescriptor::of::<UpdateScheduledDirectiveTool>(),
+    ToolDescriptor::of::<DeleteScheduledDirectiveTool>(),
 ];
 
 pub fn all_tools() -> &'static [ToolDescriptor] {
@@ -203,6 +211,10 @@ mod tests {
                 "add_task_comment",
                 "edit_task_comment",
                 "delete_task_comment",
+                "create_scheduled_directive",
+                "list_scheduled_directives",
+                "update_scheduled_directive",
+                "delete_scheduled_directive",
             ])
         );
     }
