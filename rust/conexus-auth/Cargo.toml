@@ -11,3 +11,11 @@ conexus-core = { path = "../conexus-core" }
 conexus-db = { path = "../conexus-db" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde_json = "1"
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+# Constant-time MAC comparison -- the migration plan explicitly calls
+# this out (Verification strategy section): a literal `==` port of
+# Python's `hmac.compare_digest` would silently reopen a timing
+# side-channel no functional test catches.
+subtle = "2"
