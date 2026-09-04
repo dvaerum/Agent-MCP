@@ -17,6 +17,7 @@ pub mod registry;
 pub mod task_mutation_engine;
 pub mod task_query_engine;
 pub mod task_tools;
+pub mod utility_tools;
 pub mod wake_notify;
 
 pub use registry::all_tools;

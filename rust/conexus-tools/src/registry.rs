@@ -18,12 +18,13 @@ use crate::task_tools::{
     BulkTaskOperationsTool, CreateTaskTool, DeleteTaskTool, RequestAssistanceTool, SearchTasksTool,
     UpdateTaskStatusTool, UpdateTaskTool, ViewTasksTool,
 };
+use crate::utility_tools::TestTool;
 
 // `ToolDescriptor::of` is `const fn`, so the whole registry is a
 // compile-time `static` array (needs a named `static`, not an inline
 // `&[...]` literal, since the array's elements aren't const-promotable
 // through a non-const fn body).
-static ALL_TOOLS: [ToolDescriptor; 16] = [
+static ALL_TOOLS: [ToolDescriptor; 17] = [
     ToolDescriptor::of::<ViewProjectSettingsTool>(),
     ToolDescriptor::of::<UpdateProjectSettingsTool>(),
     ToolDescriptor::of::<DeleteProjectSettingsTool>(),
@@ -40,6 +41,7 @@ static ALL_TOOLS: [ToolDescriptor; 16] = [
     ToolDescriptor::of::<CreateSelfTaskTool>(),
     ToolDescriptor::of::<RequestAssistanceTool>(),
     ToolDescriptor::of::<BulkTaskOperationsTool>(),
+    ToolDescriptor::of::<TestTool>(),
 ];
 
 pub fn all_tools() -> &'static [ToolDescriptor] {
@@ -72,9 +74,15 @@ mod tests {
 
     /// Tools intentionally registered with `Requirement::Public` — a
     /// reviewed, justified allowlist. Adding a name here IS the
-    /// security review this test exists to force. All 3 tools ported
-    /// so far are `Cap`-gated, so this stays empty.
-    const PUBLIC_TOOL_ALLOWLIST: &[&str] = &[];
+    /// security review this test exists to force.
+    ///
+    /// `"test"` (Phase D5, `utility_tools.py`): a no-argument, no-
+    /// side-effect tool that always returns the same static message
+    /// ("Tool is working!") -- verifies the tool-calling mechanism
+    /// itself, nothing project- or agent-specific. Reviewed: safe to
+    /// leave unauthenticated, matching Python's own `PUBLIC` gate on
+    /// this exact tool.
+    const PUBLIC_TOOL_ALLOWLIST: &[&str] = &["test"];
 
     #[test]
     fn public_tools_match_the_reviewed_allowlist() {
@@ -171,6 +179,7 @@ mod tests {
                 "create_self_task",
                 "request_assistance",
                 "bulk_task_operations",
+                "test",
             ])
         );
     }
