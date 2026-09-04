@@ -13,17 +13,39 @@
 //! tools -- their only callers are `agent_mcp/app/routers/agents.py`
 //! (REST). Phase E1 territory (`agent_mcp/app/*`), not this port.
 //!
-//! ## PR1 (this file's initial content): pure helpers + new primitives
+//! ## PR1: pure helpers + new primitives
 //!
-//! No tools registered yet -- matches this migration's own "PR1 pure
+//! No tools registered -- matches this migration's own "PR1 pure
 //! helpers, no tools" precedent (`project_context_tools.rs`,
-//! `task_tools.rs`). Every item `pub` (not `pub(crate)`), matching
-//! `wake_notify.rs`'s precedent for a helpers-ahead-of-their-first-
-//! consumer module (avoids a dead-code lint failure before PR2+ wire
-//! a real caller).
+//! `task_tools.rs`).
+//!
+//! ## PR2: `view_audit_log`
+//!
+//! **Re-derived, not ported at face value** (per the plan's own
+//! "things to explicitly re-derive" discipline): Python's
+//! `view_audit_log` reads `g.audit_log`, a process-local, non-durable
+//! in-memory list every OTHER tool port in this migration has already
+//! deliberately dropped in favor of the durable `agent_actions` table
+//! alone (PRs #793, #823, #824). This tool is the first whose whole
+//! job is reading that trail back -- resolved (plan file, "Phase D5
+//! (admin_tools.py)") by porting against `agent_actions` instead of
+//! building a new in-memory ring buffer just to preserve a trail every
+//! other port treats as disposable. Real, deliberate consequence: the
+//! rendered `action` strings are `agent_actions.action_type` values
+//! (e.g. `"updated_context"`), NOT necessarily identical to whatever
+//! string Python's in-memory sink used for the same event (the two
+//! trails' action-name vocabularies were never unified in Python
+//! either -- e.g. `register_agent` writes `"registered_agent"` to the
+//! DB sink and `"register_agent"` to the in-memory sink).
 
+use conexus_auth::{Requirement, Tool};
+use conexus_core::capability::Capability;
 use conexus_core::principal::Principal;
+use conexus_core::tool_result::ToolResult;
+use conexus_db::agent_action_repository;
+use rusqlite::Connection;
 use serde_json::Value;
+use tokio::sync::Mutex as AsyncMutex;
 
 /// Port of `core/auth.py::generate_token` -- `secrets.token_hex(16)`,
 /// 128 bits of OS-CSPRNG entropy, hex-encoded. `getrandom` (not a
@@ -192,6 +214,120 @@ pub fn build_mcp_config_snippet(
         }
     });
     serde_json::to_string_pretty(&snippet).expect("a snippet of only strings always serializes")
+}
+
+/// Clamp an incoming `limit` argument the same way Python's
+/// `view_audit_log_tool_impl` does: any value that doesn't parse as an
+/// integer in `[1, 200]` silently falls back to the default (50),
+/// rather than erroring -- a malformed limit degrading to "just show
+/// me the recent activity" is treated as more useful than a 400.
+fn clamp_audit_log_limit(arguments: &Value) -> i64 {
+    const DEFAULT: i64 = 50;
+    match arguments.get("limit") {
+        None => DEFAULT,
+        Some(v) => match v.as_i64() {
+            Some(n) if (1..=200).contains(&n) => n,
+            _ => DEFAULT,
+        },
+    }
+}
+
+pub struct ViewAuditLogTool;
+
+impl Tool for ViewAuditLogTool {
+    const NAME: &'static str = "view_audit_log";
+    const REQUIRED: Requirement = Requirement::Cap {
+        // SECURITY (viewer-read-gating, matches Python's own comment):
+        // system.config.write (operator-only), NOT system.view -- the
+        // audit log discloses operator user_ids and every agent
+        // action, and system.view is in the VIEWER bundle.
+        cap: Capability::SystemConfigWrite,
+        reason: None,
+    };
+    const DESCRIPTION: &'static str = "Read recent audit-log entries. Operator-only.";
+    const SCHEMA: &'static str = r#"{
+        "type": "object",
+        "properties": {
+            "agent_id": {
+                "type": "string",
+                "description": "Optional: filter by agent ID"
+            },
+            "action": {
+                "type": "string",
+                "description": "Optional: filter by action type"
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum number of entries to return (default: 50, max: 200)",
+                "default": 50
+            }
+        },
+        "required": [],
+        "additionalProperties": false
+    }"#;
+
+    fn call<'a>(
+        _principal: Option<&'a Principal>,
+        arguments: &'a Value,
+        conn: &'a AsyncMutex<Connection>,
+        _now: &'a str,
+        _ctx: &'a conexus_auth::ToolCallContext<'a>,
+    ) -> conexus_auth::BoxFuture<'a, ToolResult> {
+        Box::pin(async move {
+            let filter_agent_id = arguments.get("agent_id").and_then(Value::as_str);
+            let filter_action = arguments.get("action").and_then(Value::as_str);
+            let limit = clamp_audit_log_limit(arguments);
+
+            let guard = conn.lock().await;
+            let rows = match agent_action_repository::list_recent(
+                &guard,
+                filter_agent_id,
+                filter_action,
+                limit,
+            ) {
+                Ok(rows) => rows,
+                Err(_e) => {
+                    return ToolResult::Failed {
+                        message: "A database error occurred; it has been logged. Retry, or ask \
+                            an operator to check logs."
+                            .to_string(),
+                    }
+                }
+            };
+            drop(guard);
+
+            let entries: Vec<Value> = rows
+                .iter()
+                .map(|row| {
+                    serde_json::json!({
+                        "timestamp": row.timestamp,
+                        "agent_id": row.agent_id,
+                        "action": row.action_type,
+                        "details": row.details,
+                    })
+                })
+                .collect();
+            let log_json = serde_json::to_string_pretty(&entries)
+                .expect("every field here is already a plain JSON value");
+
+            ToolResult::Ok {
+                data: Some(serde_json::json!({
+                    "entries": entries,
+                    "count": entries.len(),
+                    "filter_agent_id": filter_agent_id,
+                    "filter_action": filter_action,
+                    "limit": limit,
+                })),
+                message: Some(format!(
+                    "Audit Log ({} entries displayed, filtered by agent: {}, action: {}):\n{}",
+                    entries.len(),
+                    filter_agent_id.unwrap_or("Any"),
+                    filter_action.unwrap_or("Any"),
+                    log_json,
+                )),
+            }
+        })
+    }
 }
 
 #[cfg(test)]
@@ -421,5 +557,157 @@ mod tests {
             parsed["mcpServers"]["agent-mcp"]["url"],
             "https://host.example/mcp"
         );
+    }
+
+    // ── ViewAuditLogTool ─────────────────────────────────────────────
+
+    use conexus_core::capability::Capabilities;
+    use conexus_core::principal::PrincipalKind;
+    use conexus_db::schema::init_schema;
+    use conexus_wakeloop::file_map::FileMap;
+    use conexus_wakeloop::waiter_registry::WaiterRegistry;
+    use std::collections::HashSet;
+
+    fn operator() -> Principal {
+        Principal {
+            kind: PrincipalKind::ForwardingHeader,
+            user_id: Some("op-1".to_string()),
+            agent_id: None,
+            project_name: None,
+            project_role: None,
+            agent_role: None,
+            can_wake_loop: false,
+            source_token: None,
+            capabilities: Capabilities::Set(HashSet::from([Capability::SystemConfigWrite])),
+        }
+    }
+
+    fn worker() -> Principal {
+        use conexus_core::capability::AgentRole;
+        Principal {
+            kind: PrincipalKind::AgentBearer,
+            user_id: None,
+            agent_id: Some("alice".to_string()),
+            project_name: None,
+            project_role: None,
+            agent_role: Some(AgentRole::Worker),
+            can_wake_loop: true,
+            source_token: None,
+            capabilities: Capabilities::Set(HashSet::new()),
+        }
+    }
+
+    async fn setup() -> AsyncMutex<Connection> {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        AsyncMutex::new(conn)
+    }
+
+    fn ctx<'a>(
+        registry: &'a WaiterRegistry,
+        file_map: &'a FileMap,
+    ) -> conexus_auth::ToolCallContext<'a> {
+        conexus_auth::ToolCallContext::off_wire(registry, file_map, std::path::Path::new("/tmp"))
+    }
+
+    async fn seed(conn: &AsyncMutex<Connection>, agent_id: &str, action_type: &str, ts: &str) {
+        let guard = conn.lock().await;
+        agent_action_repository::log_agent_action(&guard, agent_id, action_type, None, None, ts)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn view_audit_log_denies_a_plain_worker() {
+        let alice = worker();
+        let denied =
+            ViewAuditLogTool::REQUIRED.check(Some(&alice), &conexus_auth::NoPolicyOverrides);
+        assert!(denied.is_err());
+    }
+
+    #[tokio::test]
+    async fn view_audit_log_returns_recent_entries_for_an_operator() {
+        let conn = setup().await;
+        seed(&conn, "alice", "created_task", "2026-06-01T00:00:00Z").await;
+        seed(&conn, "bob", "deleted_task", "2026-06-01T00:00:01Z").await;
+        let op = operator();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = ViewAuditLogTool::call(
+            Some(&op),
+            &serde_json::json!({}),
+            &conn,
+            "2026-06-01T00:00:02Z",
+            &c,
+        )
+        .await;
+        let ToolResult::Ok { data, message } = result else {
+            panic!("expected Ok, got {result:?}");
+        };
+        let data = data.unwrap();
+        assert_eq!(data["count"], 2);
+        assert_eq!(data["entries"][0]["action"], "created_task");
+        assert_eq!(data["entries"][1]["action"], "deleted_task");
+        assert!(message.unwrap().contains("2 entries displayed"));
+    }
+
+    #[tokio::test]
+    async fn view_audit_log_filters_by_agent_id_and_action() {
+        let conn = setup().await;
+        seed(&conn, "alice", "created_task", "2026-06-01T00:00:00Z").await;
+        seed(&conn, "alice", "deleted_task", "2026-06-01T00:00:01Z").await;
+        seed(&conn, "bob", "deleted_task", "2026-06-01T00:00:02Z").await;
+        let op = operator();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = ViewAuditLogTool::call(
+            Some(&op),
+            &serde_json::json!({"agent_id": "alice", "action": "deleted_task"}),
+            &conn,
+            "2026-06-01T00:00:03Z",
+            &c,
+        )
+        .await;
+        let ToolResult::Ok { data, .. } = result else {
+            panic!("expected Ok, got {result:?}");
+        };
+        assert_eq!(data.unwrap()["count"], 1);
+    }
+
+    #[test]
+    fn clamp_audit_log_limit_falls_back_to_50_on_anything_out_of_range() {
+        assert_eq!(clamp_audit_log_limit(&serde_json::json!({})), 50);
+        assert_eq!(clamp_audit_log_limit(&serde_json::json!({"limit": 10})), 10);
+        assert_eq!(clamp_audit_log_limit(&serde_json::json!({"limit": 0})), 50);
+        assert_eq!(
+            clamp_audit_log_limit(&serde_json::json!({"limit": 201})),
+            50
+        );
+        assert_eq!(
+            clamp_audit_log_limit(&serde_json::json!({"limit": "not-a-number"})),
+            50
+        );
+    }
+
+    #[tokio::test]
+    async fn view_audit_log_on_an_empty_table_reports_zero_entries() {
+        let conn = setup().await;
+        let op = operator();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = ViewAuditLogTool::call(
+            Some(&op),
+            &serde_json::json!({}),
+            &conn,
+            "2026-06-01T00:00:00Z",
+            &c,
+        )
+        .await;
+        let ToolResult::Ok { data, .. } = result else {
+            panic!("expected Ok, got {result:?}");
+        };
+        assert_eq!(data.unwrap()["count"], 0);
     }
 }
