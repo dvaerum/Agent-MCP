@@ -7,6 +7,7 @@
 
 pub mod agent_communication_tools;
 pub mod agent_messaging;
+pub mod agent_tools;
 pub mod assign_task_tools;
 pub mod completion_client;
 pub mod context_window;
