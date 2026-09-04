@@ -125,7 +125,7 @@ pub enum StreamSlice<T> {
     Item(T),
 }
 
-type LivenessFuture = Pin<Box<dyn Future<Output = Liveness> + Send>>;
+type LivenessFuture<'a> = Pin<Box<dyn Future<Output = Liveness> + Send + 'a>>;
 
 /// Bounded wait for the next event on a `tokio::sync::mpsc` channel,
 /// fused with a liveness re-check. One instance per open stream.
@@ -136,17 +136,25 @@ type LivenessFuture = Pin<Box<dyn Future<Output = Liveness> + Send>>;
 /// slice (a plain closure covers both "fixed value" and "read a
 /// runtime-mutable setting" -- Python needs a float-or-callable union
 /// for the same two cases; a closure is the one shape Rust needs).
-pub struct RevalidatingStream<T> {
+pub struct RevalidatingStream<'a, T> {
     queue: Receiver<T>,
-    liveness: Box<dyn Fn() -> LivenessFuture + Send + Sync>,
-    interval: Box<dyn Fn() -> f64 + Send + Sync>,
+    liveness: Box<dyn Fn() -> LivenessFuture<'a> + Send + Sync + 'a>,
+    interval: Box<dyn Fn() -> f64 + Send + Sync + 'a>,
 }
 
-impl<T> RevalidatingStream<T> {
+impl<'a, T> RevalidatingStream<'a, T> {
+    /// `'a` bounds `liveness`/`interval`, NOT just `'static` -- added
+    /// the moment this crate's first real consumer (`wait_for_events`,
+    /// Phase D3) needed it: its liveness check borrows a
+    /// `&'a AsyncMutex<Connection>` whose lifetime is tied to the
+    /// enclosing `Tool::call`'s own arguments, never `'static`. Every
+    /// existing caller passing a genuinely `'static` closure (this
+    /// module's own tests) keeps working unchanged, since `'static`
+    /// satisfies any `'a`.
     pub fn new(
         queue: Receiver<T>,
-        liveness: impl Fn() -> LivenessFuture + Send + Sync + 'static,
-        interval: impl Fn() -> f64 + Send + Sync + 'static,
+        liveness: impl Fn() -> LivenessFuture<'a> + Send + Sync + 'a,
+        interval: impl Fn() -> f64 + Send + Sync + 'a,
     ) -> Self {
         Self {
             queue,
@@ -237,11 +245,11 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    fn always_live() -> LivenessFuture {
+    fn always_live<'a>() -> LivenessFuture<'a> {
         Box::pin(async { Liveness::live() })
     }
 
-    fn always_revoked() -> LivenessFuture {
+    fn always_revoked<'a>() -> LivenessFuture<'a> {
         Box::pin(async { Liveness::revoked("test revocation") })
     }
 
