@@ -76,13 +76,22 @@ fn row_to_setting(row: &Row) -> rusqlite::Result<ProjectSettingRow> {
 /// `default` — same "unreachable settings store during early bootstrap
 /// degrades to the default" contract as Python.
 pub fn get_bool(conn: &Connection, context_key: &str, default: bool) -> bool {
-    let Ok(Some(row)) = get(conn, context_key) else {
-        return default;
-    };
+    get_bool_override(conn, context_key).unwrap_or(default)
+}
+
+/// [`get_bool`] without a baked-in default -- `None` for "no row, an
+/// unreadable value, or a DB error" rather than silently resolving to
+/// a caller-supplied fallback. The seam `conexus_auth::PolicySource`
+/// impls (e.g. the backend's per-request settings snapshot) need: a
+/// `Requirement::Policy`'s own `default` field is the ONE place that
+/// fallback belongs, so a `PolicySource` reading this store must be
+/// able to say "no override" distinctly from "override is off".
+pub fn get_bool_override(conn: &Connection, context_key: &str) -> Option<bool> {
+    let row = get(conn, context_key).ok()??;
     match row.value.trim().trim_matches('"').to_lowercase().as_str() {
-        "true" | "1" | "yes" | "on" => true,
-        "false" | "0" | "no" | "off" => false,
-        _ => default,
+        "true" | "1" | "yes" | "on" => Some(true),
+        "false" | "0" | "no" | "off" => Some(false),
+        _ => None,
     }
 }
 
@@ -562,6 +571,31 @@ mod tests {
         .unwrap();
         assert!(get_bool(&conn, "k", true));
         assert!(!get_bool(&conn, "k", false));
+    }
+
+    #[test]
+    fn get_bool_override_is_none_for_a_missing_key() {
+        // Unlike `get_bool`, no default to fall back to -- `None` is
+        // the distinct "no override on record" signal a `PolicySource`
+        // needs (see this function's own doc).
+        let conn = test_conn();
+        assert_eq!(get_bool_override(&conn, "config_nope"), None);
+    }
+
+    #[test]
+    fn get_bool_override_returns_the_parsed_value_when_a_row_exists() {
+        let conn = test_conn();
+        upsert(
+            &conn,
+            "k",
+            "false",
+            None,
+            false,
+            "tester",
+            "2026-01-01T00:00:00Z",
+        )
+        .unwrap();
+        assert_eq!(get_bool_override(&conn, "k"), Some(false));
     }
 
     // -- get_int -------------------------------------------------------------
