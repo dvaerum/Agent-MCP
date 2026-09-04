@@ -487,10 +487,45 @@ def get_forwarding_hmac_key(name: str) -> bytes | None:
     return ensure_forwarding_hmac_key(name)
 
 
-def _unit_name(name: str, role: str) -> str:
-    if role == "backend":
-        return f"agent-mcp@{name}.service"
-    raise ValueError(f"unsupported role: {role!r}")
+def _backend_impl_for(name: str) -> str:
+    """Resolve `name`'s registry `backend_impl`, defaulting to
+    `project_registry.DEFAULT_BACKEND_IMPL` ("python") when the
+    project is unknown.
+
+    A concurrent delete/rename can race a reaper or stop() call that's
+    already mid-flight — those callers are winding a project DOWN, not
+    creating one, so falling back to the default preserves today's
+    only behavior (the `agent-mcp@` unit template) rather than raising
+    on a lookup miss.
+    """
+    project = project_registry.ProjectRegistry().get(name)
+    if project is None:
+        return project_registry.DEFAULT_BACKEND_IMPL
+    return project.get("backend_impl", project_registry.DEFAULT_BACKEND_IMPL)
+
+
+def _unit_name(name: str, role: str, backend_impl: str | None = None) -> str:
+    """Systemd unit name for `(name, role)`.
+
+    `backend_impl` (prancy-napping-pie Phase D1) selects between the
+    Python (`agent-mcp@`) and Rust/CoNexus (`conexus@`) unit
+    templates. `None` (the default) resolves it via a fresh registry
+    lookup — the reaper and `stop()` call sites don't have a project
+    row already in hand. Pass an already-fetched value (`_ensure`'s
+    own `registry.get(name)` row) to avoid a second lock-and-read.
+
+    Per the operator's locked decision: both templates share the same
+    `RuntimeDirectory`/socket path (see `_sock_path`, unaffected by
+    `backend_impl`) — a cutover is a same-path process swap, not a
+    socket migration.
+    """
+    if role != "backend":
+        raise ValueError(f"unsupported role: {role!r}")
+    if backend_impl is None:
+        backend_impl = _backend_impl_for(name)
+    if backend_impl == "rust":
+        return f"conexus@{name}.service"
+    return f"agent-mcp@{name}.service"
 
 
 # Whether to call ``systemctl --user`` (default, matches the
@@ -688,14 +723,17 @@ async def _ensure(name: str, role: str) -> Path:
     # orchestrator, so a fresh ``ProjectRegistry()`` here picks up the
     # test path.
     registry = project_registry.ProjectRegistry()
-    if registry.get(name) is None:
+    project = registry.get(name)
+    if project is None:
         # Fixed reason phrase — never reflect the caller-supplied
         # ``name`` into the HTTP status line. aiohttp rejects CR/LF in
         # ``reason`` today, but echoing attacker input into the status
         # line is fragile (response-splitting-adjacent); a constant
         # string removes the surface entirely.
         raise web.HTTPNotFound(reason="unknown project")
-    unit = _unit_name(name, role)
+    # Reuse the row just fetched instead of letting _unit_name() take
+    # a second lock-and-read — this is the per-request hot path.
+    unit = _unit_name(name, role, project.get("backend_impl"))
     sock = _sock_path(name, role)
 
     async with _ensure_lock(name, role):

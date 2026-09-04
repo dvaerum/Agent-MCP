@@ -499,6 +499,101 @@ async def test_systemctl_honors_agent_mcp_systemctl_mode_env_var(
         )
 
 
+# ── backend_impl unit-name selection (Phase D1, prancy-napping-pie) ──
+#
+# `_unit_name` selects between the Python (`agent-mcp@`) and Rust
+# (`conexus@`) systemd unit templates. The registry's `backend_impl`
+# field is the source of truth; `_unit_name` resolves it via a fresh
+# lookup when not given explicitly (the reaper/stop call sites don't
+# have a project row in hand), or accepts an already-fetched value
+# (`_ensure`'s own registry read) to avoid a second lock-and-read.
+
+
+async def test_unit_name_explicit_python_backend_impl(orchestrator_module):
+    assert (
+        orchestrator_module._unit_name("alpha", "backend", "python")
+        == "agent-mcp@alpha.service"
+    )
+
+
+async def test_unit_name_explicit_rust_backend_impl(orchestrator_module):
+    assert (
+        orchestrator_module._unit_name("alpha", "backend", "rust")
+        == "conexus@alpha.service"
+    )
+
+
+async def test_unit_name_resolves_backend_impl_from_the_registry_when_not_given(
+    orchestrator, orchestrator_module,
+):
+    orchestrator.registry.register("alpha", "/tmp/alpha", backend_impl="rust")
+    assert (
+        orchestrator_module._unit_name("alpha", "backend")
+        == "conexus@alpha.service"
+    )
+
+
+async def test_unit_name_defaults_to_python_for_an_unregistered_project(
+    orchestrator_module,
+):
+    # No registry row at all -- must not crash, must preserve today's
+    # only behavior (the agent-mcp@ unit template).
+    assert (
+        orchestrator_module._unit_name("ghost", "backend")
+        == "agent-mcp@ghost.service"
+    )
+
+
+async def test_unit_name_rejects_an_unsupported_role(orchestrator_module):
+    with pytest.raises(ValueError):
+        orchestrator_module._unit_name("alpha", "frontend")
+
+
+async def test_ensure_starts_the_conexus_unit_for_a_rust_project(
+    orchestrator, orchestrator_module, router_env, systemctl_stub,
+):
+    name = "rusty"
+    orchestrator.registry.register(
+        name, str(router_env.root / "ws" / name), backend_impl="rust",
+    )
+    unit = f"conexus@{name}.service"
+    sock_path = router_env.sock_dir / name / "backend.sock"
+    sock_path.parent.mkdir(parents=True, exist_ok=True)
+    sock_path.touch()
+
+    real_is_socket = Path.is_socket
+    Path.is_socket = lambda self: True  # type: ignore[assignment]
+    try:
+        result = await orchestrator.start(name)
+    finally:
+        Path.is_socket = real_is_socket  # type: ignore[assignment]
+
+    assert result == sock_path
+    assert systemctl_stub.counts[("start", unit)] == 1, (
+        f"start did not invoke systemctl start on {unit}; "
+        f"calls: {systemctl_stub.calls}"
+    )
+    # The Python unit must NEVER be touched for a rust-flagged project.
+    assert ("start", f"agent-mcp@{name}.service") not in systemctl_stub.counts
+
+
+async def test_stop_stops_the_conexus_unit_for_a_rust_project(
+    orchestrator, orchestrator_module, router_env, systemctl_stub,
+):
+    name = "rusty"
+    orchestrator.registry.register(
+        name, str(router_env.root / "ws" / name), backend_impl="rust",
+    )
+    unit = f"conexus@{name}.service"
+    systemctl_stub.active_units.add(unit)
+
+    result = orchestrator.stop(name, force=True)
+
+    assert result["stopped"] is True
+    assert systemctl_stub.counts[("stop", unit)] == 1
+    assert ("stop", f"agent-mcp@{name}.service") not in systemctl_stub.counts
+
+
 # ── Regression: URL dispatch through the router still resolves aliases ──
 
 
