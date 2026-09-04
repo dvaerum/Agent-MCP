@@ -7,4 +7,6 @@ license.workspace = true
 description = "CoNexus wake-loop support primitives -- one module per agent_mcp/core/{hold_ladder,client_hold_strategy,idle_reminder,stream_gates}.py plus the waiter registry (Phase D3). New crate, sitting between conexus-auth and conexus-tools: wait_for_events (a conexus-tools Tool) depends on these; conexus-mcp's later rmcp/Peer transport wiring is a separate, higher-level concern these modules don't need. See /home/dennis/.claude/plans/prancy-napping-pie.md."
 
 [dependencies]
+conexus-db = { path = "../conexus-db" }
+rusqlite = { version = "0.32", features = ["bundled"] }
 serde_json = "1"

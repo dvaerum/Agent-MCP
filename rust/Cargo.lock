@@ -377,6 +377,8 @@ dependencies = [
 name = "conexus-wakeloop"
 version = "0.1.0"
 dependencies = [
+ "conexus-db",
+ "rusqlite",
  "serde_json",
 ]
 
