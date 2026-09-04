@@ -169,6 +169,18 @@ _SLUG_RE = re.compile(r"^[a-z](?:[a-z0-9-]*[a-z0-9])?$")
 # expose it as a module constant so tests / operators can tune.
 DEFAULT_ALIAS_GRACE_DAYS: int = 30
 
+# CoNexus migration (prancy-napping-pie, Phase D1): which language's
+# backend process serves this project. Unlike the generic `extra`
+# kwargs `register()` otherwise discards (see the module docstring),
+# `backend_impl` is NOT opaque — `project_orchestrator.py`'s
+# `_unit_name()` reads it to choose between the `agent-mcp@<name>`
+# and `conexus@<name>` systemd unit templates, so this module defaults
+# and validates it explicitly, the same way it treats `workspace` and
+# `aliases`. Every project defaults to "python" (today's only
+# implementation); "rust" is the canary-cutover value.
+DEFAULT_BACKEND_IMPL: str = "python"
+VALID_BACKEND_IMPLS: frozenset[str] = frozenset({"python", "rust"})
+
 
 class Alias(TypedDict):
     """One alias entry — a name that resolves to the parent project
@@ -179,14 +191,15 @@ class Alias(TypedDict):
 
 
 class Project(TypedDict, total=False):
-    """One project record. `name`, `workspace`, and `aliases` are
-    always populated by the registry's reader; any other keys are
-    passed through opaque so the dashboard can stash e.g. `created_at`
-    without this module needing a schema bump."""
+    """One project record. `name`, `workspace`, `aliases`, and
+    `backend_impl` are always populated by the registry's reader; any
+    other keys are passed through opaque so the dashboard can stash
+    e.g. `created_at` without this module needing a schema bump."""
 
     name: str
     workspace: str
     aliases: list[Alias]
+    backend_impl: str
 
 
 def _now_iso() -> str:
@@ -269,18 +282,40 @@ class ProjectRegistry:
             return None
         return self._materialise(name, payload)
 
-    def register(self, name: str, workspace: str, **extra: Any) -> Project:
+    def register(
+        self,
+        name: str,
+        workspace: str,
+        *,
+        backend_impl: str = DEFAULT_BACKEND_IMPL,
+        **extra: Any,
+    ) -> Project:
         """Register (or re-confirm) a project. Returns the stored row.
 
         Idempotent: re-registering with the same `workspace` is a
-        no-op and returns the existing row. Re-registering with a
-        DIFFERENT workspace raises ValueError — silently relocating
-        would invisibly move the project's SQLite state.
+        no-op and returns the existing row UNTOUCHED — including
+        `backend_impl`: calling `register(name, workspace)` again on
+        an already-`rust` project does NOT silently reset it back to
+        the "python" default. Flipping an existing project's
+        `backend_impl` is `set_backend_impl()`'s job, not this
+        method's (same "register() is create/reconfirm, mutation gets
+        its own method" split as `add_alias`/`rename`).
 
-        `extra` is currently accepted but not persisted; see the
-        module docstring for why we keep the on-disk shape flat.
+        Re-registering with a DIFFERENT workspace raises ValueError —
+        silently relocating would invisibly move the project's SQLite
+        state.
+
+        `backend_impl` must be one of `VALID_BACKEND_IMPLS`; raises
+        ValueError otherwise. `extra` is currently accepted but not
+        persisted; see the module docstring for why we keep the
+        on-disk shape flat.
         """
         del extra  # reserved for a future shape migration
+        if backend_impl not in VALID_BACKEND_IMPLS:
+            raise ValueError(
+                f"backend_impl must be one of {sorted(VALID_BACKEND_IMPLS)!r}, "
+                f"got {backend_impl!r}"
+            )
         with self._lock_for_write() as (fd, data):
             existing = data.get(name)
             if existing is not None:
@@ -326,7 +361,9 @@ class ProjectRegistry:
                             f"for project {other_name!r}"
                         )
 
-            data[name] = self._make_record(workspace, aliases=[])
+            data[name] = self._make_record(
+                workspace, aliases=[], backend_impl=backend_impl
+            )
             self._write_locked(fd, self._normalise_for_write(data))
             return self._materialise(name, data[name])
 
@@ -337,6 +374,43 @@ class ProjectRegistry:
                 return
             data.pop(name)
             self._write_locked(fd, self._normalise_for_write(data))
+
+    def set_backend_impl(self, name: str, backend_impl: str) -> Project:
+        """Flip an EXISTING project's `backend_impl` — the Phase D1
+        canary-cutover primitive (prancy-napping-pie).
+
+        Deliberately separate from `register()`, mirroring
+        `add_alias`/`rename`'s "register() is create/reconfirm,
+        mutation gets its own method" split — `register()`'s
+        idempotent-reregister path must not silently apply a NEW
+        `backend_impl` to an already-registered project, so a real
+        cutover has to go through here instead.
+
+        Does **not** touch systemd or sockets — same division of
+        responsibility as `rename()`: this only rewrites the registry
+        file. Stopping the old unit and starting the new one (per the
+        shared-`RuntimeDirectory` design: `agent-mcp@<name>` DOWN,
+        `conexus@<name>` UP, same socket path) is the caller's job
+        (`project_orchestrator.py`).
+
+        Raises:
+            UnknownProject (KeyError): `name` isn't registered.
+            ValueError: `backend_impl` isn't a member of
+                `VALID_BACKEND_IMPLS`.
+        """
+        if backend_impl not in VALID_BACKEND_IMPLS:
+            raise ValueError(
+                f"backend_impl must be one of {sorted(VALID_BACKEND_IMPLS)!r}, "
+                f"got {backend_impl!r}"
+            )
+        with self._lock_for_write() as (fd, data):
+            if name not in data:
+                raise UnknownProject(name)
+            record = self._coerce_to_record(data[name])
+            record["backend_impl"] = backend_impl
+            data[name] = record
+            self._write_locked(fd, self._normalise_for_write(data))
+            return self._materialise(name, data[name])
 
     # ── Alias API (Phase 1b) ───────────────────────────────────────
 
@@ -707,9 +781,18 @@ class ProjectRegistry:
     # ── Shape normalisation ────────────────────────────────────────
 
     @staticmethod
-    def _make_record(workspace: str, *, aliases: list[Alias]) -> dict[str, Any]:
+    def _make_record(
+        workspace: str,
+        *,
+        aliases: list[Alias],
+        backend_impl: str = DEFAULT_BACKEND_IMPL,
+    ) -> dict[str, Any]:
         """Build a fresh nested-shape record for `register()`."""
-        return {"workspace": workspace, "aliases": list(aliases)}
+        return {
+            "workspace": workspace,
+            "aliases": list(aliases),
+            "backend_impl": backend_impl,
+        }
 
     @staticmethod
     def _coerce_to_record(payload: Any) -> dict[str, Any]:
@@ -765,14 +848,20 @@ class ProjectRegistry:
 
         Accepts both the new shape (`{"workspace": ..., "aliases":
         [...]}, **extra}`) and the legacy shape (`"<workspace-string>"`).
-        Always returns a dict carrying `name` AND `aliases` so callers
-        don't need to handle the legacy-flat case downstream.
+        Always returns a dict carrying `name`, `aliases`, AND
+        `backend_impl` so callers don't need to handle the legacy-flat
+        case, or a pre-`backend_impl` on-disk record, downstream —
+        `backend_impl` defaults to `DEFAULT_BACKEND_IMPL` ("python")
+        when absent from the stored payload, same "read synthesises
+        the default, a write upgrades the shape it touches" idiom the
+        legacy string→nested-shape upgrade already uses.
         """
         if isinstance(payload, str):
             row: dict[str, Any] = {
                 "name": name,
                 "workspace": payload,
                 "aliases": [],
+                "backend_impl": DEFAULT_BACKEND_IMPL,
             }
             return row  # type: ignore[return-value]
         if isinstance(payload, dict):
@@ -790,10 +879,14 @@ class ProjectRegistry:
                 for a in aliases
                 if isinstance(a, dict)
             ]
+            row.setdefault("backend_impl", DEFAULT_BACKEND_IMPL)
             return row  # type: ignore[return-value]
         # Defensive: unexpected payload type → treat as empty workspace.
         # Don't raise: the registry is read on hot paths and we'd rather
         # the operator see a broken-looking row than a 500.
         return {  # type: ignore[return-value]
-            "name": name, "workspace": "", "aliases": [],
+            "name": name,
+            "workspace": "",
+            "aliases": [],
+            "backend_impl": DEFAULT_BACKEND_IMPL,
         }

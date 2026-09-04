@@ -349,8 +349,16 @@ def test_write_upgrades_legacy_file_to_nested_shape(
     reg.register("beta", "/tmp/beta")  # any write triggers upgrade
 
     data = json.loads(registry_path.read_text())
+    # The legacy "alpha" entry is upgraded to the nested shape but NOT
+    # stamped with backend_impl -- only a fresh _make_record() write
+    # (a real register(), like "beta" below) persists that field; a
+    # bare shape-upgrade via _coerce_to_record leaves absent keys
+    # absent (read-time defaulting is _materialise()'s job, per that
+    # method's docstring).
     assert data["alpha"] == {"workspace": "/tmp/alpha", "aliases": []}
-    assert data["beta"] == {"workspace": "/tmp/beta", "aliases": []}
+    assert data["beta"] == {
+        "workspace": "/tmp/beta", "aliases": [], "backend_impl": "python",
+    }
 
 
 def test_add_alias_default_expiry_is_30_days(reg) -> None:
@@ -549,3 +557,78 @@ def test_add_alias_typed_failures(reg) -> None:
     reg.add_alias("beta", "shared")
     with pytest.raises(pr.AliasCollision):
         reg.add_alias("alpha", "shared")  # active alias of beta
+
+
+# ── backend_impl (Phase D1 canary-cutover flag) ──────────────────────
+#
+# `register()` accepts a `backend_impl` keyword (defaulting to
+# "python") that CREATE persists into the record; `set_backend_impl()`
+# is the separate mutator for flipping an EXISTING project (mirroring
+# add_alias/rename's "register() is create/reconfirm, mutation gets
+# its own method" split — register()'s idempotent-reregister path
+# returns the existing row untouched, so it must not silently apply a
+# new backend_impl on re-registration either).
+
+
+def test_register_defaults_backend_impl_to_python(reg) -> None:
+    row = reg.register("alpha", "/tmp/alpha")
+    assert row["backend_impl"] == "python"
+
+
+def test_register_persists_an_explicit_backend_impl(reg) -> None:
+    row = reg.register("alpha", "/tmp/alpha", backend_impl="rust")
+    assert row["backend_impl"] == "rust"
+    # Round-trips through a fresh read, not just the in-memory return.
+    assert reg.get("alpha")["backend_impl"] == "rust"
+
+
+def test_register_rejects_an_unrecognized_backend_impl(reg) -> None:
+    with pytest.raises(ValueError):
+        reg.register("alpha", "/tmp/alpha", backend_impl="cobol")
+
+
+def test_reregistering_at_the_same_workspace_does_not_change_backend_impl(reg) -> None:
+    reg.register("alpha", "/tmp/alpha", backend_impl="rust")
+    # Idempotent re-register with NO backend_impl kwarg — must not
+    # silently reset the project back to the "python" default.
+    row = reg.register("alpha", "/tmp/alpha")
+    assert row["backend_impl"] == "rust"
+
+
+def test_pre_existing_records_with_no_backend_impl_key_read_as_python(reg, registry_path: Path) -> None:
+    # Simulates a registry file written before this field existed —
+    # the on-disk record has no "backend_impl" key at all.
+    registry_path.write_text(
+        json.dumps({"legacy": {"workspace": "/tmp/legacy", "aliases": []}})
+    )
+    assert reg.get("legacy")["backend_impl"] == "python"
+    assert reg.list()[0]["backend_impl"] == "python"
+
+
+def test_set_backend_impl_flips_an_existing_project(reg) -> None:
+    reg.register("alpha", "/tmp/alpha")
+    updated = reg.set_backend_impl("alpha", "rust")
+    assert updated["backend_impl"] == "rust"
+    assert reg.get("alpha")["backend_impl"] == "rust"
+
+
+def test_set_backend_impl_preserves_workspace_and_aliases(reg) -> None:
+    reg.register("alpha", "/tmp/alpha")
+    reg.add_alias("alpha", "old-name")
+    reg.set_backend_impl("alpha", "rust")
+    row = reg.get("alpha")
+    assert row["workspace"] == "/tmp/alpha"
+    assert [a["name"] for a in row["aliases"]] == ["old-name"]
+
+
+def test_set_backend_impl_unknown_project_raises_unknown_project(reg) -> None:
+    from agent_mcp.router import project_registry as pr
+
+    with pytest.raises(pr.UnknownProject):
+        reg.set_backend_impl("ghost", "rust")
+
+
+def test_set_backend_impl_rejects_an_unrecognized_value(reg) -> None:
+    reg.register("alpha", "/tmp/alpha")
+    with pytest.raises(ValueError):
+        reg.set_backend_impl("alpha", "cobol")
