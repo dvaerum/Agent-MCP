@@ -18,6 +18,14 @@ conexus-wakeloop = { path = "../conexus-wakeloop" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde_json = "1"
 regex = "1"
+# wait_for_events's slow-path loop needs fresh wall-clock ISO
+# timestamps as real time passes during its (potentially hours-long)
+# hold -- see agent_communication_tools.rs's own doc on why this is
+# the one deliberate exception to "explicit input, never read the
+# clock". default-features off + only "clock": matches
+# conexus-backend's own chrono usage for the same "generate now"
+# purpose.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # Tool::call takes `&tokio::sync::Mutex<Connection>` (see
 # conexus_auth::tool's module doc) -- every impl here locks it as the
 # first step of its own async body.
@@ -38,5 +46,15 @@ reqwest = { version = "0.12", default-features = false, features = [
 # async Tool::call/dispatch ("rt", "macros") and the embedding/
 # completion/context-window probe tests' real bound TCP listeners
 # ("rt-multi-thread", "net", "io-util") -- "rt-multi-thread" is a
-# superset of "rt" so only one is listed.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
+# superset of "rt" so only one is listed. "test-util" drives
+# wait_for_events's slow-path loop tests through virtual time
+# (`#[tokio::test(start_paused = true)]` + `tokio::time::advance`) --
+# this crate's first real user of it (`stream_gates.rs` enabled the
+# feature but never exercised it -- see this module's own tests).
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "io-util",
+    "test-util",
+] }
