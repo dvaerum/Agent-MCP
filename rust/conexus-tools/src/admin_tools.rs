@@ -40,11 +40,15 @@
 
 use conexus_auth::{Requirement, Tool};
 use conexus_core::capability::Capability;
-use conexus_core::principal::Principal;
+use conexus_core::principal::{is_confirmed_operator_tier, Principal};
 use conexus_core::tool_result::ToolResult;
 use conexus_db::agent_action_repository;
+use conexus_db::agent_repository::{
+    parse_agent_sort_by, parse_sort_order, AgentQueryFilters, AgentRepository,
+};
 use rusqlite::Connection;
 use serde_json::Value;
+use std::sync::LazyLock;
 use tokio::sync::Mutex as AsyncMutex;
 
 /// Port of `core/auth.py::generate_token` -- `secrets.token_hex(16)`,
@@ -324,6 +328,208 @@ impl Tool for ViewAuditLogTool {
                     filter_agent_id.unwrap_or("Any"),
                     filter_action.unwrap_or("Any"),
                     log_json,
+                )),
+            }
+        })
+    }
+}
+
+/// One process-wide instance, matching Python's module-level
+/// `agent_repo` (an imported module is itself a singleton) -- the
+/// pagination cache must survive across calls the same way
+/// `task_tools.rs`'s `VIEW_TASKS_ENGINE` does.
+static GET_AGENT_TOKENS_REPO: LazyLock<AgentRepository> = LazyLock::new(AgentRepository::new);
+
+/// The canonical `sort_by` string this crate's `AgentQueryFilters`
+/// will actually use -- mirrors `parse_agent_sort_by`'s own
+/// allowlist-with-fallback so the tool's REPORTED `sort.sort_by`
+/// matches what was really applied (a caller passing `"updated_at"`,
+/// which Python's tool-layer pre-check allows but the repository's OWN
+/// allowlist does not, silently falls back to `created_at` -- a real,
+/// preserved Python inconsistency between the tool's validation and
+/// the repository's, not reconciled here).
+fn effective_agent_sort_by(raw: &str) -> &'static str {
+    match raw {
+        "agent_id" => "agent_id",
+        "status" => "status",
+        "terminated_at" => "terminated_at",
+        _ => "created_at",
+    }
+}
+
+fn effective_sort_order(raw: &str) -> &'static str {
+    if raw.eq_ignore_ascii_case("ASC") {
+        "ASC"
+    } else {
+        "DESC"
+    }
+}
+
+pub struct GetAgentTokensTool;
+
+impl Tool for GetAgentTokensTool {
+    const NAME: &'static str = "get_agent_tokens";
+    const REQUIRED: Requirement = Requirement::Cap {
+        // SECURITY (FINDING 2, ported verbatim): agent bearer tokens
+        // are operator-tier secrets. agents.register is the operation
+        // that MINTS + returns a bearer, so viewing existing bearers
+        // belongs to the same tier -- NOT agents.view (viewer bundle),
+        // which would leak plaintext tokens to read-only viewers.
+        cap: Capability::AgentsRegister,
+        reason: None,
+    };
+    const DESCRIPTION: &'static str = "Retrieve agent tokens with advanced filtering. \
+        Operator-only.";
+    const SCHEMA: &'static str = r#"{
+        "type": "object",
+        "properties": {
+            "filter_status": {"type": "string"},
+            "filter_agent_id_pattern": {"type": "string"},
+            "filter_created_after": {"type": "string"},
+            "filter_created_before": {"type": "string"},
+            "include_terminated": {"type": "boolean", "default": false},
+            "include_sensitive_data": {"type": "boolean", "default": false},
+            "limit": {"type": "integer", "default": 50},
+            "offset": {"type": "integer", "default": 0},
+            "sort_by": {"type": "string", "default": "created_at"},
+            "sort_order": {"type": "string", "default": "DESC"}
+        },
+        "required": [],
+        "additionalProperties": false
+    }"#;
+
+    fn call<'a>(
+        principal: Option<&'a Principal>,
+        arguments: &'a Value,
+        conn: &'a AsyncMutex<Connection>,
+        now: &'a str,
+        _ctx: &'a conexus_auth::ToolCallContext<'a>,
+    ) -> conexus_auth::BoxFuture<'a, ToolResult> {
+        Box::pin(async move {
+            let filter_status = arguments.get("filter_status").and_then(Value::as_str);
+            let filter_agent_id_pattern = arguments
+                .get("filter_agent_id_pattern")
+                .and_then(Value::as_str);
+            let filter_created_after = arguments
+                .get("filter_created_after")
+                .and_then(Value::as_str);
+            let filter_created_before = arguments
+                .get("filter_created_before")
+                .and_then(Value::as_str);
+            let include_terminated = arguments
+                .get("include_terminated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let include_sensitive_data = arguments
+                .get("include_sensitive_data")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+
+            let limit = match arguments.get("limit").and_then(Value::as_i64) {
+                Some(n) if (1..=500).contains(&n) => n,
+                _ => 50,
+            };
+            let offset = match arguments.get("offset").and_then(Value::as_i64) {
+                Some(n) if n >= 0 => n,
+                _ => 0,
+            };
+            let sort_by_raw = arguments
+                .get("sort_by")
+                .and_then(Value::as_str)
+                .unwrap_or("created_at");
+            let sort_order_raw = arguments
+                .get("sort_order")
+                .and_then(Value::as_str)
+                .unwrap_or("DESC");
+            let effective_sort_by = effective_agent_sort_by(sort_by_raw);
+            let effective_sort_order = effective_sort_order(sort_order_raw);
+
+            let guard = conn.lock().await;
+            let (rows, total_count) = match GET_AGENT_TOKENS_REPO.query(
+                &guard,
+                AgentQueryFilters {
+                    status: filter_status,
+                    agent_id_pattern: filter_agent_id_pattern,
+                    include_terminated,
+                    created_after: filter_created_after,
+                    created_before: filter_created_before,
+                    sort_by: parse_agent_sort_by(sort_by_raw),
+                    sort_order: parse_sort_order(sort_order_raw),
+                    limit,
+                    offset,
+                },
+            ) {
+                Ok(result) => result,
+                Err(_e) => {
+                    return ToolResult::Failed {
+                        message: "A database error occurred; it has been logged. Retry, or ask \
+                            an operator to check logs."
+                            .to_string(),
+                    }
+                }
+            };
+            drop(guard);
+
+            // SECURITY (FINDING 2): plaintext tokens surface ONLY when
+            // the caller both explicitly opted in AND is confirmed
+            // operator tier -- a viewer whose group grant let it pass
+            // the coarse Cap gate above is still masked.
+            let expose_tokens =
+                include_sensitive_data && principal.is_some_and(is_confirmed_operator_tier);
+            let agents_data: Vec<Value> = rows
+                .iter()
+                .map(|row| redact_agent_row(row, expose_tokens))
+                .collect();
+
+            let requesting_agent_id = principal.map(Principal::actor_label).unwrap_or("operator");
+            let guard = conn.lock().await;
+            let _ = agent_action_repository::log_agent_action(
+                &guard,
+                requesting_agent_id,
+                "get_agent_tokens",
+                None,
+                Some(&serde_json::json!({
+                    "filter_status": filter_status,
+                    "filter_agent_id_pattern": filter_agent_id_pattern,
+                    "agents_returned": agents_data.len(),
+                    "total_matching": total_count,
+                    "include_sensitive_data": include_sensitive_data,
+                    "tokens_exposed": expose_tokens,
+                })),
+                now,
+            );
+            drop(guard);
+
+            let has_more = offset + (agents_data.len() as i64) < total_count;
+            let response_data = serde_json::json!({
+                "agents": agents_data,
+                "pagination": {
+                    "offset": offset,
+                    "limit": limit,
+                    "total_count": total_count,
+                    "returned_count": agents_data.len(),
+                    "has_more": has_more,
+                },
+                "filters_applied": {
+                    "filter_status": filter_status,
+                    "filter_agent_id_pattern": filter_agent_id_pattern,
+                    "filter_created_after": filter_created_after,
+                    "filter_created_before": filter_created_before,
+                    "include_terminated": include_terminated,
+                    "include_sensitive_data": expose_tokens,
+                },
+                "sort": {"sort_by": effective_sort_by, "sort_order": effective_sort_order},
+            });
+            let response_json = serde_json::to_string_pretty(&response_data)
+                .expect("every field here is already a plain JSON value");
+
+            ToolResult::Ok {
+                data: Some(response_data),
+                message: Some(format!(
+                    "Agent Tokens ({} of {} total):\n{}",
+                    agents_data.len(),
+                    total_count,
+                    response_json,
                 )),
             }
         })
@@ -709,5 +915,258 @@ mod tests {
             panic!("expected Ok, got {result:?}");
         };
         assert_eq!(data.unwrap()["count"], 0);
+    }
+
+    // ── GetAgentTokensTool ───────────────────────────────────────────
+
+    use conexus_core::capability::ProjectRole;
+
+    /// Passes the Cap(agents.register) gate AND is confirmed operator
+    /// tier (project_role Operator) -- the "real admin" case.
+    fn confirmed_operator() -> Principal {
+        Principal {
+            kind: PrincipalKind::ForwardingHeader,
+            user_id: Some("op-1".to_string()),
+            agent_id: None,
+            project_name: None,
+            project_role: Some(ProjectRole::Operator),
+            agent_role: None,
+            can_wake_loop: false,
+            source_token: None,
+            capabilities: Capabilities::Set(HashSet::from([Capability::AgentsRegister])),
+        }
+    }
+
+    /// Passes the Cap(agents.register) gate (e.g. via a group grant)
+    /// but is NOT confirmed operator tier (project_role Viewer, no
+    /// Sysadmin) -- Finding 2's second, defense-in-depth layer: this
+    /// principal must still be masked even with include_sensitive_data
+    /// set, since the coarse Cap gate alone isn't sufficient proof of
+    /// operator tier.
+    fn cap_only_non_confirmed() -> Principal {
+        Principal {
+            kind: PrincipalKind::ForwardingHeader,
+            user_id: Some("op-2".to_string()),
+            agent_id: None,
+            project_name: None,
+            project_role: Some(ProjectRole::Viewer),
+            agent_role: None,
+            can_wake_loop: false,
+            source_token: None,
+            capabilities: Capabilities::Set(HashSet::from([Capability::AgentsRegister])),
+        }
+    }
+
+    async fn seed_agent(
+        conn: &AsyncMutex<Connection>,
+        agent_id: &str,
+        token: &str,
+        created_at: &str,
+    ) {
+        let guard = conn.lock().await;
+        conexus_db::agent_repository::AgentRepository::create(
+            &guard,
+            conexus_db::agent_repository::NewAgent {
+                token,
+                agent_id,
+                created_at,
+                status: "active",
+                current_task: None,
+                working_directory: "/tmp",
+                color: None,
+                agent_role: "worker",
+            },
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_agent_tokens_denies_a_plain_worker() {
+        let alice = worker();
+        let denied =
+            GetAgentTokensTool::REQUIRED.check(Some(&alice), &conexus_auth::NoPolicyOverrides);
+        assert!(denied.is_err());
+    }
+
+    #[tokio::test]
+    async fn get_agent_tokens_masks_tokens_by_default_even_for_a_confirmed_operator() {
+        let conn = setup().await;
+        seed_agent(&conn, "alice", "tok-alice-secret", "2026-06-01T00:00:00Z").await;
+        let op = confirmed_operator();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = GetAgentTokensTool::call(
+            Some(&op),
+            &serde_json::json!({}),
+            &conn,
+            "2026-06-01T00:01:00Z",
+            &c,
+        )
+        .await;
+        let ToolResult::Ok { data, .. } = result else {
+            panic!("expected Ok, got {result:?}");
+        };
+        let data = data.unwrap();
+        assert_eq!(data["agents"][0]["token"], REDACTED_TOKEN);
+        assert_eq!(data["filters_applied"]["include_sensitive_data"], false);
+    }
+
+    #[tokio::test]
+    async fn get_agent_tokens_exposes_tokens_only_for_a_confirmed_operator_who_opts_in() {
+        let conn = setup().await;
+        seed_agent(&conn, "alice", "tok-alice-secret", "2026-06-01T00:00:00Z").await;
+        let op = confirmed_operator();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = GetAgentTokensTool::call(
+            Some(&op),
+            &serde_json::json!({"include_sensitive_data": true}),
+            &conn,
+            "2026-06-01T00:01:00Z",
+            &c,
+        )
+        .await;
+        let ToolResult::Ok { data, .. } = result else {
+            panic!("expected Ok, got {result:?}");
+        };
+        let data = data.unwrap();
+        assert_eq!(data["agents"][0]["token"], "tok-alice-secret");
+        assert_eq!(data["filters_applied"]["include_sensitive_data"], true);
+    }
+
+    #[tokio::test]
+    async fn get_agent_tokens_masks_a_cap_only_non_confirmed_caller_even_with_opt_in() {
+        // Finding 2's second layer: passing the coarse Cap gate is not
+        // enough on its own -- confirmed operator tier is required too.
+        let conn = setup().await;
+        seed_agent(&conn, "alice", "tok-alice-secret", "2026-06-01T00:00:00Z").await;
+        let op = cap_only_non_confirmed();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = GetAgentTokensTool::call(
+            Some(&op),
+            &serde_json::json!({"include_sensitive_data": true}),
+            &conn,
+            "2026-06-01T00:01:00Z",
+            &c,
+        )
+        .await;
+        let ToolResult::Ok { data, .. } = result else {
+            panic!("expected Ok, got {result:?}");
+        };
+        assert_eq!(data.unwrap()["agents"][0]["token"], REDACTED_TOKEN);
+    }
+
+    #[tokio::test]
+    async fn get_agent_tokens_pagination_reports_has_more() {
+        let conn = setup().await;
+        seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
+        seed_agent(&conn, "bob", "tok-b", "2026-06-01T00:00:01Z").await;
+        seed_agent(&conn, "carol", "tok-c", "2026-06-01T00:00:02Z").await;
+        let op = confirmed_operator();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = GetAgentTokensTool::call(
+            Some(&op),
+            &serde_json::json!({"limit": 2}),
+            &conn,
+            "2026-06-01T00:01:00Z",
+            &c,
+        )
+        .await;
+        let ToolResult::Ok { data, .. } = result else {
+            panic!("expected Ok, got {result:?}");
+        };
+        let data = data.unwrap();
+        assert_eq!(data["pagination"]["total_count"], 3);
+        assert_eq!(data["pagination"]["returned_count"], 2);
+        assert_eq!(data["pagination"]["has_more"], true);
+    }
+
+    #[tokio::test]
+    async fn get_agent_tokens_filters_by_status() {
+        let conn = setup().await;
+        seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
+        {
+            let guard = conn.lock().await;
+            conexus_db::agent_repository::AgentRepository::terminate(
+                &guard,
+                "alice",
+                "2026-06-01T00:00:01Z",
+            )
+            .unwrap();
+        }
+        let op = confirmed_operator();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = GetAgentTokensTool::call(
+            Some(&op),
+            // include_terminated must ALSO be true -- Python's own
+            // repository doc: "when False, excludes status='terminated'
+            // rows" regardless of an explicit filter_status value.
+            &serde_json::json!({"filter_status": "terminated", "include_terminated": true}),
+            &conn,
+            "2026-06-01T00:01:00Z",
+            &c,
+        )
+        .await;
+        let ToolResult::Ok { data, .. } = result else {
+            panic!("expected Ok, got {result:?}");
+        };
+        assert_eq!(data.unwrap()["pagination"]["total_count"], 1);
+    }
+
+    #[test]
+    fn effective_agent_sort_by_falls_back_to_created_at_matching_the_repositorys_own_allowlist() {
+        // A real, preserved Python inconsistency: "updated_at" passes
+        // the tool's OWN (wider) pre-validation in Python but the
+        // repository's real allowlist doesn't include it, so it
+        // silently becomes created_at either way -- pin the Rust port
+        // reproduces the REPOSITORY's real behavior, not the wider
+        // tool-layer allowlist.
+        assert_eq!(effective_agent_sort_by("updated_at"), "created_at");
+        assert_eq!(effective_agent_sort_by("agent_id"), "agent_id");
+        assert_eq!(effective_agent_sort_by("garbage"), "created_at");
+    }
+
+    #[test]
+    fn effective_sort_order_only_asc_is_case_insensitively_recognized() {
+        assert_eq!(effective_sort_order("asc"), "ASC");
+        assert_eq!(effective_sort_order("ASC"), "ASC");
+        assert_eq!(effective_sort_order("desc"), "DESC");
+        assert_eq!(effective_sort_order("garbage"), "DESC");
+    }
+
+    #[tokio::test]
+    async fn get_agent_tokens_writes_a_durable_audit_row() {
+        let conn = setup().await;
+        seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
+        let op = confirmed_operator();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = GetAgentTokensTool::call(
+            Some(&op),
+            &serde_json::json!({}),
+            &conn,
+            "2026-06-01T00:01:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        let guard = conn.lock().await;
+        let count: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM agent_actions WHERE action_type = 'get_agent_tokens'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
     }
 }
