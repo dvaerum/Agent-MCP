@@ -40,7 +40,10 @@
 
 use conexus_core::ToolResult;
 use conexus_db::agent_repository::{AgentField, AgentRepository, FieldValue};
-use conexus_db::{message_repository, project_settings_repository, task_repository};
+use conexus_db::{
+    agent_action_repository, message_repository, pending_directive_repository,
+    project_settings_repository, scheduled_directive_repository, task_repository,
+};
 use rusqlite::Connection;
 use serde_json::{json, Value};
 
@@ -505,14 +508,166 @@ pub fn idle_stop_seconds_remaining(conn: &Connection, agent_id: &str, now: &str)
         return Some(seed_and_grant_full_window());
     };
     match (
-        conexus_db::scheduled_directive_repository::parse_flexible(now),
-        conexus_db::scheduled_directive_repository::parse_flexible(&last),
+        scheduled_directive_repository::parse_flexible(now),
+        scheduled_directive_repository::parse_flexible(&last),
     ) {
         (Ok(now_dt), Ok(last_dt)) => {
             Some(window as f64 - (now_dt - last_dt).num_milliseconds() as f64 / 1000.0)
         }
         _ => Some(seed_and_grant_full_window()),
     }
+}
+
+/// A [`scheduled_directive_repository::DirectiveEvent`]/
+/// [`pending_directive_repository::DirectiveEvent`] (the same type,
+/// re-exported from `pending_directive_repository`) converted to this
+/// module's plain-`Value` event shape. Both already derive `Serialize`
+/// with the exact field names/rename Python's dict shape uses
+/// (`#[serde(rename = "type")]` on `event_type`), so this is a pure
+/// reshape, never a lossy one.
+fn directive_event_to_value(event: pending_directive_repository::DirectiveEvent) -> Value {
+    serde_json::to_value(event).expect("DirectiveEvent always serializes to a JSON object")
+}
+
+/// Fire every due scheduled directive for `agent_id` and return the
+/// `directive` events. Port of `_collect_scheduled_directive_events_for`
+/// -- a thin wrapper over the already-ported
+/// [`scheduled_directive_repository::collect_due_and_fire`] (which
+/// already implements the interval-reset-from-delivery /
+/// terminal-but-kept / closed-window-reaped-without-firing invariants),
+/// plus the `agent_actions` audit-log side effect per fired event.
+///
+/// Best-effort, matching Python: a DB failure yields no events (the
+/// schedule fires on the next check-in) rather than failing the whole
+/// poll -- callers must never propagate this as a hard error.
+pub fn collect_scheduled_directive_events_for(
+    conn: &Connection,
+    agent_id: &str,
+    now_iso: &str,
+) -> Vec<Value> {
+    let events = match scheduled_directive_repository::collect_due_and_fire(conn, agent_id, now_iso)
+    {
+        Ok(events) => events,
+        Err(_) => return Vec::new(),
+    };
+    for ev in &events {
+        let details = json!({"directive_id": ev.ref_id, "prompt": ev.data.prompt});
+        // Best-effort: an audit-log write failure must not un-fire an
+        // already-committed directive or fail the poll.
+        let _ = agent_action_repository::log_agent_action(
+            conn,
+            agent_id,
+            "scheduled_directive_fired",
+            None,
+            Some(&details),
+            now_iso,
+        );
+    }
+    events.into_iter().map(directive_event_to_value).collect()
+}
+
+/// Collect + mark-delivered every undelivered operator/admin poke for
+/// `agent_id` and return the `directive` events (`data.source ==
+/// "poke"`). Port of `_collect_pending_pokes_for` -- a thin wrapper
+/// over the already-ported
+/// [`pending_directive_repository::collect_undelivered`], which owns
+/// the mark-delivered-in-loop semantics. Best-effort, matching Python:
+/// a DB failure yields no events (the poke waits for the next
+/// check-in).
+pub fn collect_pending_pokes_for(conn: &Connection, agent_id: &str, now_iso: &str) -> Vec<Value> {
+    match pending_directive_repository::collect_undelivered(conn, agent_id, now_iso) {
+        Ok(events) => events.into_iter().map(directive_event_to_value).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// `assemble_event_feed`'s result: the merged, timestamp-and-priority-
+/// ordered event batch, plus the advanced cursor.
+pub struct AssembledFeed {
+    pub events: Vec<Value>,
+    pub next_cursor: String,
+}
+
+/// Single owner of the event-feed stream-merge pipeline. Port of
+/// `assemble_event_feed` -- every event-feed surface (both
+/// `wait_for_events` paths, `fetch_events_since`, a future inbox
+/// resource) routes through here so the union / clamp / sort / cursor
+/// steps run in the ONE correct order exactly once (copy-pasting this
+/// pipeline was Python's own BL-R20/BL-R21 fault line).
+///
+/// The streams merged, in order: (1) DB-backed message+task events via
+/// [`collect_events_with_cap`] (also yields `msg_cap_ts`); (2) matching
+/// `unassigned_task_appeared` events (UNBOUNDED, invisible to stream
+/// 1's internal clamp); (3) `agent_profile_updated` events (also
+/// unbounded); (4) `drain_queue` -- items already popped off a
+/// `wait_for_events` waiter's channel (empty for the pure-DB catch-up
+/// surfaces). `fire_scheduled` gates the two MUTATING collectors
+/// (pokes, then scheduled directives) -- they run ONLY when the
+/// message backlog is NOT truncated (`msg_cap_ts.is_none()`), since
+/// firing mutates delivery state and a fired event must never be
+/// clamped away (that would advance `next_due`/`delivered_at` for a
+/// fire the agent never actually received).
+///
+/// No dedup step -- see the module doc's `_dedup_events` section for
+/// why that's a deliberate simplification, not a gap: this crate's
+/// `WaiterRegistry` wake channel is payload-less, so `drain_queue` can
+/// never carry a second, differently-timestamped copy of a DB-sourced
+/// event to collide with.
+///
+/// `drain_queue: Vec<Value>` -- Python distinguishes `drain_queue=None`
+/// (the pure-DB catch-up surfaces) from `drain_queue=Some([])` (a
+/// `wait_for_events` call whose queue happened to be empty), but
+/// `events.extend(...)` treats both identically; an empty `Vec` here
+/// covers both cases with no behavioral difference.
+pub fn assemble_event_feed(
+    conn: &Connection,
+    agent_id: &str,
+    cursor: Option<&str>,
+    now_iso: &str,
+    drain_queue: Vec<Value>,
+    fire_scheduled: bool,
+    get_env: impl Fn(&str) -> Option<String>,
+) -> rusqlite::Result<AssembledFeed> {
+    let collected = collect_events_with_cap(conn, agent_id, cursor, now_iso, get_env)?;
+    let mut events = collected.events;
+    let msg_cap_ts = collected.msg_cap_ts;
+    events.extend(collect_unassigned_task_events_for(conn, agent_id, cursor)?);
+    events.extend(collect_agent_profile_events_for(conn, agent_id, cursor)?);
+    events.extend(drain_queue);
+
+    // BL-R21-1: cap the MERGED batch to the message-truncation boundary
+    // so a newer unbounded task/profile/synthetic event can't drag the
+    // persisted cursor past the un-returned messages.
+    events = cap_events_to_boundary(events, msg_cap_ts.as_deref());
+
+    if fire_scheduled && msg_cap_ts.is_none() {
+        // Ad-hoc pokes first (highest-priority delivery), then
+        // scheduled fires -- both mutate delivery state, so both run
+        // only when the message backlog isn't truncated.
+        events.extend(collect_pending_pokes_for(conn, agent_id, now_iso));
+        events.extend(collect_scheduled_directive_events_for(
+            conn, agent_id, now_iso,
+        ));
+    }
+
+    // Priority-aware ordering: urgent directives/pokes sort ahead of
+    // ordinary events; same-priority events keep timestamp order.
+    sort_events_priority_then_time(&mut events);
+
+    // The cursor stays anchored to max TIMESTAMP (not sort position) so
+    // priority reordering never rewinds or over-advances progress.
+    let next_cursor = events
+        .iter()
+        .map(event_timestamp)
+        .max()
+        .filter(|ts| !ts.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| cursor.unwrap_or("").to_string());
+
+    Ok(AssembledFeed {
+        events,
+        next_cursor,
+    })
 }
 
 #[cfg(test)]
@@ -1135,5 +1290,225 @@ mod tests {
         idle_stop_seconds_remaining(&conn, "alice", "2026-01-01T00:00:00Z"); // seed
         let remaining = idle_stop_seconds_remaining(&conn, "alice", "2026-01-01T00:02:00Z");
         assert!(remaining.unwrap() <= 0.0);
+    }
+
+    // -- collect_pending_pokes_for -----------------------------------------
+
+    #[test]
+    fn collect_pending_pokes_for_returns_and_marks_delivered() {
+        let conn = test_conn();
+        seed_agent(&conn, "alice");
+        pending_directive_repository::create_poke(
+            &conn,
+            "poke_1",
+            "alice",
+            "check your inbox",
+            None,
+            Some("operator"),
+            "2026-01-01T00:00:00Z",
+        )
+        .unwrap();
+
+        let events = collect_pending_pokes_for(&conn, "alice", "2026-01-01T00:00:01Z");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["data"]["prompt"], "check your inbox");
+        assert_eq!(events[0]["data"]["source"], "poke");
+
+        // Delivered -- a second collection must not re-fire it.
+        let again = collect_pending_pokes_for(&conn, "alice", "2026-01-01T00:00:02Z");
+        assert!(again.is_empty());
+    }
+
+    // -- collect_scheduled_directive_events_for ------------------------------
+
+    #[test]
+    fn collect_scheduled_directive_events_for_fires_a_due_schedule_and_logs_it() {
+        let conn = test_conn();
+        seed_agent(&conn, "alice");
+        scheduled_directive_repository::create(
+            &conn,
+            "sched_1",
+            "alice",
+            "daily check-in",
+            3600,
+            "2026-01-01T00:00:00Z", // already due
+            None,
+            None,
+            Some("operator"),
+            "2025-12-31T00:00:00Z",
+        )
+        .unwrap();
+
+        let events = collect_scheduled_directive_events_for(&conn, "alice", "2026-01-01T00:00:01Z");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["data"]["prompt"], "daily check-in");
+        assert_eq!(events[0]["data"]["source"], "schedule");
+
+        // The audit-log side effect actually landed.
+        let logged: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM agent_actions WHERE action_type = 'scheduled_directive_fired'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(logged, 1);
+
+        // Not due again immediately (next_due_at was reset forward).
+        let again = collect_scheduled_directive_events_for(&conn, "alice", "2026-01-01T00:00:02Z");
+        assert!(again.is_empty());
+    }
+
+    // -- assemble_event_feed -------------------------------------------------
+
+    #[test]
+    fn assemble_event_feed_merges_messages_and_unassigned_tasks() {
+        let conn = test_conn();
+        seed_agent(&conn, "alice");
+        send_message(&conn, "m1", "alice", "2026-01-01T00:00:01Z", "text");
+        let unassigned = NewTask {
+            task_id: Some("task_1"),
+            title: "up for grabs",
+            description: None,
+            assigned_to: None,
+            created_by: "bob",
+            status: "pending",
+            priority: "medium",
+            parent_task: None,
+            child_tasks: None,
+            depends_on_tasks: None,
+            notes: None,
+            now: "2026-01-01T00:00:02Z",
+        };
+        task_repository::create(&conn, unassigned).unwrap();
+
+        let feed = assemble_event_feed(
+            &conn,
+            "alice",
+            None,
+            "2026-01-01T00:01:00Z",
+            Vec::new(),
+            false,
+            no_env,
+        )
+        .unwrap();
+        let types: Vec<_> = feed
+            .events
+            .iter()
+            .map(|e| e["type"].as_str().unwrap())
+            .collect();
+        assert!(types.contains(&"message"));
+        assert!(types.contains(&"unassigned_task_appeared"));
+        assert_eq!(feed.next_cursor, "2026-01-01T00:00:02Z");
+    }
+
+    #[test]
+    fn assemble_event_feed_includes_the_drain_queue() {
+        let conn = test_conn();
+        seed_agent(&conn, "alice");
+        let queued = event("hold_advisory", "2026-01-01T00:00:05Z");
+
+        let feed = assemble_event_feed(
+            &conn,
+            "alice",
+            None,
+            "2026-01-01T00:01:00Z",
+            vec![queued.clone()],
+            false,
+            no_env,
+        )
+        .unwrap();
+        assert!(feed.events.contains(&queued));
+    }
+
+    #[test]
+    fn assemble_event_feed_fires_scheduled_directives_only_when_fire_scheduled_is_true() {
+        let conn = test_conn();
+        seed_agent(&conn, "alice");
+        scheduled_directive_repository::create(
+            &conn,
+            "sched_1",
+            "alice",
+            "ping",
+            3600,
+            "2026-01-01T00:00:00Z",
+            None,
+            None,
+            Some("operator"),
+            "2025-12-31T00:00:00Z",
+        )
+        .unwrap();
+
+        let not_fired = assemble_event_feed(
+            &conn,
+            "alice",
+            None,
+            "2026-01-01T00:00:01Z",
+            Vec::new(),
+            false,
+            no_env,
+        )
+        .unwrap();
+        assert!(not_fired.events.is_empty());
+
+        let fired = assemble_event_feed(
+            &conn,
+            "alice",
+            None,
+            "2026-01-01T00:00:02Z",
+            Vec::new(),
+            true,
+            no_env,
+        )
+        .unwrap();
+        assert_eq!(fired.events.len(), 1);
+        assert_eq!(fired.events[0]["data"]["source"], "schedule");
+    }
+
+    #[test]
+    fn assemble_event_feed_urgent_pokes_sort_ahead_of_older_normal_events() {
+        let conn = test_conn();
+        seed_agent(&conn, "alice");
+        send_message(&conn, "m1", "alice", "2026-01-01T00:00:01Z", "text");
+        pending_directive_repository::create_poke(
+            &conn,
+            "poke_1",
+            "alice",
+            "URGENT",
+            Some("urgent"),
+            Some("operator"),
+            "2026-01-01T00:00:02Z",
+        )
+        .unwrap();
+
+        let feed = assemble_event_feed(
+            &conn,
+            "alice",
+            None,
+            "2026-01-01T00:01:00Z",
+            Vec::new(),
+            true,
+            no_env,
+        )
+        .unwrap();
+        assert_eq!(feed.events[0]["data"]["source"], "poke");
+    }
+
+    #[test]
+    fn assemble_event_feed_empty_result_preserves_the_cursor() {
+        let conn = test_conn();
+        seed_agent(&conn, "alice");
+        let feed = assemble_event_feed(
+            &conn,
+            "alice",
+            Some("2025-06-01T00:00:00Z"),
+            "2026-01-01T00:01:00Z",
+            Vec::new(),
+            false,
+            no_env,
+        )
+        .unwrap();
+        assert!(feed.events.is_empty());
+        assert_eq!(feed.next_cursor, "2025-06-01T00:00:00Z");
     }
 }
