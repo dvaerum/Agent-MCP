@@ -339,7 +339,14 @@ impl std::error::Error for CollectDueError {}
 /// treated as UTC. This crate never reads a wall clock itself (see
 /// the module doc on that rule); this only ever operates on caller-
 /// or DB-supplied timestamp strings.
-fn parse_flexible(timestamp: &str) -> Result<DateTime<Utc>, CollectDueError> {
+///
+/// `pub`, not module-private: `conexus-wakeloop`'s event-feed
+/// collectors (`idle_stop_seconds_remaining`) need the exact same
+/// flexible-ISO-8601 parsing this repository already solved — a
+/// second copy of this dual-format fallback would be the kind of
+/// drift-prone duplication this crate's own `sql_util`/
+/// `pagination_cache` consolidation already avoided elsewhere.
+pub fn parse_flexible(timestamp: &str) -> Result<DateTime<Utc>, CollectDueError> {
     if let Ok(dt) = DateTime::parse_from_rfc3339(timestamp) {
         return Ok(dt.with_timezone(&Utc));
     }
