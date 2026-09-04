@@ -11,15 +11,17 @@ use conexus_auth::ToolDescriptor;
 use crate::project_settings_tools::{
     DeleteProjectSettingsTool, UpdateProjectSettingsTool, ViewProjectSettingsTool,
 };
+use crate::rag_tools::AskProjectRagTool;
 
 // `ToolDescriptor::of` is `const fn`, so the whole registry is a
 // compile-time `static` array (needs a named `static`, not an inline
 // `&[...]` literal, since the array's elements aren't const-promotable
 // through a non-const fn body).
-static ALL_TOOLS: [ToolDescriptor; 3] = [
+static ALL_TOOLS: [ToolDescriptor; 4] = [
     ToolDescriptor::of::<ViewProjectSettingsTool>(),
     ToolDescriptor::of::<UpdateProjectSettingsTool>(),
     ToolDescriptor::of::<DeleteProjectSettingsTool>(),
+    ToolDescriptor::of::<AskProjectRagTool>(),
 ];
 
 pub fn all_tools() -> &'static [ToolDescriptor] {
@@ -129,7 +131,7 @@ mod tests {
     }
 
     #[test]
-    fn all_tools_holds_the_three_project_settings_tools() {
+    fn all_tools_holds_the_project_settings_and_rag_tools() {
         let names: BTreeSet<&str> = all_tools().iter().map(|t| t.name).collect();
         assert_eq!(
             names,
@@ -137,6 +139,7 @@ mod tests {
                 "view_project_settings",
                 "update_project_settings",
                 "delete_project_settings",
+                "ask_project_rag",
             ])
         );
     }

@@ -104,7 +104,15 @@ pub struct NewChunk<'a> {
     pub embedding: Option<&'a [f32]>,
 }
 
-fn embeddings_table_exists(conn: &Connection) -> Result<bool> {
+/// Whether the `rag_embeddings` vec0 table exists -- the degrade
+/// contract's single source of truth (see this module's doc). `pub`
+/// (Phase D2) so `ask_project_rag` can skip the embedding HTTP call
+/// entirely when RAG isn't set up, mirroring Python's own
+/// `is_vss_loadable()` pre-check in `query_rag_system` -- every other
+/// function in this module already uses this same check internally,
+/// so `ask_project_rag` calling it too doesn't introduce a second
+/// notion of "is RAG available", just reuses the one that exists.
+pub fn embeddings_table_exists(conn: &Connection) -> Result<bool> {
     conn.query_row(
         "SELECT 1 FROM sqlite_master WHERE type IN ('table', 'virtual') AND name = 'rag_embeddings'",
         [],
