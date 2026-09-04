@@ -18,6 +18,7 @@ use crate::project_settings_tools::{
     DeleteProjectSettingsTool, UpdateProjectSettingsTool, ViewProjectSettingsTool,
 };
 use crate::rag_tools::AskProjectRagTool;
+use crate::task_comments_tools::{AddTaskCommentTool, DeleteTaskCommentTool, EditTaskCommentTool};
 use crate::task_tools::{
     BulkTaskOperationsTool, CreateTaskTool, DeleteTaskTool, RequestAssistanceTool, SearchTasksTool,
     UpdateTaskStatusTool, UpdateTaskTool, ViewTasksTool,
@@ -28,7 +29,7 @@ use crate::utility_tools::TestTool;
 // compile-time `static` array (needs a named `static`, not an inline
 // `&[...]` literal, since the array's elements aren't const-promotable
 // through a non-const fn body).
-static ALL_TOOLS: [ToolDescriptor; 23] = [
+static ALL_TOOLS: [ToolDescriptor; 26] = [
     ToolDescriptor::of::<ViewProjectSettingsTool>(),
     ToolDescriptor::of::<UpdateProjectSettingsTool>(),
     ToolDescriptor::of::<DeleteProjectSettingsTool>(),
@@ -52,6 +53,9 @@ static ALL_TOOLS: [ToolDescriptor; 23] = [
     ToolDescriptor::of::<UpdateFileStatusTool>(),
     ToolDescriptor::of::<ViewFileMetadataTool>(),
     ToolDescriptor::of::<UpdateFileMetadataTool>(),
+    ToolDescriptor::of::<AddTaskCommentTool>(),
+    ToolDescriptor::of::<EditTaskCommentTool>(),
+    ToolDescriptor::of::<DeleteTaskCommentTool>(),
 ];
 
 pub fn all_tools() -> &'static [ToolDescriptor] {
@@ -196,6 +200,9 @@ mod tests {
                 "update_file_status",
                 "view_file_metadata",
                 "update_file_metadata",
+                "add_task_comment",
+                "edit_task_comment",
+                "delete_task_comment",
             ])
         );
     }

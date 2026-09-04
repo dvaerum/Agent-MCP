@@ -180,14 +180,7 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             ON tasks ((parent_task IS NULL)) WHERE parent_task IS NULL;
 
         -- Verbatim from agent_mcp/migrations/versions/0025_terminal_task_guard_trigger.py's
-        -- _TASKS_SQL. Only the `tasks`-table trigger is ported here —
-        -- the two `task_notes`/`task_comments` side-table triggers
-        -- from that same migration are deliberately NOT included:
-        -- comments are owned by a different, not-yet-ported module
-        -- (`db/actions/task_comments_db.py`, not one of the 8
-        -- `agent_mcp/repositories/*.py` files Phase B covers), so
-        -- creating that table/trigger pair here would be scope creep
-        -- into a module this phase doesn't touch.
+        -- _TASKS_SQL.
         CREATE TRIGGER IF NOT EXISTS trg_tasks_terminal_state_guard
         BEFORE UPDATE ON tasks
         FOR EACH ROW
@@ -202,6 +195,49 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
           )
         BEGIN
           SELECT RAISE(ABORT, 'terminal_task_guard: task is in a terminal state (completed/cancelled/failed); status/priority/notes/title/description are frozen and assigned_to may only be cleared, never reassigned');
+        END;
+
+        -- `task_comments` (Phase D5, task_comments_tools.py port) --
+        -- migration 0009's side table, renamed from `task_notes` in
+        -- migration 0026. `note_id` kept as the PK column name per
+        -- that migration's own docstring (a compatibility-neutral
+        -- internal detail, not part of the user-facing "note -> comment"
+        -- identity).
+        CREATE TABLE IF NOT EXISTS task_comments (
+            note_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id     TEXT NOT NULL,
+            author      TEXT,
+            timestamp   TEXT NOT NULL,
+            text        TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_task_comments_task
+            ON task_comments (task_id);
+
+        -- Verbatim from migration 0025's _NOTES_INSERT_SQL/_NOTES_UPDATE_SQL
+        -- (against the renamed table -- see migration 0026's docstring
+        -- on why SQLite keeps triggers firing correctly across an
+        -- ALTER TABLE ... RENAME without the trigger bodies needing to
+        -- change). Named for what they guard in THIS fresh schema
+        -- rather than preserving the historical task_notes-named
+        -- trigger identifiers migration 0025 originally created --
+        -- this file authors the schema from scratch, it doesn't replay
+        -- migration history, so there's no rename-continuity constraint
+        -- to preserve. DELETE is deliberately NOT guarded (matches
+        -- Python: a future task-delete cascade must still be able to
+        -- remove a terminal task's comments).
+        CREATE TRIGGER IF NOT EXISTS trg_task_comments_terminal_guard_insert
+        BEFORE INSERT ON task_comments
+        FOR EACH ROW
+        WHEN (SELECT status FROM tasks WHERE task_id = NEW.task_id) IN ('completed', 'cancelled', 'failed')
+        BEGIN
+          SELECT RAISE(ABORT, 'terminal_task_guard: cannot add a task_comment; parent task is in a terminal state (completed/cancelled/failed)');
+        END;
+        CREATE TRIGGER IF NOT EXISTS trg_task_comments_terminal_guard_update
+        BEFORE UPDATE ON task_comments
+        FOR EACH ROW
+        WHEN (SELECT status FROM tasks WHERE task_id = OLD.task_id) IN ('completed', 'cancelled', 'failed')
+        BEGIN
+          SELECT RAISE(ABORT, 'terminal_task_guard: cannot edit a task_comment; parent task is in a terminal state (completed/cancelled/failed)');
         END;
         "#,
     )
