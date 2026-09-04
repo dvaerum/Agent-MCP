@@ -8,6 +8,7 @@
 
 use conexus_auth::ToolDescriptor;
 
+use crate::agent_communication_tools::{FetchEventsSinceTool, WaitForEventsTool};
 use crate::project_settings_tools::{
     DeleteProjectSettingsTool, UpdateProjectSettingsTool, ViewProjectSettingsTool,
 };
@@ -17,11 +18,13 @@ use crate::rag_tools::AskProjectRagTool;
 // compile-time `static` array (needs a named `static`, not an inline
 // `&[...]` literal, since the array's elements aren't const-promotable
 // through a non-const fn body).
-static ALL_TOOLS: [ToolDescriptor; 4] = [
+static ALL_TOOLS: [ToolDescriptor; 6] = [
     ToolDescriptor::of::<ViewProjectSettingsTool>(),
     ToolDescriptor::of::<UpdateProjectSettingsTool>(),
     ToolDescriptor::of::<DeleteProjectSettingsTool>(),
     ToolDescriptor::of::<AskProjectRagTool>(),
+    ToolDescriptor::of::<WaitForEventsTool>(),
+    ToolDescriptor::of::<FetchEventsSinceTool>(),
 ];
 
 pub fn all_tools() -> &'static [ToolDescriptor] {
@@ -132,7 +135,7 @@ mod tests {
     }
 
     #[test]
-    fn all_tools_holds_the_project_settings_and_rag_tools() {
+    fn all_tools_holds_the_project_settings_rag_and_event_tools() {
         let names: BTreeSet<&str> = all_tools().iter().map(|t| t.name).collect();
         assert_eq!(
             names,
@@ -141,6 +144,8 @@ mod tests {
                 "update_project_settings",
                 "delete_project_settings",
                 "ask_project_rag",
+                "wait_for_events",
+                "fetch_events_since",
             ])
         );
     }
