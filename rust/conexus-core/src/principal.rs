@@ -124,10 +124,50 @@ pub fn is_operator_tier(principal: &Principal) -> bool {
         || principal.agent_id.as_deref() == Some("admin")
 }
 
+/// True iff `principal` is CONFIRMED operator tier — the defense-in-
+/// depth predicate BEHIND the coarse capability gate deciding whether
+/// a caller may receive plaintext agent bearer tokens / project
+/// secrets, or must have them masked.
+///
+/// Faithful port of `agent_mcp/core/operator_tier.py::
+/// is_confirmed_operator_tier`, narrowed to the identity shapes this
+/// crate's `Principal` can actually represent. Python's version also
+/// accepts a REST-side `"operator_bearer"` kind and an `"admin"`
+/// agent-role string that only exist on that separate `RestPrincipal`
+/// type (no such kind or role exists on `PrincipalKind`/`AgentRole`
+/// here), so this port only implements the two clauses reachable
+/// through this crate's own `Principal`:
+///
+/// 1. `AgentBearer` is confirmed iff its `agent_role` is `Manager`
+///    (the only operator-tier `AgentRole` variant this crate has —
+///    Python's `Worker` OR `Manager` OR `Admin` narrows to just
+///    `Manager` here, since `Worker` was never operator-tier and
+///    `Admin` isn't a representable `AgentRole` value).
+/// 2. `OperatorSession` and `ForwardingHeader` are BOTH confirmed
+///    only via "the backend can SEE a resolved operator identity" —
+///    the sysadmin wildcard, or `project_role == Operator`. Per the
+///    Python module's own docstring, a signed-forwarding caller is
+///    deliberately NOT given clause-1 treatment even though it
+///    carries a signed role — ADR-0025's forwarding-tier-exclusion
+///    principle, preserved bit-for-bit here.
+pub fn is_confirmed_operator_tier(principal: &Principal) -> bool {
+    match principal.kind {
+        PrincipalKind::AgentBearer => {
+            principal.agent_role == Some(crate::capability::AgentRole::Manager)
+        }
+        PrincipalKind::OperatorSession | PrincipalKind::ForwardingHeader => {
+            matches!(principal.capabilities, Capabilities::Sysadmin)
+                || principal.project_role == Some(ProjectRole::Operator)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::capability::{Capabilities, Capability};
-    use crate::principal::{is_operator_tier, Principal, PrincipalKind};
+    use crate::capability::{AgentRole, Capabilities, Capability, ProjectRole};
+    use crate::principal::{
+        is_confirmed_operator_tier, is_operator_tier, Principal, PrincipalKind,
+    };
 
     fn base_principal(kind: PrincipalKind, capabilities: Capabilities) -> Principal {
         Principal {
@@ -256,5 +296,82 @@ mod tests {
         );
         p.agent_id = Some("worker-1".to_string());
         assert!(!is_operator_tier(&p));
+    }
+
+    // ── is_confirmed_operator_tier ──────────────────────────────────
+
+    #[test]
+    fn manager_agent_bearer_is_confirmed() {
+        let mut p = base_principal(PrincipalKind::AgentBearer, Capabilities::from_iter([]));
+        p.agent_role = Some(AgentRole::Manager);
+        assert!(is_confirmed_operator_tier(&p));
+    }
+
+    #[test]
+    fn worker_agent_bearer_is_not_confirmed() {
+        let mut p = base_principal(PrincipalKind::AgentBearer, Capabilities::from_iter([]));
+        p.agent_role = Some(AgentRole::Worker);
+        assert!(!is_confirmed_operator_tier(&p));
+    }
+
+    #[test]
+    fn agent_bearer_with_no_role_is_not_confirmed() {
+        let p = base_principal(PrincipalKind::AgentBearer, Capabilities::from_iter([]));
+        assert!(!is_confirmed_operator_tier(&p));
+    }
+
+    #[test]
+    fn sysadmin_operator_session_is_confirmed() {
+        let p = base_principal(PrincipalKind::OperatorSession, Capabilities::Sysadmin);
+        assert!(is_confirmed_operator_tier(&p));
+    }
+
+    #[test]
+    fn operator_role_operator_session_is_confirmed() {
+        let mut p = base_principal(PrincipalKind::OperatorSession, Capabilities::from_iter([]));
+        p.project_role = Some(ProjectRole::Operator);
+        assert!(is_confirmed_operator_tier(&p));
+    }
+
+    #[test]
+    fn viewer_role_operator_session_is_not_confirmed() {
+        let mut p = base_principal(PrincipalKind::OperatorSession, Capabilities::from_iter([]));
+        p.project_role = Some(ProjectRole::Viewer);
+        assert!(!is_confirmed_operator_tier(&p));
+    }
+
+    #[test]
+    fn operator_session_with_no_role_at_all_is_not_confirmed() {
+        let p = base_principal(PrincipalKind::OperatorSession, Capabilities::from_iter([]));
+        assert!(!is_confirmed_operator_tier(&p));
+    }
+
+    #[test]
+    fn forwarding_header_with_operator_role_is_confirmed() {
+        // Clause 2 applies identically to ForwardingHeader as it does
+        // to OperatorSession -- "the backend can SEE a resolved
+        // operator identity" doesn't care which seam proved it.
+        let mut p = base_principal(PrincipalKind::ForwardingHeader, Capabilities::from_iter([]));
+        p.project_role = Some(ProjectRole::Operator);
+        assert!(is_confirmed_operator_tier(&p));
+    }
+
+    #[test]
+    fn forwarding_header_never_gets_clause_1_treatment() {
+        // ADR-0025: a forwarding-header caller is deliberately NOT
+        // confirmed via a bearer-like clause even if it somehow
+        // carried an agent_role -- only clause 2 (sysadmin /
+        // project_role) applies to this kind. Setting agent_role here
+        // must have NO effect.
+        let mut p = base_principal(PrincipalKind::ForwardingHeader, Capabilities::from_iter([]));
+        p.agent_role = Some(AgentRole::Manager);
+        assert!(!is_confirmed_operator_tier(&p));
+    }
+
+    #[test]
+    fn forwarding_header_with_viewer_role_is_not_confirmed() {
+        let mut p = base_principal(PrincipalKind::ForwardingHeader, Capabilities::from_iter([]));
+        p.project_role = Some(ProjectRole::Viewer);
+        assert!(!is_confirmed_operator_tier(&p));
     }
 }

@@ -1,16 +1,22 @@
-//! CoNexus Principal-resolution / tool-authorization layer (Phase C).
+//! CoNexus Principal-resolution / tool-authorization layer (Phase C/D1).
 //!
-//! Two pieces: [`capabilities::resolve_capabilities`] (the DB-backed
+//! Pieces: [`capabilities::resolve_capabilities`] (the DB-backed
 //! group-capability overlay that `conexus_core::capability`'s own
-//! module doc deferred here), and the `Tool`/`Requirement`/
-//! `all_tools()` machinery in [`requirement`]/[`tool`] (porting
-//! `agent_mcp/core/authorize.py`). See
-//! `/home/dennis/.claude/plans/prancy-napping-pie.md`.
+//! module doc deferred here), the `Tool`/`Requirement`/`all_tools()`
+//! machinery in [`requirement`]/[`tool`] (porting
+//! `agent_mcp/core/authorize.py`), and [`forwarding_header`] (the
+//! signed `X-Agent-MCP-Forwarded-Operator` header the router attaches
+//! when proxying a cookie-authenticated request to a per-project
+//! backend). See `/home/dennis/.claude/plans/prancy-napping-pie.md`.
 
 pub mod capabilities;
+pub mod forwarding_header;
 pub mod requirement;
 pub mod tool;
 
 pub use capabilities::{resolve_capabilities, ResolveCapabilitiesInput};
+pub use forwarding_header::{
+    sign as sign_forwarding_header, verify as verify_forwarding_header, ForwardedRole,
+};
 pub use requirement::{AuthRejected, NoPolicyOverrides, PolicySource, Requirement};
 pub use tool::{all_tools, dispatch, Tool, ToolDescriptor};
