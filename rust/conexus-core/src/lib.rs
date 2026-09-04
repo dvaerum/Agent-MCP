@@ -1,5 +1,6 @@
 pub mod capability;
 pub mod principal;
+pub mod schema_limits;
 pub mod tool_result;
 
 pub use capability::{AgentRole, Capabilities, Capability, ProjectRole};

@@ -1,3 +1,4 @@
+pub mod agent_action_repository;
 pub mod agent_repository;
 pub mod group_capability_repository;
 pub mod group_membership_repository;
