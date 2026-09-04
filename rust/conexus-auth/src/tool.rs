@@ -29,6 +29,7 @@
 use crate::requirement::{PolicySource, Requirement};
 use conexus_core::principal::Principal;
 use conexus_core::tool_result::ToolResult;
+use conexus_wakeloop::waiter_registry::WaiterRegistry;
 use rusqlite::Connection;
 use serde_json::Value;
 use std::future::Future;
@@ -61,6 +62,70 @@ use tokio::sync::Mutex as AsyncMutex;
 /// `ask_project_rag`'s embedding/completion calls, once its DB reads
 /// are done).
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Sends one MCP `notifications/progress` frame for the in-flight
+/// call. `conexus-auth` stays `rmcp`-free (mirrors `conexus-core`'s own
+/// "never needs an `rmcp` dependency" design value, see
+/// `conexus-core::tool_result`'s module doc) by taking this trait
+/// object instead of a raw `rmcp::service::Peer` -- only
+/// `conexus-backend` (the one crate that actually depends on `rmcp`)
+/// implements it, against a real `Peer`/`ProgressToken` pair.
+pub trait ProgressSink: Send + Sync {
+    /// Returns `false` on send failure (client transport gone) or when
+    /// off-wire (no real MCP peer to notify, e.g. a REST caller or a
+    /// test harness) -- callers treat `false` exactly like Python's
+    /// `send_progress_heartbeat` returning `False`.
+    fn notify_progress<'a>(&'a self, progress: f64) -> BoxFuture<'a, bool>;
+}
+
+/// Ambient per-call context beyond the DB connection: MCP-transport
+/// facts only `conexus-backend`'s `call_tool` (which alone holds the
+/// real `RequestContext`) can supply, plus the one piece of
+/// cross-connection shared state `wait_for_events` needs. Every
+/// `Tool::call` impl before this parameter existed added no I/O-
+/// adjacent input beyond `conn`/`now`; this is the next explicit-input
+/// addition in that same lineage -- needed the moment a tool
+/// (`wait_for_events`, Phase D3) genuinely depends on facts no prior
+/// tool did, per the same "explicit input over hidden state"
+/// convention `conn`/`now` themselves were added under. Every OTHER
+/// tool simply ignores this parameter.
+pub struct ToolCallContext<'a> {
+    /// Whether this call's MCP request carried a `_meta.progressToken`
+    /// -- Python's `current_progress_token() is not None`. Only
+    /// presence matters to tool logic (hold-strategy/ladder
+    /// eligibility); the token value itself never leaves the transport
+    /// layer (`progress_sink` already carries it internally).
+    pub progress_token_present: bool,
+    /// The client's `clientInfo.name` from its MCP `initialize`
+    /// handshake, if known -- Python's
+    /// `client_info_registry.get_client_name`. `None` off-wire or for
+    /// an unknown client.
+    pub client_name: Option<&'a str>,
+    /// Send a progress heartbeat on this call's connection. `None`
+    /// off-wire (no real MCP peer to notify).
+    pub progress_sink: Option<&'a dyn ProgressSink>,
+    /// The per-agent `wait_for_events` waiter registry.
+    pub waiter_registry: &'a WaiterRegistry,
+}
+
+impl<'a> ToolCallContext<'a> {
+    /// An off-wire context: no progress token, no client identity, no
+    /// progress sink -- what a REST caller or a test harness gets. A
+    /// `WaiterRegistry` is still required (never `Option`d away): every
+    /// real boot path constructs exactly one and every tool that
+    /// doesn't need it simply ignores this field, matching the
+    /// explicit-input convention rather than special-casing "off-wire"
+    /// as a reason to skip constructing shared state that costs
+    /// nothing to create.
+    pub fn off_wire(waiter_registry: &'a WaiterRegistry) -> Self {
+        ToolCallContext {
+            progress_token_present: false,
+            client_name: None,
+            progress_sink: None,
+            waiter_registry,
+        }
+    }
+}
 
 /// A tool entry point. Real tool modules (Phase D1+, in `conexus-
 /// tools` and later crates) each define a zero-sized type implementing
@@ -119,23 +184,32 @@ pub trait Tool {
         arguments: &'a Value,
         conn: &'a AsyncMutex<Connection>,
         now: &'a str,
+        ctx: &'a ToolCallContext<'a>,
     ) -> BoxFuture<'a, ToolResult>;
 }
 
 /// The type-erased shape of a [`Tool`], suitable for a flat runtime
 /// registry. See the module doc for why this exists instead of `dyn
 /// Tool`.
+/// The monomorphized shape of [`Tool::call`], type-erased to a plain
+/// function pointer. Named (rather than written inline on
+/// [`ToolDescriptor::call`]) purely to satisfy `clippy::type_complexity`
+/// -- the params/return themselves haven't changed shape, just where
+/// the type is spelled out.
+pub type ToolCallFn = for<'a> fn(
+    Option<&'a Principal>,
+    &'a Value,
+    &'a AsyncMutex<Connection>,
+    &'a str,
+    &'a ToolCallContext<'a>,
+) -> BoxFuture<'a, ToolResult>;
+
 pub struct ToolDescriptor {
     pub name: &'static str,
     pub description: &'static str,
     pub required: Requirement,
     pub schema: &'static str,
-    pub call: for<'a> fn(
-        Option<&'a Principal>,
-        &'a Value,
-        &'a AsyncMutex<Connection>,
-        &'a str,
-    ) -> BoxFuture<'a, ToolResult>,
+    pub call: ToolCallFn,
 }
 
 impl ToolDescriptor {
@@ -176,13 +250,14 @@ pub async fn dispatch(
     arguments: &Value,
     conn: &AsyncMutex<Connection>,
     now: &str,
+    ctx: &ToolCallContext<'_>,
 ) -> ToolResult {
     if let Err(rejected) = descriptor.required.check(principal, policy_source) {
         return ToolResult::PermissionDenied {
             reason: rejected.reason,
         };
     }
-    (descriptor.call)(principal, arguments, conn, now).await
+    (descriptor.call)(principal, arguments, conn, now, ctx).await
 }
 
 #[cfg(test)]
@@ -210,6 +285,7 @@ mod tests {
             arguments: &'a Value,
             _conn: &'a AsyncMutex<Connection>,
             _now: &'a str,
+            _ctx: &'a ToolCallContext<'a>,
         ) -> BoxFuture<'a, ToolResult> {
             Box::pin(async move {
                 CALLED.store(true, Ordering::SeqCst);
@@ -275,6 +351,7 @@ mod tests {
                 _: &'a Value,
                 _: &'a AsyncMutex<Connection>,
                 _: &'a str,
+                _: &'a ToolCallContext<'a>,
             ) -> BoxFuture<'a, ToolResult> {
                 unreachable!("not called by this test")
             }
@@ -294,6 +371,8 @@ mod tests {
     async fn dispatch_denies_before_calling_and_calls_the_tool_on_admission() {
         CALLED.store(false, Ordering::SeqCst);
         let conn = AsyncMutex::new(Connection::open_in_memory().unwrap());
+        let registry = WaiterRegistry::new();
+        let ctx = ToolCallContext::off_wire(&registry);
         let d = ToolDescriptor::of::<EchoTool>();
         let denied_principal = agent_bearer(Capabilities::from_iter([])); // missing TasksView
         let denial = dispatch(
@@ -303,6 +382,7 @@ mod tests {
             &Value::Null,
             &conn,
             "2026-01-01T00:00:00Z",
+            &ctx,
         )
         .await;
 
@@ -321,6 +401,7 @@ mod tests {
             &args,
             &conn,
             "2026-01-01T00:00:00Z",
+            &ctx,
         )
         .await;
 
@@ -332,5 +413,81 @@ mod tests {
                 message: None
             }
         );
+    }
+
+    #[test]
+    fn off_wire_context_has_no_progress_token_or_client_identity() {
+        let registry = WaiterRegistry::new();
+        let ctx = ToolCallContext::off_wire(&registry);
+        assert!(!ctx.progress_token_present);
+        assert_eq!(ctx.client_name, None);
+        assert!(ctx.progress_sink.is_none());
+    }
+
+    struct FakeSink {
+        sent: std::sync::atomic::AtomicU32,
+    }
+
+    impl ProgressSink for FakeSink {
+        fn notify_progress<'a>(&'a self, _progress: f64) -> BoxFuture<'a, bool> {
+            Box::pin(async move {
+                self.sent.fetch_add(1, Ordering::SeqCst);
+                true
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tool_can_reach_the_progress_sink_through_the_context() {
+        // Proves the wiring, not just the type: a Tool::call impl reads
+        // ctx.progress_sink and actually invokes it -- the same shape
+        // wait_for_events's real heartbeat call will use.
+        struct HeartbeatingTool;
+        impl Tool for HeartbeatingTool {
+            const NAME: &'static str = "heartbeating";
+            const REQUIRED: Requirement = Requirement::Public;
+            const DESCRIPTION: &'static str = "Sends one heartbeat then returns.";
+            const SCHEMA: &'static str = r#"{"type":"object"}"#;
+            fn call<'a>(
+                _principal: Option<&'a Principal>,
+                _arguments: &'a Value,
+                _conn: &'a AsyncMutex<Connection>,
+                _now: &'a str,
+                ctx: &'a ToolCallContext<'a>,
+            ) -> BoxFuture<'a, ToolResult> {
+                Box::pin(async move {
+                    let sent = match ctx.progress_sink {
+                        Some(sink) => sink.notify_progress(1.0).await,
+                        None => false,
+                    };
+                    ToolResult::Ok {
+                        data: Some(serde_json::json!({"heartbeat_sent": sent})),
+                        message: None,
+                    }
+                })
+            }
+        }
+
+        let registry = WaiterRegistry::new();
+        let sink = FakeSink {
+            sent: std::sync::atomic::AtomicU32::new(0),
+        };
+        let ctx = ToolCallContext {
+            progress_token_present: true,
+            client_name: Some("claude-code"),
+            progress_sink: Some(&sink),
+            waiter_registry: &registry,
+        };
+        let conn = AsyncMutex::new(Connection::open_in_memory().unwrap());
+        let result =
+            HeartbeatingTool::call(None, &Value::Null, &conn, "2026-01-01T00:00:00Z", &ctx).await;
+        assert_eq!(
+            result,
+            ToolResult::Ok {
+                data: Some(serde_json::json!({"heartbeat_sent": true})),
+                message: None,
+            }
+        );
+        assert_eq!(sink.sent.load(Ordering::SeqCst), 1);
     }
 }

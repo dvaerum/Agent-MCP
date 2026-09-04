@@ -91,6 +91,7 @@ mod tests {
                 _: &'a Value,
                 _: &'a AsyncMutex<Connection>,
                 _: &'a str,
+                _: &'a conexus_auth::ToolCallContext<'a>,
             ) -> conexus_auth::BoxFuture<'a, ToolResult> {
                 unreachable!("not called by this test")
             }

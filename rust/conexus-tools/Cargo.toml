@@ -10,6 +10,11 @@ description = "CoNexus MCP tool catalogue -- one module per agent_mcp/tools/*.py
 conexus-core = { path = "../conexus-core" }
 conexus-db = { path = "../conexus-db" }
 conexus-auth = { path = "../conexus-auth" }
+# ToolCallContext::off_wire needs a real WaiterRegistry instance (every
+# tool test constructs one, even tools that ignore the context); the
+# upcoming wait_for_events tool (Phase D3) will be a real, non-test
+# user of this dependency too.
+conexus-wakeloop = { path = "../conexus-wakeloop" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde_json = "1"
 regex = "1"

@@ -21,13 +21,16 @@ use std::sync::Arc;
 
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
-    ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
+    ListToolsResult, PaginatedRequestParams, ProgressNotificationParam, ProgressToken,
+    ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
 };
-use rmcp::service::RequestContext;
+use rmcp::service::{Peer, RequestContext};
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
 
+use conexus_auth::{BoxFuture, ProgressSink, ToolCallContext};
 use conexus_core::principal::Principal;
 use conexus_core::tool_result::ToolResult;
+use conexus_wakeloop::waiter_registry::WaiterRegistry;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::auth_gate::ResolvedPrincipal;
@@ -48,6 +51,34 @@ pub struct SharedState {
     /// load_forwarding_hmac_key`). Read by `crate::auth_gate`, not
     /// this module.
     pub forwarding_hmac_key: Option<Vec<u8>>,
+    /// The per-agent `wait_for_events` waiter registry -- one instance
+    /// per backend process (this project's single-writer-DB scope),
+    /// shared by every session's `ConexusServer` the same way `conn`
+    /// is.
+    pub waiter_registry: WaiterRegistry,
+}
+
+/// [`ProgressSink`] backed by a real MCP [`Peer`]/[`ProgressToken`]
+/// pair -- the only place in the workspace that bridges `conexus-auth`
+/// (which stays `rmcp`-free) to the real transport. Constructed fresh
+/// per `call_tool` invocation; cheap (`Peer` is a cheap `Clone`).
+struct PeerProgressSink {
+    peer: Peer<RoleServer>,
+    progress_token: ProgressToken,
+}
+
+impl ProgressSink for PeerProgressSink {
+    fn notify_progress<'a>(&'a self, progress: f64) -> BoxFuture<'a, bool> {
+        Box::pin(async move {
+            self.peer
+                .notify_progress(ProgressNotificationParam::new(
+                    self.progress_token.clone(),
+                    progress,
+                ))
+                .await
+                .is_ok()
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -162,6 +193,28 @@ impl ServerHandler for ConexusServer {
             .unwrap_or(serde_json::Value::Null);
 
         let now = chrono::Utc::now().to_rfc3339();
+
+        // Only `call_tool` holds the real `RequestContext` -- extract
+        // the MCP-transport facts a tool might need (currently just
+        // `wait_for_events`) once, here, and hand them down through
+        // `ToolCallContext` rather than smuggling them through
+        // `arguments`. `client_info()`/`get_progress_token()` are both
+        // read directly off `context`, never re-derived from raw
+        // headers a second time (see this module's own doc on that
+        // convention for `Principal`).
+        let progress_token = context.meta.get_progress_token();
+        let client_info = context.client_info();
+        let sink = progress_token.clone().map(|token| PeerProgressSink {
+            peer: context.peer.clone(),
+            progress_token: token,
+        });
+        let ctx = ToolCallContext {
+            progress_token_present: progress_token.is_some(),
+            client_name: client_info.as_ref().map(|i| i.name.as_str()),
+            progress_sink: sink.as_ref().map(|s| s as &dyn ProgressSink),
+            waiter_registry: &self.shared.waiter_registry,
+        };
+
         // `dispatch`/`Tool::call` now lock `shared.conn` themselves
         // (see `conexus_auth::tool`'s module doc for why they take
         // `&Mutex<Connection>`, not an already-locked guard) -- don't
@@ -175,6 +228,7 @@ impl ServerHandler for ConexusServer {
             &arguments,
             &self.shared.conn,
             &now,
+            &ctx,
         )
         .await;
         Ok(tool_result_to_call_tool_result(&result).into())

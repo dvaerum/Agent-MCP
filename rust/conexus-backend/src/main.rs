@@ -94,6 +94,7 @@ async fn main() -> Result<()> {
     let shared = Arc::new(SharedState {
         conn: tokio::sync::Mutex::new(conn),
         forwarding_hmac_key,
+        waiter_registry: conexus_wakeloop::waiter_registry::WaiterRegistry::new(),
     });
 
     let shared_for_factory = shared.clone();

@@ -486,6 +486,7 @@ impl Tool for AskProjectRagTool {
         arguments: &'a Value,
         conn: &'a AsyncMutex<Connection>,
         _now: &'a str,
+        _ctx: &'a conexus_auth::ToolCallContext<'a>,
     ) -> BoxFuture<'a, ToolResult> {
         Box::pin(async move {
             let query_text = match arguments.get("query").and_then(Value::as_str) {
@@ -599,8 +600,11 @@ mod tests {
     #[tokio::test]
     async fn rejects_a_missing_query() {
         let conn = test_conn();
+        let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
+        let ctx = conexus_auth::ToolCallContext::off_wire(&registry);
         let p = agent_bearer("a1", Capabilities::from_iter([Capability::RagQuery]));
-        let result = AskProjectRagTool::call(Some(&p), &serde_json::json!({}), &conn, NOW).await;
+        let result =
+            AskProjectRagTool::call(Some(&p), &serde_json::json!({}), &conn, NOW, &ctx).await;
         assert!(
             matches!(result, ToolResult::Invalid { field, .. } if field.as_deref() == Some("query"))
         );
@@ -609,15 +613,25 @@ mod tests {
     #[tokio::test]
     async fn rejects_an_empty_query() {
         let conn = test_conn();
+        let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
+        let ctx = conexus_auth::ToolCallContext::off_wire(&registry);
         let p = agent_bearer("a1", Capabilities::from_iter([Capability::RagQuery]));
-        let result =
-            AskProjectRagTool::call(Some(&p), &serde_json::json!({"query": ""}), &conn, NOW).await;
+        let result = AskProjectRagTool::call(
+            Some(&p),
+            &serde_json::json!({"query": ""}),
+            &conn,
+            NOW,
+            &ctx,
+        )
+        .await;
         assert!(matches!(result, ToolResult::Invalid { .. }));
     }
 
     #[tokio::test]
     async fn dispatch_denies_a_bearer_without_rag_query() {
         let conn = test_conn();
+        let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
+        let ctx = conexus_auth::ToolCallContext::off_wire(&registry);
         let p = agent_bearer("a1", Capabilities::from_iter([]));
         let descriptor = conexus_auth::ToolDescriptor::of::<AskProjectRagTool>();
         let result = conexus_auth::dispatch(
@@ -627,6 +641,7 @@ mod tests {
             &serde_json::json!({"query": "what is this project"}),
             &conn,
             NOW,
+            &ctx,
         )
         .await;
         assert_eq!(
