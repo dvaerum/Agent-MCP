@@ -9,6 +9,7 @@ pub mod completion_client;
 pub mod context_window;
 pub mod embedding_client;
 pub mod project_settings_tools;
+pub mod rag_tools;
 pub mod registry;
 pub mod wake_notify;
 
