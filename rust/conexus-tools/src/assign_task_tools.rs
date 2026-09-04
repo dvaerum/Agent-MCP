@@ -1598,7 +1598,8 @@ mod tests {
         conn: &AsyncMutex<Connection>,
     ) -> ToolResult {
         let registry = WaiterRegistry::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry);
+        let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
         AssignTaskTool::call(Some(principal), &args, conn, NOW, &ctx).await
     }
 
@@ -1863,7 +1864,8 @@ mod tests {
         }
         let registry = WaiterRegistry::new();
         let (_tx, mut rx) = registry.register("bob");
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry);
+        let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
         let result = AssignTaskTool::call(
             Some(&admin("alice")),
             &serde_json::json!({"agent_token": "tok-bob", "task_ids": ["t1"]}),
@@ -2142,7 +2144,8 @@ mod create_self_task_tests {
 
     async fn call(args: Value, principal: &Principal, conn: &AsyncMutex<Connection>) -> ToolResult {
         let registry = WaiterRegistry::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry);
+        let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
         CreateSelfTaskTool::call(Some(principal), &args, conn, NOW, &ctx).await
     }
 
