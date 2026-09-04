@@ -18,6 +18,7 @@ pub mod file_metadata_tools;
 pub mod project_settings_tools;
 pub mod rag_tools;
 pub mod registry;
+pub mod scheduled_directive_tools;
 pub mod task_comments_tools;
 pub mod task_mutation_engine;
 pub mod task_query_engine;
