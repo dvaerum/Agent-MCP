@@ -536,6 +536,125 @@ impl Tool for GetAgentTokensTool {
     }
 }
 
+/// Port of `view_status_tool_impl` -- **re-derived, not ported at face
+/// value** (per the plan's "things to explicitly re-derive"
+/// discipline, and the scoping report's own finding): Python's payload
+/// is almost entirely a snapshot of in-memory caches
+/// (`g.active_agents`/`g.agent_working_dirs`/`g.connections`) this
+/// migration deliberately never built, since every Rust repository
+/// reads fresh from SQLite on every call. Substitutions, each
+/// documented at its own field below:
+///
+/// - `agents_details`/`active_agents_count`: `AgentRepository::
+///   list_active` (DB-fresh) replaces `g.active_agents`. One filter
+///   difference kept intentionally: `list_active`'s own 2-status SQL
+///   exclusion (`terminated`, `tombstone`) does NOT exclude the
+///   synthetic `"system"` pseudo-agent row, but Python's cache-based
+///   `view_status` never sees it either (only `register_agent_tool_
+///   impl` ever inserts into `g.active_agents`, and `"system"` is a
+///   DB-only bootstrap row, never registered that way) -- so this
+///   port filters `status != "system"` explicitly to match the real
+///   observed behavior, not `list_active`'s literal SQL alone.
+/// - `working_directory`/`color`/`current_task`: read directly off
+///   each `AgentRow` -- no separate `g.agent_working_dirs` cache
+///   needed, the repository row already carries them.
+/// - `file_map_size`/`file_map_preview`: `ctx.file_map` (already
+///   real, process-wide state via `ToolCallContext`, ported PR #825)
+///   replaces `g.file_map` directly -- a like-for-like substitution,
+///   not a re-derivation.
+/// - `active_connections`: **dropped, not re-derived.** No live
+///   MCP session/stream registry exists in this workspace yet (see
+///   the plan's "Phase D5 (admin_tools.py)" decision 2 -- live stream
+///   teardown itself is deferred for the same reason). Reported as
+///   `0` with a documented, tracked gap rather than inventing a
+///   registry speculatively for one diagnostic field.
+/// - `server_uptime`: **hardcoded to `"N/A"`.** Python's own code
+///   comment ("Server uptime was N/A in original... For now, keeping
+///   it N/A for 1-to-1") shows this was the ORIGINAL migration's own
+///   stance before a later, apparently uncoordinated change wired in
+///   `g.server_start_time`. Threading a server-boot timestamp onto
+///   `ToolCallContext`/`SharedState` (a 4th mechanical sweep of the
+///   same shape as `waiter_registry`/`file_map`/`project_dir`) for one
+///   cosmetic diagnostic string is a real cost or a real, tracked
+///   simplification for now -- not silently dropped, documented here.
+pub struct ViewStatusTool;
+
+impl Tool for ViewStatusTool {
+    const NAME: &'static str = "view_status";
+    const REQUIRED: Requirement = Requirement::Cap {
+        // SECURITY (viewer-read-gating, ported verbatim): system.
+        // config.write (operator-only), NOT system.view (VIEWER
+        // bundle) -- this data includes every agent's absolute
+        // working directory.
+        cap: Capability::SystemConfigWrite,
+        reason: None,
+    };
+    const DESCRIPTION: &'static str = "Report active agents + server status. Operator-only.";
+    const SCHEMA: &'static str =
+        r#"{"type": "object", "properties": {}, "required": [], "additionalProperties": false}"#;
+
+    fn call<'a>(
+        _principal: Option<&'a Principal>,
+        _arguments: &'a Value,
+        conn: &'a AsyncMutex<Connection>,
+        _now: &'a str,
+        ctx: &'a conexus_auth::ToolCallContext<'a>,
+    ) -> conexus_auth::BoxFuture<'a, ToolResult> {
+        Box::pin(async move {
+            let guard = conn.lock().await;
+            let rows = match conexus_db::agent_repository::AgentRepository::list_active(&guard) {
+                Ok(rows) => rows,
+                Err(_e) => {
+                    return ToolResult::Failed {
+                        message: "A database error occurred; it has been logged. Retry, or ask \
+                            an operator to check logs."
+                            .to_string(),
+                    }
+                }
+            };
+            drop(guard);
+
+            let live_agents: Vec<_> = rows.iter().filter(|r| r.status != "system").collect();
+            let agents_details: serde_json::Map<String, Value> = live_agents
+                .iter()
+                .map(|row| {
+                    (
+                        row.agent_id.clone(),
+                        serde_json::json!({
+                            "status": row.status,
+                            "current_task": row.current_task,
+                            "working_directory": row.working_directory,
+                            "color": row.color.clone().unwrap_or_else(|| "N/A".to_string()),
+                        }),
+                    )
+                })
+                .collect();
+            let file_map_preview: serde_json::Map<String, Value> = ctx
+                .file_map
+                .preview(5)
+                .into_iter()
+                .map(|(path, entry)| (path, serde_json::json!(entry)))
+                .collect();
+
+            let status_payload = serde_json::json!({
+                "active_connections": 0,
+                "active_agents_count": live_agents.len(),
+                "agents_details": agents_details,
+                "server_uptime": "N/A",
+                "file_map_size": ctx.file_map.len(),
+                "file_map_preview": file_map_preview,
+            });
+            let status_json = serde_json::to_string_pretty(&status_payload)
+                .expect("every field here is already a plain JSON value");
+
+            ToolResult::Ok {
+                data: Some(status_payload),
+                message: Some(format!("MCP Server Status:\n{status_json}")),
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1168,5 +1287,112 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    // ── ViewStatusTool ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn view_status_denies_a_plain_worker() {
+        let alice = worker();
+        let denied = ViewStatusTool::REQUIRED.check(Some(&alice), &conexus_auth::NoPolicyOverrides);
+        assert!(denied.is_err());
+    }
+
+    #[tokio::test]
+    async fn view_status_reports_live_agents_and_excludes_the_system_pseudo_agent() {
+        let conn = setup().await;
+        seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
+        {
+            let guard = conn.lock().await;
+            conexus_db::agent_repository::AgentRepository::create(
+                &guard,
+                conexus_db::agent_repository::NewAgent {
+                    token: "tok-system",
+                    agent_id: "system",
+                    created_at: "2026-06-01T00:00:00Z",
+                    status: "system",
+                    current_task: None,
+                    working_directory: "/tmp",
+                    color: None,
+                    agent_role: "worker",
+                },
+            )
+            .unwrap();
+        }
+        let op = operator();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = ViewStatusTool::call(
+            Some(&op),
+            &serde_json::json!({}),
+            &conn,
+            "2026-06-01T00:01:00Z",
+            &c,
+        )
+        .await;
+        let ToolResult::Ok { data, message } = result else {
+            panic!("expected Ok, got {result:?}");
+        };
+        let data = data.unwrap();
+        assert_eq!(data["active_agents_count"], 1);
+        assert!(data["agents_details"].get("alice").is_some());
+        assert!(data["agents_details"].get("system").is_none());
+        assert!(message.unwrap().contains("MCP Server Status"));
+    }
+
+    #[tokio::test]
+    async fn view_status_excludes_a_terminated_agent() {
+        let conn = setup().await;
+        seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
+        {
+            let guard = conn.lock().await;
+            conexus_db::agent_repository::AgentRepository::terminate(
+                &guard,
+                "alice",
+                "2026-06-01T00:00:01Z",
+            )
+            .unwrap();
+        }
+        let op = operator();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = ViewStatusTool::call(
+            Some(&op),
+            &serde_json::json!({}),
+            &conn,
+            "2026-06-01T00:01:00Z",
+            &c,
+        )
+        .await;
+        let ToolResult::Ok { data, .. } = result else {
+            panic!("expected Ok, got {result:?}");
+        };
+        assert_eq!(data.unwrap()["active_agents_count"], 0);
+    }
+
+    #[tokio::test]
+    async fn view_status_reports_the_file_map_size_and_preview() {
+        let conn = setup().await;
+        let op = operator();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        file_map.claim("/tmp/a.txt", "alice", "editing", "2026-06-01T00:00:00Z");
+        let c = ctx(&registry, &file_map);
+        let result = ViewStatusTool::call(
+            Some(&op),
+            &serde_json::json!({}),
+            &conn,
+            "2026-06-01T00:01:00Z",
+            &c,
+        )
+        .await;
+        let ToolResult::Ok { data, .. } = result else {
+            panic!("expected Ok, got {result:?}");
+        };
+        let data = data.unwrap();
+        assert_eq!(data["file_map_size"], 1);
+        assert!(data["file_map_preview"].get("/tmp/a.txt").is_some());
     }
 }
