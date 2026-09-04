@@ -476,9 +476,28 @@ jobs:
         # by Dependabot and its bump PRs but must not red the build on the
         # committed lockfile (currently 2 known moderate postcss/next
         # advisories). Raise the threshold here if that tolerance changes.
+        #
+        # Retry the audit call itself: registry.npmjs.org's audit
+        # endpoint has genuinely 500'd/503'd mid-run twice in one week
+        # (2026-09-04, PRs #788 and #789 — "npm warn audit 500 Internal
+        # Server Error" / "503 Service Unavailable" from
+        # POST .../security/audits/quick, both while npm ci itself
+        # succeeded moments earlier), redding otherwise-green PRs on a
+        # transient third-party outage rather than a real advisory.
+        # `npm ci` is NOT retried — it wasn't the failure in either
+        # incident, and its own registry calls are already covered by
+        # actions/setup-node's package cache on a re-run.
         run: |
           npm ci
-          npm audit --audit-level=high
+          for attempt in 1 2 3; do
+            if npm audit --audit-level=high; then
+              exit 0
+            fi
+            echo "npm audit attempt ${attempt}/3 failed" >&2
+            [ "$attempt" -lt 3 ] && sleep $((attempt * 10))
+          done
+          echo "npm audit failed 3/3 attempts" >&2
+          exit 1
 
   closure-advisory-audit:
     # R13-F1: the job above audits uv.lock — the dev / `pip install`
