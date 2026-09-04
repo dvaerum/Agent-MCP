@@ -229,20 +229,22 @@ impl ServerHandler for ConexusServer {
         Ok(info)
     }
 
+    // Port of `mcp_list_tools_handler` (Phase E1 PR C): filtered by
+    // the caller's `CatalogRole` per `conexus_tools::access`, closing
+    // the gap this fn's own doc comment used to flag as un-ported.
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        // Every tool in the catalogue is listed regardless of the
-        // caller's capabilities -- matches Python's `mcp_list_tools_
-        // handler` (visibility filtering by role happens in
-        // `access.py::TOOL_ACCESS` for the WORKER-facing tool
-        // subset, a mechanism not yet ported; the 3 project_settings
-        // tools are all operator-only and Python lists them
-        // unconditionally too).
+        let role = conexus_core::principal::catalog_role(principal_from_context(&context).as_ref());
+        let guard = self.shared.conn.lock().await;
         let tools = conexus_tools::all_tools()
             .iter()
+            .filter(|descriptor| {
+                let tier = conexus_tools::access::access_tier(descriptor);
+                conexus_tools::access::is_visible_to_role(tier, role, &guard)
+            })
             .map(|descriptor| {
                 let schema = descriptor
                     .parsed_schema()
@@ -252,6 +254,7 @@ impl ServerHandler for ConexusServer {
                 Tool::new(descriptor.name, descriptor.description, schema)
             })
             .collect();
+        drop(guard);
         Ok(ListToolsResult {
             tools,
             ..Default::default()
