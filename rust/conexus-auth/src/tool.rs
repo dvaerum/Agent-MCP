@@ -33,6 +33,20 @@ pub trait Tool {
     const NAME: &'static str;
     const REQUIRED: Requirement;
 
+    /// The tool's one-line description, verbatim from the Python
+    /// `register_tool(..., description=...)` call site — part of the
+    /// `tools/list` surface a client sees.
+    const DESCRIPTION: &'static str;
+
+    /// The tool's JSON Schema for its `arguments`, as literal JSON
+    /// text — mirrors the exact `input_schema` dict shape Python's
+    /// `register_tool(...)` call sites pass. A `&'static str` rather
+    /// than a `serde_json::Value` because `Value` isn't `const`-
+    /// constructible; parse it via [`ToolDescriptor::parsed_schema`]
+    /// when a real `Value` is needed (e.g. building a `tools/list`
+    /// response).
+    const SCHEMA: &'static str;
+
     /// Run the tool. Enforcement is the DISPATCHER's job (see
     /// [`dispatch`]), not this method's — a direct call here is
     /// intentionally ungated, the same way Python's raw impl function
@@ -47,7 +61,9 @@ pub trait Tool {
 /// Tool`.
 pub struct ToolDescriptor {
     pub name: &'static str,
+    pub description: &'static str,
     pub required: Requirement,
+    pub schema: &'static str,
     pub call: fn(Option<&Principal>, &Value) -> ToolResult,
 }
 
@@ -55,9 +71,22 @@ impl ToolDescriptor {
     pub const fn of<T: Tool>() -> Self {
         ToolDescriptor {
             name: T::NAME,
+            description: T::DESCRIPTION,
             required: T::REQUIRED,
+            schema: T::SCHEMA,
             call: T::call,
         }
+    }
+
+    /// Parse `schema` into a `serde_json::Value` — e.g. for a
+    /// `tools/list` response. Panics on malformed JSON: a `Tool`
+    /// impl's `SCHEMA` is developer-authored literal text, not
+    /// untrusted runtime input, so a parse failure is a bug to catch
+    /// via `every_registered_tools_schema_is_valid_json` (below) in
+    /// CI, not a condition a real caller could ever trigger.
+    pub fn parsed_schema(&self) -> serde_json::Value {
+        serde_json::from_str(self.schema)
+            .unwrap_or_else(|e| panic!("Tool {:?}'s SCHEMA is not valid JSON: {e}", self.name))
     }
 }
 
@@ -108,6 +137,9 @@ mod tests {
             cap: Capability::TasksView,
             reason: None,
         };
+        const DESCRIPTION: &'static str = "Echoes its arguments back.";
+        const SCHEMA: &'static str =
+            r#"{"type":"object","properties":{},"additionalProperties":true}"#;
         fn call(_principal: Option<&Principal>, arguments: &Value) -> ToolResult {
             CALLED.store(true, Ordering::SeqCst);
             ToolResult::Ok {
@@ -135,6 +167,7 @@ mod tests {
     fn tool_descriptor_of_captures_the_impls_const_declaration() {
         let d = ToolDescriptor::of::<EchoTool>();
         assert_eq!(d.name, "echo");
+        assert_eq!(d.description, "Echoes its arguments back.");
         assert_eq!(
             d.required,
             Requirement::Cap {
@@ -142,6 +175,34 @@ mod tests {
                 reason: None
             }
         );
+        assert_eq!(
+            d.schema,
+            r#"{"type":"object","properties":{},"additionalProperties":true}"#
+        );
+    }
+
+    #[test]
+    fn parsed_schema_parses_the_literal_schema_text() {
+        let d = ToolDescriptor::of::<EchoTool>();
+        let parsed = d.parsed_schema();
+        assert_eq!(parsed["type"], "object");
+        assert_eq!(parsed["additionalProperties"], true);
+    }
+
+    #[test]
+    #[should_panic(expected = "not valid JSON")]
+    fn parsed_schema_panics_on_malformed_json() {
+        struct BrokenSchemaTool;
+        impl Tool for BrokenSchemaTool {
+            const NAME: &'static str = "broken";
+            const REQUIRED: Requirement = Requirement::Public;
+            const DESCRIPTION: &'static str = "Has a malformed schema.";
+            const SCHEMA: &'static str = "{not json";
+            fn call(_: Option<&Principal>, _: &Value) -> ToolResult {
+                unreachable!("not called by this test")
+            }
+        }
+        ToolDescriptor::of::<BrokenSchemaTool>().parsed_schema();
     }
 
     // Both cases below share the `CALLED` static and MUST run in one
@@ -227,6 +288,8 @@ mod tests {
         impl Tool for SneakyPublicTool {
             const NAME: &'static str = "sneaky";
             const REQUIRED: Requirement = Requirement::Public;
+            const DESCRIPTION: &'static str = "Shouldn't be public.";
+            const SCHEMA: &'static str = r#"{"type":"object"}"#;
             fn call(_: Option<&Principal>, _: &Value) -> ToolResult {
                 unreachable!("not called by this test")
             }
@@ -242,5 +305,17 @@ mod tests {
             actual, allowlist,
             "an unreviewed PUBLIC tool must make the allowlist comparison fail"
         );
+    }
+
+    #[test]
+    fn every_registered_tools_schema_is_valid_json() {
+        // Vacuous while all_tools() is still empty (Phase D1's real
+        // tool ports haven't landed yet), but a real, non-tautological
+        // check the moment they do -- `parsed_schema()` panics on
+        // malformed JSON, so this test is what would actually catch a
+        // typo'd SCHEMA literal in CI rather than at first runtime use.
+        for descriptor in all_tools() {
+            let _ = descriptor.parsed_schema();
+        }
     }
 }
