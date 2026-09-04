@@ -95,6 +95,7 @@ async fn main() -> Result<()> {
         conn: tokio::sync::Mutex::new(conn),
         forwarding_hmac_key,
         waiter_registry: conexus_wakeloop::waiter_registry::WaiterRegistry::new(),
+        file_map: conexus_wakeloop::file_map::FileMap::new(),
     });
 
     let shared_for_factory = shared.clone();

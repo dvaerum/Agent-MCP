@@ -13,6 +13,7 @@ pub mod assign_task_tools;
 pub mod completion_client;
 pub mod context_window;
 pub mod embedding_client;
+pub mod file_management_tools;
 pub mod project_settings_tools;
 pub mod rag_tools;
 pub mod registry;

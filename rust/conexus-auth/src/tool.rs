@@ -29,6 +29,7 @@
 use crate::requirement::{PolicySource, Requirement};
 use conexus_core::principal::Principal;
 use conexus_core::tool_result::ToolResult;
+use conexus_wakeloop::file_map::FileMap;
 use conexus_wakeloop::waiter_registry::WaiterRegistry;
 use rusqlite::Connection;
 use serde_json::Value;
@@ -106,6 +107,13 @@ pub struct ToolCallContext<'a> {
     pub progress_sink: Option<&'a dyn ProgressSink>,
     /// The per-agent `wait_for_events` waiter registry.
     pub waiter_registry: &'a WaiterRegistry,
+    /// The process-wide in-memory advisory file-claim map --
+    /// `file_management_tools.py`'s `g.file_map`. Threaded the same
+    /// explicit way as `waiter_registry`: a real, cheap-to-construct
+    /// piece of shared runtime state every tool that doesn't need it
+    /// simply ignores, rather than an `Option` special-cased for
+    /// "this call doesn't touch files".
+    pub file_map: &'a FileMap,
 }
 
 impl<'a> ToolCallContext<'a> {
@@ -117,12 +125,13 @@ impl<'a> ToolCallContext<'a> {
     /// explicit-input convention rather than special-casing "off-wire"
     /// as a reason to skip constructing shared state that costs
     /// nothing to create.
-    pub fn off_wire(waiter_registry: &'a WaiterRegistry) -> Self {
+    pub fn off_wire(waiter_registry: &'a WaiterRegistry, file_map: &'a FileMap) -> Self {
         ToolCallContext {
             progress_token_present: false,
             client_name: None,
             progress_sink: None,
             waiter_registry,
+            file_map,
         }
     }
 }
@@ -372,7 +381,8 @@ mod tests {
         CALLED.store(false, Ordering::SeqCst);
         let conn = AsyncMutex::new(Connection::open_in_memory().unwrap());
         let registry = WaiterRegistry::new();
-        let ctx = ToolCallContext::off_wire(&registry);
+        let file_map = FileMap::new();
+        let ctx = ToolCallContext::off_wire(&registry, &file_map);
         let d = ToolDescriptor::of::<EchoTool>();
         let denied_principal = agent_bearer(Capabilities::from_iter([])); // missing TasksView
         let denial = dispatch(
@@ -418,7 +428,8 @@ mod tests {
     #[test]
     fn off_wire_context_has_no_progress_token_or_client_identity() {
         let registry = WaiterRegistry::new();
-        let ctx = ToolCallContext::off_wire(&registry);
+        let file_map = FileMap::new();
+        let ctx = ToolCallContext::off_wire(&registry, &file_map);
         assert!(!ctx.progress_token_present);
         assert_eq!(ctx.client_name, None);
         assert!(ctx.progress_sink.is_none());
@@ -469,6 +480,7 @@ mod tests {
         }
 
         let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
         let sink = FakeSink {
             sent: std::sync::atomic::AtomicU32::new(0),
         };
@@ -477,6 +489,7 @@ mod tests {
             client_name: Some("claude-code"),
             progress_sink: Some(&sink),
             waiter_registry: &registry,
+            file_map: &file_map,
         };
         let conn = AsyncMutex::new(Connection::open_in_memory().unwrap());
         let result =

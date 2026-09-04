@@ -15,3 +15,6 @@ pub const IDENTIFIER_MAX_LEN: usize = 256;
 
 /// Human-authored title fields: task titles, project display names.
 pub const TITLE_MAX_LEN: usize = 512;
+
+/// Path-shaped fields: filesystem paths passed to file-claim tools.
+pub const PATH_MAX_LEN: usize = 4096;

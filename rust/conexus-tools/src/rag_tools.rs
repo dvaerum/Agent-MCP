@@ -601,7 +601,8 @@ mod tests {
     async fn rejects_a_missing_query() {
         let conn = test_conn();
         let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry);
+        let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
         let p = agent_bearer("a1", Capabilities::from_iter([Capability::RagQuery]));
         let result =
             AskProjectRagTool::call(Some(&p), &serde_json::json!({}), &conn, NOW, &ctx).await;
@@ -614,7 +615,8 @@ mod tests {
     async fn rejects_an_empty_query() {
         let conn = test_conn();
         let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry);
+        let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
         let p = agent_bearer("a1", Capabilities::from_iter([Capability::RagQuery]));
         let result = AskProjectRagTool::call(
             Some(&p),
@@ -631,7 +633,8 @@ mod tests {
     async fn dispatch_denies_a_bearer_without_rag_query() {
         let conn = test_conn();
         let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry);
+        let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
         let p = agent_bearer("a1", Capabilities::from_iter([]));
         let descriptor = conexus_auth::ToolDescriptor::of::<AskProjectRagTool>();
         let result = conexus_auth::dispatch(

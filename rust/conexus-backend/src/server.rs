@@ -30,6 +30,7 @@ use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
 use conexus_auth::{BoxFuture, ProgressSink, ToolCallContext};
 use conexus_core::principal::Principal;
 use conexus_core::tool_result::ToolResult;
+use conexus_wakeloop::file_map::FileMap;
 use conexus_wakeloop::waiter_registry::WaiterRegistry;
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -56,6 +57,10 @@ pub struct SharedState {
     /// shared by every session's `ConexusServer` the same way `conn`
     /// is.
     pub waiter_registry: WaiterRegistry,
+    /// The process-wide in-memory advisory file-claim map --
+    /// `file_management_tools.py`'s `g.file_map`. Same one-per-process
+    /// scope as `waiter_registry` above.
+    pub file_map: FileMap,
 }
 
 /// [`ProgressSink`] backed by a real MCP [`Peer`]/[`ProgressToken`]
@@ -259,6 +264,7 @@ impl ServerHandler for ConexusServer {
             client_name: client_info.as_ref().map(|i| i.name.as_str()),
             progress_sink: sink.as_ref().map(|s| s as &dyn ProgressSink),
             waiter_registry: &self.shared.waiter_registry,
+            file_map: &self.shared.file_map,
         };
 
         // `dispatch`/`Tool::call` now lock `shared.conn` themselves
