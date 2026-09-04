@@ -35,6 +35,7 @@ mod tests {
     use rusqlite::Connection;
     use serde_json::Value;
     use std::collections::BTreeSet;
+    use tokio::sync::Mutex as AsyncMutex;
 
     // ── all_tools() / PUBLIC allowlist arch test ────────────────────
     //
@@ -83,7 +84,12 @@ mod tests {
             const REQUIRED: Requirement = Requirement::Public;
             const DESCRIPTION: &'static str = "Shouldn't be public.";
             const SCHEMA: &'static str = r#"{"type":"object"}"#;
-            fn call(_: Option<&Principal>, _: &Value, _: &Connection, _: &str) -> ToolResult {
+            fn call<'a>(
+                _: Option<&'a Principal>,
+                _: &'a Value,
+                _: &'a AsyncMutex<Connection>,
+                _: &'a str,
+            ) -> conexus_auth::BoxFuture<'a, ToolResult> {
                 unreachable!("not called by this test")
             }
         }

@@ -31,6 +31,36 @@ use conexus_core::principal::Principal;
 use conexus_core::tool_result::ToolResult;
 use rusqlite::Connection;
 use serde_json::Value;
+use std::future::Future;
+use std::pin::Pin;
+use tokio::sync::Mutex as AsyncMutex;
+
+/// A boxed, type-erased future — the return shape [`Tool::call`] uses
+/// instead of a bare `async fn` (a trait method can't return `impl
+/// Future` and still be storable as a plain `fn` pointer field on
+/// [`ToolDescriptor`], the way `Tool::call`'s synchronous predecessor
+/// was). `Send` is required because `conexus-backend`'s `call_tool`
+/// awaits this from inside an `rmcp` handler future that the runtime
+/// may resume on a different worker thread.
+///
+/// Why `conn: &AsyncMutex<Connection>`, not a bare `&Connection`
+/// (tried first, reverted): `rusqlite::Connection` is `Send` but not
+/// `Sync`, so a bare `&'a Connection` captured into an `async move`
+/// block is itself `!Send` — and that makes the WHOLE generated
+/// future non-`Send`, even for a tool with zero internal `.await`
+/// points, because the future's pre-first-poll state already holds
+/// its captured parameters (the compiler can't assume nothing will
+/// ever move the boxed-but-unpolled future to another thread first).
+/// `tokio::sync::Mutex<T>` is unconditionally `Sync` when `T: Send`
+/// (its whole point is providing its own synchronization), so
+/// `&AsyncMutex<Connection>` IS `Send` regardless of `Connection`'s
+/// own `Sync`-ness. Every `Tool::call` impl's first line is `let conn
+/// = conn.lock().await;` — the resulting `MutexGuard<'_, Connection>`
+/// is itself `Send` (only needs `T: Send`), so it stays fine to hold
+/// across any FURTHER internal `.await` the tool body needs (e.g.
+/// `ask_project_rag`'s embedding/completion calls, once its DB reads
+/// are done).
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// A tool entry point. Real tool modules (Phase D1+, in `conexus-
 /// tools` and later crates) each define a zero-sized type implementing
@@ -61,24 +91,35 @@ pub trait Tool {
     /// real call path must go through [`dispatch`] or an equivalent
     /// that checks `Self::REQUIRED` first.
     ///
-    /// `conn` is the caller's already-open connection to the
-    /// project's own database (Python's `unit_of_work()` seam); `now`
-    /// is an ISO-8601 timestamp (the shape every `conexus-db` write
-    /// function's own `now: &str` parameter already expects). Both
-    /// added when Phase D1's first real tool port
-    /// (`project_settings_tools`) needed them; `EchoTool` and friends
-    /// in this module's own tests ignore both. Explicit parameters,
-    /// not a hidden global/thread-local/wall-clock read, matching
-    /// this crate's established "explicit input over hidden state"
-    /// convention (`router_conn: Option<&Connection>` in
+    /// `conn` is a lock over the caller's already-open connection to
+    /// the project's own database (Python's `unit_of_work()` seam) —
+    /// see [`BoxFuture`]'s doc for why it's a `Mutex` reference, not a
+    /// bare `&Connection`. `now` is an ISO-8601 timestamp (the shape
+    /// every `conexus-db` write function's own `now: &str` parameter
+    /// already expects). Both added when Phase D1's first real tool
+    /// port (`project_settings_tools`) needed them; `EchoTool` and
+    /// friends in this module's own tests ignore both. Explicit
+    /// parameters, not a hidden global/thread-local/wall-clock read,
+    /// matching this crate's established "explicit input over hidden
+    /// state" convention (`router_conn: Option<&Connection>` in
     /// `capabilities::resolve_capabilities`, `now: u64` in
     /// `forwarding_header`).
-    fn call(
-        principal: Option<&Principal>,
-        arguments: &Value,
-        conn: &Connection,
-        now: &str,
-    ) -> ToolResult;
+    ///
+    /// Async (returns [`BoxFuture`], not a bare `ToolResult`) since
+    /// Phase D2's `ask_project_rag` needs real network I/O (an
+    /// embedding call and a chat-completion call) mid-call — the
+    /// crate's own `never block the event loop` discipline (mirroring Python's
+    /// R12-F2, a live-exploited full-server-freeze bug from exactly
+    /// this mistake) rules out a synchronous `call` reaching for
+    /// `block_on` internally. A tool with no I/O of its own (every
+    /// tool ported before D2) just locks `conn`, does its (fully
+    /// synchronous) work, and never actually suspends.
+    fn call<'a>(
+        principal: Option<&'a Principal>,
+        arguments: &'a Value,
+        conn: &'a AsyncMutex<Connection>,
+        now: &'a str,
+    ) -> BoxFuture<'a, ToolResult>;
 }
 
 /// The type-erased shape of a [`Tool`], suitable for a flat runtime
@@ -89,7 +130,12 @@ pub struct ToolDescriptor {
     pub description: &'static str,
     pub required: Requirement,
     pub schema: &'static str,
-    pub call: fn(Option<&Principal>, &Value, &Connection, &str) -> ToolResult,
+    pub call: for<'a> fn(
+        Option<&'a Principal>,
+        &'a Value,
+        &'a AsyncMutex<Connection>,
+        &'a str,
+    ) -> BoxFuture<'a, ToolResult>,
 }
 
 impl ToolDescriptor {
@@ -123,12 +169,12 @@ impl ToolDescriptor {
 /// before calling" split the migration plan calls for, and the direct
 /// analogue of `dispatch_tool_call`'s R20-F4 pre-schema-validation
 /// gate (enforcement happens before the tool ever sees `arguments`).
-pub fn dispatch(
+pub async fn dispatch(
     descriptor: &ToolDescriptor,
     principal: Option<&Principal>,
     policy_source: &dyn PolicySource,
     arguments: &Value,
-    conn: &Connection,
+    conn: &AsyncMutex<Connection>,
     now: &str,
 ) -> ToolResult {
     if let Err(rejected) = descriptor.required.check(principal, policy_source) {
@@ -136,7 +182,7 @@ pub fn dispatch(
             reason: rejected.reason,
         };
     }
-    (descriptor.call)(principal, arguments, conn, now)
+    (descriptor.call)(principal, arguments, conn, now).await
 }
 
 #[cfg(test)]
@@ -159,17 +205,19 @@ mod tests {
         const DESCRIPTION: &'static str = "Echoes its arguments back.";
         const SCHEMA: &'static str =
             r#"{"type":"object","properties":{},"additionalProperties":true}"#;
-        fn call(
-            _principal: Option<&Principal>,
-            arguments: &Value,
-            _conn: &Connection,
-            _now: &str,
-        ) -> ToolResult {
-            CALLED.store(true, Ordering::SeqCst);
-            ToolResult::Ok {
-                data: Some(arguments.clone()),
-                message: None,
-            }
+        fn call<'a>(
+            _principal: Option<&'a Principal>,
+            arguments: &'a Value,
+            _conn: &'a AsyncMutex<Connection>,
+            _now: &'a str,
+        ) -> BoxFuture<'a, ToolResult> {
+            Box::pin(async move {
+                CALLED.store(true, Ordering::SeqCst);
+                ToolResult::Ok {
+                    data: Some(arguments.clone()),
+                    message: None,
+                }
+            })
         }
     }
 
@@ -222,7 +270,12 @@ mod tests {
             const REQUIRED: Requirement = Requirement::Public;
             const DESCRIPTION: &'static str = "Has a malformed schema.";
             const SCHEMA: &'static str = "{not json";
-            fn call(_: Option<&Principal>, _: &Value, _: &Connection, _: &str) -> ToolResult {
+            fn call<'a>(
+                _: Option<&'a Principal>,
+                _: &'a Value,
+                _: &'a AsyncMutex<Connection>,
+                _: &'a str,
+            ) -> BoxFuture<'a, ToolResult> {
                 unreachable!("not called by this test")
             }
         }
@@ -237,10 +290,10 @@ mod tests {
     // shared global state can interleave and observe each other's
     // writes). Sequencing both assertions in one test makes the
     // ordering deterministic instead.
-    #[test]
-    fn dispatch_denies_before_calling_and_calls_the_tool_on_admission() {
+    #[tokio::test]
+    async fn dispatch_denies_before_calling_and_calls_the_tool_on_admission() {
         CALLED.store(false, Ordering::SeqCst);
-        let conn = Connection::open_in_memory().unwrap();
+        let conn = AsyncMutex::new(Connection::open_in_memory().unwrap());
         let d = ToolDescriptor::of::<EchoTool>();
         let denied_principal = agent_bearer(Capabilities::from_iter([])); // missing TasksView
         let denial = dispatch(
@@ -250,7 +303,8 @@ mod tests {
             &Value::Null,
             &conn,
             "2026-01-01T00:00:00Z",
-        );
+        )
+        .await;
 
         assert!(
             !CALLED.load(Ordering::SeqCst),
@@ -267,7 +321,8 @@ mod tests {
             &args,
             &conn,
             "2026-01-01T00:00:00Z",
-        );
+        )
+        .await;
 
         assert!(CALLED.load(Ordering::SeqCst));
         assert_eq!(

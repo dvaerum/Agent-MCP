@@ -33,6 +33,7 @@ use conexus_db::{agent_action_repository, project_settings_repository::ProjectSe
 use regex::Regex;
 use rusqlite::Connection;
 use serde_json::Value;
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::wake_notify::wakes_for;
 
@@ -100,53 +101,56 @@ impl conexus_auth::Tool for ViewProjectSettingsTool {
     const SCHEMA: &'static str =
         r#"{"type":"object","properties":{},"required":[],"additionalProperties":false}"#;
 
-    fn call(
-        principal: Option<&Principal>,
-        _arguments: &Value,
-        conn: &Connection,
-        _now: &str,
-    ) -> ToolResult {
-        let rows = match settings_repo::list_all(conn) {
-            Ok(rows) => rows,
-            // Server-side error logging deferred: no logging/tracing
-            // crate exists anywhere in this workspace yet (wire one in
-            // when the `conexus` binary lands). The caller-facing
-            // message stays generic either way (SEC-R8-1: never echo
-            // an internal DB error verbatim).
-            Err(_e) => {
-                return ToolResult::Failed {
-                    message: "Database error reading project settings".to_string(),
+    fn call<'a>(
+        principal: Option<&'a Principal>,
+        _arguments: &'a Value,
+        conn: &'a AsyncMutex<Connection>,
+        _now: &'a str,
+    ) -> conexus_auth::BoxFuture<'a, ToolResult> {
+        Box::pin(async move {
+            let conn = conn.lock().await;
+            let rows = match settings_repo::list_all(&conn) {
+                Ok(rows) => rows,
+                // Server-side error logging deferred: no logging/tracing
+                // crate exists anywhere in this workspace yet (wire one in
+                // when the `conexus` binary lands). The caller-facing
+                // message stays generic either way (SEC-R8-1: never echo
+                // an internal DB error verbatim).
+                Err(_e) => {
+                    return ToolResult::Failed {
+                        message: "Database error reading project settings".to_string(),
+                    }
                 }
+            };
+
+            let confirmed = principal.is_some_and(is_confirmed_operator_tier);
+            let redacted: Vec<ProjectSettingRow> = rows
+                .iter()
+                .map(|r| redact_settings_row(r, confirmed))
+                .collect();
+
+            let message = if redacted.is_empty() {
+                "No project settings set (all toggles at defaults).".to_string()
+            } else {
+                let mut lines = vec![format!("Project Settings ({} entries):", redacted.len())];
+                for row in &redacted {
+                    let desc = row
+                        .description
+                        .as_deref()
+                        .map(|d| format!(" — {d}"))
+                        .unwrap_or_default();
+                    lines.push(format!("  • {} = {}{desc}", row.context_key, row.value));
+                }
+                lines.join("\n")
+            };
+
+            ToolResult::Ok {
+                data: Some(serde_json::json!({
+                    "settings": redacted.iter().map(row_to_json).collect::<Vec<_>>(),
+                })),
+                message: Some(message),
             }
-        };
-
-        let confirmed = principal.is_some_and(is_confirmed_operator_tier);
-        let redacted: Vec<ProjectSettingRow> = rows
-            .iter()
-            .map(|r| redact_settings_row(r, confirmed))
-            .collect();
-
-        let message = if redacted.is_empty() {
-            "No project settings set (all toggles at defaults).".to_string()
-        } else {
-            let mut lines = vec![format!("Project Settings ({} entries):", redacted.len())];
-            for row in &redacted {
-                let desc = row
-                    .description
-                    .as_deref()
-                    .map(|d| format!(" — {d}"))
-                    .unwrap_or_default();
-                lines.push(format!("  • {} = {}{desc}", row.context_key, row.value));
-            }
-            lines.join("\n")
-        };
-
-        ToolResult::Ok {
-            data: Some(serde_json::json!({
-                "settings": redacted.iter().map(row_to_json).collect::<Vec<_>>(),
-            })),
-            message: Some(message),
-        }
+        })
     }
 }
 
@@ -196,130 +200,133 @@ impl conexus_auth::Tool for UpdateProjectSettingsTool {
         "additionalProperties": false
     }"#;
 
-    fn call(
-        principal: Option<&Principal>,
-        arguments: &Value,
-        conn: &Connection,
-        now: &str,
-    ) -> ToolResult {
-        let context_key = match arguments.get("context_key").and_then(Value::as_str) {
-            Some(k) if !k.is_empty() => k,
-            _ => {
+    fn call<'a>(
+        principal: Option<&'a Principal>,
+        arguments: &'a Value,
+        conn: &'a AsyncMutex<Connection>,
+        now: &'a str,
+    ) -> conexus_auth::BoxFuture<'a, ToolResult> {
+        Box::pin(async move {
+            let conn = conn.lock().await;
+            let context_key = match arguments.get("context_key").and_then(Value::as_str) {
+                Some(k) if !k.is_empty() => k,
+                _ => {
+                    return ToolResult::Invalid {
+                        field: Some("context_key".to_string()),
+                        message: "context_key is required".to_string(),
+                    }
+                }
+            };
+            if !CONFIG_KEY_RE.is_match(context_key) {
                 return ToolResult::Invalid {
                     field: Some("context_key".to_string()),
-                    message: "context_key is required".to_string(),
-                }
-            }
-        };
-        if !CONFIG_KEY_RE.is_match(context_key) {
-            return ToolResult::Invalid {
-                field: Some("context_key".to_string()),
-                message: "project settings hold config_* keys only; use project_context tools \
+                    message: "project settings hold config_* keys only; use project_context tools \
                     for knowledge"
-                    .to_string(),
+                        .to_string(),
+                };
+            }
+
+            let has_context_value = arguments
+                .as_object()
+                .is_some_and(|o| o.contains_key("context_value"));
+            if !has_context_value {
+                return ToolResult::Invalid {
+                    field: Some("context_value".to_string()),
+                    message: "context_value is required".to_string(),
+                };
+            }
+            // Unlike Python (which must `json.dumps()` an arbitrary Python
+            // object and can hit a `TypeError` on a non-serializable one,
+            // e.g. a Python `set`), a value that arrived over the MCP wire
+            // as JSON is already representable as JSON -- `to_string()`
+            // here cannot fail the way Python's `json.dumps` call can, so
+            // there is no Rust equivalent of Python's serialization-
+            // failure `Invalid` branch to port.
+            let context_value = arguments
+                .get("context_value")
+                .cloned()
+                .unwrap_or(Value::Null);
+            let value_json_str = context_value.to_string();
+
+            let description = arguments.get("description").and_then(Value::as_str);
+            let description_provided = arguments
+                .as_object()
+                .is_some_and(|o| o.contains_key("description"));
+
+            let requesting_actor = actor_label(principal);
+
+            let tx = match conn.unchecked_transaction() {
+                Ok(tx) => tx,
+                Err(_e) => {
+                    return ToolResult::Failed {
+                        message: "Database error updating project settings".to_string(),
+                    }
+                }
             };
-        }
-
-        let has_context_value = arguments
-            .as_object()
-            .is_some_and(|o| o.contains_key("context_value"));
-        if !has_context_value {
-            return ToolResult::Invalid {
-                field: Some("context_value".to_string()),
-                message: "context_value is required".to_string(),
+            let (_, created) = match settings_repo::upsert(
+                &tx,
+                context_key,
+                &value_json_str,
+                description,
+                description_provided,
+                requesting_actor,
+                now,
+            ) {
+                Ok(result) => result,
+                Err(_e) => {
+                    return ToolResult::Failed {
+                        message: "Database error updating project settings".to_string(),
+                    }
+                }
             };
-        }
-        // Unlike Python (which must `json.dumps()` an arbitrary Python
-        // object and can hit a `TypeError` on a non-serializable one,
-        // e.g. a Python `set`), a value that arrived over the MCP wire
-        // as JSON is already representable as JSON -- `to_string()`
-        // here cannot fail the way Python's `json.dumps` call can, so
-        // there is no Rust equivalent of Python's serialization-
-        // failure `Invalid` branch to port.
-        let context_value = arguments
-            .get("context_value")
-            .cloned()
-            .unwrap_or(Value::Null);
-        let value_json_str = context_value.to_string();
-
-        let description = arguments.get("description").and_then(Value::as_str);
-        let description_provided = arguments
-            .as_object()
-            .is_some_and(|o| o.contains_key("description"));
-
-        let requesting_actor = actor_label(principal);
-
-        let tx = match conn.unchecked_transaction() {
-            Ok(tx) => tx,
-            Err(_e) => {
+            // Audit through the SAME transaction as the settings write --
+            // matches Python's `with unit_of_work() as u:` wrapping both
+            // calls on one cursor.
+            let audit_details = serde_json::json!({"context_key": context_key, "created": created});
+            if let Err(_e) = agent_action_repository::log_agent_action(
+                &tx,
+                requesting_actor,
+                "updated_setting",
+                None,
+                Some(&audit_details),
+                now,
+            ) {
+                // Best-effort: an audit-log failure must not fail the
+                // primary write (matches Python's own try/except around
+                // `log_agent_action_to_db`'s INSERT) -- but it DOES still
+                // fail the whole transaction if left uncommitted, so
+                // explicitly fall through to the same commit either way
+                // rather than returning early, matching Python's
+                // fire-and-forget semantics (the underlying call there
+                // also can't roll back the settings write on audit
+                // failure -- it just logs and continues).
+            }
+            if let Err(_e) = tx.commit() {
                 return ToolResult::Failed {
                     message: "Database error updating project settings".to_string(),
-                }
+                };
             }
-        };
-        let (_, created) = match settings_repo::upsert(
-            &tx,
-            context_key,
-            &value_json_str,
-            description,
-            description_provided,
-            requesting_actor,
-            now,
-        ) {
-            Ok(result) => result,
-            Err(_e) => {
-                return ToolResult::Failed {
-                    message: "Database error updating project settings".to_string(),
-                }
+
+            // BL-R14-1 parity: classify which post-write wake(s) this key
+            // requires. Actual delivery deferred -- see crate::wake_notify.
+            let wakes: Vec<&str> = wakes_for(context_key)
+                .into_iter()
+                .map(|w| w.as_str())
+                .collect();
+
+            ToolResult::Ok {
+                data: Some(serde_json::json!({
+                    "context_key": context_key,
+                    "created": created,
+                    "wakes": wakes,
+                })),
+                message: Some(format!(
+                    "Project setting {} for key '{}'.",
+                    if created { "created" } else { "updated" },
+                    context_key
+                )),
             }
-        };
-        // Audit through the SAME transaction as the settings write --
-        // matches Python's `with unit_of_work() as u:` wrapping both
-        // calls on one cursor.
-        let audit_details = serde_json::json!({"context_key": context_key, "created": created});
-        if let Err(_e) = agent_action_repository::log_agent_action(
-            &tx,
-            requesting_actor,
-            "updated_setting",
-            None,
-            Some(&audit_details),
-            now,
-        ) {
-            // Best-effort: an audit-log failure must not fail the
-            // primary write (matches Python's own try/except around
-            // `log_agent_action_to_db`'s INSERT) -- but it DOES still
-            // fail the whole transaction if left uncommitted, so
-            // explicitly fall through to the same commit either way
-            // rather than returning early, matching Python's
-            // fire-and-forget semantics (the underlying call there
-            // also can't roll back the settings write on audit
-            // failure -- it just logs and continues).
-        }
-        if let Err(_e) = tx.commit() {
-            return ToolResult::Failed {
-                message: "Database error updating project settings".to_string(),
-            };
-        }
-
-        // BL-R14-1 parity: classify which post-write wake(s) this key
-        // requires. Actual delivery deferred -- see crate::wake_notify.
-        let wakes: Vec<&str> = wakes_for(context_key)
-            .into_iter()
-            .map(|w| w.as_str())
-            .collect();
-
-        ToolResult::Ok {
-            data: Some(serde_json::json!({
-                "context_key": context_key,
-                "created": created,
-                "wakes": wakes,
-            })),
-            message: Some(format!(
-                "Project setting {} for key '{}'.",
-                if created { "created" } else { "updated" },
-                context_key
-            )),
-        }
+        })
     }
 }
 
@@ -349,76 +356,79 @@ impl conexus_auth::Tool for DeleteProjectSettingsTool {
         "additionalProperties": false
     }"#;
 
-    fn call(
-        principal: Option<&Principal>,
-        arguments: &Value,
-        conn: &Connection,
-        now: &str,
-    ) -> ToolResult {
-        let context_key = match arguments.get("context_key").and_then(Value::as_str) {
-            Some(k) if !k.is_empty() => k,
-            _ => {
-                return ToolResult::Invalid {
-                    field: Some("context_key".to_string()),
-                    message: "context_key is required".to_string(),
+    fn call<'a>(
+        principal: Option<&'a Principal>,
+        arguments: &'a Value,
+        conn: &'a AsyncMutex<Connection>,
+        now: &'a str,
+    ) -> conexus_auth::BoxFuture<'a, ToolResult> {
+        Box::pin(async move {
+            let conn = conn.lock().await;
+            let context_key = match arguments.get("context_key").and_then(Value::as_str) {
+                Some(k) if !k.is_empty() => k,
+                _ => {
+                    return ToolResult::Invalid {
+                        field: Some("context_key".to_string()),
+                        message: "context_key is required".to_string(),
+                    }
                 }
+            };
+
+            let requesting_actor = actor_label(principal);
+
+            let tx = match conn.unchecked_transaction() {
+                Ok(tx) => tx,
+                Err(_e) => {
+                    return ToolResult::Failed {
+                        message: "Database error deleting project settings".to_string(),
+                    }
+                }
+            };
+            let deleted = match settings_repo::delete_many(&tx, &[context_key]) {
+                Ok(rows) => rows,
+                Err(_e) => {
+                    return ToolResult::Failed {
+                        message: "Database error deleting project settings".to_string(),
+                    }
+                }
+            };
+            if deleted.is_empty() {
+                return ToolResult::NotFound {
+                    resource: "project_settings".to_string(),
+                    identifier: context_key.to_string(),
+                    hint: None,
+                };
             }
-        };
-
-        let requesting_actor = actor_label(principal);
-
-        let tx = match conn.unchecked_transaction() {
-            Ok(tx) => tx,
-            Err(_e) => {
+            let audit_details = serde_json::json!({"context_key": context_key});
+            if let Err(_e) = agent_action_repository::log_agent_action(
+                &tx,
+                requesting_actor,
+                "deleted_setting",
+                None,
+                Some(&audit_details),
+                now,
+            ) {
+                // Best-effort audit, same rationale as the update tool above.
+            }
+            if let Err(_e) = tx.commit() {
                 return ToolResult::Failed {
                     message: "Database error deleting project settings".to_string(),
-                }
+                };
             }
-        };
-        let deleted = match settings_repo::delete_many(&tx, &[context_key]) {
-            Ok(rows) => rows,
-            Err(_e) => {
-                return ToolResult::Failed {
-                    message: "Database error deleting project settings".to_string(),
-                }
+
+            let wakes: Vec<&str> = wakes_for(context_key)
+                .into_iter()
+                .map(|w| w.as_str())
+                .collect();
+
+            ToolResult::Ok {
+                data: Some(serde_json::json!({
+                    "context_key": context_key,
+                    "wakes": wakes,
+                })),
+                message: Some(format!("Project setting '{context_key}' deleted.")),
             }
-        };
-        if deleted.is_empty() {
-            return ToolResult::NotFound {
-                resource: "project_settings".to_string(),
-                identifier: context_key.to_string(),
-                hint: None,
-            };
-        }
-        let audit_details = serde_json::json!({"context_key": context_key});
-        if let Err(_e) = agent_action_repository::log_agent_action(
-            &tx,
-            requesting_actor,
-            "deleted_setting",
-            None,
-            Some(&audit_details),
-            now,
-        ) {
-            // Best-effort audit, same rationale as the update tool above.
-        }
-        if let Err(_e) = tx.commit() {
-            return ToolResult::Failed {
-                message: "Database error deleting project settings".to_string(),
-            };
-        }
-
-        let wakes: Vec<&str> = wakes_for(context_key)
-            .into_iter()
-            .map(|w| w.as_str())
-            .collect();
-
-        ToolResult::Ok {
-            data: Some(serde_json::json!({
-                "context_key": context_key,
-                "wakes": wakes,
-            })),
-            message: Some(format!("Project setting '{context_key}' deleted.")),
-        }
+        })
     }
 }
 
@@ -430,10 +440,10 @@ mod tests {
     use conexus_core::principal::PrincipalKind;
     use conexus_db::schema::init_schema;
 
-    fn test_conn() -> Connection {
+    fn test_conn() -> AsyncMutex<Connection> {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
-        conn
+        AsyncMutex::new(conn)
     }
 
     fn operator_principal() -> Principal {
@@ -469,11 +479,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn view_reports_no_settings_when_store_is_empty() {
+    #[tokio::test]
+    async fn view_reports_no_settings_when_store_is_empty() {
         let conn = test_conn();
         let result =
-            ViewProjectSettingsTool::call(Some(&operator_principal()), &Value::Null, &conn, NOW);
+            ViewProjectSettingsTool::call(Some(&operator_principal()), &Value::Null, &conn, NOW)
+                .await;
         assert_eq!(
             result,
             ToolResult::Ok {
@@ -483,57 +494,61 @@ mod tests {
         );
     }
 
-    #[test]
-    fn update_rejects_a_missing_context_key() {
+    #[tokio::test]
+    async fn update_rejects_a_missing_context_key() {
         let conn = test_conn();
         let result = UpdateProjectSettingsTool::call(
             Some(&operator_principal()),
             &serde_json::json!({"context_value": true}),
             &conn,
             NOW,
-        );
+        )
+        .await;
         assert!(
             matches!(result, ToolResult::Invalid { field, .. } if field.as_deref() == Some("context_key"))
         );
     }
 
-    #[test]
-    fn update_rejects_a_key_outside_the_config_namespace() {
+    #[tokio::test]
+    async fn update_rejects_a_key_outside_the_config_namespace() {
         let conn = test_conn();
         let result = UpdateProjectSettingsTool::call(
             Some(&operator_principal()),
             &serde_json::json!({"context_key": "not_config_shaped", "context_value": true}),
             &conn,
             NOW,
-        );
+        )
+        .await;
         assert!(
             matches!(result, ToolResult::Invalid { field, .. } if field.as_deref() == Some("context_key"))
         );
     }
 
-    #[test]
-    fn update_rejects_a_missing_context_value() {
+    #[tokio::test]
+    async fn update_rejects_a_missing_context_value() {
         let conn = test_conn();
         let result = UpdateProjectSettingsTool::call(
             Some(&operator_principal()),
             &serde_json::json!({"context_key": "config_x"}),
             &conn,
             NOW,
-        );
+        )
+        .await;
         assert!(
             matches!(result, ToolResult::Invalid { field, .. } if field.as_deref() == Some("context_value"))
         );
     }
 
-    #[test]
-    fn update_creates_a_new_row_and_reports_created_true() {
+    #[tokio::test]
+    async fn update_creates_a_new_row_and_reports_created_true() {
         let conn = test_conn();
         let result = UpdateProjectSettingsTool::call(
             Some(&operator_principal()),
             &serde_json::json!({"context_key": "config_max_agents", "context_value": 10}),
             &conn,
             NOW,
-        );
+        )
+        .await;
         let ToolResult::Ok { data, .. } = result else {
             panic!("expected Ok, got {result:?}")
         };
@@ -541,43 +556,48 @@ mod tests {
         assert_eq!(data["context_key"], "config_max_agents");
         assert_eq!(data["created"], true);
 
-        let row = settings_repo::get(&conn, "config_max_agents")
+        let row = settings_repo::get(&*conn.lock().await, "config_max_agents")
             .unwrap()
             .unwrap();
         assert_eq!(row.value, "10");
     }
 
-    #[test]
-    fn update_on_existing_key_reports_created_false() {
+    #[tokio::test]
+    async fn update_on_existing_key_reports_created_false() {
         let conn = test_conn();
         UpdateProjectSettingsTool::call(
             Some(&operator_principal()),
             &serde_json::json!({"context_key": "config_x", "context_value": 1}),
             &conn,
             NOW,
-        );
+        )
+        .await;
         let result = UpdateProjectSettingsTool::call(
             Some(&operator_principal()),
             &serde_json::json!({"context_key": "config_x", "context_value": 2}),
             &conn,
             NOW,
-        );
+        )
+        .await;
         let ToolResult::Ok { data, .. } = result else {
             panic!("expected Ok, got {result:?}")
         };
         assert_eq!(data.unwrap()["created"], false);
     }
 
-    #[test]
-    fn update_writes_an_audit_row_in_the_same_transaction() {
+    #[tokio::test]
+    async fn update_writes_an_audit_row_in_the_same_transaction() {
         let conn = test_conn();
         UpdateProjectSettingsTool::call(
             Some(&operator_principal()),
             &serde_json::json!({"context_key": "config_x", "context_value": 1}),
             &conn,
             NOW,
-        );
+        )
+        .await;
         let (action_type, agent_id): (String, String) = conn
+            .lock()
+            .await
             .query_row("SELECT action_type, agent_id FROM agent_actions", [], |r| {
                 Ok((r.get(0)?, r.get(1)?))
             })
@@ -586,15 +606,15 @@ mod tests {
         assert_eq!(agent_id, "op1");
     }
 
-    #[test]
-    fn update_embeds_the_worker_policy_wake_for_a_matching_key() {
+    #[tokio::test]
+    async fn update_embeds_the_worker_policy_wake_for_a_matching_key() {
         let conn = test_conn();
         let result = UpdateProjectSettingsTool::call(
             Some(&operator_principal()),
             &serde_json::json!({"context_key": "config_allow_worker_to_worker", "context_value": true}),
             &conn,
             NOW,
-        );
+        ).await;
         let ToolResult::Ok { data, .. } = result else {
             panic!("expected Ok, got {result:?}")
         };
@@ -604,44 +624,47 @@ mod tests {
         );
     }
 
-    #[test]
-    fn update_embeds_no_wakes_for_an_unrelated_key() {
+    #[tokio::test]
+    async fn update_embeds_no_wakes_for_an_unrelated_key() {
         let conn = test_conn();
         let result = UpdateProjectSettingsTool::call(
             Some(&operator_principal()),
             &serde_json::json!({"context_key": "config_max_agents", "context_value": 1}),
             &conn,
             NOW,
-        );
+        )
+        .await;
         let ToolResult::Ok { data, .. } = result else {
             panic!("expected Ok, got {result:?}")
         };
         assert_eq!(data.unwrap()["wakes"], serde_json::json!([]));
     }
 
-    #[test]
-    fn delete_rejects_a_missing_context_key() {
+    #[tokio::test]
+    async fn delete_rejects_a_missing_context_key() {
         let conn = test_conn();
         let result = DeleteProjectSettingsTool::call(
             Some(&operator_principal()),
             &serde_json::json!({}),
             &conn,
             NOW,
-        );
+        )
+        .await;
         assert!(
             matches!(result, ToolResult::Invalid { field, .. } if field.as_deref() == Some("context_key"))
         );
     }
 
-    #[test]
-    fn delete_reports_not_found_for_a_missing_key() {
+    #[tokio::test]
+    async fn delete_reports_not_found_for_a_missing_key() {
         let conn = test_conn();
         let result = DeleteProjectSettingsTool::call(
             Some(&operator_principal()),
             &serde_json::json!({"context_key": "config_does_not_exist"}),
             &conn,
             NOW,
-        );
+        )
+        .await;
         assert_eq!(
             result,
             ToolResult::NotFound {
@@ -652,21 +675,23 @@ mod tests {
         );
     }
 
-    #[test]
-    fn delete_removes_an_existing_row_and_writes_an_audit_row() {
+    #[tokio::test]
+    async fn delete_removes_an_existing_row_and_writes_an_audit_row() {
         let conn = test_conn();
         UpdateProjectSettingsTool::call(
             Some(&operator_principal()),
             &serde_json::json!({"context_key": "config_x", "context_value": 1}),
             &conn,
             NOW,
-        );
+        )
+        .await;
         let result = DeleteProjectSettingsTool::call(
             Some(&operator_principal()),
             &serde_json::json!({"context_key": "config_x"}),
             &conn,
             NOW,
-        );
+        )
+        .await;
         assert_eq!(
             result,
             ToolResult::Ok {
@@ -676,9 +701,14 @@ mod tests {
                 message: Some("Project setting 'config_x' deleted.".to_string()),
             }
         );
-        assert_eq!(settings_repo::get(&conn, "config_x").unwrap(), None);
+        assert_eq!(
+            settings_repo::get(&*conn.lock().await, "config_x").unwrap(),
+            None
+        );
 
         let count: i64 = conn
+            .lock()
+            .await
             .query_row(
                 "SELECT COUNT(*) FROM agent_actions WHERE action_type = 'deleted_setting'",
                 [],
