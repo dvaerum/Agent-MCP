@@ -17,6 +17,7 @@
 //! `call_tool` reads it back via `context.extensions.get::<Parts>()`
 //! rather than re-deriving it from headers a second time.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use rmcp::model::{
@@ -61,6 +62,10 @@ pub struct SharedState {
     /// `file_management_tools.py`'s `g.file_map`. Same one-per-process
     /// scope as `waiter_registry` above.
     pub file_map: FileMap,
+    /// The `--project-dir` this process was started with -- threaded
+    /// into every `ToolCallContext` (Phase D5, `backup_project_context`
+    /// is the first real consumer).
+    pub project_dir: PathBuf,
 }
 
 /// [`ProgressSink`] backed by a real MCP [`Peer`]/[`ProgressToken`]
@@ -265,6 +270,7 @@ impl ServerHandler for ConexusServer {
             progress_sink: sink.as_ref().map(|s| s as &dyn ProgressSink),
             waiter_registry: &self.shared.waiter_registry,
             file_map: &self.shared.file_map,
+            project_dir: &self.shared.project_dir,
         };
 
         // `dispatch`/`Tool::call` now lock `shared.conn` themselves

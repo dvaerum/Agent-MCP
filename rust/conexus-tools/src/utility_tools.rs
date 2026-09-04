@@ -55,7 +55,11 @@ mod tests {
         let conn = AsyncMutex::new(conn);
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         let result = TestTool::call(None, &Value::Null, &conn, "2026-06-01T00:00:00Z", &ctx).await;
         assert_eq!(
             result,

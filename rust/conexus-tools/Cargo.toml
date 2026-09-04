@@ -58,3 +58,7 @@ tokio = { version = "1", features = [
     "io-util",
     "test-util",
 ] }
+# backup_project_context (Phase D5) is this crate's first tool that
+# writes a real file to disk -- an isolated real tempdir per test,
+# same crate `conexus-backend` already uses for its own boot tests.
+tempfile = "3"

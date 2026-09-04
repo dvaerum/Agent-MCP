@@ -34,6 +34,7 @@ use conexus_wakeloop::waiter_registry::WaiterRegistry;
 use rusqlite::Connection;
 use serde_json::Value;
 use std::future::Future;
+use std::path::Path;
 use std::pin::Pin;
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -114,24 +115,39 @@ pub struct ToolCallContext<'a> {
     /// simply ignores, rather than an `Option` special-cased for
     /// "this call doesn't touch files".
     pub file_map: &'a FileMap,
+    /// The `--project-dir` this backend process was started with --
+    /// `project_context_tools.py`'s `os.environ.get("MCP_PROJECT_DIR",
+    /// ".")`. Threaded explicitly (Phase D5, `backup_project_context`)
+    /// rather than read from an env var a second time: every real
+    /// call site already has the value from its own CLI parse
+    /// (`conexus-backend`'s `Cli::project_dir`), and every OTHER tool
+    /// simply ignores this field, matching `waiter_registry`/
+    /// `file_map`'s own "construct it once per process, thread it
+    /// everywhere, ignore it where irrelevant" convention.
+    pub project_dir: &'a Path,
 }
 
 impl<'a> ToolCallContext<'a> {
     /// An off-wire context: no progress token, no client identity, no
     /// progress sink -- what a REST caller or a test harness gets. A
-    /// `WaiterRegistry` is still required (never `Option`d away): every
-    /// real boot path constructs exactly one and every tool that
-    /// doesn't need it simply ignores this field, matching the
-    /// explicit-input convention rather than special-casing "off-wire"
-    /// as a reason to skip constructing shared state that costs
-    /// nothing to create.
-    pub fn off_wire(waiter_registry: &'a WaiterRegistry, file_map: &'a FileMap) -> Self {
+    /// `WaiterRegistry`/`FileMap`/`project_dir` are still required
+    /// (never `Option`d away): every real boot path constructs them
+    /// and every tool that doesn't need one simply ignores it,
+    /// matching the explicit-input convention rather than
+    /// special-casing "off-wire" as a reason to skip constructing
+    /// shared state that costs nothing to create.
+    pub fn off_wire(
+        waiter_registry: &'a WaiterRegistry,
+        file_map: &'a FileMap,
+        project_dir: &'a Path,
+    ) -> Self {
         ToolCallContext {
             progress_token_present: false,
             client_name: None,
             progress_sink: None,
             waiter_registry,
             file_map,
+            project_dir,
         }
     }
 }
@@ -382,7 +398,7 @@ mod tests {
         let conn = AsyncMutex::new(Connection::open_in_memory().unwrap());
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
         let d = ToolDescriptor::of::<EchoTool>();
         let denied_principal = agent_bearer(Capabilities::from_iter([])); // missing TasksView
         let denial = dispatch(
@@ -429,7 +445,7 @@ mod tests {
     fn off_wire_context_has_no_progress_token_or_client_identity() {
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
         assert!(!ctx.progress_token_present);
         assert_eq!(ctx.client_name, None);
         assert!(ctx.progress_sink.is_none());
@@ -490,6 +506,7 @@ mod tests {
             progress_sink: Some(&sink),
             waiter_registry: &registry,
             file_map: &file_map,
+            project_dir: std::path::Path::new("/tmp"),
         };
         let conn = AsyncMutex::new(Connection::open_in_memory().unwrap());
         let result =

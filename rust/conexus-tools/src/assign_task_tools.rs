@@ -1599,7 +1599,11 @@ mod tests {
     ) -> ToolResult {
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         AssignTaskTool::call(Some(principal), &args, conn, NOW, &ctx).await
     }
 
@@ -1865,7 +1869,11 @@ mod tests {
         let registry = WaiterRegistry::new();
         let (_tx, mut rx) = registry.register("bob");
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         let result = AssignTaskTool::call(
             Some(&admin("alice")),
             &serde_json::json!({"agent_token": "tok-bob", "task_ids": ["t1"]}),
@@ -2145,7 +2153,11 @@ mod create_self_task_tests {
     async fn call(args: Value, principal: &Principal, conn: &AsyncMutex<Connection>) -> ToolResult {
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         CreateSelfTaskTool::call(Some(principal), &args, conn, NOW, &ctx).await
     }
 
