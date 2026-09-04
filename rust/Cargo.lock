@@ -105,6 +105,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "conexus-tools"
+version = "0.1.0"
+dependencies = [
+ "conexus-auth",
+ "conexus-core",
+ "conexus-db",
+ "regex",
+ "rusqlite",
+ "serde_json",
+]
+
+[[package]]
 name = "conexus-vec"
 version = "0.1.0"
 dependencies = [

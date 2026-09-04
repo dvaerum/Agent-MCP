@@ -59,6 +59,19 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             updated_by    TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS agent_actions (
+            action_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+            agent_id      TEXT NOT NULL,
+            action_type   TEXT NOT NULL,
+            task_id       TEXT,
+            timestamp     TEXT NOT NULL,
+            details       TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_agent_actions_agent_id_timestamp
+            ON agent_actions (agent_id, timestamp);
+        CREATE INDEX IF NOT EXISTS idx_agent_actions_task_id_timestamp
+            ON agent_actions (task_id, timestamp);
+
         CREATE TABLE IF NOT EXISTS pending_directive (
             poke_id       TEXT PRIMARY KEY,
             agent_id      TEXT NOT NULL,

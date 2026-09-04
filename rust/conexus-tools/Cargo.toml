@@ -1,0 +1,15 @@
+[package]
+name = "conexus-tools"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "CoNexus MCP tool catalogue -- one module per agent_mcp/tools/*.py (Phase D). See /home/dennis/.claude/plans/prancy-napping-pie.md."
+
+[dependencies]
+conexus-core = { path = "../conexus-core" }
+conexus-db = { path = "../conexus-db" }
+conexus-auth = { path = "../conexus-auth" }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde_json = "1"
+regex = "1"
