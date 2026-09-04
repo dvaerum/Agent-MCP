@@ -183,6 +183,44 @@ mod tests {
     }
 
     #[test]
+    fn every_registered_tool_derives_an_access_tier_without_panicking() {
+        // Completeness check for Phase E1 PR C's `access::access_tier`
+        // -- every currently-registered tool's Requirement must map to
+        // a defined tier (the match in `access_tier` is exhaustive over
+        // `Requirement`'s variants, so this mostly guards against a
+        // future Requirement variant leaving a hole clippy's own
+        // exhaustiveness check wouldn't catch across crate boundaries).
+        for descriptor in all_tools() {
+            let _ = crate::access::access_tier(descriptor);
+        }
+    }
+
+    #[test]
+    fn spot_checked_tools_derive_the_expected_access_tier() {
+        // Pins the real, reviewed tier for a representative sample --
+        // a regression here means either a tool's Requirement changed
+        // (re-review whether it should still show to the same roles)
+        // or `access::TIER_OVERRIDES` drifted. Not exhaustive by
+        // design -- see `access.rs`'s own module doc for the FULL
+        // reviewed set this was derived from.
+        use crate::access::{access_tier, AccessTier};
+        let tier_of =
+            |name: &str| access_tier(all_tools().iter().find(|t| t.name == name).unwrap());
+        assert_eq!(tier_of("test"), AccessTier::Any);
+        assert_eq!(tier_of("view_tasks"), AccessTier::Worker);
+        assert_eq!(tier_of("view_status"), AccessTier::Operator);
+        assert_eq!(tier_of("view_agents"), AccessTier::Worker);
+        assert_eq!(tier_of("create_task"), AccessTier::Operator);
+        assert_eq!(tier_of("bulk_task_operations"), AccessTier::Operator);
+        assert!(matches!(
+            tier_of("assign_task"),
+            AccessTier::WorkerIfToggled(..)
+        ));
+        assert_eq!(tier_of("wait_for_events"), AccessTier::Any);
+        assert_eq!(tier_of("fetch_events_since"), AccessTier::Any);
+    }
+
+    #[test]
     fn every_registered_tools_schema_is_valid_json() {
         // No longer vacuous now that all_tools() holds 3 real tools --
         // parsed_schema() panics on malformed JSON, so this is what
