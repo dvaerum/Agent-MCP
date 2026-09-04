@@ -20,6 +20,7 @@
 
 mod auth_gate;
 mod boot;
+mod instructions;
 mod principal_resolve;
 mod server;
 mod uds;
