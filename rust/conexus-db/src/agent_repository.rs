@@ -96,6 +96,17 @@ const AGENT_COLUMNS: &str = "token, agent_id, created_at, status, current_task, 
      color, terminated_at, updated_at, aoe_session_id, auto_event_loop, last_event_seen_at, \
      last_activity_at, agent_role, profile, profile_updated_at, profile_reviewed_at, profile_updated_by";
 
+/// One row of the `wait_for_events` peer-profile-change catch-up feed —
+/// see [`AgentRepository::list_profile_changes_since`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProfileChangeRow {
+    pub agent_id: String,
+    pub agent_role: String,
+    pub profile: Option<String>,
+    pub profile_updated_at: String,
+    pub profile_updated_by: Option<String>,
+}
+
 /// The `NOT IN (...)` fragment excluding every terminal status from
 /// an "active"/"live" agent view. Ported from Python's
 /// `TERMINAL_AGENT_STATUSES`/`LIVE_AGENT_SQL` — kept as one constant
@@ -651,6 +662,57 @@ impl AgentRepository {
             "SELECT {AGENT_COLUMNS} FROM agents ORDER BY agent_id"
         ))?;
         let rows = stmt.query_map([], row_to_agent)?;
+        rows.collect()
+    }
+
+    /// Peer profile changes newer than `since`, excluding `self_id`'s
+    /// OWN edits and its own NULL-editor seed row. Feeds
+    /// `conexus-wakeloop::event_feed`'s `agent_profile_updated`
+    /// catch-up stream (`_collect_agent_profile_events_for`) — the
+    /// `agents` table itself IS the log, so a peer offline across an
+    /// edit replays it on reconnect via `profile_updated_at > cursor`.
+    ///
+    /// Two exclusions baked into SQL (kept in sync with the in-memory
+    /// live-push path Python calls `notify_agent_profile_updated`, not
+    /// yet ported):
+    /// - `profile_updated_by != self_id` — the EDITOR is excluded, not
+    ///   the subject, so a manager editing a worker reaches the worker
+    ///   but not the manager.
+    /// - `NOT (agent_id = self_id AND profile_updated_by IS NULL)` — a
+    ///   recipient never gets its own NULL-editor seed (its initial
+    ///   charter) echoed back to itself, while another agent's seed
+    ///   (a new manager's charter) still surfaces as a roster change.
+    ///
+    /// Tombstone/terminated/system rows are never a profile source —
+    /// note this 3-way exclusion is intentionally WIDER than
+    /// `NOT_TERMINAL_SQL` (2-way, no `system`); Python's own live-push
+    /// path uses the narrower 2-way set, a real asymmetry in the source
+    /// this port preserves rather than reconciles (see the Phase D3
+    /// research notes in the migration plan).
+    pub fn list_profile_changes_since(
+        conn: &Connection,
+        since: &str,
+        self_id: &str,
+    ) -> Result<Vec<ProfileChangeRow>> {
+        let mut stmt = conn.prepare(
+            "SELECT agent_id, agent_role, profile, profile_updated_at, profile_updated_by \
+             FROM agents \
+             WHERE profile_updated_at IS NOT NULL \
+               AND profile_updated_at > ?1 \
+               AND (profile_updated_by IS NULL OR profile_updated_by != ?2) \
+               AND NOT (agent_id = ?2 AND profile_updated_by IS NULL) \
+               AND status NOT IN ('tombstone', 'terminated', 'system') \
+             ORDER BY profile_updated_at ASC",
+        )?;
+        let rows = stmt.query_map((since, self_id), |row| {
+            Ok(ProfileChangeRow {
+                agent_id: row.get(0)?,
+                agent_role: row.get(1)?,
+                profile: row.get(2)?,
+                profile_updated_at: row.get(3)?,
+                profile_updated_by: row.get(4)?,
+            })
+        })?;
         rows.collect()
     }
 
@@ -1772,5 +1834,120 @@ mod tests {
             .collect();
         ids.sort();
         assert_eq!(ids, vec!["dead", "live", "tomb"]);
+    }
+
+    // -- list_profile_changes_since --------------------------------------
+
+    #[test]
+    fn list_profile_changes_since_excludes_the_editors_own_edit() {
+        let conn = test_conn();
+        seed(&conn, "manager", "t1", "active");
+        seed(&conn, "worker", "t2", "active");
+        AgentRepository::review_profile(
+            &conn,
+            "worker",
+            Some("curated by manager"),
+            Some("manager"),
+            "2026-01-01T00:00:01Z",
+        )
+        .unwrap();
+
+        // The editor (manager) never sees its own edit.
+        let for_manager =
+            AgentRepository::list_profile_changes_since(&conn, "2025-01-01T00:00:00Z", "manager")
+                .unwrap();
+        assert!(for_manager.is_empty());
+
+        // The subject (worker) is NOT excluded — a manager's curation of
+        // a DIFFERENT agent reaches that agent.
+        let for_worker =
+            AgentRepository::list_profile_changes_since(&conn, "2025-01-01T00:00:00Z", "worker")
+                .unwrap();
+        assert_eq!(for_worker.len(), 1);
+        assert_eq!(for_worker[0].agent_id, "worker");
+        assert_eq!(for_worker[0].profile_updated_by.as_deref(), Some("manager"));
+    }
+
+    #[test]
+    fn list_profile_changes_since_excludes_own_null_editor_seed_but_not_a_peers() {
+        let conn = test_conn();
+        seed(&conn, "manager", "t1", "active");
+        seed(&conn, "peer", "t2", "active");
+        // A NULL-editor seed (e.g. an initial charter) on "manager".
+        AgentRepository::review_profile(
+            &conn,
+            "manager",
+            Some("initial charter"),
+            None,
+            "2026-01-01T00:00:01Z",
+        )
+        .unwrap();
+
+        // "manager" itself never sees its own NULL-editor seed echoed back.
+        let for_manager =
+            AgentRepository::list_profile_changes_since(&conn, "2025-01-01T00:00:00Z", "manager")
+                .unwrap();
+        assert!(for_manager.is_empty());
+
+        // A DIFFERENT agent still sees it — a new manager's charter is a
+        // roster change worth learning about.
+        let for_peer =
+            AgentRepository::list_profile_changes_since(&conn, "2025-01-01T00:00:00Z", "peer")
+                .unwrap();
+        assert_eq!(for_peer.len(), 1);
+        assert_eq!(for_peer[0].agent_id, "manager");
+    }
+
+    #[test]
+    fn list_profile_changes_since_excludes_rows_at_or_before_the_cursor() {
+        let conn = test_conn();
+        seed(&conn, "manager", "t1", "active");
+        seed(&conn, "worker", "t2", "active");
+        AgentRepository::review_profile(
+            &conn,
+            "worker",
+            Some("v1"),
+            Some("manager"),
+            "2026-01-01T00:00:00Z",
+        )
+        .unwrap();
+
+        assert!(AgentRepository::list_profile_changes_since(
+            &conn,
+            "2026-01-01T00:00:00Z",
+            "someone-else",
+        )
+        .unwrap()
+        .is_empty());
+    }
+
+    #[test]
+    fn list_profile_changes_since_excludes_tombstone_terminated_and_system_rows() {
+        let conn = test_conn();
+        seed(&conn, "alice", "t1", "active");
+        AgentRepository::review_profile(
+            &conn,
+            "alice",
+            Some("v1"),
+            Some("bob"),
+            "2026-01-01T00:00:01Z",
+        )
+        .unwrap();
+        AgentRepository::update_field(
+            &conn,
+            "alice",
+            AgentField::Status,
+            FieldValue::Text("terminated".to_string()),
+            "2026-01-01T00:00:02Z",
+        )
+        .unwrap();
+
+        assert!(AgentRepository::list_profile_changes_since(
+            &conn,
+            "2025-01-01T00:00:00Z",
+            "someone-else",
+        )
+        .unwrap()
+        .is_empty());
     }
 }

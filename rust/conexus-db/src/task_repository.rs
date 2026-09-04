@@ -178,6 +178,91 @@ pub fn list_by_agent(
     rows.collect()
 }
 
+/// Skinny row for the `wait_for_events`/`fetch_events_since` task-event
+/// streams (`conexus-wakeloop::event_feed`) -- a "pointer, not a dump":
+/// enough to build a `task_assigned`/`task_changed`/
+/// `unassigned_task_appeared` event without the full [`TaskRow`]'s
+/// notes/relations, matching the skinny projection Python's own
+/// collectors build inline from raw cursor rows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TaskEventRow {
+    pub task_id: String,
+    pub title: String,
+    pub status: String,
+    pub priority: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+fn row_to_task_event(row: &Row) -> rusqlite::Result<TaskEventRow> {
+    Ok(TaskEventRow {
+        task_id: row.get(0)?,
+        title: row.get(1)?,
+        status: row.get(2)?,
+        priority: row.get(3)?,
+        created_at: row.get(4)?,
+        updated_at: row.get(5)?,
+    })
+}
+
+/// Tasks assigned to `agent_id` touched since `since` (`updated_at >
+/// since`), oldest first. Feeds `_collect_events_with_cap`'s
+/// `task_assigned`/`task_changed` stream -- the caller classifies each
+/// row using `created_at` vs `since` (v1 heuristic: `created_at >
+/// since` is a fresh assignment, else a mutation of an existing one).
+pub fn list_assigned_updated_since(
+    conn: &Connection,
+    agent_id: &str,
+    since: &str,
+) -> Result<Vec<TaskEventRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT task_id, title, status, priority, created_at, updated_at FROM tasks \
+         WHERE assigned_to = ?1 AND updated_at > ?2 ORDER BY updated_at ASC",
+    )?;
+    let rows = stmt.query_map((agent_id, since), row_to_task_event)?;
+    rows.collect()
+}
+
+/// Unassigned tasks NOT in `excluded_statuses`, touched since `since`
+/// (`updated_at > since`), oldest first. Feeds
+/// `_collect_unassigned_task_events_for`'s `unassigned_task_appeared`
+/// stream.
+///
+/// BL-R10-2: keyed on `updated_at` (the transition-to-unassigned time),
+/// not `created_at` -- a task orphaned by terminate/purge/reassignment
+/// keeps its original creation time, so a `created_at`-keyed catch-up
+/// would never re-surface a task that only became claimable afterwards.
+///
+/// `excluded_statuses` is a caller-supplied slice, NOT a constant in
+/// this crate -- `conexus-wakeloop::hold_ladder`'s sibling module
+/// `idle_reminder` already has its OWN 4-element terminal-status
+/// constant (with an extra single-L "canceled" spelling) for a
+/// genuinely different Python feature (`core/idle_reminder.py`). This
+/// query's actual Python source (`_collect_unassigned_task_events_for`)
+/// uses `features.task_queries.TERMINAL_TASK_STATUSES`, a DIFFERENT
+/// 3-element set (`completed`/`cancelled`/`failed`) -- hardcoding
+/// either constant here would risk silently reusing the wrong one at a
+/// future call site. The caller owns which set applies.
+pub fn list_unassigned_active_updated_since(
+    conn: &Connection,
+    since: &str,
+    excluded_statuses: &[&str],
+) -> Result<Vec<TaskEventRow>> {
+    let placeholders = std::iter::repeat_n("?", excluded_statuses.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT task_id, title, status, priority, created_at, updated_at FROM tasks \
+         WHERE assigned_to IS NULL AND status NOT IN ({placeholders}) AND updated_at > ? \
+         ORDER BY updated_at ASC"
+    );
+    let mut params: Vec<&dyn ToSql> = excluded_statuses.iter().map(|s| s as &dyn ToSql).collect();
+    params.push(&since);
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params.as_slice(), row_to_task_event)?;
+    rows.collect()
+}
+
 /// Parameters for [`create`]. Unlike every other repository's
 /// `create()` in this crate (which all require the caller to supply
 /// the primary id), `task_id` is genuinely optional here — matching
@@ -1032,5 +1117,140 @@ mod tests {
             result,
             Err(UpdateTaskError::TerminalTaskWriteBlocked(_))
         ));
+    }
+
+    fn set_updated_at(conn: &Connection, task_id: &str, updated_at: &str) {
+        conn.execute(
+            "UPDATE tasks SET updated_at = ?1 WHERE task_id = ?2",
+            (updated_at, task_id),
+        )
+        .unwrap();
+    }
+
+    // -- list_assigned_updated_since ------------------------------------
+
+    #[test]
+    fn list_assigned_updated_since_excludes_rows_at_or_before_the_cursor() {
+        let conn = test_conn();
+        let mut t = new_task(Some("task_1"), "a");
+        t.assigned_to = Some("alice");
+        create(&conn, t).unwrap();
+        set_updated_at(&conn, "task_1", "2026-01-01T00:00:00Z");
+
+        assert!(
+            list_assigned_updated_since(&conn, "alice", "2026-01-01T00:00:00Z")
+                .unwrap()
+                .is_empty()
+        );
+        let after = list_assigned_updated_since(&conn, "alice", "2025-12-31T00:00:00Z").unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].task_id, "task_1");
+    }
+
+    #[test]
+    fn list_assigned_updated_since_ignores_other_agents_tasks() {
+        let conn = test_conn();
+        let mut t = new_task(Some("task_1"), "a");
+        t.assigned_to = Some("bob");
+        create(&conn, t).unwrap();
+        set_updated_at(&conn, "task_1", "2026-01-01T00:00:01Z");
+
+        assert!(
+            list_assigned_updated_since(&conn, "alice", "2025-01-01T00:00:00Z")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn list_assigned_updated_since_is_oldest_first() {
+        let conn = test_conn();
+        let mut t1 = new_task(Some("task_1"), "first");
+        t1.assigned_to = Some("alice");
+        create(&conn, t1).unwrap();
+        let mut t2 = new_task(Some("task_2"), "second");
+        t2.assigned_to = Some("alice");
+        t2.parent_task = Some("task_1");
+        create(&conn, t2).unwrap();
+        set_updated_at(&conn, "task_1", "2026-01-01T00:00:02Z");
+        set_updated_at(&conn, "task_2", "2026-01-01T00:00:01Z");
+
+        let rows = list_assigned_updated_since(&conn, "alice", "2025-01-01T00:00:00Z").unwrap();
+        assert_eq!(rows[0].task_id, "task_2");
+        assert_eq!(rows[1].task_id, "task_1");
+    }
+
+    // -- list_unassigned_active_updated_since ----------------------------
+
+    #[test]
+    fn list_unassigned_active_updated_since_excludes_assigned_tasks() {
+        let conn = test_conn();
+        let mut t = new_task(Some("task_1"), "a");
+        t.assigned_to = Some("alice");
+        create(&conn, t).unwrap();
+        set_updated_at(&conn, "task_1", "2026-01-01T00:00:00Z");
+
+        assert!(list_unassigned_active_updated_since(
+            &conn,
+            "2025-01-01T00:00:00Z",
+            &["completed", "cancelled", "failed"],
+        )
+        .unwrap()
+        .is_empty());
+    }
+
+    #[test]
+    fn list_unassigned_active_updated_since_excludes_the_given_terminal_statuses() {
+        let conn = test_conn();
+        let mut t = new_task(Some("task_1"), "done");
+        t.status = "completed";
+        create(&conn, t).unwrap();
+        set_updated_at(&conn, "task_1", "2026-01-01T00:00:00Z");
+
+        assert!(list_unassigned_active_updated_since(
+            &conn,
+            "2025-01-01T00:00:00Z",
+            &["completed", "cancelled", "failed"],
+        )
+        .unwrap()
+        .is_empty());
+    }
+
+    #[test]
+    fn list_unassigned_active_updated_since_returns_claimable_tasks() {
+        let conn = test_conn();
+        let t = new_task(Some("task_1"), "up for grabs");
+        create(&conn, t).unwrap();
+        set_updated_at(&conn, "task_1", "2026-01-01T00:00:00Z");
+
+        let rows = list_unassigned_active_updated_since(
+            &conn,
+            "2025-01-01T00:00:00Z",
+            &["completed", "cancelled", "failed"],
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].task_id, "task_1");
+    }
+
+    #[test]
+    fn list_unassigned_active_updated_since_keys_on_updated_at_not_created_at() {
+        // BL-R10-2: a task orphaned by reassignment keeps its original
+        // created_at but must still surface once its updated_at (the
+        // transition-to-unassigned time) crosses the cursor.
+        let conn = test_conn();
+        let t = new_task(Some("task_1"), "orphaned");
+        create(&conn, t).unwrap();
+        // created_at is "2026-01-01T00:00:00Z" (from new_task's `now`);
+        // simulate a later unassign event bumping only updated_at.
+        set_updated_at(&conn, "task_1", "2026-06-01T00:00:00Z");
+
+        let rows = list_unassigned_active_updated_since(
+            &conn,
+            "2026-03-01T00:00:00Z", // after created_at, before updated_at
+            &["completed", "cancelled", "failed"],
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1, "must surface via updated_at, not created_at");
     }
 }

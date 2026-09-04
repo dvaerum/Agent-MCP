@@ -64,6 +64,34 @@ const COLUMNS: &str =
     "message_id, sender_id, recipient_id, message_content, message_type, priority, \
      timestamp, delivered, read, subject, parent_message_id";
 
+/// `(display_subject, is_placeholder)` for a message row. Port of
+/// `message_subject_view` (Python's `repositories/message_repository.py`).
+///
+/// A NULL/empty DB `subject` means no real subject was ever set — the
+/// send path stores NULL rather than calling a synchronous, RAM-hungry
+/// AI-subject helper. In that case, return a first-50-chars preview of
+/// the body — computed HERE, never stored — flagged as a placeholder so
+/// callers (the `wait_for_events` skinny message-event projection, the
+/// dashboard) can tell it apart from a real, sender-chosen subject.
+///
+/// The reply carve-out lives at the CALL SITE, not here (matches
+/// Python): a reply (`parent_message_id` set) has a NULL subject by
+/// design (threaded, not subject-bearing) — callers short-circuit a
+/// reply to `(None, false)` before calling this function at all.
+pub fn message_subject_view(subject: Option<&str>, content: &str) -> (Option<String>, bool) {
+    if let Some(s) = subject.filter(|s| !s.is_empty()) {
+        return (Some(s.to_string()), false);
+    }
+    let preview: String = content.chars().take(50).collect();
+    let is_truncated = content.chars().count() > 50;
+    let display = if is_truncated {
+        format!("{preview}...")
+    } else {
+        preview
+    };
+    (Some(display), true)
+}
+
 fn row_to_message(row: &Row) -> rusqlite::Result<MessageRow> {
     Ok(MessageRow {
         message_id: row.get(0)?,
@@ -1623,5 +1651,45 @@ mod tests {
         assert!(participants
             .tombstones
             .contains(&"[deleted-carol]".to_string()));
+    }
+
+    // -- message_subject_view --------------------------------------------
+
+    #[test]
+    fn message_subject_view_returns_the_real_subject_verbatim() {
+        let (subject, is_placeholder) = message_subject_view(Some("Real subject"), "body text");
+        assert_eq!(subject.as_deref(), Some("Real subject"));
+        assert!(!is_placeholder);
+    }
+
+    #[test]
+    fn message_subject_view_previews_the_body_when_subject_is_absent() {
+        let (subject, is_placeholder) = message_subject_view(None, "short body");
+        assert_eq!(subject.as_deref(), Some("short body"));
+        assert!(is_placeholder);
+    }
+
+    #[test]
+    fn message_subject_view_previews_the_body_when_subject_is_empty() {
+        let (subject, is_placeholder) = message_subject_view(Some(""), "fallback body");
+        assert_eq!(subject.as_deref(), Some("fallback body"));
+        assert!(is_placeholder);
+    }
+
+    #[test]
+    fn message_subject_view_truncates_a_long_body_to_50_chars_plus_ellipsis() {
+        let body = "x".repeat(75);
+        let (subject, is_placeholder) = message_subject_view(None, &body);
+        let subject = subject.unwrap();
+        assert!(is_placeholder);
+        assert_eq!(subject.len(), 53); // 50 'x' + "..."
+        assert!(subject.ends_with("..."));
+    }
+
+    #[test]
+    fn message_subject_view_does_not_truncate_a_body_at_exactly_50_chars() {
+        let body = "x".repeat(50);
+        let (subject, _) = message_subject_view(None, &body);
+        assert_eq!(subject.unwrap(), body);
     }
 }
