@@ -9,6 +9,7 @@
 use conexus_auth::ToolDescriptor;
 
 use crate::agent_communication_tools::{FetchEventsSinceTool, WaitForEventsTool};
+use crate::agent_tools::GetSystemPromptTool;
 use crate::assign_task_tools::{AssignTaskTool, CreateSelfTaskTool};
 use crate::project_settings_tools::{
     DeleteProjectSettingsTool, UpdateProjectSettingsTool, ViewProjectSettingsTool,
@@ -24,7 +25,7 @@ use crate::utility_tools::TestTool;
 // compile-time `static` array (needs a named `static`, not an inline
 // `&[...]` literal, since the array's elements aren't const-promotable
 // through a non-const fn body).
-static ALL_TOOLS: [ToolDescriptor; 17] = [
+static ALL_TOOLS: [ToolDescriptor; 18] = [
     ToolDescriptor::of::<ViewProjectSettingsTool>(),
     ToolDescriptor::of::<UpdateProjectSettingsTool>(),
     ToolDescriptor::of::<DeleteProjectSettingsTool>(),
@@ -42,6 +43,7 @@ static ALL_TOOLS: [ToolDescriptor; 17] = [
     ToolDescriptor::of::<RequestAssistanceTool>(),
     ToolDescriptor::of::<BulkTaskOperationsTool>(),
     ToolDescriptor::of::<TestTool>(),
+    ToolDescriptor::of::<GetSystemPromptTool>(),
 ];
 
 pub fn all_tools() -> &'static [ToolDescriptor] {
@@ -180,6 +182,7 @@ mod tests {
                 "request_assistance",
                 "bulk_task_operations",
                 "test",
+                "get_system_prompt",
             ])
         );
     }
