@@ -10,3 +10,9 @@ description = "CoNexus wake-loop support primitives -- one module per agent_mcp/
 conexus-db = { path = "../conexus-db" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde_json = "1"
+# RevalidatingStream's bounded wait (stream_gates.rs).
+tokio = { version = "1", features = ["sync", "time"] }
+
+[dev-dependencies]
+# Tests drive RevalidatingStream's real bounded waits.
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "test-util"] }

@@ -380,6 +380,7 @@ dependencies = [
  "conexus-db",
  "rusqlite",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
