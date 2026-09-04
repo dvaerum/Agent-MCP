@@ -428,7 +428,7 @@ mod tests {
         let principal = agent_principal("alice");
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
         let result = CheckFileStatusTool::call(
             Some(&principal),
             &serde_json::json!({"filepath": "main.rs"}),
@@ -451,7 +451,7 @@ mod tests {
         let principal = agent_principal("alice");
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
         UpdateFileStatusTool::call(
             Some(&principal),
             &serde_json::json!({"filepath": "main.rs", "status": "editing"}),
@@ -484,7 +484,7 @@ mod tests {
         let bob = agent_principal("bob");
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
         UpdateFileStatusTool::call(
             Some(&alice),
             &serde_json::json!({"filepath": "/shared/main.rs", "status": "editing"}),
@@ -513,7 +513,7 @@ mod tests {
         let bob = agent_principal("bob");
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
         UpdateFileStatusTool::call(
             Some(&alice),
             &serde_json::json!({"filepath": "/shared/main.rs", "status": "editing"}),
@@ -542,7 +542,7 @@ mod tests {
         let alice = agent_principal("alice");
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
         UpdateFileStatusTool::call(
             Some(&alice),
             &serde_json::json!({"filepath": "main.rs", "status": "editing"}),
@@ -569,7 +569,7 @@ mod tests {
         let alice = agent_principal("alice");
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
         let result = UpdateFileStatusTool::call(
             Some(&alice),
             &serde_json::json!({"filepath": "never-claimed.rs", "status": "released"}),
@@ -590,7 +590,7 @@ mod tests {
         let alice = agent_principal("alice");
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
         let result = UpdateFileStatusTool::call(
             Some(&alice),
             &serde_json::json!({"filepath": "main.rs", "status": "sleeping"}),
@@ -608,7 +608,7 @@ mod tests {
         let alice = agent_principal("alice");
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
         let r1 = CheckFileStatusTool::call(
             Some(&alice),
             &serde_json::json!({}),

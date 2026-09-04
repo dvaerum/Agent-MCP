@@ -954,7 +954,7 @@ mod tests {
 
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
         let principal = agent_bearer("alice");
         let outcome = wait_for_events_entry(&principal, &json!({}), &conn, NOW, &ctx).await;
         let EntryOutcome::Done(result) = outcome else {
@@ -989,7 +989,7 @@ mod tests {
 
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
         let principal = agent_bearer("alice");
         let outcome = wait_for_events_entry(&principal, &json!({}), &conn, NOW, &ctx).await;
         let EntryOutcome::Done(result) = outcome else {
@@ -1035,7 +1035,7 @@ mod tests {
 
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
         let principal = agent_bearer("alice");
         let outcome = wait_for_events_entry(&principal, &json!({}), &conn, NOW, &ctx).await;
         let EntryOutcome::Done(result) = outcome else {
@@ -1090,7 +1090,7 @@ mod tests {
 
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
         let principal = agent_bearer("alice");
         let outcome = wait_for_events_entry(&principal, &json!({}), &conn, NOW, &ctx).await;
         assert!(
@@ -1106,7 +1106,7 @@ mod tests {
 
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
         let principal = agent_bearer("alice");
         let outcome = wait_for_events_entry(&principal, &json!({}), &conn, NOW, &ctx).await;
         let EntryOutcome::EnterSlowPath(setup) = outcome else {
@@ -1122,7 +1122,7 @@ mod tests {
         seed_agent(&conn, "alice").await;
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
         let principal = agent_bearer("alice");
 
         let first = wait_for_events_entry(&principal, &json!({}), &conn, NOW, &ctx).await;
@@ -1143,7 +1143,7 @@ mod tests {
         seed_agent(&conn, "alice").await;
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
         let principal = agent_bearer("alice");
         let outcome =
             wait_for_events_entry(&principal, &json!({"since": 12345}), &conn, NOW, &ctx).await;
@@ -1211,7 +1211,7 @@ mod tests {
         seed_agent(&conn, "bob").await;
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
         let setup = enter_slow_path(&conn, &ctx, "bob", &json!({"timeout_seconds": 5})).await;
 
         let result = wait_for_events_slow_path(setup, &conn, &ctx).await;
@@ -1228,7 +1228,7 @@ mod tests {
         seed_agent(&conn, "carol").await;
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
         // Register with NO backlog yet, so entry takes the slow path
         // rather than the fast path finding this message immediately.
         let setup = enter_slow_path(&conn, &ctx, "carol", &json!({})).await;
@@ -1268,7 +1268,7 @@ mod tests {
         seed_agent(&conn, "erin").await;
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
         let setup = enter_slow_path(&conn, &ctx, "erin", &json!({})).await;
         setup.sender.send(WakeSignal::Superseded).await.unwrap();
 
@@ -1297,6 +1297,7 @@ mod tests {
             progress_sink: Some(&sink),
             waiter_registry: &registry,
             file_map: &file_map,
+            project_dir: std::path::Path::new("/tmp"),
         };
         // Just over one HEARTBEAT_INTERVAL_SECONDS (25s) so exactly one
         // heartbeat fires before the hold itself expires.
@@ -1324,6 +1325,7 @@ mod tests {
             progress_sink: Some(&sink),
             waiter_registry: &registry,
             file_map: &file_map,
+            project_dir: std::path::Path::new("/tmp"),
         };
         // Long enough hold that reaping (after MAX_HEARTBEAT_MISSES misses,
         // one per 25s) must happen well before the hold itself would.
@@ -1359,6 +1361,7 @@ mod tests {
             progress_sink: None,
             waiter_registry: &registry,
             file_map: &file_map,
+            project_dir: std::path::Path::new("/tmp"),
         };
         // heartbeat=true, progress_token_present=true, requested < base_hold
         // -> ladder_eligible; not yet at OVERRIDE_AFTER so no override.
@@ -1407,7 +1410,7 @@ mod tests {
         send_message(&conn, "m1", "kate", &now_iso(), "text").await;
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
         let principal = agent_bearer("kate");
 
         let result =
@@ -1456,7 +1459,7 @@ mod tests {
         send_message(&conn, "m1", "leo", &now_iso(), "text").await;
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
         let principal = agent_bearer("leo");
 
         let result =
@@ -1478,7 +1481,7 @@ mod tests {
         seed_agent(&conn, "mia").await;
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
         let principal = agent_bearer("mia");
 
         let result = FetchEventsSinceTool::call(
@@ -1502,7 +1505,7 @@ mod tests {
         seed_agent(&conn, "nora").await;
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
         let principal = agent_bearer("nora");
 
         let result =
@@ -1516,7 +1519,7 @@ mod tests {
         let conn = test_conn();
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
         let mut operator = agent_bearer("alice");
         operator.agent_id = None;
         let descriptor = conexus_auth::ToolDescriptor::of::<WaitForEventsTool>();

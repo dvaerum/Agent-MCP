@@ -115,8 +115,11 @@ pub fn can_delete_project_context(principal: Option<&Principal>) -> bool {
     compound_write_gate(principal, Capability::MemoriesDelete)
 }
 
-/// Port of `_analyze_context_health`'s full return shape.
-#[derive(Debug, Clone, PartialEq)]
+/// Port of `_analyze_context_health`'s full return shape. `Serialize`
+/// (Phase D5, `backup_project_context`) embeds this directly as the
+/// backup JSON's `health_report` field -- field names already match
+/// Python's dict keys verbatim, so the derive needs no renaming.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct ContextHealthReport {
     pub status: String,
     pub health_score: f64,
@@ -522,6 +525,46 @@ fn python_str(value: &Value) -> String {
     }
 }
 
+/// Python's `str.title()`: uppercase the first letter of every
+/// maximal alphabetic run, lowercase every other letter in that run;
+/// a non-alphabetic character (here, always `_`) is left untouched
+/// and starts a new word. Every health-status string this crate
+/// renders is closed-set lowercase-with-underscores
+/// (`needs_attention`, `no_data`, ...), so a naive "capitalize only
+/// the very first character" port is wrong for any status past the
+/// first word: Python gives `"Needs_Attention"`, a first-char-only
+/// port gives `"Needs_attention"`.
+/// The emoji Python's `health_icon` ternary chain picks for a health
+/// status -- shared by `render_view_message` and
+/// `backup_project_context`'s response text, which both render it.
+fn health_status_icon(status: &str) -> &'static str {
+    match status {
+        "excellent" => "\u{1f7e2}",
+        "good" => "\u{1f7e1}",
+        "needs_attention" => "\u{1f7e0}",
+        _ => "\u{1f534}",
+    }
+}
+
+fn python_title_case(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut at_word_start = true;
+    for c in s.chars() {
+        if c.is_alphabetic() {
+            if at_word_start {
+                result.extend(c.to_uppercase());
+            } else {
+                result.extend(c.to_lowercase());
+            }
+            at_word_start = false;
+        } else {
+            result.push(c);
+            at_word_start = true;
+        }
+    }
+    result
+}
+
 /// One `view_project_context` result entry, with the same `_metadata`
 /// block Python's `entry_data` dict attaches.
 struct ViewEntry {
@@ -615,19 +658,8 @@ fn render_view_message(
 
     if show_health_analysis {
         let health = analyze_context_health(all_entries, now);
-        let health_icon = match health.status.as_str() {
-            "excellent" => "\u{1f7e2}",
-            "good" => "\u{1f7e1}",
-            "needs_attention" => "\u{1f7e0}",
-            _ => "\u{1f534}",
-        };
-        let status_title = {
-            let mut c = health.status.chars();
-            match c.next() {
-                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
-                None => String::new(),
-            }
-        };
+        let health_icon = health_status_icon(&health.status);
+        let status_title = python_title_case(&health.status);
         parts.push(format!(
             "\u{1f4ca} **Context Health:** {health_icon} {status_title} ({}/100)",
             health.health_score
@@ -1820,6 +1852,252 @@ impl Tool for DeleteProjectContextTool {
     }
 }
 
+/// VULN-003, primary gate: in every other Python tool in this file,
+/// this crate's dispatcher skipping `tools/call` argument validation
+/// against `SCHEMA` is safe because nothing in the schema was ever
+/// load-bearing for security. HERE it is NOT safe to skip -- Python's
+/// own comment on this exact schema `pattern` calls it the primary
+/// path-traversal defense, with the `resolve()`/`relative_to()` check
+/// in the impl as only a SECOND, belt-and-suspenders layer for
+/// in-process callers that bypass schema validation. Since this
+/// crate's dispatcher never runs schema validation for ANY tool, the
+/// "second layer" is the ONLY layer here unless this check is made
+/// explicit in the tool body -- so it is, checked before anything
+/// else runs.
+static BACKUP_NAME_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[A-Za-z0-9._-]{1,128}$").unwrap());
+
+/// Port of `_create_context_backup`. `now` doubles as both the
+/// auto-generated name's timestamp component and the `created_at`
+/// field -- Python re-reads the wall clock for each
+/// (`datetime.datetime.now()` twice); this crate's "one injected `now`
+/// per call" convention collapses that to one value, which can only
+/// ever matter at a microsecond level neither call site's output is
+/// sensitive to.
+fn create_context_backup(
+    entries: Vec<ProjectContextRow>,
+    backup_name: Option<&str>,
+    now: DateTime<Utc>,
+) -> Value {
+    let backup_name = backup_name
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("context_backup_{}", now.format("%Y%m%d_%H%M%S")));
+    serde_json::json!({
+        "backup_name": backup_name,
+        "created_at": now.to_rfc3339(),
+        "total_entries": entries.len(),
+        "entries": entries,
+    })
+}
+
+pub struct BackupProjectContextTool;
+
+impl Tool for BackupProjectContextTool {
+    const NAME: &'static str = "backup_project_context";
+    const REQUIRED: Requirement = Requirement::Cap {
+        cap: Capability::SystemConfigWrite,
+        reason: None,
+    };
+    const DESCRIPTION: &'static str = "Create comprehensive backup of all project context with \
+        health analysis. Admin-only operation for data safety and recovery.";
+    const SCHEMA: &'static str = r#"{
+        "type": "object",
+        "properties": {
+            "backup_name": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9._-]{1,128}$",
+                "description": "Optional custom backup name (auto-generated if not provided). Slug — alphanumeric plus . _ - only, max 128 chars."
+            },
+            "include_health_report": {
+                "type": "boolean",
+                "description": "Include health analysis in backup (default: true)",
+                "default": true
+            }
+        },
+        "required": [],
+        "additionalProperties": false
+    }"#;
+
+    fn call<'a>(
+        principal: Option<&'a Principal>,
+        arguments: &'a Value,
+        conn: &'a AsyncMutex<Connection>,
+        now: &'a str,
+        ctx: &'a conexus_auth::ToolCallContext<'a>,
+    ) -> conexus_auth::BoxFuture<'a, ToolResult> {
+        Box::pin(async move {
+            let backup_name_arg = arguments.get("backup_name").and_then(Value::as_str);
+            if let Some(name) = backup_name_arg {
+                if !BACKUP_NAME_RE.is_match(name) {
+                    return ToolResult::Invalid {
+                        field: Some("backup_name".to_string()),
+                        message: "backup_name may contain only letters, digits, and . _ - \
+                            (A-Z a-z 0-9 . _ -), max 128 chars."
+                            .to_string(),
+                    };
+                }
+            }
+            let include_health_report = arguments
+                .get("include_health_report")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let requesting_agent_id = principal.map(Principal::actor_label).unwrap_or("unknown");
+
+            let now_dt: DateTime<Utc> = match now.parse() {
+                Ok(dt) => dt,
+                Err(_) => Utc::now(),
+            };
+
+            let guard = conn.lock().await;
+            let entries = match project_context_repository::list_all(&guard) {
+                Ok(rows) => rows,
+                Err(_e) => {
+                    return ToolResult::Failed {
+                        message: "A database error occurred; it has been logged. Retry, or ask \
+                            an operator to check logs."
+                            .to_string(),
+                    }
+                }
+            };
+            let health_report = if include_health_report {
+                Some(analyze_context_health(&entries, now_dt))
+            } else {
+                None
+            };
+            let total_entries = entries.len();
+            let mut backup_data = create_context_backup(entries, backup_name_arg, now_dt);
+            if let Some(health) = &health_report {
+                backup_data["health_report"] =
+                    serde_json::to_value(health).expect("ContextHealthReport always serializes");
+            }
+            let backup_name = backup_data["backup_name"].as_str().unwrap().to_string();
+
+            // Save to <project_dir>/.agent/backups/context/<name>.json.
+            let backup_dir = ctx
+                .project_dir
+                .join(".agent")
+                .join("backups")
+                .join("context");
+            if let Err(_e) = std::fs::create_dir_all(&backup_dir) {
+                return ToolResult::Failed {
+                    message: "A database error occurred; it has been logged. Retry, or ask an \
+                        operator to check logs."
+                        .to_string(),
+                };
+            }
+            let backup_filename = format!("{backup_name}.json");
+
+            // VULN-003 defense-in-depth (see BACKUP_NAME_RE's doc for
+            // why the primary gate above is load-bearing here, unlike
+            // every other tool in this file): resolve the candidate
+            // path and verify it stays inside the backup directory
+            // before writing. Since backup_filename is entirely
+            // derived from a BACKUP_NAME_RE-validated slug (no `/`,
+            // no `..`, no NUL), this can never actually fail today --
+            // kept as belt-and-suspenders against a future change to
+            // how backup_filename is derived, matching Python's own
+            // stated rationale for keeping this check at all.
+            let backup_dir_resolved = match std::fs::canonicalize(&backup_dir) {
+                Ok(p) => p,
+                Err(_e) => {
+                    return ToolResult::Invalid {
+                        field: Some("backup_name".to_string()),
+                        message: "backup_name resolves outside the backup directory".to_string(),
+                    }
+                }
+            };
+            let backup_path_resolved = backup_dir_resolved.join(&backup_filename);
+            if !backup_path_resolved.starts_with(&backup_dir_resolved) {
+                return ToolResult::Invalid {
+                    field: Some("backup_name".to_string()),
+                    message: "backup_name resolves outside the backup directory".to_string(),
+                };
+            }
+
+            let json_text = match serde_json::to_string_pretty(&backup_data) {
+                Ok(s) => s,
+                Err(_e) => {
+                    return ToolResult::Failed {
+                        message: "A database error occurred; it has been logged. Retry, or ask \
+                            an operator to check logs."
+                            .to_string(),
+                    }
+                }
+            };
+            if let Err(_e) = std::fs::write(&backup_path_resolved, json_text) {
+                return ToolResult::Failed {
+                    message: "A database error occurred; it has been logged. Retry, or ask an \
+                        operator to check logs."
+                        .to_string(),
+                };
+            }
+            let backup_path = backup_path_resolved.display().to_string();
+
+            let _ = agent_action_repository::log_agent_action(
+                &guard,
+                requesting_agent_id,
+                "backup_project_context",
+                Some(&backup_name),
+                Some(&serde_json::json!({
+                    "total_entries": total_entries,
+                    "backup_path": backup_path,
+                })),
+                now,
+            );
+            drop(guard);
+
+            let created_at = backup_data["created_at"].as_str().unwrap_or(now);
+            let mut response_parts = vec![
+                "\u{2705} **Context Backup Created**".to_string(),
+                format!("   Name: {backup_name}"),
+                format!("   Entries: {total_entries}"),
+                format!("   File: {backup_path}"),
+                format!("   Created: {created_at}"),
+            ];
+            if let Some(health) = &health_report {
+                let icon = health_status_icon(&health.status);
+                let status_title = python_title_case(&health.status);
+                response_parts.push(String::new());
+                response_parts.push(format!(
+                    "\u{1f4ca} **Health Report:** {icon} {status_title} ({}/100)",
+                    health.health_score
+                ));
+                response_parts.push(format!(
+                    "   Issues: {} JSON errors, {} stale entries",
+                    health.json_errors, health.stale_entries
+                ));
+                response_parts.push(format!(
+                    "   Recommendations: {} items",
+                    health.recommendations.len()
+                ));
+            }
+            response_parts.push(String::new());
+            response_parts.push("\u{1f4a1} **Backup Usage:**".to_string());
+            response_parts.push(
+                "\u{2022} Use this backup to restore context in case of corruption".to_string(),
+            );
+            response_parts.push(
+                "\u{2022} Store backup files securely - they contain sensitive project data"
+                    .to_string(),
+            );
+            response_parts.push(
+                "\u{2022} Regular backups recommended before major context changes".to_string(),
+            );
+
+            ToolResult::Ok {
+                data: Some(serde_json::json!({
+                    "backup_name": backup_name,
+                    "backup_path": backup_path,
+                    "total_entries": total_entries,
+                    "created_at": created_at,
+                    "health_report": health_report,
+                })),
+                message: Some(response_parts.join("\n")),
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2047,7 +2325,18 @@ mod tests {
     }
 
     fn ctx<'a>(registry: &'a WaiterRegistry, file_map: &'a FileMap) -> ToolCallContext<'a> {
-        ToolCallContext::off_wire(registry, file_map)
+        ToolCallContext::off_wire(registry, file_map, std::path::Path::new("/tmp"))
+    }
+
+    /// For `BackupProjectContextTool` tests only -- a real isolated
+    /// tempdir, since this tool is the first in the crate to actually
+    /// write a file to `project_dir`.
+    fn ctx_with_project_dir<'a>(
+        registry: &'a WaiterRegistry,
+        file_map: &'a FileMap,
+        project_dir: &'a std::path::Path,
+    ) -> ToolCallContext<'a> {
+        ToolCallContext::off_wire(registry, file_map, project_dir)
     }
 
     #[tokio::test]
@@ -2392,6 +2681,65 @@ mod tests {
         assert_eq!(python_str(&Value::Bool(true)), "True");
         assert_eq!(python_str(&Value::Bool(false)), "False");
         assert_eq!(python_str(&Value::String("hello".to_string())), "hello");
+    }
+
+    #[test]
+    fn python_title_case_matches_pythons_str_title_for_underscored_words() {
+        // Python: "needs_attention".title() == "Needs_Attention" --
+        // NOT "Needs_attention" (a naive first-char-only port's wrong
+        // answer, the actual bug this test pins).
+        assert_eq!(python_title_case("needs_attention"), "Needs_Attention");
+        assert_eq!(python_title_case("no_data"), "No_Data");
+        assert_eq!(python_title_case("excellent"), "Excellent");
+        assert_eq!(python_title_case(""), "");
+    }
+
+    #[tokio::test]
+    async fn view_health_analysis_title_cases_a_multi_word_status_correctly() {
+        // Regression for the found-and-fixed bug: a naive first-char-
+        // only title-case renders "Needs_attention" for the
+        // "needs_attention" status; Python's real `.title()` gives
+        // "Needs_Attention". One healthy + one stale-and-invalid-JSON
+        // entry (out of 2 total) lands the health score at 55, inside
+        // the needs_attention band (50-70).
+        let conn = setup().await;
+        seed_context(&conn, "healthy", "\"ok\"", "2026-06-01T00:00:00Z").await;
+        {
+            let guard = conn.lock().await;
+            project_context_repository::create_new(
+                &guard,
+                "bad",
+                "not valid json",
+                Some("d"),
+                "alice",
+                "2026-01-01T00:00:00Z",
+            )
+            .unwrap();
+        }
+        let alice = worker();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = ViewProjectContextTool::call(
+            Some(&alice),
+            &serde_json::json!({"show_health_analysis": true}),
+            &conn,
+            "2026-06-01T00:01:00Z",
+            &c,
+        )
+        .await;
+        let ToolResult::Ok { message, .. } = result else {
+            panic!("expected Ok, got {result:?}");
+        };
+        let message = message.unwrap();
+        assert!(
+            message.contains("Needs_Attention"),
+            "message was: {message}"
+        );
+        assert!(
+            !message.contains("Needs_attention"),
+            "message was: {message}"
+        );
     }
 
     #[test]
@@ -3206,5 +3554,179 @@ mod tests {
         assert!(parsed["properties"]["context_key"]
             .get("maxLength")
             .is_none());
+    }
+
+    // ── BackupProjectContextTool ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn backup_writes_a_json_file_with_the_auto_generated_name() {
+        let conn = setup().await;
+        seed_context(&conn, "a", "\"one\"", "2026-06-01T00:00:00Z").await;
+        let admin = admin_agent();
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx_with_project_dir(&registry, &file_map, tmp.path());
+        let result = BackupProjectContextTool::call(
+            Some(&admin),
+            &serde_json::json!({}),
+            &conn,
+            "2026-06-01T12:34:56Z",
+            &c,
+        )
+        .await;
+        let ToolResult::Ok { data, message } = result else {
+            panic!("expected Ok, got {result:?}");
+        };
+        let data = data.unwrap();
+        let backup_name = data["backup_name"].as_str().unwrap();
+        assert_eq!(backup_name, "context_backup_20260601_123456");
+        assert_eq!(data["total_entries"], 1);
+
+        let backup_path = data["backup_path"].as_str().unwrap();
+        let contents = std::fs::read_to_string(backup_path).unwrap();
+        let parsed: Value = serde_json::from_str(&contents).unwrap();
+        assert_eq!(parsed["backup_name"], backup_name);
+        assert_eq!(parsed["entries"][0]["context_key"], "a");
+        assert!(message.unwrap().contains("Context Backup Created"));
+    }
+
+    #[tokio::test]
+    async fn backup_uses_a_caller_supplied_name() {
+        let conn = setup().await;
+        let admin = admin_agent();
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx_with_project_dir(&registry, &file_map, tmp.path());
+        let result = BackupProjectContextTool::call(
+            Some(&admin),
+            &serde_json::json!({"backup_name": "before-migration.v2"}),
+            &conn,
+            "2026-06-01T00:00:00Z",
+            &c,
+        )
+        .await;
+        let ToolResult::Ok { data, .. } = result else {
+            panic!("expected Ok, got {result:?}");
+        };
+        assert_eq!(data.unwrap()["backup_name"], "before-migration.v2");
+        assert!(tmp
+            .path()
+            .join(".agent/backups/context/before-migration.v2.json")
+            .is_file());
+    }
+
+    #[tokio::test]
+    async fn backup_rejects_a_backup_name_outside_the_allowed_charset() {
+        // VULN-003 primary gate: this crate's dispatcher never runs
+        // JSON-schema validation, so this check in the tool body is
+        // the ONLY thing standing between a caller and a path-
+        // traversal-shaped backup_name (see BACKUP_NAME_RE's doc).
+        let conn = setup().await;
+        let admin = admin_agent();
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx_with_project_dir(&registry, &file_map, tmp.path());
+        for bad_name in ["../../etc/passwd", "a/b", "with spaces", ""] {
+            let result = BackupProjectContextTool::call(
+                Some(&admin),
+                &serde_json::json!({"backup_name": bad_name}),
+                &conn,
+                "2026-06-01T00:00:00Z",
+                &c,
+            )
+            .await;
+            assert!(
+                matches!(result, ToolResult::Invalid { .. }),
+                "expected Invalid for {bad_name:?}, got {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn backup_includes_health_report_by_default() {
+        let conn = setup().await;
+        seed_context(&conn, "a", "\"ok\"", "2026-06-01T00:00:00Z").await;
+        let admin = admin_agent();
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx_with_project_dir(&registry, &file_map, tmp.path());
+        let result = BackupProjectContextTool::call(
+            Some(&admin),
+            &serde_json::json!({}),
+            &conn,
+            "2026-06-01T00:01:00Z",
+            &c,
+        )
+        .await;
+        let ToolResult::Ok { data, message } = result else {
+            panic!("expected Ok, got {result:?}");
+        };
+        assert!(data.unwrap()["health_report"].is_object());
+        assert!(message.unwrap().contains("Health Report"));
+    }
+
+    #[tokio::test]
+    async fn backup_omits_health_report_when_disabled() {
+        let conn = setup().await;
+        let admin = admin_agent();
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx_with_project_dir(&registry, &file_map, tmp.path());
+        let result = BackupProjectContextTool::call(
+            Some(&admin),
+            &serde_json::json!({"include_health_report": false}),
+            &conn,
+            "2026-06-01T00:00:00Z",
+            &c,
+        )
+        .await;
+        let ToolResult::Ok { data, message } = result else {
+            panic!("expected Ok, got {result:?}");
+        };
+        assert!(data.unwrap()["health_report"].is_null());
+        assert!(!message.unwrap().contains("Health Report"));
+    }
+
+    #[tokio::test]
+    async fn backup_denies_a_worker_without_system_config_write() {
+        let conn = setup().await;
+        let alice = worker();
+        let denied = BackupProjectContextTool::REQUIRED
+            .check(Some(&alice), &conexus_auth::NoPolicyOverrides);
+        assert!(denied.is_err());
+        let _ = conn;
+    }
+
+    #[tokio::test]
+    async fn backup_writes_a_durable_audit_row() {
+        let conn = setup().await;
+        let admin = admin_agent();
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx_with_project_dir(&registry, &file_map, tmp.path());
+        let result = BackupProjectContextTool::call(
+            Some(&admin),
+            &serde_json::json!({"backup_name": "audited"}),
+            &conn,
+            "2026-06-01T00:00:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        let guard = conn.lock().await;
+        let count: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM agent_actions WHERE action_type = 'backup_project_context'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
     }
 }

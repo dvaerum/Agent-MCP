@@ -338,7 +338,7 @@ mod tests {
         let principal = worker_principal("alice");
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
         let result = ViewFileMetadataTool::call(
             Some(&principal),
             &serde_json::json!({"filepath": "main.rs"}),
@@ -371,7 +371,7 @@ mod tests {
         let operator = operator_principal();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
         let result = UpdateFileMetadataTool::call(
             Some(&operator),
             &serde_json::json!({
@@ -411,7 +411,7 @@ mod tests {
         let principal = worker_principal("alice");
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
         let result = ViewFileMetadataTool::call(
             Some(&principal),
             &serde_json::json!({"filepath": "bad\u{0}path.rs"}),

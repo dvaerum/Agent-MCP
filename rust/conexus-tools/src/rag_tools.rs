@@ -602,7 +602,11 @@ mod tests {
         let conn = test_conn();
         let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         let p = agent_bearer("a1", Capabilities::from_iter([Capability::RagQuery]));
         let result =
             AskProjectRagTool::call(Some(&p), &serde_json::json!({}), &conn, NOW, &ctx).await;
@@ -616,7 +620,11 @@ mod tests {
         let conn = test_conn();
         let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         let p = agent_bearer("a1", Capabilities::from_iter([Capability::RagQuery]));
         let result = AskProjectRagTool::call(
             Some(&p),
@@ -634,7 +642,11 @@ mod tests {
         let conn = test_conn();
         let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         let p = agent_bearer("a1", Capabilities::from_iter([]));
         let descriptor = conexus_auth::ToolDescriptor::of::<AskProjectRagTool>();
         let result = conexus_auth::dispatch(

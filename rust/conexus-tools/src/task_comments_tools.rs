@@ -457,7 +457,7 @@ mod tests {
     }
 
     fn ctx<'a>(registry: &'a WaiterRegistry, file_map: &'a FileMap) -> ToolCallContext<'a> {
-        ToolCallContext::off_wire(registry, file_map)
+        ToolCallContext::off_wire(registry, file_map, std::path::Path::new("/tmp"))
     }
 
     #[tokio::test]

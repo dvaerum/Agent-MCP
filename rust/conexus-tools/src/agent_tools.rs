@@ -214,7 +214,7 @@ mod tests {
         let principal = worker_principal("worker-1");
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
         let result = GetSystemPromptTool::call(
             Some(&principal),
             &Value::Null,
@@ -257,7 +257,7 @@ mod tests {
         principal.agent_role = Some(conexus_core::capability::AgentRole::Manager);
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
         let result = GetSystemPromptTool::call(
             Some(&principal),
             &Value::Null,
@@ -281,7 +281,7 @@ mod tests {
         let principal = worker_principal("ghost-agent");
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
         let result = GetSystemPromptTool::call(
             Some(&principal),
             &Value::Null,

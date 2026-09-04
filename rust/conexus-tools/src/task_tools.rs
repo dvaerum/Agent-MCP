@@ -3788,7 +3788,11 @@ mod view_search_tests {
         let conn = test_conn();
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         let result = ViewTasksTool::call(Some(&admin("a")), &Value::Null, &conn, NOW, &ctx).await;
         assert_eq!(
             result,
@@ -3809,7 +3813,11 @@ mod view_search_tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         let result = ViewTasksTool::call(
             Some(&admin("bob")),
             &serde_json::json!({"created_by": "bob"}),
@@ -3838,7 +3846,11 @@ mod view_search_tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         let result =
             ViewTasksTool::call(Some(&worker("alice")), &Value::Null, &conn, NOW, &ctx).await;
         let msg = message_of(&result);
@@ -3857,7 +3869,11 @@ mod view_search_tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         let result = ViewTasksTool::call(
             Some(&worker("alice")),
             &serde_json::json!({"agent_id": "carol"}),
@@ -3878,7 +3894,11 @@ mod view_search_tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         let result = ViewTasksTool::call(
             Some(&admin("bob")),
             &serde_json::json!({"summary": true}),
@@ -3901,7 +3921,11 @@ mod view_search_tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         let result = ViewTasksTool::call(
             Some(&admin("bob")),
             &serde_json::json!({"show_dependencies": true}),
@@ -3924,7 +3948,11 @@ mod view_search_tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         let result = ViewTasksTool::call(
             Some(&admin("bob")),
             &serde_json::json!({"show_health_analysis": true}),
@@ -3947,7 +3975,11 @@ mod view_search_tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         let full = ViewTasksTool::call(
             Some(&admin("bob")),
             &serde_json::json!({"created_by": "bob"}),
@@ -3988,7 +4020,11 @@ mod view_search_tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         let result = ViewTasksTool::call(
             Some(&admin("bob")),
             &serde_json::json!({"limit": 1, "created_by": "bob"}),
@@ -4008,7 +4044,11 @@ mod view_search_tests {
         let conn = test_conn();
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         let result =
             SearchTasksTool::call(Some(&admin("bob")), &Value::Null, &conn, NOW, &ctx).await;
         assert!(matches!(result, ToolResult::Invalid { field: None, .. }));
@@ -4019,7 +4059,11 @@ mod view_search_tests {
         let conn = test_conn();
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         let result = SearchTasksTool::call(
             Some(&admin("bob")),
             &serde_json::json!({"search_query": "to a"}),
@@ -4063,7 +4107,11 @@ mod view_search_tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         let result = SearchTasksTool::call(
             Some(&admin("bob")),
             &serde_json::json!({"status_filter": "pending"}),
@@ -4125,7 +4173,11 @@ mod view_search_tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         let result = SearchTasksTool::call(
             Some(&admin("bob")),
             &serde_json::json!({"search_query": "widget"}),
@@ -4147,7 +4199,11 @@ mod view_search_tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         let result = SearchTasksTool::call(
             Some(&admin("bob")),
             &serde_json::json!({"search_query": "nonexistent"}),
@@ -4176,7 +4232,11 @@ mod view_search_tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         let result = SearchTasksTool::call(
             Some(&worker("alice")),
             &serde_json::json!({"assigned": true}),
@@ -4292,7 +4352,11 @@ mod create_task_tests {
         let conn = test_conn();
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         let result = CreateTaskTool::call(
             Some(&worker("bob")),
             &serde_json::json!({"task_title": "x"}),
@@ -4309,7 +4373,11 @@ mod create_task_tests {
         let conn = test_conn();
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         let result = CreateTaskTool::call(
             Some(&manager("alice")),
             &serde_json::json!({"task_title": "   "}),
@@ -4328,7 +4396,11 @@ mod create_task_tests {
         let conn = test_conn();
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         let result = CreateTaskTool::call(
             Some(&manager("alice")),
             &serde_json::json!({"task_title": "x", "priority": "urgent"}),
@@ -4347,7 +4419,11 @@ mod create_task_tests {
         let conn = test_conn();
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         let result = CreateTaskTool::call(
             Some(&manager("alice")),
             &serde_json::json!({"task_title": "x", "parent_task": "ghost"}),
@@ -4364,7 +4440,11 @@ mod create_task_tests {
         let conn = test_conn();
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         let result = CreateTaskTool::call(
             Some(&manager("alice")),
             &serde_json::json!({"task_title": "x", "assigned_to": "ghost-agent"}),
@@ -4385,7 +4465,11 @@ mod create_task_tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         let result = CreateTaskTool::call(
             Some(&manager("alice")),
             &serde_json::json!({"task_title": "second root"}),
@@ -4405,7 +4489,11 @@ mod create_task_tests {
         let conn = test_conn();
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         let result = CreateTaskTool::call(
             Some(&manager("alice")),
             &serde_json::json!({"task_title": "unassigned work"}),
@@ -4428,7 +4516,11 @@ mod create_task_tests {
         seed_agent(&conn, "carol").await;
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         let result = CreateTaskTool::call(
             Some(&manager("alice")),
             &serde_json::json!({"task_title": "for carol", "assigned_to": "carol"}),
@@ -4458,7 +4550,11 @@ mod create_task_tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         let result = CreateTaskTool::call(
             Some(&manager("alice")),
             &serde_json::json!({"task_title": "child", "parent_task": "root1"}),
@@ -4480,7 +4576,11 @@ mod create_task_tests {
         let conn = test_conn();
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         let result = CreateTaskTool::call(
             Some(&manager("alice")),
             &serde_json::json!({"task_title": "audited"}),
@@ -4509,7 +4609,11 @@ mod create_task_tests {
         let registry = WaiterRegistry::new();
         let (_tx, mut rx) = registry.register("carol");
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         let result = CreateTaskTool::call(
             Some(&manager("alice")),
             &serde_json::json!({"task_title": "for carol", "assigned_to": "carol"}),
@@ -4529,7 +4633,11 @@ mod create_task_tests {
         let registry = WaiterRegistry::new();
         let (_tx, mut rx) = registry.register("dave");
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         let result = CreateTaskTool::call(
             Some(&manager("alice")),
             &serde_json::json!({"task_title": "pool work"}),
@@ -4638,7 +4746,11 @@ mod update_task_status_tests {
     async fn call(principal: &Principal, args: Value, conn: &AsyncMutex<Connection>) -> ToolResult {
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         UpdateTaskStatusTool::call(Some(principal), &args, conn, NOW, &ctx).await
     }
 
@@ -4861,7 +4973,11 @@ mod update_task_status_tests {
         let registry = WaiterRegistry::new();
         let (_tx, mut rx) = registry.register("bob");
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         let result = UpdateTaskStatusTool::call(
             Some(&worker("bob")),
             &serde_json::json!({"task_id": "t1", "status": "in_progress"}),
@@ -4949,7 +5065,11 @@ mod update_task_tests {
     async fn call(args: Value, conn: &AsyncMutex<Connection>) -> ToolResult {
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         UpdateTaskTool::call(Some(&admin("alice")), &args, conn, NOW, &ctx).await
     }
 
@@ -5118,7 +5238,11 @@ mod update_task_tests {
         let (_tx_bob, mut rx_bob) = registry.register("bob");
         let (_tx_carol, mut rx_carol) = registry.register("carol");
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         let result = UpdateTaskTool::call(
             Some(&admin("alice")),
             &serde_json::json!({"task_id": "t1", "assigned_to": "carol"}),
@@ -5200,7 +5324,11 @@ mod delete_task_tests {
     async fn call(args: Value, conn: &AsyncMutex<Connection>) -> ToolResult {
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         DeleteTaskTool::call(None, &args, conn, NOW, &ctx).await
     }
 
@@ -5478,7 +5606,11 @@ mod delete_task_tests {
         let registry = WaiterRegistry::new();
         let (_tx, mut rx) = registry.register("bob");
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         let result = DeleteTaskTool::call(
             None,
             &serde_json::json!({"task_id": "t1"}),
@@ -5546,7 +5678,11 @@ mod request_assistance_tests {
     async fn call(args: Value, principal: &Principal, conn: &AsyncMutex<Connection>) -> ToolResult {
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         RequestAssistanceTool::call(Some(principal), &args, conn, NOW, &ctx).await
     }
 
@@ -5754,7 +5890,11 @@ mod bulk_task_operations_tests {
     async fn call(args: Value, principal: &Principal, conn: &AsyncMutex<Connection>) -> ToolResult {
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         BulkTaskOperationsTool::call(Some(principal), &args, conn, NOW, &ctx).await
     }
 
@@ -6028,7 +6168,11 @@ mod bulk_task_operations_tests {
         let registry = WaiterRegistry::new();
         let (_tx, mut rx) = registry.register("carol");
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         let result = BulkTaskOperationsTool::call(
             Some(&admin("alice")),
             &serde_json::json!({"operations": [{"type": "reassign", "task_id": "t1", "assigned_to": "carol"}]}),

@@ -185,7 +185,7 @@ mod tests {
         let principal = agent_bearer_with(Capability::AgentsUse);
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
         let result = ViewAgentsTool::call(
             Some(&principal),
             &Value::Null,
@@ -218,7 +218,7 @@ mod tests {
         principal.agent_id = None;
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
         let result = ViewAgentsTool::call(
             Some(&principal),
             &Value::Null,

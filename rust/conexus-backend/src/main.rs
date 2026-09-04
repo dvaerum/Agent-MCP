@@ -96,6 +96,7 @@ async fn main() -> Result<()> {
         forwarding_hmac_key,
         waiter_registry: conexus_wakeloop::waiter_registry::WaiterRegistry::new(),
         file_map: conexus_wakeloop::file_map::FileMap::new(),
+        project_dir: cli.project_dir.clone(),
     });
 
     let shared_for_factory = shared.clone();

@@ -487,7 +487,11 @@ mod tests {
         let conn = test_conn();
         let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         let result = ViewProjectSettingsTool::call(
             Some(&operator_principal()),
             &Value::Null,
@@ -510,7 +514,11 @@ mod tests {
         let conn = test_conn();
         let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         let result = UpdateProjectSettingsTool::call(
             Some(&operator_principal()),
             &serde_json::json!({"context_value": true}),
@@ -529,7 +537,11 @@ mod tests {
         let conn = test_conn();
         let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         let result = UpdateProjectSettingsTool::call(
             Some(&operator_principal()),
             &serde_json::json!({"context_key": "not_config_shaped", "context_value": true}),
@@ -548,7 +560,11 @@ mod tests {
         let conn = test_conn();
         let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         let result = UpdateProjectSettingsTool::call(
             Some(&operator_principal()),
             &serde_json::json!({"context_key": "config_x"}),
@@ -567,7 +583,11 @@ mod tests {
         let conn = test_conn();
         let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         let result = UpdateProjectSettingsTool::call(
             Some(&operator_principal()),
             &serde_json::json!({"context_key": "config_max_agents", "context_value": 10}),
@@ -594,7 +614,11 @@ mod tests {
         let conn = test_conn();
         let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         UpdateProjectSettingsTool::call(
             Some(&operator_principal()),
             &serde_json::json!({"context_key": "config_x", "context_value": 1}),
@@ -622,7 +646,11 @@ mod tests {
         let conn = test_conn();
         let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         UpdateProjectSettingsTool::call(
             Some(&operator_principal()),
             &serde_json::json!({"context_key": "config_x", "context_value": 1}),
@@ -647,7 +675,11 @@ mod tests {
         let conn = test_conn();
         let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         let result = UpdateProjectSettingsTool::call(
             Some(&operator_principal()),
             &serde_json::json!({"context_key": "config_allow_worker_to_worker", "context_value": true}),
@@ -669,7 +701,11 @@ mod tests {
         let conn = test_conn();
         let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         let result = UpdateProjectSettingsTool::call(
             Some(&operator_principal()),
             &serde_json::json!({"context_key": "config_max_agents", "context_value": 1}),
@@ -689,7 +725,11 @@ mod tests {
         let conn = test_conn();
         let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         let result = DeleteProjectSettingsTool::call(
             Some(&operator_principal()),
             &serde_json::json!({}),
@@ -708,7 +748,11 @@ mod tests {
         let conn = test_conn();
         let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         let result = DeleteProjectSettingsTool::call(
             Some(&operator_principal()),
             &serde_json::json!({"context_key": "config_does_not_exist"}),
@@ -732,7 +776,11 @@ mod tests {
         let conn = test_conn();
         let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = conexus_auth::ToolCallContext::off_wire(&registry, &file_map);
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
         UpdateProjectSettingsTool::call(
             Some(&operator_principal()),
             &serde_json::json!({"context_key": "config_x", "context_value": 1}),
