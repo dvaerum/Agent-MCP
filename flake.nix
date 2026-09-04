@@ -5,7 +5,17 @@
   # 22 toolchain available; the 25.05 / 25.11 releases also work.
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
-  outputs = { self, nixpkgs, ... }:
+  # Rust-Nix packaging for the CoNexus migration's rust/ workspace
+  # (Phase D1 step 4, prancy-napping-pie). Chosen over the zero-input
+  # `rustPlatform.buildRustPackage` per the operator's own call
+  # (2026-09-04): finer-grained incremental build caching as the
+  # workspace grows toward the full migration's eventual size. No
+  # existing Rust-Nix precedent anywhere in this org's flakes to
+  # follow — `aoe-bridge/` (this repo's other Rust crate) is built via
+  # bare `cargo build`, not packaged by this flake at all.
+  inputs.crane.url = "github:ipetkov/crane";
+
+  outputs = { self, nixpkgs, crane, ... }:
     let
       system = "x86_64-linux";
 
@@ -39,6 +49,15 @@
       productionPkgs = import ./nix/packages.nix {
         inherit pkgs lib;
         src = self;
+      };
+
+      # ── CoNexus Rust packaging (Phase D1 step 4) ──────────────────
+      # Parallel package set for the rust/ Cargo workspace; see
+      # nix/conexus.nix for the per-derivation rationale.
+      conexusPkgs = import ./nix/conexus.nix {
+        inherit pkgs lib;
+        src = self;
+        craneLib = crane.mkLib pkgs;
       };
 
       # There is deliberately no second package set here.
@@ -148,6 +167,12 @@
         agent-mcp-router-wrapper = productionPkgs.agentMcpRouterWrapper;
         default = productionPkgs.agentMcpPy;
 
+        # CoNexus Rust backend (Phase D1). Not yet wired into any
+        # home-manager option or systemd unit — see nix/conexus.nix
+        # and the migration plan's Phase D1 steps 5-6.
+        conexus-backend = conexusPkgs.conexusBackend;
+        conexus-launcher = conexusPkgs.conexusLauncher;
+
         vm = vmMulti;
         vm-multi = vmMulti;
         vm-single = vmSingle;
@@ -209,6 +234,12 @@
         agent-mcp = productionPkgs.agentMcpPy;
         agent-mcp-dashboard = productionPkgs.agentMcpDashboard;
         agent-mcp-router-wrapper = productionPkgs.agentMcpRouterWrapper;
+        # CoNexus Rust backend (Phase D1 step 4) — cheap build-only
+        # check, same rationale as the three Python derivations above.
+        # The CI-gated `conexus (Rust)` job already covers fmt/
+        # clippy/test/audit for the crate sources directly; this check
+        # additionally proves the flake's own crane wiring builds.
+        conexus-backend = conexusPkgs.conexusBackend;
         vm-multi-tenant = import ./nix/tests/multi-tenant.nix {
           inherit pkgs lib self;
         };
