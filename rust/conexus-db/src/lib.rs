@@ -1,5 +1,6 @@
 pub mod agent_action_repository;
 pub mod agent_repository;
+pub mod file_metadata_repository;
 pub mod group_capability_repository;
 pub mod group_membership_repository;
 pub mod message_repository;
@@ -17,6 +18,7 @@ pub use agent_repository::{
     AgentField, AgentQueryFilters, AgentRepository, AgentRow, AgentSortBy, CreateAgentError,
     FieldValue, NewAgent, ReviewProfileResult, SortOrder,
 };
+pub use file_metadata_repository::FileMetadataRow;
 pub use message_repository::{
     LiveParticipant, MessageQueryFilters, MessageRepository, MessageRow, NewMessage, Participants,
     SendMessageError,

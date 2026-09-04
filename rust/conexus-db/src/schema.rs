@@ -59,6 +59,14 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             updated_by    TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS file_metadata (
+            filepath      TEXT PRIMARY KEY,
+            metadata      TEXT NOT NULL,
+            last_updated  TEXT NOT NULL,
+            updated_by    TEXT NOT NULL,
+            content_hash  TEXT
+        );
+
         CREATE TABLE IF NOT EXISTS agent_actions (
             action_id     INTEGER PRIMARY KEY AUTOINCREMENT,
             agent_id      TEXT NOT NULL,

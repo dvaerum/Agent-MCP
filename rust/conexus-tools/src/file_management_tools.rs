@@ -41,7 +41,7 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::task_tools::str_arg;
 
-fn is_file_capable_agent(principal: Option<&Principal>) -> bool {
+pub(crate) fn is_file_capable_agent(principal: Option<&Principal>) -> bool {
     principal.is_some_and(|p| {
         p.kind == PrincipalKind::AgentBearer && p.has_capability(Capability::FilesUse)
     })
@@ -56,7 +56,7 @@ const UPDATE_DENIED: &str =
 /// absolute) and normalize `.`/`..` components without touching the
 /// filesystem — see this module's doc for why this, not
 /// `fs::canonicalize`, is the right primitive.
-fn resolve_abs_filepath(base: &str, path: &str) -> String {
+pub(crate) fn resolve_abs_filepath(base: &str, path: &str) -> String {
     let p = Path::new(path);
     let joined = if p.is_absolute() {
         p.to_path_buf()
@@ -92,7 +92,7 @@ fn normalize_lexically(path: &Path) -> PathBuf {
 /// but not `Sync`) -- the same root cause already documented on
 /// `Tool::call`'s own `BoxFuture` doc, avoided here at the source by
 /// never making this helper `async` in the first place.
-fn working_directory_for(conn: &Connection, agent_id: &str) -> String {
+pub(crate) fn working_directory_for(conn: &Connection, agent_id: &str) -> String {
     AgentRepository::get_by_id(conn, agent_id)
         .ok()
         .flatten()

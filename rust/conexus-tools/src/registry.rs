@@ -13,6 +13,7 @@ use crate::agent_roster_tools::ViewAgentsTool;
 use crate::agent_tools::GetSystemPromptTool;
 use crate::assign_task_tools::{AssignTaskTool, CreateSelfTaskTool};
 use crate::file_management_tools::{CheckFileStatusTool, UpdateFileStatusTool};
+use crate::file_metadata_tools::{UpdateFileMetadataTool, ViewFileMetadataTool};
 use crate::project_settings_tools::{
     DeleteProjectSettingsTool, UpdateProjectSettingsTool, ViewProjectSettingsTool,
 };
@@ -27,7 +28,7 @@ use crate::utility_tools::TestTool;
 // compile-time `static` array (needs a named `static`, not an inline
 // `&[...]` literal, since the array's elements aren't const-promotable
 // through a non-const fn body).
-static ALL_TOOLS: [ToolDescriptor; 21] = [
+static ALL_TOOLS: [ToolDescriptor; 23] = [
     ToolDescriptor::of::<ViewProjectSettingsTool>(),
     ToolDescriptor::of::<UpdateProjectSettingsTool>(),
     ToolDescriptor::of::<DeleteProjectSettingsTool>(),
@@ -49,6 +50,8 @@ static ALL_TOOLS: [ToolDescriptor; 21] = [
     ToolDescriptor::of::<ViewAgentsTool>(),
     ToolDescriptor::of::<CheckFileStatusTool>(),
     ToolDescriptor::of::<UpdateFileStatusTool>(),
+    ToolDescriptor::of::<ViewFileMetadataTool>(),
+    ToolDescriptor::of::<UpdateFileMetadataTool>(),
 ];
 
 pub fn all_tools() -> &'static [ToolDescriptor] {
@@ -191,6 +194,8 @@ mod tests {
                 "view_agents",
                 "check_file_status",
                 "update_file_status",
+                "view_file_metadata",
+                "update_file_metadata",
             ])
         );
     }
