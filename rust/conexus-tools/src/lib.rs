@@ -6,6 +6,7 @@
 //! See `/home/dennis/.claude/plans/prancy-napping-pie.md`.
 
 pub mod agent_communication_tools;
+pub mod agent_messaging;
 pub mod assign_task_tools;
 pub mod completion_client;
 pub mod context_window;
