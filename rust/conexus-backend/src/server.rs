@@ -23,9 +23,10 @@ use std::sync::Arc;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, GetPromptRequestParams,
     GetPromptResponse, GetPromptResult, Implementation, InitializeRequestParams, InitializeResult,
-    ListPromptsResult, ListToolsResult, PaginatedRequestParams, ProgressNotificationParam,
-    ProgressToken, Prompt, PromptArgument, PromptMessage, ProtocolVersion, Role,
-    ServerCapabilities, ServerInfo, Tool,
+    ListPromptsResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
+    ProgressNotificationParam, ProgressToken, Prompt, PromptArgument, PromptMessage,
+    ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
+    ResourceContents, Role, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::{Peer, RequestContext};
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
@@ -184,6 +185,7 @@ impl ServerHandler for ConexusServer {
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_prompts()
+                .enable_resources()
                 .build(),
         )
         .with_server_info(Implementation::new(
@@ -411,6 +413,68 @@ impl ServerHandler for ConexusServer {
                 .with_description(entry.description.clone())
                 .into(),
         )
+    }
+
+    // Port of `mcp_list_resources_handler` (Phase E1 PR B2) -- the two
+    // per-agent ambient-state resources, scoped to the caller's own
+    // agent_id (empty for an unauthenticated caller or an
+    // operator/forwarding-header Principal, which carries none).
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, McpError> {
+        let principal = principal_from_context(&context);
+        let agent_id = principal.as_ref().and_then(|p| p.agent_id.as_deref());
+        let resources = conexus_tools::resources::list_for(agent_id)
+            .into_iter()
+            .map(|entry| {
+                Resource::new(entry.uri, entry.name)
+                    .with_description(entry.description)
+                    .with_mime_type(entry.mime_type)
+            })
+            .collect();
+        Ok(ListResourcesResult {
+            resources,
+            ..Default::default()
+        })
+    }
+
+    // Port of `mcp_read_resource_handler` (Phase E1 PR B2). Error
+    // codes match `ResourceReadError`'s contract exactly: an unknown
+    // URI is INVALID_PARAMS, every denial kind (not-visible /
+    // unauthenticated / out-of-scope) is INTERNAL_ERROR.
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, McpError> {
+        let principal = principal_from_context(&context);
+        let now = chrono::Utc::now().to_rfc3339();
+        let outcome = {
+            let guard = self.shared.conn.lock().await;
+            conexus_tools::resources::read(&guard, &request.uri, principal.as_ref(), &now)
+        }
+        .map_err(|_| {
+            McpError::internal_error(format!("failed to read resource {:?}", request.uri), None)
+        })?;
+        match outcome {
+            conexus_tools::resources::ReadOutcome::Ok { body, mime_type } => {
+                Ok(ReadResourceResult::new(vec![
+                    ResourceContents::text(body, request.uri).with_mime_type(mime_type)
+                ])
+                .into())
+            }
+            conexus_tools::resources::ReadOutcome::UnknownUri => Err(McpError::invalid_params(
+                format!("Unknown resource URI: {}", request.uri),
+                None,
+            )),
+            conexus_tools::resources::ReadOutcome::Denied(_) => Err(McpError::internal_error(
+                "Unauthorized: callers may only read their own inbox / status resources"
+                    .to_string(),
+                None,
+            )),
+        }
     }
 }
 

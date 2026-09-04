@@ -22,6 +22,7 @@ pub mod prompts;
 mod python_compat;
 pub mod rag_tools;
 pub mod registry;
+pub mod resources;
 pub mod scheduled_directive_tools;
 pub mod task_comments_tools;
 pub mod task_mutation_engine;

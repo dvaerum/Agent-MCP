@@ -143,7 +143,7 @@ pub enum EntryOutcome {
 /// `event_feed::collect_events_with_cap`'s own doc for why this is an
 /// explicit `get_env` parameter rather than a direct `std::env::var`
 /// call inside that function.
-fn process_env(key: &str) -> Option<String> {
+pub(crate) fn process_env(key: &str) -> Option<String> {
     std::env::var(key).ok()
 }
 
