@@ -1592,6 +1592,234 @@ impl Tool for BulkUpdateProjectContextTool {
     }
 }
 
+/// Critical system keys that require `force_delete=true`. Matches
+/// Python's own loose prefix-or-exact match (`key.startswith(pattern.
+/// split("_")[0] + "_") or key == pattern`) verbatim -- e.g.
+/// `"server_anything"` matches the `"server_startup"` pattern via its
+/// `"server_"` prefix, not just the literal string.
+const CRITICAL_KEY_PATTERNS: &[&str] = &[
+    "server_startup",
+    "database_version",
+    "system_config",
+    "mcp_server_url",
+];
+
+fn critical_key_match(key: &str, pattern: &str) -> bool {
+    let prefix = format!("{}_", pattern.split('_').next().unwrap_or(pattern));
+    key.starts_with(&prefix) || key == pattern
+}
+
+pub struct DeleteProjectContextTool;
+
+impl Tool for DeleteProjectContextTool {
+    const NAME: &'static str = "delete_project_context";
+    const REQUIRED: Requirement = Requirement::Predicate {
+        check: can_delete_project_context,
+        reason: WRITE_DENIED_REASON,
+    };
+    const DESCRIPTION: &'static str = "Delete project context entries permanently. Admin-only \
+        operation with safety checks for critical system keys.";
+    const SCHEMA: &'static str = r#"{
+        "type": "object",
+        "properties": {
+            "context_key": {
+                "type": "string",
+                "description": "Single context key to delete (alternative to context_keys)"
+            },
+            "context_keys": {
+                "type": "array",
+                "description": "List of context keys to delete",
+                "items": {"type": "string"},
+                "minItems": 1
+            },
+            "force_delete": {
+                "type": "boolean",
+                "description": "Force deletion even for critical system keys (default: false)",
+                "default": false
+            }
+        },
+        "required": [],
+        "additionalProperties": false
+    }"#;
+
+    fn call<'a>(
+        principal: Option<&'a Principal>,
+        arguments: &'a Value,
+        conn: &'a AsyncMutex<Connection>,
+        now: &'a str,
+        ctx: &'a conexus_auth::ToolCallContext<'a>,
+    ) -> conexus_auth::BoxFuture<'a, ToolResult> {
+        Box::pin(async move {
+            let mut keys_to_delete: Vec<String> = Vec::new();
+            if let Some(k) = arguments.get("context_key").and_then(Value::as_str) {
+                if !k.is_empty() {
+                    keys_to_delete.push(k.to_string());
+                }
+            }
+            if let Some(arr) = arguments.get("context_keys").and_then(Value::as_array) {
+                keys_to_delete.extend(arr.iter().filter_map(Value::as_str).map(str::to_string));
+            }
+            if keys_to_delete.is_empty() {
+                return ToolResult::Invalid {
+                    field: Some("context_key".to_string()),
+                    message: "No context keys specified for deletion".to_string(),
+                };
+            }
+            let force_delete = arguments
+                .get("force_delete")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+
+            // ADR-0016: reject config_* up front, checked BEFORE the
+            // critical-key guard, so the caller gets the category
+            // error rather than a misleading force_delete hint.
+            if keys_to_delete.iter().any(|k| CONFIG_KEY_RE.is_match(k)) {
+                return config_key_error();
+            }
+
+            let critical_keys_found: Vec<&String> = keys_to_delete
+                .iter()
+                .filter(|k| {
+                    CRITICAL_KEY_PATTERNS
+                        .iter()
+                        .any(|p| critical_key_match(k, p))
+                })
+                .collect();
+            if !critical_keys_found.is_empty() && !force_delete {
+                return ToolResult::Invalid {
+                    field: Some("force_delete".to_string()),
+                    message: format!(
+                        "Cannot delete critical system keys without force_delete=true: {:?}",
+                        critical_keys_found
+                    ),
+                };
+            }
+
+            let requesting_agent_id = principal.map(Principal::actor_label).unwrap_or("unknown");
+            let is_admin = principal.is_some_and(conexus_core::principal::is_operator_tier);
+
+            let guard = conn.lock().await;
+
+            for key in &keys_to_delete {
+                if let Some(denial) =
+                    check_write_authorization(&guard, requesting_agent_id, key, is_admin)
+                {
+                    return denial;
+                }
+            }
+
+            let key_refs: Vec<&str> = keys_to_delete.iter().map(String::as_str).collect();
+            let deleted_rows = match project_context_repository::delete_many(&guard, &key_refs) {
+                Ok(rows) => rows,
+                Err(_e) => {
+                    return ToolResult::Failed {
+                        message: "A database error occurred; it has been logged. Retry, or ask \
+                            an operator to check logs."
+                            .to_string(),
+                    }
+                }
+            };
+
+            if deleted_rows.is_empty() {
+                return ToolResult::NotFound {
+                    resource: "project_context".to_string(),
+                    identifier: keys_to_delete.join(", "),
+                    hint: None,
+                };
+            }
+
+            let deletion_details: Vec<(String, String, bool)> = deleted_rows
+                .iter()
+                .map(|row| {
+                    let was_critical = critical_keys_found.iter().any(|k| **k == row.context_key);
+                    (
+                        row.context_key.clone(),
+                        row.description.clone().unwrap_or_default(),
+                        was_critical,
+                    )
+                })
+                .collect();
+            let deleted_keys: Vec<&str> = deletion_details
+                .iter()
+                .map(|(k, _, _)| k.as_str())
+                .collect();
+
+            let _ = agent_action_repository::log_agent_action(
+                &guard,
+                requesting_agent_id,
+                "deleted_context",
+                None,
+                Some(&serde_json::json!({
+                    "deleted_keys": deleted_keys,
+                    "critical_keys_deleted": critical_keys_found,
+                    "force_delete": force_delete,
+                    "total_deleted": deleted_rows.len(),
+                })),
+                now,
+            );
+
+            // BL-R4-1: prune each deleted key's RAG chunk + hash
+            // watermark in the SAME transaction/connection as the row
+            // delete -- the incremental indexer never sweeps orphans,
+            // so a deleted context row's chunk would otherwise stay
+            // queryable via ask_project_rag forever.
+            for key in &deleted_keys {
+                let _ = conexus_db::rag_repository::purge_source(&guard, "context", key);
+            }
+
+            drop(guard);
+
+            // SEC-C/F5: fire the same wake seam every other write
+            // surface in this file uses -- this delete path was the
+            // last one that bypassed it entirely.
+            let wakes: Vec<&str> = {
+                let guard = conn.lock().await;
+                wake_notify::deliver_bulk(&guard, ctx.waiter_registry, deleted_keys.clone())
+            }
+            .into_iter()
+            .map(|w| w.as_str())
+            .collect();
+
+            let mut response_parts = vec![format!(
+                "Deleted {} project context entries successfully:",
+                deletion_details.len()
+            )];
+            for (key, description, was_critical) in &deletion_details {
+                let mut line = format!("  \u{2022} {key}");
+                if !description.is_empty() {
+                    line.push_str(&format!(" ({description})"));
+                }
+                if *was_critical {
+                    line.push_str(" [CRITICAL]");
+                }
+                response_parts.push(line);
+            }
+            if !critical_keys_found.is_empty() {
+                response_parts.push(format!(
+                    "\n\u{26a0}\u{fe0f}  WARNING: {} critical system keys were deleted!",
+                    critical_keys_found.len()
+                ));
+                response_parts.push(
+                    "System functionality may be affected. Consider backing up before restart."
+                        .to_string(),
+                );
+            }
+            response_parts.push(format!("\nDeletion completed at: {now}"));
+
+            ToolResult::Ok {
+                data: Some(serde_json::json!({
+                    "deleted_count": deletion_details.len(),
+                    "deleted_keys": deleted_keys,
+                    "critical_keys_deleted": critical_keys_found,
+                    "force_delete": force_delete,
+                    "wakes": wakes,
+                })),
+                message: Some(response_parts.join("\n")),
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1658,6 +1886,19 @@ mod tests {
                 Capability::MemoriesUpdate,
                 Capability::MemoriesDelete,
             ])),
+        }
+    }
+
+    /// A genuinely `is_operator_tier` caller (agent_id literally
+    /// `"admin"`) -- bypasses `check_write_authorization`'s
+    /// per-key creator-ownership matrix entirely, unlike
+    /// `write_operator()` above (which only carries the memories.*
+    /// capabilities, not `system.config.write`/the `"admin"`
+    /// agent_id, so it does NOT trip `is_operator_tier`).
+    fn admin_agent() -> Principal {
+        Principal {
+            agent_id: Some("admin".to_string()),
+            ..worker()
         }
     }
 
@@ -2681,5 +2922,289 @@ mod tests {
         let denied = BulkUpdateProjectContextTool::REQUIRED
             .check(Some(&viewer), &conexus_auth::NoPolicyOverrides);
         assert!(denied.is_err());
+    }
+
+    // ── DeleteProjectContextTool ─────────────────────────────────────
+
+    #[test]
+    fn critical_key_match_covers_prefix_and_exact_forms() {
+        assert!(critical_key_match("server_startup", "server_startup"));
+        assert!(critical_key_match("server_anything_else", "server_startup"));
+        assert!(!critical_key_match("serverish", "server_startup"));
+        assert!(critical_key_match("mcp_server_url", "mcp_server_url"));
+        assert!(critical_key_match("mcp_whatever", "mcp_server_url"));
+    }
+
+    #[tokio::test]
+    async fn deletes_a_single_owned_key() {
+        let conn = setup().await;
+        seed_context(&conn, "k", "\"v\"", "2026-06-01T00:00:00Z").await;
+        let alice = worker();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = DeleteProjectContextTool::call(
+            Some(&alice),
+            &serde_json::json!({"context_key": "k"}),
+            &conn,
+            "2026-06-01T00:01:00Z",
+            &c,
+        )
+        .await;
+        let ToolResult::Ok { data, .. } = result else {
+            panic!("expected Ok, got {result:?}");
+        };
+        assert_eq!(data.unwrap()["deleted_count"], 1);
+        let guard = conn.lock().await;
+        assert!(project_context_repository::get(&guard, "k")
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn deletes_multiple_keys_via_context_keys_array() {
+        let conn = setup().await;
+        seed_context(&conn, "a", "\"1\"", "2026-06-01T00:00:00Z").await;
+        seed_context(&conn, "b", "\"2\"", "2026-06-01T00:00:00Z").await;
+        let alice = worker();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = DeleteProjectContextTool::call(
+            Some(&alice),
+            &serde_json::json!({"context_keys": ["a", "b"]}),
+            &conn,
+            "2026-06-01T00:01:00Z",
+            &c,
+        )
+        .await;
+        let ToolResult::Ok { data, .. } = result else {
+            panic!("expected Ok, got {result:?}");
+        };
+        assert_eq!(data.unwrap()["deleted_count"], 2);
+    }
+
+    #[tokio::test]
+    async fn no_keys_specified_is_invalid() {
+        let conn = setup().await;
+        let alice = worker();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = DeleteProjectContextTool::call(
+            Some(&alice),
+            &serde_json::json!({}),
+            &conn,
+            "2026-06-01T00:00:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Invalid { .. }));
+    }
+
+    #[tokio::test]
+    async fn deleting_a_nonexistent_key_is_not_found() {
+        let conn = setup().await;
+        let alice = worker();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = DeleteProjectContextTool::call(
+            Some(&alice),
+            &serde_json::json!({"context_key": "ghost"}),
+            &conn,
+            "2026-06-01T00:00:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::NotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_config_namespaced_delete_is_rejected_before_the_critical_key_guard() {
+        let conn = setup().await;
+        let op = write_operator();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = DeleteProjectContextTool::call(
+            Some(&op),
+            &serde_json::json!({"context_key": "config_server_startup"}),
+            &conn,
+            "2026-06-01T00:00:00Z",
+            &c,
+        )
+        .await;
+        // The config_* category error (Invalid on `context_key`), NOT
+        // the critical-key force_delete hint (Invalid on
+        // `force_delete`) -- confirmed via the field, since both
+        // branches return the same variant.
+        let ToolResult::Invalid { field, .. } = result else {
+            panic!("expected Invalid, got {result:?}");
+        };
+        assert_eq!(field.as_deref(), Some("context_key"));
+    }
+
+    #[tokio::test]
+    async fn a_critical_key_without_force_delete_is_refused() {
+        let conn = setup().await;
+        seed_context(&conn, "server_startup", "\"v\"", "2026-06-01T00:00:00Z").await;
+        let admin = admin_agent();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = DeleteProjectContextTool::call(
+            Some(&admin),
+            &serde_json::json!({"context_key": "server_startup"}),
+            &conn,
+            "2026-06-01T00:00:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Invalid { .. }));
+        let guard = conn.lock().await;
+        assert!(project_context_repository::get(&guard, "server_startup")
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn a_critical_key_with_force_delete_succeeds() {
+        let conn = setup().await;
+        seed_context(&conn, "server_startup", "\"v\"", "2026-06-01T00:00:00Z").await;
+        let admin = admin_agent();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = DeleteProjectContextTool::call(
+            Some(&admin),
+            &serde_json::json!({"context_key": "server_startup", "force_delete": true}),
+            &conn,
+            "2026-06-01T00:00:00Z",
+            &c,
+        )
+        .await;
+        let ToolResult::Ok { data, message } = result else {
+            panic!("expected Ok, got {result:?}");
+        };
+        let data = data.unwrap();
+        assert_eq!(
+            data["critical_keys_deleted"],
+            serde_json::json!(["server_startup"])
+        );
+        assert!(message.unwrap().contains("CRITICAL"));
+    }
+
+    #[tokio::test]
+    async fn a_non_owner_worker_is_denied_before_any_deletion() {
+        let conn = setup().await;
+        seed_context(&conn, "k", "\"v\"", "2026-06-01T00:00:00Z").await;
+        let bob = Principal {
+            agent_id: Some("bob".to_string()),
+            ..worker()
+        };
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = DeleteProjectContextTool::call(
+            Some(&bob),
+            &serde_json::json!({"context_key": "k"}),
+            &conn,
+            "2026-06-01T00:00:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::PermissionDenied { .. }));
+        let guard = conn.lock().await;
+        assert!(project_context_repository::get(&guard, "k")
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn a_multi_key_delete_aborts_entirely_if_any_key_fails_authorization() {
+        let conn = setup().await;
+        seed_context(&conn, "owned-by-alice", "\"v\"", "2026-06-01T00:00:00Z").await;
+        {
+            let guard = conn.lock().await;
+            project_context_repository::create_new(
+                &guard,
+                "owned-by-bob",
+                "\"v\"",
+                Some("d"),
+                "bob",
+                "2026-06-01T00:00:00Z",
+            )
+            .unwrap();
+        }
+        let alice = worker();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = DeleteProjectContextTool::call(
+            Some(&alice),
+            &serde_json::json!({"context_keys": ["owned-by-alice", "owned-by-bob"]}),
+            &conn,
+            "2026-06-01T00:00:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::PermissionDenied { .. }));
+        let guard = conn.lock().await;
+        assert!(project_context_repository::get(&guard, "owned-by-alice")
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn delete_purges_the_rag_chunk_for_the_deleted_key() {
+        let conn = setup().await;
+        seed_context(&conn, "k", "\"v\"", "2026-06-01T00:00:00Z").await;
+        {
+            let guard = conn.lock().await;
+            let chunks = [conexus_db::rag_repository::NewChunk {
+                chunk_text: "some indexed text",
+                metadata: None,
+                embedding: None,
+            }];
+            conexus_db::rag_repository::bulk_index_chunks(
+                &guard,
+                "context",
+                "k",
+                &chunks,
+                "2026-06-01T00:00:00Z",
+            )
+            .unwrap();
+        }
+        let alice = worker();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = DeleteProjectContextTool::call(
+            Some(&alice),
+            &serde_json::json!({"context_key": "k"}),
+            &conn,
+            "2026-06-01T00:01:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        let guard = conn.lock().await;
+        let remaining: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM rag_chunks WHERE source_type = 'context' AND source_ref = 'k'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    #[tokio::test]
+    async fn delete_schema_has_no_key_length_cap_matching_pythons_own_note() {
+        let parsed: Value = serde_json::from_str(DeleteProjectContextTool::SCHEMA).unwrap();
+        assert!(parsed["properties"]["context_key"]
+            .get("maxLength")
+            .is_none());
     }
 }
