@@ -655,6 +655,212 @@ impl Tool for ViewStatusTool {
     }
 }
 
+/// Process-wide round-robin index for [`next_agent_color`] -- Python's
+/// `g.agent_color_index`. A private atomic counter local to this
+/// module rather than a `ToolCallContext`/`SharedState` field: nothing
+/// outside `register_agent` ever needs to read or write it, so
+/// threading it through the same explicit-shared-state mechanism as
+/// `waiter_registry`/`file_map`/`project_dir` (each needed by MULTIPLE
+/// tools) would be over-engineering for a single tool's own internal
+/// counter -- a plain process-wide `static` gives the identical
+/// "persists across calls, one instance per process" semantics.
+static AGENT_COLOR_INDEX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `[`/`]` are reserved for the purge-cascade tombstone format
+/// (`[deleted-<id>]`) -- checked up front for a precise operator-
+/// facing reason; `AgentRepository::create`'s own regex would also
+/// reject them (defense in depth, not the only gate).
+fn contains_reserved_bracket(agent_id: &str) -> bool {
+    agent_id.contains('[') || agent_id.contains(']')
+}
+
+/// Port of `agent_repo._is_reserved_agent_id` -- checked up front here
+/// too (same precise-reason rationale as the bracket guard above);
+/// `AgentRepository::create`'s own prefix check is the real,
+/// load-bearing gate.
+fn is_reserved_agent_id(agent_id: &str) -> bool {
+    agent_id.to_lowercase().starts_with("admin")
+}
+
+pub struct RegisterAgentTool;
+
+impl Tool for RegisterAgentTool {
+    const NAME: &'static str = "register_agent";
+    const REQUIRED: Requirement = Requirement::Cap {
+        cap: Capability::AgentsRegister,
+        reason: None,
+    };
+    const DESCRIPTION: &'static str = "Register an agent identity. Operator-only. No spawning \
+        -- returns a bearer token + a ready-to-paste .mcp.json snippet.";
+    const SCHEMA: &'static str = r#"{
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "description": "agent_id for the new row"},
+            "agent_id": {"type": "string", "description": "Back-compat alias for name"},
+            "role": {"type": "string", "description": "'worker' or 'manager', default worker"},
+            "agent_role": {"type": "string", "description": "Back-compat alias for role"},
+            "project_name": {"type": "string"},
+            "host": {"type": "string"},
+            "mount_prefix": {"type": "string"}
+        },
+        "required": [],
+        "additionalProperties": false
+    }"#;
+
+    fn call<'a>(
+        principal: Option<&'a Principal>,
+        arguments: &'a Value,
+        conn: &'a AsyncMutex<Connection>,
+        now: &'a str,
+        ctx: &'a conexus_auth::ToolCallContext<'a>,
+    ) -> conexus_auth::BoxFuture<'a, ToolResult> {
+        Box::pin(async move {
+            let name = arguments
+                .get("name")
+                .and_then(Value::as_str)
+                .or_else(|| arguments.get("agent_id").and_then(Value::as_str))
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let Some(agent_id) = name else {
+                return ToolResult::Invalid {
+                    field: Some("name".to_string()),
+                    message: "`name` (agent_id) is required and must be a non-empty string."
+                        .to_string(),
+                };
+            };
+
+            let role = arguments
+                .get("role")
+                .and_then(Value::as_str)
+                .or_else(|| arguments.get("agent_role").and_then(Value::as_str))
+                .unwrap_or("worker");
+            if role != "worker" && role != "manager" {
+                return ToolResult::Invalid {
+                    field: Some("role".to_string()),
+                    message: "`role` must be 'worker' or 'manager'.".to_string(),
+                };
+            }
+
+            if contains_reserved_bracket(agent_id) {
+                return ToolResult::Invalid {
+                    field: Some("name".to_string()),
+                    message: format!(
+                        "invalid name {agent_id:?}: `[` and `]` are reserved characters \
+                         (used by the purge-cascade tombstone format `[deleted-<id>]`)."
+                    ),
+                };
+            }
+            if is_reserved_agent_id(agent_id) {
+                return ToolResult::Invalid {
+                    field: Some("name".to_string()),
+                    message: format!(
+                        "reserved name {agent_id:?}: names beginning with 'admin' are \
+                         reserved for privileged / built-in identities and cannot be \
+                         assigned to an agent."
+                    ),
+                };
+            }
+
+            // Note: Python also checks `agent_id in g.agent_working_dirs`
+            // (an in-memory cache) for a "(in active memory)" Conflict
+            // BEFORE the DB check -- no Rust equivalent cache exists
+            // (every tool port in this workspace reads fresh from
+            // SQLite), so only the DB-level Conflict below is reachable
+            // here; the in-memory-duplicate branch has no Rust analogue
+            // to port, not a dropped behavior.
+            let new_agent_token = generate_token();
+            let working_directory = ctx.project_dir.display().to_string();
+            let color_index = AGENT_COLOR_INDEX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let agent_color = next_agent_color(color_index);
+
+            let guard = conn.lock().await;
+            let created_row = match conexus_db::agent_repository::AgentRepository::create(
+                &guard,
+                conexus_db::agent_repository::NewAgent {
+                    token: &new_agent_token,
+                    agent_id,
+                    created_at: now,
+                    status: "created",
+                    current_task: None,
+                    working_directory: &working_directory,
+                    color: Some(agent_color),
+                    agent_role: role,
+                },
+            ) {
+                Ok(row) => row,
+                Err(conexus_db::agent_repository::CreateAgentError::InvalidAgentId(_)) => {
+                    return ToolResult::Invalid {
+                        field: Some("name".to_string()),
+                        message: format!("invalid name {agent_id:?}."),
+                    }
+                }
+                Err(conexus_db::agent_repository::CreateAgentError::Conflict(_)) => {
+                    return ToolResult::Conflict {
+                        reason: format!("Agent '{agent_id}' already exists (in database)."),
+                    }
+                }
+                Err(conexus_db::agent_repository::CreateAgentError::Db(_)) => {
+                    return ToolResult::Failed {
+                        message: "A database error occurred; it has been logged. Retry, or ask \
+                            an operator to check logs."
+                            .to_string(),
+                    }
+                }
+            };
+
+            if role == "manager" {
+                let seed_ts = created_row.created_at.clone();
+                let _ = conexus_db::agent_repository::AgentRepository::seed_manager_profile(
+                    &guard,
+                    agent_id,
+                    MANAGER_DEFAULT_PROFILE,
+                    &seed_ts,
+                );
+            }
+
+            let requesting_agent_id = principal.map(Principal::actor_label).unwrap_or("operator");
+            let _ = agent_action_repository::log_agent_action(
+                &guard,
+                requesting_agent_id,
+                "registered_agent",
+                None,
+                Some(&serde_json::json!({"agent_id": agent_id, "role": role})),
+                now,
+            );
+            drop(guard);
+
+            let project_name_arg = arguments.get("project_name").and_then(Value::as_str);
+            let project_for_snippet = resolve_snippet_project(project_name_arg, principal);
+            let host_arg = arguments.get("host").and_then(Value::as_str);
+            let host_for_snippet = resolve_snippet_host(host_arg, |key| std::env::var(key).ok());
+            let mount_prefix = arguments
+                .get("mount_prefix")
+                .and_then(Value::as_str)
+                .unwrap_or("/agent-mcp");
+            let snippet = build_mcp_config_snippet(
+                project_for_snippet.as_deref(),
+                &new_agent_token,
+                &host_for_snippet,
+                mount_prefix,
+            );
+
+            ToolResult::Ok {
+                data: Some(serde_json::json!({
+                    "agent_id": agent_id,
+                    "token": new_agent_token,
+                    "agent_role": role,
+                    "mcp_snippet": snippet,
+                    "project_name": project_for_snippet,
+                })),
+                message: Some(format!(
+                    "Agent '{agent_id}' registered. Paste the snippet into the user's claude \
+                     .mcp.json — agent-mcp no longer spawns the claude session itself."
+                )),
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1394,5 +1600,220 @@ mod tests {
         let data = data.unwrap();
         assert_eq!(data["file_map_size"], 1);
         assert!(data["file_map_preview"].get("/tmp/a.txt").is_some());
+    }
+
+    // ── RegisterAgentTool ────────────────────────────────────────────
+
+    #[test]
+    fn contains_reserved_bracket_matches_either_bracket() {
+        assert!(contains_reserved_bracket("deleted[1]"));
+        assert!(contains_reserved_bracket("a[b"));
+        assert!(contains_reserved_bracket("a]b"));
+        assert!(!contains_reserved_bracket("alice"));
+    }
+
+    #[test]
+    fn is_reserved_agent_id_is_case_insensitive() {
+        assert!(is_reserved_agent_id("admin"));
+        assert!(is_reserved_agent_id("Admin-bob"));
+        assert!(is_reserved_agent_id("ADMINISTRATOR"));
+        assert!(!is_reserved_agent_id("alice"));
+    }
+
+    #[tokio::test]
+    async fn register_agent_denies_a_plain_worker() {
+        let alice = worker();
+        let denied =
+            RegisterAgentTool::REQUIRED.check(Some(&alice), &conexus_auth::NoPolicyOverrides);
+        assert!(denied.is_err());
+    }
+
+    #[tokio::test]
+    async fn register_agent_creates_a_worker_with_default_role() {
+        let conn = setup().await;
+        let op = confirmed_operator();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = RegisterAgentTool::call(
+            Some(&op),
+            &serde_json::json!({"name": "alice"}),
+            &conn,
+            "2026-06-01T00:00:00Z",
+            &c,
+        )
+        .await;
+        let ToolResult::Ok { data, message } = result else {
+            panic!("expected Ok, got {result:?}");
+        };
+        let data = data.unwrap();
+        assert_eq!(data["agent_id"], "alice");
+        assert_eq!(data["agent_role"], "worker");
+        let token = data["token"].as_str().unwrap().to_string();
+        assert_eq!(token.len(), 32);
+        assert!(data["mcp_snippet"].as_str().unwrap().contains(&token));
+        assert!(message.unwrap().contains("registered"));
+
+        let guard = conn.lock().await;
+        let row = conexus_db::agent_repository::AgentRepository::get_by_id(&guard, "alice")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "created");
+        assert_eq!(row.profile, None);
+    }
+
+    #[tokio::test]
+    async fn register_agent_seeds_the_manager_default_profile() {
+        let conn = setup().await;
+        let op = confirmed_operator();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = RegisterAgentTool::call(
+            Some(&op),
+            &serde_json::json!({"name": "boss", "role": "manager"}),
+            &conn,
+            "2026-06-01T00:00:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        let guard = conn.lock().await;
+        let row = conexus_db::agent_repository::AgentRepository::get_by_id(&guard, "boss")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.profile.as_deref(), Some(MANAGER_DEFAULT_PROFILE));
+        assert_eq!(row.profile_updated_by, None);
+    }
+
+    #[tokio::test]
+    async fn register_agent_rejects_an_invalid_role() {
+        let conn = setup().await;
+        let op = confirmed_operator();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = RegisterAgentTool::call(
+            Some(&op),
+            &serde_json::json!({"name": "alice", "role": "superadmin"}),
+            &conn,
+            "2026-06-01T00:00:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Invalid { .. }));
+    }
+
+    #[tokio::test]
+    async fn register_agent_rejects_a_bracketed_name() {
+        let conn = setup().await;
+        let op = confirmed_operator();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = RegisterAgentTool::call(
+            Some(&op),
+            &serde_json::json!({"name": "deleted-alice]"}),
+            &conn,
+            "2026-06-01T00:00:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Invalid { .. }));
+    }
+
+    #[tokio::test]
+    async fn register_agent_rejects_a_reserved_admin_prefixed_name() {
+        let conn = setup().await;
+        let op = confirmed_operator();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = RegisterAgentTool::call(
+            Some(&op),
+            &serde_json::json!({"name": "admin-bob"}),
+            &conn,
+            "2026-06-01T00:00:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Invalid { .. }));
+    }
+
+    #[tokio::test]
+    async fn register_agent_duplicate_name_is_a_conflict() {
+        let conn = setup().await;
+        seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
+        let op = confirmed_operator();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = RegisterAgentTool::call(
+            Some(&op),
+            &serde_json::json!({"name": "alice"}),
+            &conn,
+            "2026-06-01T00:00:01Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Conflict { .. }));
+    }
+
+    #[tokio::test]
+    async fn register_agent_snippet_includes_the_project_and_host() {
+        let conn = setup().await;
+        let op = confirmed_operator();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = RegisterAgentTool::call(
+            Some(&op),
+            &serde_json::json!({
+                "name": "alice",
+                "project_name": "demo",
+                "host": "https://host.example",
+            }),
+            &conn,
+            "2026-06-01T00:00:00Z",
+            &c,
+        )
+        .await;
+        let ToolResult::Ok { data, .. } = result else {
+            panic!("expected Ok, got {result:?}");
+        };
+        let data = data.unwrap();
+        assert_eq!(data["project_name"], "demo");
+        let snippet: Value = serde_json::from_str(data["mcp_snippet"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            snippet["mcpServers"]["agent-mcp"]["url"],
+            "https://host.example/agent-mcp/mcp/demo"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_agent_writes_a_durable_audit_row() {
+        let conn = setup().await;
+        let op = confirmed_operator();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = RegisterAgentTool::call(
+            Some(&op),
+            &serde_json::json!({"name": "alice"}),
+            &conn,
+            "2026-06-01T00:00:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        let guard = conn.lock().await;
+        let count: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM agent_actions WHERE action_type = 'registered_agent'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
     }
 }

@@ -330,6 +330,30 @@ impl AgentRepository {
             .ok_or_else(|| CreateAgentError::Db(rusqlite::Error::QueryReturnedNoRows))
     }
 
+    /// Seeds a freshly-registered `manager`-role agent's profile with
+    /// its default charter, stamping `profile_reviewed_at =
+    /// profile_updated_at = seed_ts` so a fresh manager isn't
+    /// instantly "stale" -- `profile_updated_by` stays NULL (a seed,
+    /// not an editor, so it never fires a peer-broadcast). A 3-column
+    /// atomic UPDATE, not `update_field` (whose one-column-at-a-time
+    /// API can't express this in a single statement, and whose
+    /// `AgentField` enum doesn't cover these profile columns at all --
+    /// matches Python's own choice of a raw SQL UPDATE here instead of
+    /// its usual per-field repo helper).
+    pub fn seed_manager_profile(
+        conn: &Connection,
+        agent_id: &str,
+        profile: &str,
+        seed_ts: &str,
+    ) -> Result<()> {
+        conn.execute(
+            "UPDATE agents SET profile = ?1, profile_updated_at = ?2, \
+             profile_reviewed_at = ?3, profile_updated_by = NULL WHERE agent_id = ?4",
+            (profile, seed_ts, seed_ts, agent_id),
+        )?;
+        Ok(())
+    }
+
     /// `None` means "no agent with that `agent_id`" — the only
     /// failure mode left once [`AgentField`]'s closed enum rules out
     /// an off-allowlist field at compile time. Always bumps
@@ -997,6 +1021,32 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, CreateAgentError::InvalidAgentId(_)));
+    }
+
+    #[test]
+    fn seed_manager_profile_sets_all_three_columns_and_leaves_updated_by_null() {
+        let conn = test_conn();
+        seed(&conn, "manager-1", "tok-m1", "active");
+        AgentRepository::seed_manager_profile(
+            &conn,
+            "manager-1",
+            "You are a manager.",
+            "2026-06-01T00:00:00Z",
+        )
+        .unwrap();
+        let row = AgentRepository::get_by_id(&conn, "manager-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.profile.as_deref(), Some("You are a manager."));
+        assert_eq!(
+            row.profile_updated_at.as_deref(),
+            Some("2026-06-01T00:00:00Z")
+        );
+        assert_eq!(
+            row.profile_reviewed_at.as_deref(),
+            Some("2026-06-01T00:00:00Z")
+        );
+        assert_eq!(row.profile_updated_by, None);
     }
 
     #[test]
