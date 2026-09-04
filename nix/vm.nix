@@ -1,4 +1,4 @@
-{ config, lib, pkgs, modulesPath, src ? null, mode ? "multi", ... }@vmArgs:
+{ config, lib, pkgs, modulesPath, src ? null, mode ? "multi", craneLib ? null, ... }@vmArgs:
 # NixOS configuration consumed by `lib.nixosSystem`. The flake builds
 # one derivation per mode (`multi`, `single`). Storage is layered:
 #
@@ -116,6 +116,14 @@ let
   };
 
   llmEndpointCheckUnit = "agent-mcp-llm-endpoint-check.service";
+
+  # CoNexus Rust backend (Phase D1 step 5) — `null` when the caller
+  # doesn't pass `craneLib` (e.g. nix/vm-dev.nix's plain-function call
+  # site), which just means the `conexus@<name>.service` template is
+  # omitted (see module.nix's `conexusLauncherPackage` option doc).
+  conexusLauncher =
+    if craneLib == null then null
+    else (import ./conexus.nix { inherit pkgs lib craneLib; src = src; }).conexusLauncher;
 in
 {
   imports = [
@@ -328,6 +336,7 @@ in
     enable = true;
     mode = mode;
     src = src;
+    conexusLauncherPackage = conexusLauncher;
     externalUrl = "http://localhost:5454";
     # /var/lib lives on the qcow2 disk, which the wrapper places in
     # the user's persist dir so it survives between runs.

@@ -82,9 +82,16 @@
         # specialArgs are the only way to thread arbitrary attrs into
         # the module function signatures. _module.args works too but
         # is more verbose and would require declaring them as options.
+        # craneLib (Phase D1 step 5): nix/vm.nix's own function head
+        # declares this param, so the module system requires SOME
+        # value here even for single-tenant mode, which doesn't use
+        # it — every declared name gets resolved through specialArgs
+        # with no fallback to a `?` default (see nix/vm.nix's own
+        # comment on this exact gotcha, right above its `llm` reads).
         specialArgs = {
           src = self;
           inherit mode;
+          craneLib = crane.mkLib pkgs;
         };
         modules = [ ./nix/vm.nix ];
       }).config.system.build.vm;
@@ -210,9 +217,22 @@
       # to `self` — operators who import this flake's
       # `homeManagerModules.default` don't have to repeat the fork's
       # repo path themselves.
-      homeManagerModules.default = { ... }: {
+      # `config` is needed (not just `{ ... }:`) so `conexusLauncherPackage`
+      # below can build against WHATEVER package set the consumer's
+      # home-manager config resolves for `services.agent-mcp.pkgs`
+      # (defaults to their own `pkgs`, but is itself overridable) --
+      # never this flake's own fixed x86_64-linux `pkgs`, which would
+      # silently be wrong for a consumer on a different system.
+      homeManagerModules.default = { config, ... }: {
         imports = [ ./nix/home-manager-module.nix ];
         services.agent-mcp.source = lib.mkDefault self;
+        services.agent-mcp.conexusLauncherPackage = lib.mkDefault
+          (import ./nix/conexus.nix {
+            pkgs = config.services.agent-mcp.pkgs;
+            inherit lib;
+            src = self;
+            craneLib = crane.mkLib config.services.agent-mcp.pkgs;
+          }).conexusLauncher;
       };
       homeManagerModules.agent-mcp = self.homeManagerModules.default;
 

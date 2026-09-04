@@ -128,6 +128,22 @@ in {
         match the qemu hostfwd the wrapper script sets up.
       '';
     };
+
+    conexusLauncherPackage = lib.mkOption {
+      type = lib.types.nullOr lib.types.package;
+      default = null;
+      description = ''
+        The CoNexus Rust backend's systemd-template launcher (`nix/
+        conexus.nix`'s `conexusLauncher`), for the `conexus@<name>.service`
+        template (Phase D1 step 5, prancy-napping-pie). `null` (the
+        default) omits the template entirely — this module has no
+        direct access to the `crane` flake input, so whichever caller
+        DOES (the flake's own outputs, `nix/vm.nix`) is responsible
+        for building `nix/conexus.nix` and setting this option, the
+        same "build elsewhere, pass the package in" pattern `src`
+        already uses one option up.
+      '';
+    };
   };
 
   # NOTE: A legacy `autoProject` option used to live here, backed by
@@ -207,13 +223,16 @@ in {
 
       # Polkit rule so the router's unprivileged user can drive
       # agent-mcp@*.service via systemctl without sudo prompts.
+      # conexus@* (Phase D1 step 5) gets the SAME rule — the router's
+      # `_unit_name()` picks between the two templates per-project's
+      # `backend_impl`, so both must be manageable by the same user.
       security.polkit.enable = true;
       security.polkit.extraConfig = ''
         polkit.addRule(function(action, subject) {
           if (action.id == "org.freedesktop.systemd1.manage-units" &&
               subject.user == "${cfg.user}") {
             var unit = action.lookup("unit");
-            if (unit && (unit.indexOf("agent-mcp@") == 0)) {
+            if (unit && (unit.indexOf("agent-mcp@") == 0 || unit.indexOf("conexus@") == 0)) {
               return polkit.Result.YES;
             }
           }
@@ -281,6 +300,60 @@ in {
             "${pkgs.coreutils}/bin/rm -f ${cfg.runtimeDir}/%i/backend.sock"
           ];
           ExecStart = "${pkgs'.agentMcpLauncher}/bin/agent-mcp-launcher %i";
+          Restart = "on-failure";
+          RestartSec = 5;
+          TimeoutStopSec = 10;
+        } // systemHardening;
+      };
+
+      # `conexus@<name>.service` — the CoNexus Rust backend template
+      # (Phase D1 step 5). Structurally identical to `agent-mcp@`
+      # above (same hardening, same ExecStartPre HMAC-key/stale-socket
+      # handling, same restart budget) EXCEPT the `ExecStart` target —
+      # deliberately kept a near-duplicate rather than parameterized
+      # into one shared template, matching this repo's own precedent
+      # for genuinely-separate-lifecycle units (see e.g.
+      # project_settings_repository's doc comment on why table
+      # separation beats genericizing a near-duplicate).
+      #
+      # Decision #1 (2026-09-04, operator): SHARES `agent-mcp@`'s
+      # `RuntimeDirectory`/socket path (`agent-mcp/%i`, not a new
+      # `conexus/%i`) — a `backend_impl` flip is a same-path process
+      # swap, the cleanest rollback. The two templates never run
+      # concurrently for one project (`project_orchestrator.py::
+      # _unit_name()` picks exactly one per project's `backend_impl`),
+      # so two different unit files referencing the same runtime-dir
+      # string is safe: whichever unit is active owns it for as long
+      # as it's running, and `RuntimeDirectoryPreserve=yes` on BOTH
+      # means a flip never loses the `forwarding_hmac` key file
+      # in-flight.
+      #
+      # `null` by default (see `conexusLauncherPackage`'s option doc)
+      # — the template is omitted entirely until a caller (the flake,
+      # or `nix/vm.nix` for VM tests) actually builds `nix/conexus.nix`
+      # and sets the option, since this module has no direct access to
+      # the `crane` flake input.
+      systemd.services."conexus@" = lib.mkIf (cfg.conexusLauncherPackage != null) {
+        description = "CoNexus backend — project %i (UDS)";
+        after = [ "network.target" ];
+        startLimitBurst = 100;
+        startLimitIntervalSec = 300;
+        serviceConfig = {
+          Type = "simple";
+          User = cfg.user;
+          Group = cfg.group;
+          RuntimeDirectory = "agent-mcp/%i";
+          RuntimeDirectoryMode = "0750";
+          RuntimeDirectoryPreserve = "yes";
+          Environment = [
+            "AGENT_MCP_PROJECTS_FILE=${cfg.stateDir}/projects.local.json"
+            "AGENT_MCP_SOCK_DIR=${cfg.runtimeDir}"
+          ];
+          ExecStartPre = [
+            "${pkgs.runtimeShell} -c 'test -f \"$RUNTIME_DIRECTORY/forwarding_hmac\" || { ${pkgs.coreutils}/bin/head -c 32 /dev/urandom > \"$RUNTIME_DIRECTORY/forwarding_hmac\" && ${pkgs.coreutils}/bin/chmod 600 \"$RUNTIME_DIRECTORY/forwarding_hmac\"; }'"
+            "${pkgs.coreutils}/bin/rm -f ${cfg.runtimeDir}/%i/backend.sock"
+          ];
+          ExecStart = "${cfg.conexusLauncherPackage}/bin/conexus-launcher %i";
           Restart = "on-failure";
           RestartSec = 5;
           TimeoutStopSec = 10;

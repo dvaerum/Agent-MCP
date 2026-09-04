@@ -191,6 +191,22 @@ in {
       '';
     };
 
+    conexusLauncherPackage = lib.mkOption {
+      type = lib.types.nullOr lib.types.package;
+      default = null;
+      description = ''
+        The CoNexus Rust backend's systemd-user-template launcher
+        (`nix/conexus.nix`'s `conexusLauncher`), for the
+        `conexus@<name>.service` user template (Phase D1 step 5,
+        prancy-napping-pie). `null` (the default) omits the template
+        entirely -- this module has no direct access to the `crane`
+        flake input, so the flake's own `homeManagerModules.default`
+        wrapper sets this from its already-built `conexusPkgs`, the
+        same "build elsewhere, pass the package in" pattern `source`
+        already uses one option up.
+      '';
+    };
+
     pkgs = lib.mkOption {
       type = lib.types.pkgs;
       default = consumerPkgs;
@@ -700,6 +716,47 @@ in {
         } // hardening;
         # Not WantedBy any target — instances are started on demand by
         # the router (`systemctl --user start agent-mcp@<name>`).
+      };
+
+      # `conexus@<name>.service` — the CoNexus Rust backend user
+      # template (Phase D1 step 5). Structurally identical to
+      # `agent-mcp@` above (same RuntimeDirectory, same ExecStartPre
+      # HMAC-key/stale-socket handling, same restart budget, same
+      # hardening) except it has no `AGENT_MCP_ROUTER_DB` environment
+      # entry -- conexus-backend doesn't touch the router.db at all
+      # (no group-capability overlay from the per-project backend,
+      # matching Python's own documented behavior for this seam) --
+      # and the `ExecStart` target.
+      #
+      # Decision #1 (2026-09-04, operator): SHARES `agent-mcp@`'s
+      # `RuntimeDirectory` (`agent-mcp/%i`, not a new `conexus/%i`) --
+      # a `backend_impl` flip is a same-path process swap. See
+      # `nix/module.nix`'s parallel system-mode template for the full
+      # rationale on why sharing the runtime dir across two mutually-
+      # exclusive unit templates is safe.
+      #
+      # `null` by default (see `conexusLauncherPackage`'s option doc)
+      # -- omitted until the flake's `homeManagerModules.default`
+      # wrapper sets it from `conexusPkgs.conexusLauncher`.
+      "conexus@" = lib.mkIf (cfg.conexusLauncherPackage != null) {
+        Unit = {
+          Description = "CoNexus backend — project %i (UDS)";
+        };
+        Service = {
+          Type = "simple";
+          RuntimeDirectory = "agent-mcp/%i";
+          RuntimeDirectoryMode = "0700";
+          ExecStartPre = [
+            "${pkgs.runtimeShell} -c 'test -f \"$RUNTIME_DIRECTORY/forwarding_hmac\" || { ${pkgs.coreutils}/bin/head -c 32 /dev/urandom > \"$RUNTIME_DIRECTORY/forwarding_hmac\" && ${pkgs.coreutils}/bin/chmod 600 \"$RUNTIME_DIRECTORY/forwarding_hmac\"; }'"
+            "${pkgs.coreutils}/bin/rm -f %t/agent-mcp/%i/backend.sock"
+          ];
+          ExecStart = "${cfg.conexusLauncherPackage}/bin/conexus-launcher %i";
+          Restart = "on-failure";
+          RestartSec = 5;
+          TimeoutStopSec = 10;
+        } // hardening;
+        # Not WantedBy any target — instances are started on demand by
+        # the router (`systemctl --user start conexus@<name>`).
       };
 
       "agent-mcp-router" = {
