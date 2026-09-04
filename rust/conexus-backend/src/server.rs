@@ -21,10 +21,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
-    InitializeRequestParams, InitializeResult, ListToolsResult, PaginatedRequestParams,
-    ProgressNotificationParam, ProgressToken, ProtocolVersion, ServerCapabilities, ServerInfo,
-    Tool,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, GetPromptRequestParams,
+    GetPromptResponse, GetPromptResult, Implementation, InitializeRequestParams, InitializeResult,
+    ListPromptsResult, ListToolsResult, PaginatedRequestParams, ProgressNotificationParam,
+    ProgressToken, Prompt, PromptArgument, PromptMessage, ProtocolVersion, Role,
+    ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::{Peer, RequestContext};
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
@@ -179,12 +180,17 @@ fn tool_result_to_call_tool_result(result: &ToolResult) -> CallToolResult {
 
 impl ServerHandler for ConexusServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new(
-                "conexus-backend",
-                env!("CARGO_PKG_VERSION"),
-            ))
-            .with_protocol_version(ProtocolVersion::LATEST)
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_prompts()
+                .build(),
+        )
+        .with_server_info(Implementation::new(
+            "conexus-backend",
+            env!("CARGO_PKG_VERSION"),
+        ))
+        .with_protocol_version(ProtocolVersion::LATEST)
     }
 
     // Overrides `ServerHandler`'s provided default (which just calls
@@ -331,6 +337,80 @@ impl ServerHandler for ConexusServer {
         )
         .await;
         Ok(tool_result_to_call_tool_result(&result).into())
+    }
+
+    // Port of `mcp_list_prompts_handler` (Phase E1 PR B1) -- the
+    // Prompt Book catalogue, filtered to what `role` may see.
+    async fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListPromptsResult, McpError> {
+        let role = conexus_core::principal::catalog_role(principal_from_context(&context).as_ref());
+        let prompts = conexus_tools::prompts::list_visible(role)
+            .into_iter()
+            .map(|entry| {
+                // Python always passes `arguments=args` as a (possibly
+                // empty) list, never `None` -- match that on the wire
+                // rather than omitting the field for a zero-variable
+                // prompt.
+                let arguments = entry
+                    .variables
+                    .iter()
+                    .map(|v| {
+                        PromptArgument::new(v.name.clone())
+                            .with_description(v.description.clone())
+                            .with_required(v.required)
+                    })
+                    .collect();
+                Prompt::new(
+                    entry.id.clone(),
+                    Some(entry.description.clone()),
+                    Some(arguments),
+                )
+                .with_title(entry.title.clone())
+            })
+            .collect();
+        Ok(ListPromptsResult {
+            prompts,
+            ..Default::default()
+        })
+    }
+
+    // Port of `mcp_get_prompt_handler` (Phase E1 PR B1). Error codes
+    // match Python's `_PromptValueError`/`_PromptPermissionError`
+    // exactly: an unknown id is INVALID_PARAMS, a visibility denial is
+    // INTERNAL_ERROR (FLAG-R17-1 -- an `McpError` is the only way a
+    // handler's error carries a spec-valid JSON-RPC code through the
+    // SDK's dispatcher, in Python and here alike).
+    async fn get_prompt(
+        &self,
+        request: GetPromptRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<GetPromptResponse, McpError> {
+        let role = conexus_core::principal::catalog_role(principal_from_context(&context).as_ref());
+        let entry = conexus_tools::prompts::get(&request.name).ok_or_else(|| {
+            McpError::invalid_params(format!("Unknown prompt: {}", request.name), None)
+        })?;
+        let arguments: std::collections::HashMap<String, serde_json::Value> = request
+            .arguments
+            .map(|obj| obj.into_iter().collect())
+            .unwrap_or_default();
+        let rendered = conexus_tools::prompts::render(entry, &arguments, role).map_err(|_| {
+            McpError::internal_error(
+                format!(
+                    "Prompt {:?} is not visible to role {:?}",
+                    entry.id,
+                    role.as_str()
+                ),
+                None,
+            )
+        })?;
+        Ok(
+            GetPromptResult::new(vec![PromptMessage::new_text(Role::User, rendered)])
+                .with_description(entry.description.clone())
+                .into(),
+        )
     }
 }
 

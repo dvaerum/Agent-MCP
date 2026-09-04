@@ -124,6 +124,56 @@ pub fn is_operator_tier(principal: &Principal) -> bool {
         || principal.agent_id.as_deref() == Some("admin")
 }
 
+/// A caller's MCP-catalog role — the single value every catalog
+/// surface (`tools/list`, `prompts/list`+`prompts/get`,
+/// `resources/list`+`resources/read`) filters visibility on.
+///
+/// Faithful port of `agent_mcp/core/principal_builder.py::CatalogRole`
+/// and `catalog_role()`. Before that Python function existed, the
+/// three surfaces each re-derived "is this caller an admin"
+/// differently and disagreed (a viewer-tier forwarding-header caller
+/// resolved `"anonymous"` for `tools/list` but `"worker"` for
+/// prompts) — a single source of truth removes that drift class here
+/// too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogRole {
+    /// No authenticated Principal in flight.
+    Anonymous,
+    /// Operator-tier (`is_operator_tier`) or the legacy `"admin"`
+    /// pseudo-agent.
+    Admin,
+    /// Any other authenticated Principal — an agent bearer, or a
+    /// viewer-tier operator/forwarding-header caller. Carries read
+    /// capabilities, so the worker-tier catalog is exactly what it
+    /// can act on; `Anonymous` would wrongly hide those.
+    Worker,
+}
+
+impl CatalogRole {
+    /// Lowercase role vocabulary matching Python's own `catalog_role`
+    /// string return values (`"admin"`/`"worker"`/`"anonymous"`) --
+    /// for user-facing message text only, never for equality
+    /// comparisons (compare the enum directly for those).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CatalogRole::Anonymous => "anonymous",
+            CatalogRole::Admin => "admin",
+            CatalogRole::Worker => "worker",
+        }
+    }
+}
+
+/// The single source of truth for a caller's MCP-catalog role. See
+/// [`CatalogRole`]'s own doc for why every catalog surface routes
+/// through this one function rather than re-deriving admin-ness.
+pub fn catalog_role(principal: Option<&Principal>) -> CatalogRole {
+    match principal {
+        None => CatalogRole::Anonymous,
+        Some(p) if is_operator_tier(p) => CatalogRole::Admin,
+        Some(_) => CatalogRole::Worker,
+    }
+}
+
 /// True iff `principal` is CONFIRMED operator tier — the defense-in-
 /// depth predicate BEHIND the coarse capability gate deciding whether
 /// a caller may receive plaintext agent bearer tokens / project
@@ -166,7 +216,8 @@ pub fn is_confirmed_operator_tier(principal: &Principal) -> bool {
 mod tests {
     use crate::capability::{AgentRole, Capabilities, Capability, ProjectRole};
     use crate::principal::{
-        is_confirmed_operator_tier, is_operator_tier, Principal, PrincipalKind,
+        catalog_role, is_confirmed_operator_tier, is_operator_tier, CatalogRole, Principal,
+        PrincipalKind,
     };
 
     fn base_principal(kind: PrincipalKind, capabilities: Capabilities) -> Principal {
@@ -373,5 +424,54 @@ mod tests {
         let mut p = base_principal(PrincipalKind::ForwardingHeader, Capabilities::from_iter([]));
         p.project_role = Some(ProjectRole::Viewer);
         assert!(!is_confirmed_operator_tier(&p));
+    }
+
+    // -- catalog_role ----------------------------------------------
+
+    #[test]
+    fn no_principal_resolves_to_anonymous() {
+        assert_eq!(catalog_role(None), CatalogRole::Anonymous);
+    }
+
+    #[test]
+    fn an_operator_tier_principal_resolves_to_admin() {
+        let p = base_principal(
+            PrincipalKind::AgentBearer,
+            Capabilities::from_iter([Capability::SystemConfigWrite]),
+        );
+        assert_eq!(catalog_role(Some(&p)), CatalogRole::Admin);
+    }
+
+    #[test]
+    fn the_legacy_admin_pseudo_agent_resolves_to_admin_even_without_the_capability() {
+        let mut p = base_principal(PrincipalKind::AgentBearer, Capabilities::from_iter([]));
+        p.agent_id = Some("admin".to_string());
+        assert_eq!(catalog_role(Some(&p)), CatalogRole::Admin);
+    }
+
+    #[test]
+    fn a_plain_worker_bearer_resolves_to_worker() {
+        let p = base_principal(
+            PrincipalKind::AgentBearer,
+            Capabilities::from_iter([Capability::TasksView]),
+        );
+        assert_eq!(catalog_role(Some(&p)), CatalogRole::Worker);
+    }
+
+    #[test]
+    fn as_str_uses_pythons_lowercase_role_vocabulary() {
+        assert_eq!(CatalogRole::Anonymous.as_str(), "anonymous");
+        assert_eq!(CatalogRole::Admin.as_str(), "admin");
+        assert_eq!(CatalogRole::Worker.as_str(), "worker");
+    }
+
+    #[test]
+    fn a_viewer_tier_forwarding_header_caller_resolves_to_worker_not_anonymous() {
+        // The exact drift this function exists to close: a viewer-tier
+        // forwarding-header caller is authenticated and carries read
+        // capabilities, so it must resolve `Worker`, not `Anonymous`.
+        let mut p = base_principal(PrincipalKind::ForwardingHeader, Capabilities::from_iter([]));
+        p.project_role = Some(ProjectRole::Viewer);
+        assert_eq!(catalog_role(Some(&p)), CatalogRole::Worker);
     }
 }
