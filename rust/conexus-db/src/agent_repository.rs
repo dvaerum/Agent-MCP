@@ -261,6 +261,23 @@ impl AgentRepository {
         rows.collect()
     }
 
+    /// True iff a live (non-terminated, non-tombstone) agent row exists
+    /// for `agent_id`. Reuses [`NOT_TERMINAL_SQL`] so this predicate can
+    /// never drift from the other converged "live agent" sites
+    /// (`list_active`, `count_active_by_status`) -- matches Python's
+    /// `agent_repository.is_live_agent`, needed by `task_tools.py`'s
+    /// assignment-target validation (a task pinned on a terminated
+    /// agent, or a `[deleted-<id>]` tombstone, is unreachable work).
+    pub fn is_live(conn: &Connection, agent_id: &str) -> Result<bool> {
+        conn.query_row(
+            &format!("SELECT 1 FROM agents WHERE agent_id = ?1 AND {NOT_TERMINAL_SQL}"),
+            [agent_id],
+            |_| Ok(()),
+        )
+        .optional()
+        .map(|row| row.is_some())
+    }
+
     pub fn count_active_by_status(conn: &Connection) -> Result<HashMap<String, i64>> {
         let mut stmt = conn.prepare(&format!(
             "SELECT status, COUNT(token) FROM agents WHERE {NOT_TERMINAL_SQL} GROUP BY status"
@@ -1949,5 +1966,35 @@ mod tests {
         )
         .unwrap()
         .is_empty());
+    }
+
+    // -- is_live -----------------------------------------------------------
+
+    #[test]
+    fn is_live_true_for_an_active_agent() {
+        let conn = test_conn();
+        seed(&conn, "alice", "t1", "active");
+        assert!(AgentRepository::is_live(&conn, "alice").unwrap());
+    }
+
+    #[test]
+    fn is_live_false_for_a_terminated_agent() {
+        let conn = test_conn();
+        seed(&conn, "alice", "t1", "terminated");
+        assert!(!AgentRepository::is_live(&conn, "alice").unwrap());
+    }
+
+    #[test]
+    fn is_live_false_for_a_tombstone() {
+        let conn = test_conn();
+        AgentRepository::insert_tombstone(&conn, "t1", "[deleted-alice]", "2026-01-01T00:00:00Z")
+            .unwrap();
+        assert!(!AgentRepository::is_live(&conn, "[deleted-alice]").unwrap());
+    }
+
+    #[test]
+    fn is_live_false_for_an_unknown_agent() {
+        let conn = test_conn();
+        assert!(!AgentRepository::is_live(&conn, "nobody").unwrap());
     }
 }
