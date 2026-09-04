@@ -134,6 +134,10 @@ pub enum AgentField {
     LastActivityAt,
     LastEventSeenAt,
     AgentRole,
+    /// The AoE notification-stream session id. Added for
+    /// `edit_agent`/`admin_tools.py`'s `EDITABLE_AGENT_FIELDS` (Phase
+    /// D5) -- no prior Rust tool needed to write this column.
+    AoeSessionId,
 }
 
 impl AgentField {
@@ -148,6 +152,7 @@ impl AgentField {
             AgentField::LastActivityAt => "last_activity_at",
             AgentField::LastEventSeenAt => "last_event_seen_at",
             AgentField::AgentRole => "agent_role",
+            AgentField::AoeSessionId => "aoe_session_id",
         }
     }
 }

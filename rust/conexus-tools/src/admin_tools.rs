@@ -861,6 +861,429 @@ impl Tool for RegisterAgentTool {
     }
 }
 
+/// `agents` statuses a bearer rotation/restore refuses to act past.
+/// Port of `agent_repository.TERMINAL_AGENT_STATUSES` -- kept inline
+/// (not re-exported from `conexus-db`) since only this module's three
+/// lifecycle tools need it.
+const TERMINAL_AGENT_STATUSES: &[&str] = &["terminated", "tombstone"];
+
+pub struct RotateAgentTokenTool;
+
+impl Tool for RotateAgentTokenTool {
+    const NAME: &'static str = "rotate_agent_token";
+    const REQUIRED: Requirement = Requirement::Cap {
+        cap: Capability::AgentsRotateToken,
+        reason: None,
+    };
+    const DESCRIPTION: &'static str = "Replace an agent's bearer token, preserving its \
+        identity. The new token is shown ONCE.";
+    const SCHEMA: &'static str = r#"{
+        "type": "object",
+        "properties": {"agent_id": {"type": "string"}},
+        "required": ["agent_id"],
+        "additionalProperties": false
+    }"#;
+
+    fn call<'a>(
+        principal: Option<&'a Principal>,
+        arguments: &'a Value,
+        conn: &'a AsyncMutex<Connection>,
+        now: &'a str,
+        _ctx: &'a conexus_auth::ToolCallContext<'a>,
+    ) -> conexus_auth::BoxFuture<'a, ToolResult> {
+        Box::pin(async move {
+            let Some(agent_id) = arguments.get("agent_id").and_then(Value::as_str) else {
+                return ToolResult::Invalid {
+                    field: Some("agent_id".to_string()),
+                    message: "`agent_id` is required.".to_string(),
+                };
+            };
+
+            let guard = conn.lock().await;
+            let Some(row) =
+                (match conexus_db::agent_repository::AgentRepository::get_by_id(&guard, agent_id) {
+                    Ok(row) => row,
+                    Err(_e) => {
+                        return ToolResult::Failed {
+                            message:
+                                "A database error occurred; it has been logged. Retry, or ask \
+                            an operator to check logs."
+                                    .to_string(),
+                        }
+                    }
+                })
+            else {
+                return ToolResult::NotFound {
+                    resource: "agent".to_string(),
+                    identifier: agent_id.to_string(),
+                    hint: None,
+                };
+            };
+
+            if TERMINAL_AGENT_STATUSES.contains(&row.status.as_str()) {
+                return ToolResult::Conflict {
+                    reason: format!(
+                        "Agent '{agent_id}' is {}; restore it before rotating its token",
+                        row.status
+                    ),
+                };
+            }
+
+            let old_token = row.token;
+            let new_token = generate_token();
+            match conexus_db::agent_repository::AgentRepository::rotate_token(
+                &guard, agent_id, &new_token, now,
+            ) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return ToolResult::Failed {
+                        message: format!("Failed to rotate token for agent '{agent_id}'."),
+                    }
+                }
+                Err(_e) => {
+                    return ToolResult::Failed {
+                        message: "A database error occurred; it has been logged. Retry, or ask \
+                            an operator to check logs."
+                            .to_string(),
+                    }
+                }
+            }
+
+            let requesting_agent_id = principal.map(Principal::actor_label).unwrap_or("operator");
+            // SECURITY: suffixes only, never a plaintext bearer -- same
+            // discipline the durable audit trail applies elsewhere.
+            let old_suffix = old_token.get(old_token.len().saturating_sub(4)..);
+            let new_suffix = &new_token[new_token.len() - 4..];
+            let _ = agent_action_repository::log_agent_action(
+                &guard,
+                requesting_agent_id,
+                "rotated_agent_token",
+                None,
+                Some(&serde_json::json!({
+                    "agent_id": agent_id,
+                    "old_token_suffix": old_suffix,
+                    "new_token_suffix": new_suffix,
+                })),
+                now,
+            );
+            drop(guard);
+
+            ToolResult::Ok {
+                data: Some(serde_json::json!({"agent_id": agent_id, "token": new_token})),
+                message: Some(format!(
+                    "Agent '{agent_id}' token rotated. The previous token is revoked \
+                     immediately — hand the new one to the agent's claude session and \
+                     relaunch it. This is the only time the new token is shown."
+                )),
+            }
+        })
+    }
+}
+
+pub struct RestoreAgentTool;
+
+impl Tool for RestoreAgentTool {
+    const NAME: &'static str = "restore_agent";
+    const REQUIRED: Requirement = Requirement::Cap {
+        cap: Capability::AgentsTerminate,
+        reason: None,
+    };
+    const DESCRIPTION: &'static str = "Reverse a soft-delete: flip a terminated agent's status \
+        back to 'created'.";
+    const SCHEMA: &'static str = r#"{
+        "type": "object",
+        "properties": {"agent_id": {"type": "string"}},
+        "required": ["agent_id"],
+        "additionalProperties": false
+    }"#;
+
+    fn call<'a>(
+        principal: Option<&'a Principal>,
+        arguments: &'a Value,
+        conn: &'a AsyncMutex<Connection>,
+        now: &'a str,
+        _ctx: &'a conexus_auth::ToolCallContext<'a>,
+    ) -> conexus_auth::BoxFuture<'a, ToolResult> {
+        Box::pin(async move {
+            let Some(agent_id) = arguments.get("agent_id").and_then(Value::as_str) else {
+                return ToolResult::Invalid {
+                    field: Some("agent_id".to_string()),
+                    message: "`agent_id` is required.".to_string(),
+                };
+            };
+
+            let guard = conn.lock().await;
+            let Some(row) =
+                (match conexus_db::agent_repository::AgentRepository::get_by_id(&guard, agent_id) {
+                    Ok(row) => row,
+                    Err(_e) => {
+                        return ToolResult::Failed {
+                            message:
+                                "A database error occurred; it has been logged. Retry, or ask \
+                            an operator to check logs."
+                                    .to_string(),
+                        }
+                    }
+                })
+            else {
+                return ToolResult::NotFound {
+                    resource: "agent".to_string(),
+                    identifier: agent_id.to_string(),
+                    hint: None,
+                };
+            };
+
+            if row.status != "terminated" {
+                return ToolResult::Conflict {
+                    reason: format!(
+                        "Agent '{agent_id}' is not terminated (status={:?}); nothing to restore",
+                        row.status
+                    ),
+                };
+            }
+
+            use conexus_db::agent_repository::{AgentField, AgentRepository, FieldValue};
+            if AgentRepository::update_field(
+                &guard,
+                agent_id,
+                AgentField::Status,
+                FieldValue::Text("created".to_string()),
+                now,
+            )
+            .is_err()
+            {
+                return ToolResult::Failed {
+                    message: "A database error occurred; it has been logged. Retry, or ask an \
+                        operator to check logs."
+                        .to_string(),
+                };
+            }
+            let _ = AgentRepository::update_field(
+                &guard,
+                agent_id,
+                AgentField::TerminatedAt,
+                FieldValue::OptionalText(None),
+                now,
+            );
+
+            let requesting_agent_id = principal.map(Principal::actor_label).unwrap_or("operator");
+            let _ = agent_action_repository::log_agent_action(
+                &guard,
+                requesting_agent_id,
+                "restored_agent",
+                None,
+                Some(&serde_json::json!({"agent_id": agent_id})),
+                now,
+            );
+            drop(guard);
+
+            ToolResult::Ok {
+                data: Some(serde_json::json!({"agent_id": agent_id, "status": "created"})),
+                message: Some(format!("Agent '{agent_id}' restored")),
+            }
+        })
+    }
+}
+
+/// Whitelisted editable agent fields -- port of
+/// `EDITABLE_AGENT_FIELDS`. Anything outside this list is silently
+/// ignored (defense in depth: status/agent_id/token must never flow
+/// through the edit surface).
+const EDITABLE_AGENT_FIELDS: &[&str] = &[
+    "color",
+    "working_directory",
+    "aoe_session_id",
+    "auto_event_loop",
+    "agent_role",
+];
+
+pub struct EditAgentTool;
+
+impl Tool for EditAgentTool {
+    const NAME: &'static str = "edit_agent";
+    const REQUIRED: Requirement = Requirement::Cap {
+        cap: Capability::AgentsTerminate,
+        reason: None,
+    };
+    const DESCRIPTION: &'static str = "Update mutable agent fields (color, working_directory, \
+        aoe_session_id, auto_event_loop, agent_role).";
+    const SCHEMA: &'static str = r#"{
+        "type": "object",
+        "properties": {
+            "agent_id": {"type": "string"},
+            "color": {"type": "string"},
+            "working_directory": {"type": "string"},
+            "aoe_session_id": {"type": "string"},
+            "auto_event_loop": {"type": "boolean"},
+            "agent_role": {"type": "string"}
+        },
+        "required": ["agent_id"],
+        "additionalProperties": false
+    }"#;
+
+    fn call<'a>(
+        principal: Option<&'a Principal>,
+        arguments: &'a Value,
+        conn: &'a AsyncMutex<Connection>,
+        now: &'a str,
+        ctx: &'a conexus_auth::ToolCallContext<'a>,
+    ) -> conexus_auth::BoxFuture<'a, ToolResult> {
+        Box::pin(async move {
+            let Some(agent_id) = arguments.get("agent_id").and_then(Value::as_str) else {
+                return ToolResult::Invalid {
+                    field: Some("agent_id".to_string()),
+                    message: "`agent_id` is required.".to_string(),
+                };
+            };
+
+            let Value::Object(args_map) = arguments else {
+                return ToolResult::Invalid {
+                    field: None,
+                    message: "No editable fields supplied.".to_string(),
+                };
+            };
+            let updates: Vec<&str> = EDITABLE_AGENT_FIELDS
+                .iter()
+                .filter(|f| args_map.contains_key(**f))
+                .copied()
+                .collect();
+            if updates.is_empty() {
+                return ToolResult::Invalid {
+                    field: None,
+                    message: format!(
+                        "No editable fields supplied. Accepts any of: {}",
+                        EDITABLE_AGENT_FIELDS.join(", ")
+                    ),
+                };
+            }
+            if let Some(role) = arguments.get("agent_role").and_then(Value::as_str) {
+                if role != "worker" && role != "manager" {
+                    return ToolResult::Invalid {
+                        field: Some("agent_role".to_string()),
+                        message: format!(
+                            "Invalid agent_role {role:?}: must be 'worker' or 'manager'."
+                        ),
+                    };
+                }
+            }
+
+            use conexus_db::agent_repository::{AgentField, AgentRepository, FieldValue};
+
+            let guard = conn.lock().await;
+            match AgentRepository::get_by_id(&guard, agent_id) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return ToolResult::NotFound {
+                        resource: "agent".to_string(),
+                        identifier: agent_id.to_string(),
+                        hint: None,
+                    }
+                }
+                Err(_e) => {
+                    return ToolResult::Failed {
+                        message: "A database error occurred; it has been logged. Retry, or ask \
+                            an operator to check logs."
+                            .to_string(),
+                    }
+                }
+            }
+
+            let mut applied: Vec<&str> = Vec::with_capacity(updates.len());
+            for field in &updates {
+                let (agent_field, value) = match *field {
+                    "color" => (
+                        AgentField::Color,
+                        FieldValue::OptionalText(
+                            arguments
+                                .get("color")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                        ),
+                    ),
+                    "working_directory" => (
+                        AgentField::WorkingDirectory,
+                        FieldValue::Text(
+                            arguments
+                                .get("working_directory")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                        ),
+                    ),
+                    "aoe_session_id" => {
+                        // Clear sentinel: an explicit "" means clear
+                        // (Python's REST adapter normalizes None to ""
+                        // since a raw None gets stripped by the
+                        // dispatch layer before reaching the impl).
+                        let raw = arguments.get("aoe_session_id").and_then(Value::as_str);
+                        let cleared = raw.map(|s| {
+                            if s.is_empty() {
+                                None
+                            } else {
+                                Some(s.to_string())
+                            }
+                        });
+                        (
+                            AgentField::AoeSessionId,
+                            FieldValue::OptionalText(cleared.flatten()),
+                        )
+                    }
+                    "auto_event_loop" => (
+                        AgentField::AutoEventLoop,
+                        FieldValue::Bool(
+                            arguments
+                                .get("auto_event_loop")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false),
+                        ),
+                    ),
+                    "agent_role" => (
+                        AgentField::AgentRole,
+                        FieldValue::Text(
+                            arguments
+                                .get("agent_role")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                        ),
+                    ),
+                    _ => unreachable!("filtered to EDITABLE_AGENT_FIELDS above"),
+                };
+                if AgentRepository::update_field(&guard, agent_id, agent_field, value, now).is_err()
+                {
+                    return ToolResult::Failed {
+                        message: format!("Failed to update field {field:?}"),
+                    };
+                }
+                applied.push(field);
+            }
+
+            let requesting_agent_id = principal.map(Principal::actor_label).unwrap_or("operator");
+            let _ = agent_action_repository::log_agent_action(
+                &guard,
+                requesting_agent_id,
+                "edited_agent",
+                None,
+                Some(&serde_json::json!({"agent_id": agent_id, "fields": applied})),
+                now,
+            );
+            drop(guard);
+
+            if applied.contains(&"auto_event_loop") {
+                ctx.waiter_registry.notify(agent_id);
+            }
+
+            ToolResult::Ok {
+                data: Some(serde_json::json!({"agent_id": agent_id, "updated": applied})),
+                message: Some(format!(
+                    "Agent '{agent_id}' updated: {}",
+                    applied.join(", ")
+                )),
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1815,5 +2238,360 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    // ── RotateAgentTokenTool / RestoreAgentTool / EditAgentTool ───────
+
+    fn operator_with(caps: &[Capability]) -> Principal {
+        Principal {
+            kind: PrincipalKind::ForwardingHeader,
+            user_id: Some("op-1".to_string()),
+            agent_id: None,
+            project_name: None,
+            project_role: Some(ProjectRole::Operator),
+            agent_role: None,
+            can_wake_loop: false,
+            source_token: None,
+            capabilities: Capabilities::Set(caps.iter().copied().collect()),
+        }
+    }
+
+    #[tokio::test]
+    async fn rotate_agent_token_denies_a_plain_worker() {
+        let alice = worker();
+        let denied =
+            RotateAgentTokenTool::REQUIRED.check(Some(&alice), &conexus_auth::NoPolicyOverrides);
+        assert!(denied.is_err());
+    }
+
+    #[tokio::test]
+    async fn rotate_agent_token_replaces_the_bearer_and_returns_it_once() {
+        let conn = setup().await;
+        seed_agent(&conn, "alice", "old-token-value", "2026-06-01T00:00:00Z").await;
+        let op = operator_with(&[Capability::AgentsRotateToken]);
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = RotateAgentTokenTool::call(
+            Some(&op),
+            &serde_json::json!({"agent_id": "alice"}),
+            &conn,
+            "2026-06-01T00:01:00Z",
+            &c,
+        )
+        .await;
+        let ToolResult::Ok { data, .. } = result else {
+            panic!("expected Ok, got {result:?}");
+        };
+        let new_token = data.unwrap()["token"].as_str().unwrap().to_string();
+        assert_ne!(new_token, "old-token-value");
+        assert_eq!(new_token.len(), 32);
+        let guard = conn.lock().await;
+        let row = conexus_db::agent_repository::AgentRepository::get_by_id(&guard, "alice")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.token, new_token);
+    }
+
+    #[tokio::test]
+    async fn rotate_agent_token_missing_agent_is_not_found() {
+        let conn = setup().await;
+        let op = operator_with(&[Capability::AgentsRotateToken]);
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = RotateAgentTokenTool::call(
+            Some(&op),
+            &serde_json::json!({"agent_id": "ghost"}),
+            &conn,
+            "2026-06-01T00:00:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::NotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn rotate_agent_token_refuses_a_terminated_agent() {
+        let conn = setup().await;
+        seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
+        {
+            let guard = conn.lock().await;
+            conexus_db::agent_repository::AgentRepository::terminate(
+                &guard,
+                "alice",
+                "2026-06-01T00:00:01Z",
+            )
+            .unwrap();
+        }
+        let op = operator_with(&[Capability::AgentsRotateToken]);
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = RotateAgentTokenTool::call(
+            Some(&op),
+            &serde_json::json!({"agent_id": "alice"}),
+            &conn,
+            "2026-06-01T00:02:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Conflict { .. }));
+    }
+
+    #[tokio::test]
+    async fn rotate_agent_token_writes_a_durable_audit_row_with_suffixes_only() {
+        let conn = setup().await;
+        seed_agent(&conn, "alice", "old-token-value", "2026-06-01T00:00:00Z").await;
+        let op = operator_with(&[Capability::AgentsRotateToken]);
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = RotateAgentTokenTool::call(
+            Some(&op),
+            &serde_json::json!({"agent_id": "alice"}),
+            &conn,
+            "2026-06-01T00:01:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        let guard = conn.lock().await;
+        let details: String = guard
+            .query_row(
+                "SELECT details FROM agent_actions WHERE action_type = 'rotated_agent_token'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!details.contains("old-token-value"));
+        assert!(details.contains("alue")); // the 4-char suffix of the old token
+    }
+
+    #[tokio::test]
+    async fn restore_agent_denies_a_plain_worker() {
+        let alice = worker();
+        let denied =
+            RestoreAgentTool::REQUIRED.check(Some(&alice), &conexus_auth::NoPolicyOverrides);
+        assert!(denied.is_err());
+    }
+
+    #[tokio::test]
+    async fn restore_agent_flips_a_terminated_agent_back_to_created() {
+        let conn = setup().await;
+        seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
+        {
+            let guard = conn.lock().await;
+            conexus_db::agent_repository::AgentRepository::terminate(
+                &guard,
+                "alice",
+                "2026-06-01T00:00:01Z",
+            )
+            .unwrap();
+        }
+        let op = operator_with(&[Capability::AgentsTerminate]);
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = RestoreAgentTool::call(
+            Some(&op),
+            &serde_json::json!({"agent_id": "alice"}),
+            &conn,
+            "2026-06-01T00:02:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        let guard = conn.lock().await;
+        let row = conexus_db::agent_repository::AgentRepository::get_by_id(&guard, "alice")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "created");
+        assert_eq!(row.terminated_at, None);
+    }
+
+    #[tokio::test]
+    async fn restore_agent_refuses_a_non_terminated_agent() {
+        let conn = setup().await;
+        seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
+        let op = operator_with(&[Capability::AgentsTerminate]);
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = RestoreAgentTool::call(
+            Some(&op),
+            &serde_json::json!({"agent_id": "alice"}),
+            &conn,
+            "2026-06-01T00:01:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Conflict { .. }));
+    }
+
+    #[tokio::test]
+    async fn restore_agent_missing_agent_is_not_found() {
+        let conn = setup().await;
+        let op = operator_with(&[Capability::AgentsTerminate]);
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = RestoreAgentTool::call(
+            Some(&op),
+            &serde_json::json!({"agent_id": "ghost"}),
+            &conn,
+            "2026-06-01T00:00:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::NotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn edit_agent_denies_a_plain_worker() {
+        let alice = worker();
+        let denied = EditAgentTool::REQUIRED.check(Some(&alice), &conexus_auth::NoPolicyOverrides);
+        assert!(denied.is_err());
+    }
+
+    #[tokio::test]
+    async fn edit_agent_updates_the_color() {
+        let conn = setup().await;
+        seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
+        let op = operator_with(&[Capability::AgentsTerminate]);
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = EditAgentTool::call(
+            Some(&op),
+            &serde_json::json!({"agent_id": "alice", "color": "#123456"}),
+            &conn,
+            "2026-06-01T00:01:00Z",
+            &c,
+        )
+        .await;
+        let ToolResult::Ok { data, .. } = result else {
+            panic!("expected Ok, got {result:?}");
+        };
+        assert_eq!(data.unwrap()["updated"], serde_json::json!(["color"]));
+        let guard = conn.lock().await;
+        let row = conexus_db::agent_repository::AgentRepository::get_by_id(&guard, "alice")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.color.as_deref(), Some("#123456"));
+    }
+
+    #[tokio::test]
+    async fn edit_agent_no_editable_fields_is_invalid() {
+        let conn = setup().await;
+        seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
+        let op = operator_with(&[Capability::AgentsTerminate]);
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = EditAgentTool::call(
+            Some(&op),
+            &serde_json::json!({"agent_id": "alice"}),
+            &conn,
+            "2026-06-01T00:01:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Invalid { .. }));
+    }
+
+    #[tokio::test]
+    async fn edit_agent_rejects_an_invalid_agent_role() {
+        let conn = setup().await;
+        seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
+        let op = operator_with(&[Capability::AgentsTerminate]);
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = EditAgentTool::call(
+            Some(&op),
+            &serde_json::json!({"agent_id": "alice", "agent_role": "overlord"}),
+            &conn,
+            "2026-06-01T00:01:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Invalid { .. }));
+    }
+
+    #[tokio::test]
+    async fn edit_agent_clears_aoe_session_id_with_an_empty_string() {
+        let conn = setup().await;
+        seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
+        {
+            let guard = conn.lock().await;
+            conexus_db::agent_repository::AgentRepository::update_field(
+                &guard,
+                "alice",
+                conexus_db::agent_repository::AgentField::AoeSessionId,
+                conexus_db::agent_repository::FieldValue::OptionalText(Some(
+                    "old-session".to_string(),
+                )),
+                "2026-06-01T00:00:01Z",
+            )
+            .unwrap();
+        }
+        let op = operator_with(&[Capability::AgentsTerminate]);
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = EditAgentTool::call(
+            Some(&op),
+            &serde_json::json!({"agent_id": "alice", "aoe_session_id": ""}),
+            &conn,
+            "2026-06-01T00:02:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        let guard = conn.lock().await;
+        let row = conexus_db::agent_repository::AgentRepository::get_by_id(&guard, "alice")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.aoe_session_id, None);
+    }
+
+    #[tokio::test]
+    async fn edit_agent_toggling_auto_event_loop_wakes_the_agents_waiter() {
+        let conn = setup().await;
+        seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
+        let op = operator_with(&[Capability::AgentsTerminate]);
+        let registry = WaiterRegistry::new();
+        let (_sender, mut receiver) = registry.register("alice");
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = EditAgentTool::call(
+            Some(&op),
+            &serde_json::json!({"agent_id": "alice", "auto_event_loop": false}),
+            &conn,
+            "2026-06-01T00:01:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        assert!(receiver.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn edit_agent_missing_agent_is_not_found() {
+        let conn = setup().await;
+        let op = operator_with(&[Capability::AgentsTerminate]);
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = EditAgentTool::call(
+            Some(&op),
+            &serde_json::json!({"agent_id": "ghost", "color": "#000000"}),
+            &conn,
+            "2026-06-01T00:00:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::NotFound { .. }));
     }
 }
