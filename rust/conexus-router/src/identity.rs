@@ -626,6 +626,86 @@ pub fn update_project_membership_role(
     Ok(())
 }
 
+/// Remove exactly one of `user_id`/`group_id`'s membership row on
+/// `project_name` -- port of `delete_project_membership_handler`'s
+/// `DELETE`. `true` iff a row was removed (deliberately distinct from
+/// [`remove_project_membership_by_project`] below, which drops EVERY
+/// row for a project during project deletion -- a different contract
+/// for a different caller).
+pub fn remove_project_membership(
+    conn: &Connection,
+    project_name: &str,
+    user_id: Option<&str>,
+    group_id: Option<&str>,
+) -> Result<bool, IdentityError> {
+    let id = user_id
+        .or(group_id)
+        .expect("remove_project_membership requires exactly one of user_id or group_id");
+    let sql = if user_id.is_some() {
+        "DELETE FROM project_membership WHERE project_name = ?1 AND user_id = ?2"
+    } else {
+        "DELETE FROM project_membership WHERE project_name = ?1 AND group_id = ?2"
+    };
+    Ok(conn.execute(sql, (project_name, id))? > 0)
+}
+
+/// One row of [`list_project_memberships`] -- either a user or group
+/// membership, matching `list_project_memberships_handler`'s own
+/// "either shape, never the union" JSON projection. `membership_id`
+/// is the `u:<id>`/`g:<id>` surrogate PATCH/DELETE addresses.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProjectMembershipRow {
+    User {
+        user_id: String,
+        username: String,
+        role: String,
+    },
+    Group {
+        group_id: String,
+        name: String,
+        role: String,
+    },
+}
+
+/// Port of `list_project_memberships_handler`'s own query: every
+/// membership row for `project_name` (user or group), each carrying a
+/// renderable label via a `LEFT JOIN` against `users`/`groups`.
+/// Ordered by the member's own display label.
+pub fn list_project_memberships(
+    conn: &Connection,
+    project_name: &str,
+) -> Result<Vec<ProjectMembershipRow>, IdentityError> {
+    let mut stmt = conn.prepare(
+        "SELECT pm.user_id, pm.group_id, pm.role, u.username, g.name \
+         FROM project_membership pm \
+         LEFT JOIN users u ON pm.user_id = u.user_id \
+         LEFT JOIN groups g ON pm.group_id = g.group_id \
+         WHERE pm.project_name = ?1 \
+         ORDER BY COALESCE(u.username, g.name)",
+    )?;
+    let rows = stmt.query_map([project_name], |row| {
+        let user_id: Option<String> = row.get(0)?;
+        let group_id: Option<String> = row.get(1)?;
+        let role: String = row.get(2)?;
+        let username: Option<String> = row.get(3)?;
+        let name: Option<String> = row.get(4)?;
+        Ok(if let Some(user_id) = user_id {
+            ProjectMembershipRow::User {
+                user_id,
+                username: username.unwrap_or_default(),
+                role,
+            }
+        } else {
+            ProjectMembershipRow::Group {
+                group_id: group_id.unwrap_or_default(),
+                name: name.unwrap_or_default(),
+                role,
+            }
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
 /// Re-key every `project_membership` row from `old_name` to
 /// `new_name` -- port of `rename_project_handler`'s inline
 /// best-effort `UPDATE` (AZ-R13-1). A project rename is registry-
@@ -1188,6 +1268,85 @@ mod tests {
     fn update_project_membership_role_on_a_missing_row_is_a_noop() {
         let c = conn();
         update_project_membership_role(&c, "proj-a", Some("nobody"), None, "operator").unwrap();
+    }
+
+    #[test]
+    fn remove_project_membership_deletes_a_user_row_and_reports_whether_one_existed() {
+        let mut c = conn();
+        let uid = create_user(
+            &mut c,
+            "alice",
+            "correct horse battery staple",
+            None,
+            false,
+            true,
+            &[],
+            NOW,
+        )
+        .unwrap();
+        grant_project_membership(&c, "proj-a", Some(&uid), None, "operator").unwrap();
+        assert!(remove_project_membership(&c, "proj-a", Some(&uid), None).unwrap());
+        assert!(project_membership_role(&c, "proj-a", Some(&uid), None)
+            .unwrap()
+            .is_none());
+        assert!(!remove_project_membership(&c, "proj-a", Some(&uid), None).unwrap());
+    }
+
+    #[test]
+    fn remove_project_membership_deletes_a_group_row() {
+        let c = conn();
+        let group_id =
+            conexus_db::group_membership_repository::create_group(&c, "engineers", false, NOW)
+                .unwrap()
+                .group_id;
+        grant_project_membership(&c, "proj-a", None, Some(&group_id), "viewer").unwrap();
+        assert!(remove_project_membership(&c, "proj-a", None, Some(&group_id)).unwrap());
+    }
+
+    #[test]
+    fn list_project_memberships_projects_both_kinds() {
+        let mut c = conn();
+        let uid = create_user(
+            &mut c,
+            "alice",
+            "correct horse battery staple",
+            None,
+            false,
+            true,
+            &[],
+            NOW,
+        )
+        .unwrap();
+        let group_id =
+            conexus_db::group_membership_repository::create_group(&c, "engineers", false, NOW)
+                .unwrap()
+                .group_id;
+        grant_project_membership(&c, "proj-a", Some(&uid), None, "operator").unwrap();
+        grant_project_membership(&c, "proj-a", None, Some(&group_id), "viewer").unwrap();
+        let rows = list_project_memberships(&c, "proj-a").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0],
+            ProjectMembershipRow::User {
+                user_id: uid,
+                username: "alice".to_string(),
+                role: "operator".to_string(),
+            }
+        );
+        assert_eq!(
+            rows[1],
+            ProjectMembershipRow::Group {
+                group_id,
+                name: "engineers".to_string(),
+                role: "viewer".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn list_project_memberships_is_empty_for_an_unmembered_project() {
+        let c = conn();
+        assert!(list_project_memberships(&c, "proj-a").unwrap().is_empty());
     }
 
     #[test]
