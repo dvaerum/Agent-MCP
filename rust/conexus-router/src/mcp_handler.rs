@@ -104,6 +104,52 @@ impl std::fmt::Debug for HandlerResponse {
     }
 }
 
+/// The ONE conversion from this crate's framework-agnostic vocabulary
+/// into a real axum `Response` -- every PR23 app-wiring step's
+/// handlers/middleware return a `HandlerResponse` and let this `impl`
+/// do the framework-specific work, rather than each call site
+/// re-deriving it. `Proxied(Streaming(..))` streams straight through
+/// (`axum::body::Body::from_stream`, no full-response buffering) --
+/// the one case this crate's decision-function layer could never
+/// build directly, since `HandlerResponse` has no axum types in its
+/// own definition.
+impl axum::response::IntoResponse for HandlerResponse {
+    fn into_response(self) -> axum::response::Response {
+        let mut builder = axum::http::Response::builder().status(
+            axum::http::StatusCode::from_u16(self.status)
+                .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR),
+        );
+        for (name, value) in &self.headers {
+            if let (Ok(name), Ok(value)) = (
+                axum::http::HeaderName::try_from(name.as_str()),
+                axum::http::HeaderValue::try_from(value.as_str()),
+            ) {
+                builder = builder.header(name, value);
+            }
+        }
+        let body = match self.body {
+            HandlerBody::Empty => axum::body::Body::empty(),
+            HandlerBody::Text(s) => axum::body::Body::from(s),
+            HandlerBody::Json(v) => {
+                builder = builder.header(
+                    axum::http::header::CONTENT_TYPE,
+                    axum::http::HeaderValue::from_static("application/json"),
+                );
+                axum::body::Body::from(v.to_string())
+            }
+            HandlerBody::Proxied(proxy_core::ProxyResponseBody::Buffered(bytes)) => {
+                axum::body::Body::from(bytes)
+            }
+            HandlerBody::Proxied(proxy_core::ProxyResponseBody::Streaming(stream)) => {
+                axum::body::Body::from_stream(stream)
+            }
+        };
+        builder
+            .body(body)
+            .unwrap_or_else(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response())
+    }
+}
+
 impl HandlerResponse {
     fn proxied(resp: proxy_core::ProxyResponse) -> Self {
         Self {
