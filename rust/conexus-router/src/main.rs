@@ -32,6 +32,7 @@ mod mount;
 mod orchestrator;
 mod path_policy;
 mod project_gate;
+mod project_reads;
 mod project_registry;
 mod project_rename;
 mod project_teardown;
