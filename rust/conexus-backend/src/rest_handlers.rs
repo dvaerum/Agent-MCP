@@ -14,7 +14,7 @@ use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use conexus_core::settings_schema::SETTINGS_SCHEMA;
 use conexus_core::tool_result::ToolResult;
@@ -422,4 +422,162 @@ fn is_json_falsy(value: Option<&serde_json::Value>) -> bool {
         Some(serde_json::Value::Array(a)) => a.is_empty(),
         Some(serde_json::Value::Object(o)) => o.is_empty(),
     }
+}
+
+// -- /api/schedules (Phase E1 PR 5/14, conexus-rest-schedules) ------
+
+/// `GET /api/schedules` -- every schedule across the project's
+/// agents, matching `agent_mcp/app/routers/schedules.py::
+/// list_schedules_api_route`. Reads the repository directly (an
+/// operator-only, cross-agent, UNSCOPED view -- deliberately not
+/// dispatched through the MCP `list_scheduled_directives` tool, which
+/// is scoped to the caller's own schedules; reuses that tool's
+/// `serialize()` for an identical row shape, nothing else).
+pub async fn list_schedules(State(shared): State<Arc<SharedState>>) -> Response {
+    let guard = shared.conn.lock().await;
+    let rows = match conexus_db::scheduled_directive_repository::list_all(&guard) {
+        Ok(rows) => rows,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Failed to list schedules"})),
+            )
+                .into_response()
+        }
+    };
+    drop(guard);
+    let schedules: Vec<_> = rows
+        .iter()
+        .map(conexus_tools::scheduled_directive_tools::serialize)
+        .collect();
+    Json(json!({"schedules": schedules})).into_response()
+}
+
+/// `POST /api/schedules` -- operator creates a schedule for any agent.
+/// Matches `create_schedule_api_route`: the whole decoded body is
+/// threaded straight through as the tool's arguments.
+pub async fn create_schedule(
+    State(shared): State<Arc<SharedState>>,
+    Extension(resolved): Extension<ResolvedRestPrincipal>,
+    body: Bytes,
+) -> Response {
+    let data = match decode_untrusted_body(&body) {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
+    };
+    let principal = resolved.dispatch_principal.clone();
+    dispatch_schedule_tool(
+        &shared,
+        "create_scheduled_directive",
+        Value::Object(data),
+        &principal,
+        "Failed to create schedule",
+    )
+    .await
+}
+
+/// `PUT /api/schedules/{directive_id}` -- edit / pause / resume.
+/// Matches `update_schedule_api_route`: the decoded body plus the
+/// path's `directive_id` become the tool's arguments.
+pub async fn update_schedule(
+    Path(directive_id): Path<String>,
+    State(shared): State<Arc<SharedState>>,
+    Extension(resolved): Extension<ResolvedRestPrincipal>,
+    body: Bytes,
+) -> Response {
+    let mut data = match decode_untrusted_body(&body) {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
+    };
+    data.insert("directive_id".to_string(), Value::String(directive_id));
+    let principal = resolved.dispatch_principal.clone();
+    dispatch_schedule_tool(
+        &shared,
+        "update_scheduled_directive",
+        Value::Object(data),
+        &principal,
+        "Failed to update schedule",
+    )
+    .await
+}
+
+/// `DELETE /api/schedules/{directive_id}` -- remove a schedule
+/// permanently. Matches `delete_schedule_api_route`: no body, just
+/// the path's `directive_id`.
+pub async fn delete_schedule(
+    Path(directive_id): Path<String>,
+    State(shared): State<Arc<SharedState>>,
+    Extension(resolved): Extension<ResolvedRestPrincipal>,
+) -> Response {
+    let principal = resolved.dispatch_principal.clone();
+    let arguments = json!({"directive_id": directive_id});
+    dispatch_schedule_tool(
+        &shared,
+        "delete_scheduled_directive",
+        arguments,
+        &principal,
+        "Failed to delete schedule",
+    )
+    .await
+}
+
+/// Shared dispatch + envelope for the 3 mutating `/api/schedules`
+/// handlers above. Matches `_tool_result_to_response`: `Ok` ->
+/// `{"success": true, ...result.data}` (the tool's OWN data spread at
+/// the top level -- `{"directive": {...}}` for create/update,
+/// `{"deleted": id}` for delete; NOT the bespoke fixed-message
+/// envelope `/api/memories` uses -- each router keeps its own real,
+/// pre-existing shape, not a shared one this migration invents).
+/// Every other variant -> `to_http`'s status with `{"error": <the
+/// body's own "message" field>}`, falling back to "Request rejected"
+/// if that field is ever absent (never observed in practice -- every
+/// `ToolResult::to_http` body always sets one).
+async fn dispatch_schedule_tool(
+    shared: &Arc<SharedState>,
+    tool_name: &str,
+    arguments: Value,
+    principal: &conexus_core::principal::Principal,
+    fallback_500: &str,
+) -> Response {
+    let result = match dispatch_rest_tool(shared, tool_name, arguments, Some(principal)).await {
+        Ok(r) => r,
+        Err(()) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": fallback_500})),
+            )
+                .into_response()
+        }
+    };
+    if let ToolResult::Ok { data, .. } = &result {
+        let mut body = json!({"success": true});
+        if let Some(Value::Object(extra)) = data {
+            if let Value::Object(map) = &mut body {
+                map.extend(extra.clone());
+            }
+        }
+        return Json(body).into_response();
+    }
+    let (status, http_body) = result.to_http();
+    let message = http_body
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("Request rejected");
+    (
+        StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        Json(json!({"error": message})),
+    )
+        .into_response()
 }
