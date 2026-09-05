@@ -11,17 +11,20 @@
 //! [`project_mutation_precheck`] is the ONE function both call.
 //!
 //! The actual `systemctl stop`/`is-active` AWAIT and the
-//! `_ensure_lock` it runs inside are PR 23's job -- this crate's own
-//! established deferral (see `project_gate.rs`'s module doc) for the
-//! same reason: `session_gate.rs`/`project_gate.rs` already prove the
-//! DB-side re-check needs no async, and inventing a generic async
-//! fusion wrapper ahead of axum's real yield-point shape would be
-//! guessing. [`finish_delete_project`]/[`finish_stop_project`] are the
-//! synchronous mutation that runs AFTER that (deferred) await
-//! resolves -- they take no systemctl result as input because neither
-//! Python handler branches on it (a delete/stop's final state-clear is
-//! unconditional either way, per BL-R36-1's own "even when the unit
-//! was already inactive" fix).
+//! `_ensure_lock` it runs inside were PR 23's job -- wired for real
+//! in `lifecycle_rest.rs` (step 6c), using `perm_gates::
+//! revalidated_lock`/`revalidate_after` fused around
+//! `orchestrator::primitives::systemctl`/`is_active`.
+//! [`finish_delete_project`]/[`finish_stop_project`] are the
+//! synchronous mutation that runs AFTER that await resolves --
+//! **corrected from an earlier claim in this doc**: delete's stop
+//! result IS ignored (BL-R36-1: the unregister/purge proceeds
+//! unconditionally, even when the unit was already inactive or the
+//! stop itself failed), but stop's own handler DOES branch on it (a
+//! nonzero `systemctl stop` return code is a 500, and
+//! `finish_stop_project` is never called in that case) -- the two
+//! handlers are NOT symmetric here, confirmed by re-reading the real
+//! Python source, not assumed from the file's own earlier framing.
 #![allow(dead_code)]
 
 use std::path::Path;
@@ -40,6 +43,36 @@ use crate::project_registry::ProjectRegistry;
 /// immediately before the destructive stop).
 pub fn active_connections(store: &RuntimeStore, name: &str) -> u32 {
     store.snapshot(name).map(|rt| rt.active_conns).unwrap_or(0)
+}
+
+/// Port of the shared "conns > 0" 409 -- extracted once a SECOND real
+/// call site needed the identical shape: `project_mutation_precheck`'s
+/// own entry-time probe, and [`active_sessions_recheck`]'s in-lock
+/// TOCTOU re-check (gap 8 from PR23 step 6's own research -- Python
+/// hand-duplicates this exact branch at both call sites; a Rust
+/// handler author gets it once instead).
+fn active_sessions_response(store: &RuntimeStore, name: &str) -> Option<HandlerResponse> {
+    let conns = active_connections(store, name);
+    if conns > 0 {
+        Some(lifecycle::error_envelope(
+            LifecycleError::ActiveSessions,
+            &format!("{name:?} has {conns} active connection(s); disconnect them and retry"),
+            Some(serde_json::json!({"active_connections": conns, "agents": []})),
+        ))
+    } else {
+        None
+    }
+}
+
+/// The IN-LOCK re-check both `delete_project_handler`/
+/// `stop_project_handler` run immediately before their destructive
+/// `systemctl stop` (R3-F3/BL-R6-1: the entry-time probe above ran
+/// OUTSIDE the lock and is never re-checked on its own -- a client
+/// whose stream starts connecting in the window between that check
+/// and the actual stop must still get the clean 409 rather than
+/// racing the teardown).
+pub fn active_sessions_recheck(store: &RuntimeStore, name: &str) -> Option<HandlerResponse> {
+    active_sessions_response(store, name)
 }
 
 #[derive(Debug)]
@@ -97,15 +130,76 @@ pub fn project_mutation_precheck(
             None,
         )));
     }
-    let conns = active_connections(store, name);
-    if conns > 0 {
-        return Ok(MutationPrecheck::Rejected(lifecycle::error_envelope(
-            LifecycleError::ActiveSessions,
-            &format!("{name:?} has {conns} active connection(s); disconnect them and retry"),
-            Some(serde_json::json!({"active_connections": conns, "agents": []})),
-        )));
+    if let Some(resp) = active_sessions_response(store, name) {
+        return Ok(MutationPrecheck::Rejected(resp));
     }
     Ok(MutationPrecheck::Proceed)
+}
+
+/// Port of `?delete_workspace=true`'s truthy-string parsing
+/// (`{"true","1","yes","on"}`, case-insensitive) -- `delete_project_
+/// handler`'s own opt-in for recursive workspace removal.
+pub fn parse_delete_workspace_flag(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(|s| s.to_ascii_lowercase()).as_deref(),
+        Some("true") | Some("1") | Some("yes") | Some("on")
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceDeleteOutcome {
+    pub deleted: bool,
+    pub skipped_reason: Option<String>,
+}
+
+/// Port of `delete_project_handler`'s `?delete_workspace=true` opt-in
+/// recursive workspace removal. Runs BEFORE the lock, exactly like
+/// Python -- a standalone, synchronous mutation genuinely separate
+/// from the stop+unregister the lock protects (moving it inside would
+/// change no safety property Python's own placement cares about).
+///
+/// SD-R15: `skipped_reason` must never carry the resolved ABSOLUTE
+/// workspace path (server home dir / deployment filesystem layout) --
+/// only a generic category. `std::io::Error`'s own `Display` already
+/// omits the path for a bare `remove_dir_all` failure (unlike some of
+/// Python's `OSError` variants), so no extra scrubbing is needed here.
+pub fn maybe_delete_workspace(
+    workspace_path: &Path,
+    default_workspace_parent: &Path,
+    want_delete: bool,
+) -> WorkspaceDeleteOutcome {
+    if !want_delete {
+        return WorkspaceDeleteOutcome {
+            deleted: false,
+            skipped_reason: None,
+        };
+    }
+    if !lifecycle::is_within_default_workspace(workspace_path, default_workspace_parent) {
+        return WorkspaceDeleteOutcome {
+            deleted: false,
+            skipped_reason: Some(
+                "workspace resolves outside the default workspace parent; refusing recursive delete"
+                    .to_string(),
+            ),
+        };
+    }
+    if workspace_path.exists() {
+        match std::fs::remove_dir_all(workspace_path) {
+            Ok(()) => WorkspaceDeleteOutcome {
+                deleted: true,
+                skipped_reason: None,
+            },
+            Err(e) => WorkspaceDeleteOutcome {
+                deleted: false,
+                skipped_reason: Some(format!("could not delete project workspace: {e}")),
+            },
+        }
+    } else {
+        WorkspaceDeleteOutcome {
+            deleted: true,
+            skipped_reason: Some("workspace did not exist on disk".to_string()),
+        }
+    }
 }
 
 /// Port of `delete_project_handler`'s post-`systemctl stop` mutation:
@@ -197,6 +291,124 @@ mod tests {
         "2026-01-01T00:00:00Z".parse().unwrap()
     }
     const NOW_STR: &str = "2026-01-01T00:00:00.000+00:00";
+
+    // -- parse_delete_workspace_flag ------------------------------------
+
+    #[test]
+    fn parse_delete_workspace_flag_accepts_the_documented_truthy_strings() {
+        for s in ["true", "TRUE", "1", "yes", "YES", "on"] {
+            assert!(
+                parse_delete_workspace_flag(Some(s)),
+                "{s:?} should be truthy"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_delete_workspace_flag_rejects_everything_else() {
+        for s in [None, Some(""), Some("false"), Some("0"), Some("no")] {
+            assert!(!parse_delete_workspace_flag(s), "{s:?} should be falsy");
+        }
+    }
+
+    // -- maybe_delete_workspace ------------------------------------------
+
+    #[test]
+    fn maybe_delete_workspace_is_a_noop_when_not_requested() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("parent").join("proj-a");
+        std::fs::create_dir_all(&ws).unwrap();
+        let outcome = maybe_delete_workspace(&ws, &dir.path().join("parent"), false);
+        assert_eq!(
+            outcome,
+            WorkspaceDeleteOutcome {
+                deleted: false,
+                skipped_reason: None
+            }
+        );
+        assert!(ws.exists(), "a non-requested delete must not touch the dir");
+    }
+
+    #[test]
+    fn maybe_delete_workspace_refuses_a_workspace_outside_the_default_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("parent");
+        let outside = dir.path().join("elsewhere").join("proj-a");
+        std::fs::create_dir_all(&outside).unwrap();
+        let outcome = maybe_delete_workspace(&outside, &parent, true);
+        assert!(!outcome.deleted);
+        assert_eq!(
+            outcome.skipped_reason.as_deref(),
+            Some(
+                "workspace resolves outside the default workspace parent; refusing recursive delete"
+            )
+        );
+        assert!(outside.exists(), "refused delete must not touch the dir");
+        assert!(
+            !outcome
+                .skipped_reason
+                .unwrap()
+                .contains(&outside.to_string_lossy().to_string()),
+            "SD-R15: skipped_reason must never leak the absolute path"
+        );
+    }
+
+    #[test]
+    fn maybe_delete_workspace_recursively_removes_a_real_workspace_within_the_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("parent");
+        let ws = parent.join("proj-a");
+        std::fs::create_dir_all(ws.join("nested")).unwrap();
+        std::fs::write(ws.join("nested").join("file.txt"), b"data").unwrap();
+
+        let outcome = maybe_delete_workspace(&ws, &parent, true);
+
+        assert_eq!(
+            outcome,
+            WorkspaceDeleteOutcome {
+                deleted: true,
+                skipped_reason: None
+            }
+        );
+        assert!(!ws.exists());
+    }
+
+    #[test]
+    fn maybe_delete_workspace_treats_an_already_absent_workspace_as_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("parent");
+        std::fs::create_dir_all(&parent).unwrap();
+        let ws = parent.join("proj-a"); // never created
+
+        let outcome = maybe_delete_workspace(&ws, &parent, true);
+
+        assert!(outcome.deleted);
+        assert_eq!(
+            outcome.skipped_reason.as_deref(),
+            Some("workspace did not exist on disk")
+        );
+    }
+
+    // -- active_sessions_recheck -------------------------------------------
+
+    #[test]
+    fn active_sessions_recheck_is_none_when_the_project_is_idle() {
+        let store = RuntimeStore::default();
+        assert!(active_sessions_recheck(&store, "proj-a").is_none());
+    }
+
+    #[test]
+    fn active_sessions_recheck_matches_the_entry_time_409_shape() {
+        let store = RuntimeStore::default();
+        store.with_runtime_mut("proj-a", |rt| rt.active_conns = 3);
+        let resp = active_sessions_recheck(&store, "proj-a").unwrap();
+        assert_eq!(resp.status, 409);
+        let HandlerBody::Json(body) = resp.body else {
+            panic!("expected JSON");
+        };
+        assert_eq!(body["error"], "active_sessions");
+        assert_eq!(body["active_connections"], 3);
+    }
 
     fn registry_with(dir: &std::path::Path, name: &str) -> ProjectRegistry {
         let registry = ProjectRegistry::new(dir.join("projects.local.json"));
