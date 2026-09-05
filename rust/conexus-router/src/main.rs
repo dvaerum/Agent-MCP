@@ -24,6 +24,7 @@
 
 mod identity;
 mod mount;
+mod orchestrator;
 mod path_policy;
 mod project_registry;
 

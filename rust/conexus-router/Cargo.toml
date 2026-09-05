@@ -56,3 +56,13 @@ fd-lock = "4"
 # race test (see below), here as a REAL (not dev) dependency since
 # production code needs it, not just tests.
 tempfile = "3"
+# orchestrator/runtime.rs's per-(name, role) ensure-lock registry
+# (Phase E2 PR 6a) needs an ATOMIC get-or-insert-of-a-lock -- a plain
+# `Mutex<HashMap<K, Arc<Mutex<()>>>>`'s "read, maybe insert" is a
+# real TOCTOU here (unlike `WaiterRegistry`'s own `Mutex<HashMap<...>>`
+# elsewhere in this workspace, which never races two callers creating
+# DIFFERENT channel instances for the same key). No existing workspace
+# precedent for this choice (same "genuinely new, no fork to resolve"
+# shape as the argon2/fd-lock picks in PRs 3/5); `dashmap` is the
+# de facto standard for exactly this shape.
+dashmap = "6"
