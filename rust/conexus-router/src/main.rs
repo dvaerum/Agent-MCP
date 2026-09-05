@@ -27,6 +27,7 @@ mod mount;
 mod orchestrator;
 mod path_policy;
 mod project_registry;
+mod proxy_client;
 
 use std::net::SocketAddr;
 

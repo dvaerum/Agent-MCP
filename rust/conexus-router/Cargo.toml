@@ -72,3 +72,18 @@ tempfile = "3"
 # shape as the argon2/fd-lock picks in PRs 3/5); `dashmap` is the
 # de facto standard for exactly this shape.
 dashmap = "6"
+# proxy_client.rs (Phase E2 PR 7) -- the UDS-dialing HTTP client
+# primitive `conexus-backend::uds.rs` doesn't provide (that module is
+# server-side only). Matches the exact hyper-over-UnixStream pattern
+# already PROVEN in this workspace as a test-only tool
+# (`conexus-backend`'s own dev-dependency `hyper` "client" feature,
+# used to drive its UDS accept loop end-to-end) -- this promotes that
+# pattern into a real production primitive rather than picking a new
+# HTTP-client crate; no off-the-shelf client (reqwest included) speaks
+# Unix sockets without an extra connector crate. `hyper-util`/
+# `http-body-util`/`bytes` are all already resolved workspace-wide
+# (transitive deps of axum/hyper), added here as direct edges only.
+hyper = { version = "1", features = ["http1", "client"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
