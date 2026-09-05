@@ -25,6 +25,7 @@
 mod identity;
 mod mount;
 mod path_policy;
+mod project_registry;
 
 use std::net::SocketAddr;
 
