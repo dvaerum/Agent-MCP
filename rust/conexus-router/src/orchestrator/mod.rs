@@ -26,4 +26,5 @@
 // identity.rs/project_registry.rs).
 #![allow(dead_code)]
 
+pub mod primitives;
 pub mod runtime;
