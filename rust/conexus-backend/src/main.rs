@@ -163,7 +163,8 @@ async fn main() -> Result<()> {
     // same-path-different-method merge semantics.
     let api_public = Router::new()
         .route("/prompts/catalog", get(rest_handlers::prompts_catalog))
-        .route("/tasks", get(rest_handlers::list_tasks));
+        .route("/tasks", get(rest_handlers::list_tasks))
+        .route("/agents", get(rest_handlers::list_agents_dashboard));
     let api_authenticated = Router::new()
         .route("/settings-schema", get(rest_handlers::settings_schema))
         .route("/memories", post(rest_handlers::create_memory))
@@ -223,6 +224,27 @@ async fn main() -> Result<()> {
         .route(
             "/messages/{message_id}",
             patch(rest_handlers::patch_message).delete(rest_handlers::delete_message),
+        )
+        .route(
+            "/agents/register",
+            post(rest_handlers::register_agent_dashboard),
+        )
+        .route(
+            "/agents/{agent_id}/restore",
+            post(rest_handlers::restore_agent),
+        )
+        .route("/agents/{agent_id}/edit", post(rest_handlers::edit_agent))
+        .route(
+            "/agents/{agent_id}/rotate-token",
+            post(rest_handlers::rotate_agent_token),
+        )
+        .route(
+            "/agents/{agent_id}/purge-preview",
+            get(rest_handlers::agent_purge_preview),
+        )
+        .route(
+            "/agents/{agent_id}",
+            axum::routing::delete(rest_handlers::purge_agent),
         )
         .fallback(api_not_found)
         .layer(middleware::from_fn_with_state(

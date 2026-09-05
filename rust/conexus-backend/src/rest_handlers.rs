@@ -2549,3 +2549,576 @@ pub async fn delete_message(
             .into_response()
     }
 }
+
+// -- /api/agents (Phase E1 PR 11/14, conexus-rest-agents-crud) -----
+//
+// `agent_mcp/app/routers/agents.py`'s CRUD half: list, register,
+// restore, edit, rotate-token, purge-preview, purge. The lifecycle
+// half (disconnect/reconnect/directive -- touches live-stream +
+// waiter-wake runtime state, "different risk profile" per that
+// router's own module doc) is its own follow-up PR.
+//
+// `register_agent`/`restore_agent`/`edit_agent`/`rotate_agent_token`/
+// `purge_agent` are all already-registered MCP tools (unlike
+// messages.py's create/broadcast) -- these handlers are thin
+// `dispatch_rest_tool` adapters, matching `create_task`/`delete_task`'s
+// established shape, each with its own bespoke field-flattening since
+// none of their real response envelopes match the generic
+// `dispatch_through_tool` shape (a flat `{"success", "agent_id", ...}`
+// body, not `{"success", "message", "data": {...}}`).
+
+/// `GET /api/agents[?status=&limit=]` -- matches `agents_list_api_route`
+/// EXACTLY, including its genuinely no-auth-by-design admission
+/// (Python's own docstring: "the router-level gate is deferred to a
+/// follow-up PR") -- mounted on `api_public`, not behind `rest_gate`.
+/// `status=tombstone` always returns empty (an internal DB state, never
+/// operator-queryable) via `AgentRepository::list_for_dashboard`'s own
+/// SQL-level exclusion.
+///
+/// **Documented scope gap, same shape as `/api/all-data`'s (PR 9)**:
+/// Python's `_mcp_presence_for` merges the waiter-registry PRIMARY
+/// signal with a `core.session_registry`-derived SECONDARY signal (live
+/// SSE streams, also `last_mcp_connection`'s source) and a
+/// `features.delivery_transport` status. Neither `session_registry` nor
+/// `delivery_transport` has a Rust equivalent yet -- this port
+/// implements the primary (waiter) signal only; `transport_status` is
+/// always `null`. Tracked to close once that SSE/pub-sub subsystem
+/// exists (this phase's own remaining PRs), not guessed at early.
+pub async fn list_agents_dashboard(
+    State(shared): State<Arc<SharedState>>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let status_filter = params.get("status").map(String::as_str);
+    if status_filter == Some("tombstone") {
+        return Json(Value::Array(Vec::new())).into_response();
+    }
+    let limit = crate::read_limits::clamp_section_limit(params.get("limit").map(String::as_str));
+
+    let guard = shared.conn.lock().await;
+    let global_loop_on = conexus_db::project_settings_repository::get_bool(
+        &guard,
+        "config_auto_event_loop_global",
+        true,
+    );
+    let rows = conexus_db::agent_repository::AgentRepository::list_for_dashboard(
+        &guard,
+        status_filter,
+        limit,
+    );
+    drop(guard);
+
+    let rows = match rows {
+        Ok(r) => r,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Failed to fetch agents list"})),
+            )
+                .into_response()
+        }
+    };
+
+    let agents_data: Vec<Value> = rows
+        .iter()
+        .map(|a| {
+            // Same Authoritative-Disconnect formula as `/api/all-data`
+            // (PR 9) -- see this fn's own doc for the documented gap.
+            let paused = !a.auto_event_loop || !global_loop_on;
+            let online = !paused && shared.waiter_registry.waiter_count(&a.agent_id) > 0;
+            json!({
+                "agent_id": a.agent_id,
+                "status": a.status,
+                "color": a.color,
+                "created_at": a.created_at,
+                "current_task": a.current_task,
+                "last_activity_at": a.last_activity_at,
+                "auto_event_loop": a.auto_event_loop,
+                "online": online,
+                "last_mcp_connection": if online { a.last_activity_at.clone() } else { None },
+                "transport_status": Value::Null,
+            })
+        })
+        .collect();
+
+    Json(Value::Array(agents_data)).into_response()
+}
+
+/// `POST /api/agents/register` -- operator mints an agent identity,
+/// matching `register_agent_dashboard_api_route`. Dispatches the
+/// registered `register_agent` tool; the response fields are RENAMED
+/// from the tool's own `Ok.data` shape (`token` -> `agent_token`) to
+/// match this route's historical wire contract, preserved verbatim.
+pub async fn register_agent_dashboard(
+    State(shared): State<Arc<SharedState>>,
+    Extension(resolved): Extension<ResolvedRestPrincipal>,
+    body: Bytes,
+) -> Response {
+    let data = match decode_untrusted_body(&body) {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"message": e.to_string()})),
+            )
+                .into_response()
+        }
+    };
+
+    let name = data
+        .get("name")
+        .and_then(Value::as_str)
+        .or_else(|| data.get("agent_id").and_then(Value::as_str));
+    let role = data
+        .get("role")
+        .and_then(Value::as_str)
+        .or_else(|| data.get("agent_role").and_then(Value::as_str))
+        .unwrap_or("worker");
+    let project_name = data.get("project_name").and_then(Value::as_str);
+    let host = data.get("host").and_then(Value::as_str);
+    let mount_prefix = data.get("mount_prefix").and_then(Value::as_str);
+
+    let Some(name) = name.filter(|s| !s.is_empty()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"message": "`name` (agent_id) is required."})),
+        )
+            .into_response();
+    };
+    if role != "worker" && role != "manager" {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"message": format!("Invalid role {role:?}: must be 'worker' or 'manager'.")})),
+        )
+            .into_response();
+    }
+
+    let mut arguments = json!({"name": name, "role": role});
+    if let Some(p) = project_name.filter(|s| !s.is_empty()) {
+        arguments["project_name"] = json!(p);
+    }
+    if let Some(h) = host.filter(|s| !s.is_empty()) {
+        arguments["host"] = json!(h);
+    }
+    if let Some(m) = mount_prefix {
+        arguments["mount_prefix"] = json!(m);
+    }
+
+    let principal = resolved.dispatch_principal.clone();
+    let result =
+        match dispatch_rest_tool(&shared, "register_agent", arguments, Some(&principal)).await {
+            Ok(r) => r,
+            Err(()) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"message": "Error registering agent"})),
+                )
+                    .into_response()
+            }
+        };
+
+    if let ToolResult::Ok { data, message } = &result {
+        let payload = data.clone().unwrap_or(Value::Null);
+        return Json(json!({
+            "message": message.clone().unwrap_or_else(|| format!("Agent '{name}' registered.")),
+            "agent_id": payload.get("agent_id"),
+            "agent_token": payload.get("token"),
+            "agent_role": payload.get("agent_role"),
+            "mcp_snippet": payload.get("mcp_snippet"),
+            "project_name": payload.get("project_name"),
+        }))
+        .into_response();
+    }
+    let (status, _) = result.to_http();
+    let message = result.error_message("Error registering agent", None);
+    (
+        StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        Json(json!({"message": message})),
+    )
+        .into_response()
+}
+
+/// `POST /api/agents/{id}/restore` -- reverse a soft-delete, matching
+/// `restore_agent_api_route`.
+pub async fn restore_agent(
+    Path(agent_id): Path<String>,
+    State(shared): State<Arc<SharedState>>,
+    Extension(resolved): Extension<ResolvedRestPrincipal>,
+    body: Bytes,
+) -> Response {
+    if let Err(e) = decode_untrusted_body(&body) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
+    let arguments = json!({"agent_id": agent_id});
+    let principal = resolved.dispatch_principal.clone();
+    let result =
+        match dispatch_rest_tool(&shared, "restore_agent", arguments, Some(&principal)).await {
+            Ok(r) => r,
+            Err(()) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "Failed to restore agent"})),
+                )
+                    .into_response()
+            }
+        };
+    if let ToolResult::Ok { data, message } = &result {
+        let payload = data.clone().unwrap_or(Value::Null);
+        return Json(json!({
+            "success": true,
+            "agent_id": payload.get("agent_id"),
+            "status": payload.get("status"),
+            "message": message.clone().unwrap_or_else(|| format!("Agent '{agent_id}' restored")),
+        }))
+        .into_response();
+    }
+    let (status, _) = result.to_http();
+    let message = result.error_message("Failed to restore agent", Some("Agent"));
+    (
+        StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        Json(json!({"error": message})),
+    )
+        .into_response()
+}
+
+/// `POST /api/agents/{id}/edit` -- update mutable fields (+ the
+/// operator-curated `profile`, which bypasses the tool entirely and
+/// goes through `AgentRepository::review_profile` directly, matching
+/// Python's own out-of-band handling), matching `edit_agent_api_route`.
+pub async fn edit_agent(
+    Path(agent_id): Path<String>,
+    State(shared): State<Arc<SharedState>>,
+    Extension(resolved): Extension<ResolvedRestPrincipal>,
+    body: Bytes,
+) -> Response {
+    let data = match decode_untrusted_body(&body) {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
+    };
+
+    const EDITABLE_AGENT_FIELDS: [&str; 5] = [
+        "color",
+        "working_directory",
+        "aoe_session_id",
+        "auto_event_loop",
+        "agent_role",
+    ];
+    let mut updates: serde_json::Map<String, Value> = serde_json::Map::new();
+    for field in EDITABLE_AGENT_FIELDS {
+        if let Some(v) = data.get(field) {
+            updates.insert(field.to_string(), v.clone());
+        }
+    }
+
+    let profile_supplied = data.contains_key("profile");
+    let profile_value = data.get("profile");
+    if profile_supplied {
+        if let Some(resp) = require_str(profile_value, "profile") {
+            return resp;
+        }
+    }
+
+    if let Some(role) = updates.get("agent_role").and_then(Value::as_str) {
+        if role != "worker" && role != "manager" {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({"error": format!("Invalid agent_role {role:?}: must be 'worker' or 'manager'.")})),
+            )
+                .into_response();
+        }
+    }
+
+    if updates.is_empty() && !profile_supplied {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!(
+                "No editable fields supplied. Accepts any of: {}, profile",
+                EDITABLE_AGENT_FIELDS.join(", ")
+            )})),
+        )
+            .into_response();
+    }
+
+    for field in ["color", "working_directory"] {
+        if let Some(resp) = require_str(updates.get(field), field) {
+            return resp;
+        }
+    }
+    if let Some(v) = updates.get("auto_event_loop") {
+        if !v.is_boolean() && !v.is_number() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "auto_event_loop must be a boolean"})),
+            )
+                .into_response();
+        }
+    }
+    if let Some(raw) = updates.get("aoe_session_id") {
+        let is_clear = raw.is_null() || raw.as_str() == Some("");
+        if is_clear {
+            updates.insert("aoe_session_id".to_string(), json!(""));
+        } else {
+            let valid = raw
+                .as_str()
+                .filter(|s| {
+                    s.len() == 16
+                        && s.chars()
+                            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+                })
+                .is_some();
+            if !valid {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": format!(
+                        "aoe_session_id must be 16 lowercase hex chars or empty (got {raw:?})"
+                    )})),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    let mut updated_fields: serde_json::Map<String, Value> = serde_json::Map::new();
+
+    if !updates.is_empty() {
+        let mut arguments = Value::Object(updates.clone());
+        arguments["agent_id"] = json!(agent_id);
+        let principal = resolved.dispatch_principal.clone();
+        let result =
+            match dispatch_rest_tool(&shared, "edit_agent", arguments, Some(&principal)).await {
+                Ok(r) => r,
+                Err(()) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": "Failed to edit agent"})),
+                    )
+                        .into_response()
+                }
+            };
+        match &result {
+            ToolResult::Ok { .. } => {
+                // The REST response echoes back the fields THIS request
+                // just wrote, from the request's own already-validated
+                // values -- decoupled from `EditAgentTool::Ok.data`'s
+                // exact shape (a plain field-name array, not a
+                // field->value dict) so a future change to that tool's
+                // internal response shape can't silently break this
+                // route's wire contract.
+                for (k, v) in &updates {
+                    updated_fields.insert(k.clone(), v.clone());
+                }
+            }
+            _ => {
+                let (status, _) = result.to_http();
+                let message = result.error_message("Failed to edit agent", Some("Agent"));
+                return (
+                    StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                    Json(json!({"error": message})),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    if profile_supplied {
+        let new_profile = profile_value.and_then(Value::as_str).unwrap_or("");
+        let now = chrono::Utc::now().to_rfc3339();
+        let operator_id = resolved.admission.caller_identity();
+        let guard = shared.conn.lock().await;
+        let reviewed = conexus_db::agent_repository::AgentRepository::review_profile(
+            &guard,
+            &agent_id,
+            Some(new_profile).filter(|s| !s.is_empty()),
+            Some(&operator_id),
+            &now,
+        );
+        drop(guard);
+        match reviewed {
+            Ok(Some(result)) => {
+                updated_fields.insert("profile".to_string(), json!(result.agent.profile));
+            }
+            Ok(None) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": format!("Agent '{agent_id}' not found.")})),
+                )
+                    .into_response();
+            }
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "Failed to edit agent"})),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    let field_names: Vec<&str> = updated_fields.keys().map(String::as_str).collect();
+    Json(json!({
+        "success": true,
+        "agent_id": agent_id,
+        "updated": updated_fields,
+        "message": format!("Agent '{agent_id}' updated: {}", field_names.join(", ")),
+    }))
+    .into_response()
+}
+
+/// `POST /api/agents/{id}/rotate-token` -- credential-only replacement,
+/// matching `rotate_agent_token_api_route`.
+pub async fn rotate_agent_token(
+    Path(agent_id): Path<String>,
+    State(shared): State<Arc<SharedState>>,
+    Extension(resolved): Extension<ResolvedRestPrincipal>,
+    body: Bytes,
+) -> Response {
+    if let Err(e) = decode_untrusted_body(&body) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
+    let arguments = json!({"agent_id": agent_id});
+    let principal = resolved.dispatch_principal.clone();
+    let result = match dispatch_rest_tool(
+        &shared,
+        "rotate_agent_token",
+        arguments,
+        Some(&principal),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(()) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Failed to rotate agent token"})),
+            )
+                .into_response()
+        }
+    };
+    if let ToolResult::Ok { data, message } = &result {
+        let payload = data.clone().unwrap_or(Value::Null);
+        return Json(json!({
+            "success": true,
+            "agent_id": payload.get("agent_id"),
+            "agent_token": payload.get("token"),
+            "message": message.clone().unwrap_or_else(|| format!("Agent '{agent_id}' token rotated")),
+        }))
+        .into_response();
+    }
+    let (status, _) = result.to_http();
+    let message = result.error_message("Failed to rotate agent token", Some("Agent"));
+    (
+        StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        Json(json!({"error": message})),
+    )
+        .into_response()
+}
+
+/// `GET /api/agents/{id}/purge-preview` -- blast-radius counts +
+/// samples, matching `purge_preview_api_route`. A direct DB read (no
+/// tool dispatch -- there is no `purge_preview` tool, mirroring
+/// Python's own direct-cursor implementation).
+pub async fn agent_purge_preview(
+    Path(agent_id): Path<String>,
+    State(shared): State<Arc<SharedState>>,
+) -> Response {
+    let guard = shared.conn.lock().await;
+    let status: Option<String> = guard
+        .query_row(
+            "SELECT status FROM agents WHERE agent_id = ?1",
+            [&agent_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap_or(None);
+    let Some(status) = status else {
+        drop(guard);
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("Agent '{agent_id}' not found")})),
+        )
+            .into_response();
+    };
+
+    let mut preview = conexus_tools::admin_tools::gather_purge_preview(&guard, &agent_id);
+    drop(guard);
+    preview["agent_id"] = json!(agent_id);
+    preview["status"] = json!(status);
+    preview["tombstone"] = json!(conexus_tools::admin_tools::purge_tombstone(&agent_id));
+    Json(preview).into_response()
+}
+
+/// `DELETE /api/agents/{id}?cascade=true` -- hard-delete + tombstone
+/// cascade, matching `purge_agent_api_route`. Refuses without the
+/// explicit confirmation query param -- wire-level safety kept here,
+/// same as Python.
+pub async fn purge_agent(
+    Path(agent_id): Path<String>,
+    State(shared): State<Arc<SharedState>>,
+    Extension(resolved): Extension<ResolvedRestPrincipal>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+    body: Bytes,
+) -> Response {
+    let cascade_confirmed = params
+        .get("cascade")
+        .map(|v| v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !cascade_confirmed {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "Refusing to hard-delete without cascade=true. Pass ?cascade=true to confirm tombstone cascade."})),
+        )
+            .into_response();
+    }
+    if let Err(e) = decode_untrusted_body(&body) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
+
+    let arguments = json!({"agent_id": agent_id});
+    let principal = resolved.dispatch_principal.clone();
+    let result = match dispatch_rest_tool(&shared, "purge_agent", arguments, Some(&principal)).await
+    {
+        Ok(r) => r,
+        Err(()) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Failed to purge agent"})),
+            )
+                .into_response()
+        }
+    };
+    if let ToolResult::Ok { data, message } = &result {
+        let payload = data.clone().unwrap_or(Value::Null);
+        return Json(json!({
+            "success": true,
+            "agent_id": payload.get("agent_id"),
+            "tombstone": payload.get("tombstone"),
+            "counts": payload.get("counts"),
+            "message": message.clone().unwrap_or_else(|| format!("Agent '{agent_id}' purged")),
+        }))
+        .into_response();
+    }
+    let (status, _) = result.to_http();
+    let message = result.error_message("Failed to purge agent", Some("Agent"));
+    (
+        StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        Json(json!({"error": message})),
+    )
+        .into_response()
+}

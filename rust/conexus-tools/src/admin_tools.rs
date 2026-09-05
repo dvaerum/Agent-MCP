@@ -1420,9 +1420,139 @@ impl Tool for TerminateAgentTool {
 /// through. Port of `_purge_tombstone`. `[`/`]` are reserved
 /// characters `register_agent` refuses in a real agent_id (see
 /// `contains_reserved_bracket`), so this can never collide with a
-/// genuine identity.
-fn purge_tombstone(agent_id: &str) -> String {
+/// genuine identity. `pub` (not `pub(crate)`): `GET /api/agents/{id}/
+/// purge-preview` (Phase E1, conexus-rest-agents-crud) needs the same
+/// literal `PurgeAgentTool::call` computes inline.
+pub fn purge_tombstone(agent_id: &str) -> String {
     format!("[deleted-{agent_id}]")
+}
+
+/// Port of `_gather_purge_preview` -- the blast-radius counts + samples
+/// for a FUTURE purge, computed WITHOUT mutating anything. Unlike
+/// Python (one function shared by the tool's counts-only need and this
+/// route's counts+samples need), `PurgeAgentTool::call` above computes
+/// its own counts inline rather than calling this -- this function
+/// exists solely for `GET /api/agents/{id}/purge-preview`, which is
+/// the only caller that also needs the samples. A deliberate,
+/// documented divergence from Python's sharing structure, not a
+/// missed reuse opportunity: refactoring the already-tested,
+/// already-merged `PurgeAgentTool` to call this instead would touch
+/// working code for no behavioral gain.
+pub fn gather_purge_preview(conn: &Connection, agent_id: &str) -> Value {
+    use conexus_db::message_repository::{MessageQueryFilters, MessageRepository};
+
+    // A fresh, non-paginated instance -- this is a one-shot preview
+    // snapshot, never anchored across repeat calls, same rationale as
+    // `PurgeAgentTool`'s own `MessageRepository::new()` above.
+    let message_repo = MessageRepository::new();
+    let messages_sent = message_repo
+        .count_query(
+            conn,
+            &MessageQueryFilters {
+                from: Some(agent_id),
+                ..Default::default()
+            },
+        )
+        .unwrap_or(0);
+    let messages_received = message_repo
+        .count_query(
+            conn,
+            &MessageQueryFilters {
+                to: Some(agent_id),
+                ..Default::default()
+            },
+        )
+        .unwrap_or(0);
+    let tasks_created: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tasks WHERE created_by = ?1",
+            [agent_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let tasks_assigned: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tasks WHERE assigned_to = ?1",
+            [agent_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let agent_actions_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM agent_actions WHERE agent_id = ?1",
+            [agent_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+
+    // Samples: most-recent-first, capped at 3, trimmed to 80 chars --
+    // small enough to inline in a confirmation modal. `trim80` mirrors
+    // Python's own `_trim` closure exactly (char-count, not byte-count,
+    // matching Python's `len(s)`/slice semantics on a `str`).
+    fn trim80(s: &str) -> String {
+        let mut chars = s.chars();
+        let head: String = chars.by_ref().take(80).collect();
+        if chars.next().is_some() {
+            format!("{head}...")
+        } else {
+            head
+        }
+    }
+
+    let sent_rows = message_repo
+        .query(
+            conn,
+            &MessageQueryFilters {
+                from: Some(agent_id),
+                limit: 3,
+                offset: 0,
+                ..Default::default()
+            },
+            false,
+        )
+        .unwrap_or_default();
+    let sample_messages_sent: Vec<Value> = sent_rows
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "content": trim80(&m.message_content),
+                "timestamp": m.timestamp,
+            })
+        })
+        .collect();
+
+    fn recent_titles(conn: &Connection, sql: &str, agent_id: &str) -> Vec<String> {
+        let mut stmt = conn.prepare(sql).expect("valid SQL");
+        let rows = stmt
+            .query_map([agent_id], |r| r.get::<_, String>(0))
+            .expect("valid query");
+        rows.flatten().collect()
+    }
+    let sample_tasks_created = recent_titles(
+        conn,
+        "SELECT title FROM tasks WHERE created_by = ?1 ORDER BY created_at DESC LIMIT 3",
+        agent_id,
+    );
+    let sample_tasks_assigned = recent_titles(
+        conn,
+        "SELECT title FROM tasks WHERE assigned_to = ?1 ORDER BY created_at DESC LIMIT 3",
+        agent_id,
+    );
+
+    serde_json::json!({
+        "counts": {
+            "messages_sent": messages_sent,
+            "messages_received": messages_received,
+            "tasks_created": tasks_created,
+            "tasks_assigned": tasks_assigned,
+            "agent_actions": agent_actions_count,
+        },
+        "samples": {
+            "messages_sent": sample_messages_sent,
+            "tasks_created": sample_tasks_created,
+            "tasks_assigned": sample_tasks_assigned,
+        },
+    })
 }
 
 pub struct PurgeAgentTool;
