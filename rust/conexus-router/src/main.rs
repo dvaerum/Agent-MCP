@@ -271,7 +271,8 @@ async fn main() -> Result<()> {
         )
         .route(
             "/agent-mcp/api/router/projects/{name}",
-            axum::routing::delete(lifecycle_rest::delete_project_handler),
+            axum::routing::delete(lifecycle_rest::delete_project_handler)
+                .patch(lifecycle_rest::rename_project_handler),
         )
         .route(
             "/agent-mcp/api/router/projects/{name}/stop",
