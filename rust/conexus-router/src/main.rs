@@ -2,14 +2,14 @@
 //! cli.py::router_cmd` + `agent_mcp/router/app.py`.
 //!
 //! **App-wiring status (Phase E2, `conexus-router-app-wiring`
-//! breakdown)**: this is PR23 step 1 (`conexus-router-shared-state`)
-//! -- real `RouterState` construction, the fail-closed
-//! `boot::assert_startup_safe` guard, the router DB boot sequence,
-//! and background reaper/reconciliation task spawns are now real. The
-//! HTTP surface itself is still just `GET /health` -- every real
-//! route (the MCP/API proxy, login/setup, the admin REST surface) is
-//! deliberately deferred to the LATER steps of the same breakdown
-//! (steps 2-10: security-middleware, mcp-api-proxy, login-setup,
+//! breakdown)**: steps 1-3 of 10 are done -- real `RouterState`
+//! construction + the fail-closed `boot::assert_startup_safe` guard +
+//! the router DB boot sequence + background reaper/reconciliation
+//! task spawns (step 1); the real security-headers/rate-limit/
+//! empty-users-redirect/session-gate middleware stack (step 2); and
+//! the real MCP/API reverse-proxy routes, mounted OUTSIDE the
+//! session-gate middleware (step 3, `proxy_routes.rs`). Still
+//! deferred to LATER steps of the same breakdown (4-10: login-setup,
 //! revalidation-fusion, lifecycle-rest, users-groups-rest, dashboard-
 //! static, mount-aliases, sso-admin-config), matching this migration's
 //! own "smallest, most foundational first" discipline for large
@@ -46,6 +46,7 @@ mod project_rename;
 mod project_teardown;
 mod proxy_client;
 mod proxy_core;
+mod proxy_routes;
 mod rate_limit;
 mod security_headers;
 mod session_gate;
@@ -204,19 +205,50 @@ async fn main() -> Result<()> {
 
     spawn_background_tasks(std::sync::Arc::clone(&state));
 
-    // Layer order matches Python's real app.py middleware chain
-    // exactly: security headers outermost (touches every response,
-    // even one an inner layer rejects) -> rate-limit -> empty-users-
-    // redirect -> session-gate (innermost, closest to the real
-    // handler). `Router::layer` wraps the CURRENT service, so the
-    // LAST `.layer()` call becomes the OUTERMOST layer -- these four
-    // are added in REVERSE of the request's own traversal order.
-    let app = Router::new()
+    // Two sub-routers, matching the real path-policy split
+    // (path_policy::UNAUTH_PREFIXES/REDIRECT_EXEMPT_PREFIXES):
+    // `admin_router` sits behind the session gate (every future
+    // login/setup/admin-REST route lands here, later steps);
+    // `proxy_router` (the MCP/API reverse-proxy) is mounted OUTSIDE
+    // it entirely -- both handlers do their own bearer/Accept-header
+    // admission before ever touching `proxy_core` (see
+    // `proxy_routes.rs`'s own doc). `DefaultBodyLimit` on the proxy
+    // router alone matches Python's own per-route `MCP_MAX_BODY_BYTES`
+    // enforcement (the admin router has no comparably-sized body yet).
+    let admin_router: Router<std::sync::Arc<state::RouterState>> = Router::new()
         .route("/health", get(health))
         .layer(axum::middleware::from_fn_with_state(
             std::sync::Arc::clone(&state),
             middleware::session_gate_layer,
-        ))
+        ));
+
+    let proxy_router: Router<std::sync::Arc<state::RouterState>> = Router::new()
+        .route(
+            "/agent-mcp/mcp/{name}",
+            axum::routing::any(proxy_routes::mcp_proxy_handler),
+        )
+        .route(
+            "/agent-mcp/api/{name}",
+            axum::routing::any(proxy_routes::api_proxy_handler_no_rest),
+        )
+        .route(
+            "/agent-mcp/api/{name}/{*rest}",
+            axum::routing::any(proxy_routes::api_proxy_handler),
+        )
+        .layer(axum::extract::DefaultBodyLimit::max(
+            state.mcp_handler_config.mcp_max_body_bytes,
+        ));
+
+    // Layer order matches Python's real app.py middleware chain
+    // exactly: security headers outermost (touches every response,
+    // even one an inner layer rejects) -> rate-limit -> empty-users-
+    // redirect -> (session-gate, admin_router only, applied above).
+    // `Router::layer` wraps the CURRENT service, so the LAST
+    // `.layer()` call becomes the OUTERMOST layer -- these three are
+    // added in REVERSE of the request's own traversal order, applied
+    // AFTER merging so both sub-routers share them.
+    let app = admin_router
+        .merge(proxy_router)
         .layer(axum::middleware::from_fn_with_state(
             std::sync::Arc::clone(&state),
             middleware::empty_users_redirect_layer,
@@ -228,13 +260,14 @@ async fn main() -> Result<()> {
         .layer(axum::middleware::from_fn_with_state(
             std::sync::Arc::clone(&state),
             middleware::security_headers_layer,
-        ));
+        ))
+        .with_state(std::sync::Arc::clone(&state));
 
     let addr = SocketAddr::from(([0, 0, 0, 0], cli.port));
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("bind {addr}"))?;
-    eprintln!("conexus-router: listening on {addr} (app-wiring in progress -- no proxying yet)");
+    eprintln!("conexus-router: listening on {addr} (MCP/API proxy live; admin REST surface app-wiring in progress)");
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
