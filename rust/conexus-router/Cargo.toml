@@ -18,7 +18,13 @@ path = "src/main.rs"
 # a dependency yet -- no real consumer until the proxy-core PR.
 conexus-core = { path = "../conexus-core" }
 conexus-db = { path = "../conexus-db" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+# "process" (Phase E2 PR 6b): orchestrator/primitives.rs shells out to
+# `systemctl` via `tokio::process::Command` -- more idiomatic than
+# `std::process::Command` + `spawn_blocking` given this binary is
+# already `#[tokio::main]`/`rt-multi-thread`; no existing workspace
+# precedent for shelling out at all, so this is a fresh choice, not a
+# fork resolution.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "process"] }
 axum = "0.8"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
