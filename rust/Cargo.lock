@@ -356,6 +356,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "conexus-router"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "tokio",
+]
+
+[[package]]
 name = "conexus-tools"
 version = "0.1.0"
 dependencies = [
