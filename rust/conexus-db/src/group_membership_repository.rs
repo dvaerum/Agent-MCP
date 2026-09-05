@@ -464,6 +464,83 @@ pub fn remove_group_member(conn: &Connection, group_id: &str, user_id: &str) -> 
     Ok(n > 0)
 }
 
+/// Port of `remove_group_member_handler`'s own `DELETE` -- `member_id`
+/// is an opaque surrogate matched against BOTH `member_user_id` AND
+/// `member_group_id` (the caller doesn't need to know which kind it
+/// is). Deliberately a SEPARATE function from [`remove_group_member`]
+/// above (that one is user-only, used by the SSO reconcile path,
+/// which always knows it's removing a user edge).
+pub fn remove_group_member_by_id(
+    conn: &Connection,
+    group_id: &str,
+    member_id: &str,
+) -> Result<bool> {
+    let n = conn.execute(
+        "DELETE FROM group_membership WHERE group_id = ?1 AND (member_user_id = ?2 OR member_group_id = ?2)",
+        [group_id, member_id],
+    )?;
+    Ok(n > 0)
+}
+
+/// One row of [`list_group_members`] -- either a user member or a
+/// nested group member, matching `list_group_members_handler`'s own
+/// "either shape, never the union" JSON projection (Python strips the
+/// None-valued half of the LEFT JOIN rather than emitting nulls).
+#[derive(Debug, Clone, PartialEq)]
+pub enum GroupMemberRow {
+    User {
+        user_id: String,
+        username: String,
+        added_at: String,
+    },
+    Group {
+        group_id: String,
+        name: String,
+        is_sysadmin: bool,
+        added_at: String,
+    },
+}
+
+/// Port of `list_group_members_handler`'s own query: every direct
+/// member of `group_id` (user or nested group), each carrying a
+/// renderable label via a `LEFT JOIN` against `users`/`groups` so the
+/// dashboard needs no follow-up fetch. Ordered by the member's own
+/// display label (`COALESCE(username, group_name)`).
+pub fn list_group_members(conn: &Connection, group_id: &str) -> Result<Vec<GroupMemberRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT gm.member_user_id, gm.member_group_id, gm.added_at, \
+                u.username, g.name, g.is_sysadmin \
+         FROM group_membership gm \
+         LEFT JOIN users u ON gm.member_user_id = u.user_id \
+         LEFT JOIN groups g ON gm.member_group_id = g.group_id \
+         WHERE gm.group_id = ?1 \
+         ORDER BY COALESCE(u.username, g.name)",
+    )?;
+    let rows = stmt.query_map([group_id], |row| {
+        let member_user_id: Option<String> = row.get(0)?;
+        let member_group_id: Option<String> = row.get(1)?;
+        let added_at: String = row.get(2)?;
+        let username: Option<String> = row.get(3)?;
+        let name: Option<String> = row.get(4)?;
+        let is_sysadmin: Option<bool> = row.get(5)?;
+        Ok(if let Some(user_id) = member_user_id {
+            GroupMemberRow::User {
+                user_id,
+                username: username.unwrap_or_default(),
+                added_at,
+            }
+        } else {
+            GroupMemberRow::Group {
+                group_id: member_group_id.unwrap_or_default(),
+                name: name.unwrap_or_default(),
+                is_sysadmin: is_sysadmin.unwrap_or(false),
+                added_at,
+            }
+        })
+    })?;
+    rows.collect()
+}
+
 /// `{group_name: group_id}` for `user_id`'s DIRECT memberships in
 /// groups whose `name` starts with `name_prefix` -- the SSO OIDC
 /// `oidc:`-namespaced group reconcile scope. `name_prefix` is treated
@@ -1342,5 +1419,84 @@ mod tests {
         add_user_member(&conn, &group.group_id, "alice");
         assert!(delete_group(&conn, &group.group_id).unwrap());
         assert_eq!(group_member_count(&conn, &group.group_id).unwrap(), 0);
+    }
+
+    #[test]
+    fn remove_group_member_by_id_matches_a_user_member() {
+        let conn = test_conn();
+        let group = create_group(&conn, "engineers", false, NOW).unwrap();
+        add_user_member(&conn, &group.group_id, "alice");
+        assert!(remove_group_member_by_id(&conn, &group.group_id, "alice").unwrap());
+        assert_eq!(group_member_count(&conn, &group.group_id).unwrap(), 0);
+    }
+
+    #[test]
+    fn remove_group_member_by_id_matches_a_nested_group_member() {
+        let conn = test_conn();
+        let parent = create_group(&conn, "parent", false, NOW).unwrap();
+        let child = create_group(&conn, "child", false, NOW).unwrap();
+        add_group_member(&conn, &parent.group_id, None, Some(&child.group_id), NOW).unwrap();
+        assert!(remove_group_member_by_id(&conn, &parent.group_id, &child.group_id).unwrap());
+        assert_eq!(group_member_count(&conn, &parent.group_id).unwrap(), 0);
+    }
+
+    #[test]
+    fn remove_group_member_by_id_returns_false_when_no_row_matches() {
+        let conn = test_conn();
+        let group = create_group(&conn, "engineers", false, NOW).unwrap();
+        assert!(!remove_group_member_by_id(&conn, &group.group_id, "nobody").unwrap());
+    }
+
+    #[test]
+    fn list_group_members_projects_a_user_member() {
+        let conn = test_conn();
+        let group = create_group(&conn, "engineers", false, NOW).unwrap();
+        add_user_member(&conn, &group.group_id, "alice");
+        let members = list_group_members(&conn, &group.group_id).unwrap();
+        assert_eq!(members.len(), 1);
+        assert_eq!(
+            members[0],
+            GroupMemberRow::User {
+                user_id: "alice".to_string(),
+                username: "alice".to_string(),
+                added_at: "2026-01-01T00:00:00Z".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn list_group_members_projects_a_nested_group_member() {
+        let conn = test_conn();
+        let parent = create_group(&conn, "parent", false, NOW).unwrap();
+        let child = create_group(&conn, "child", true, NOW).unwrap();
+        add_group_member(&conn, &parent.group_id, None, Some(&child.group_id), NOW).unwrap();
+        let members = list_group_members(&conn, &parent.group_id).unwrap();
+        assert_eq!(members.len(), 1);
+        assert_eq!(
+            members[0],
+            GroupMemberRow::Group {
+                group_id: child.group_id,
+                name: "child".to_string(),
+                is_sysadmin: true,
+                added_at: NOW.to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn list_group_members_orders_by_display_label() {
+        let conn = test_conn();
+        let group = create_group(&conn, "engineers", false, NOW).unwrap();
+        add_user_member(&conn, &group.group_id, "zeb");
+        add_user_member(&conn, &group.group_id, "alice");
+        let members = list_group_members(&conn, &group.group_id).unwrap();
+        let usernames: Vec<&str> = members
+            .iter()
+            .map(|m| match m {
+                GroupMemberRow::User { username, .. } => username.as_str(),
+                GroupMemberRow::Group { .. } => "",
+            })
+            .collect();
+        assert_eq!(usernames, vec!["alice", "zeb"]);
     }
 }
