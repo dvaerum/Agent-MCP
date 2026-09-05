@@ -22,6 +22,8 @@
 //! a per-project backend as an opaque process is enforced at compile
 //! time here, not just by convention.
 
+mod asset_prefix;
+mod client_disconnect;
 mod identity;
 mod login;
 mod mcp_handler;
@@ -32,6 +34,7 @@ mod project_registry;
 mod proxy_client;
 mod proxy_core;
 mod rate_limit;
+mod security_headers;
 mod session_gate;
 
 use std::net::SocketAddr;
