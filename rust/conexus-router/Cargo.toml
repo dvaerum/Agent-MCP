@@ -1,0 +1,26 @@
+[package]
+name = "conexus-router"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "CoNexus always-on URL-keyed router binary (Phase E2). See /home/dennis/.claude/plans/prancy-napping-pie.md."
+
+[[bin]]
+name = "conexus-router"
+path = "src/main.rs"
+
+[dependencies]
+# Guiding Principle 2 / ADR-0020: this crate will depend on
+# conexus-auth (forwarding_header signing, already ported) and
+# conexus-core once a later PR wires real request signing/forwarding
+# -- but NEVER conexus-tools or conexus-mcp, so the router stays
+# structurally incapable of importing a tool type (a compile-time
+# guarantee of "the router is mount-agnostic", not just a convention).
+# Not added yet: this scaffold has no real consumer for either, and
+# this migration's own convention is a dependency lands with the PR
+# that actually needs it, not speculatively ahead of one.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+axum = "0.8"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
