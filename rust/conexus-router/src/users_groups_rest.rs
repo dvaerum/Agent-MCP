@@ -33,6 +33,7 @@ use bytes::Bytes;
 use chrono::Utc;
 use conexus_core::capability::Capability;
 
+use crate::admin_groups::{self, CreateGroupOutcome, DeleteGroupOutcome, EditGroupOutcome};
 use crate::admin_users_gate;
 use crate::admin_users_users::{self, CreateUserOutcome, DeleteUserOutcome, EditUserOutcome};
 use crate::identity::IdentityError;
@@ -56,6 +57,12 @@ fn internal_error(e: impl std::fmt::Display) -> HandlerResponse {
 
 impl From<IdentityError> for HandlerResponse {
     fn from(e: IdentityError) -> Self {
+        internal_error(e)
+    }
+}
+
+impl From<rusqlite::Error> for HandlerResponse {
+    fn from(e: rusqlite::Error) -> Self {
         internal_error(e)
     }
 }
@@ -207,5 +214,148 @@ pub async fn delete_user_handler(
                 .into_response()
         }
         DeleteUserOutcome::Rejected(resp) => resp.into_response(),
+    }
+}
+
+fn require_groups_capability(
+    state: &RouterState,
+    identity: &GateIdentity,
+) -> Result<(), HandlerResponse> {
+    project_gate::require_capability(
+        identity,
+        state.mcp_handler_config.single_tenant_name.as_deref(),
+        Capability::SystemGroupsManage,
+    )
+}
+
+/// Port of `list_groups_handler`. No body, entry-time check only.
+pub async fn list_groups_handler(
+    State(state): State<Arc<RouterState>>,
+    Extension(identity): Extension<GateIdentity>,
+) -> Response {
+    if let Err(resp) = require_groups_capability(&state, &identity) {
+        return resp.into_response();
+    }
+    let conn = state.conn.lock().await;
+    match admin_groups::list_groups_response(&conn) {
+        Ok(resp) => resp.into_response(),
+        Err(e) => HandlerResponse::from(e).into_response(),
+    }
+}
+
+/// Port of `create_group_handler`.
+pub async fn create_group_handler(
+    State(state): State<Arc<RouterState>>,
+    Extension(identity): Extension<GateIdentity>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(resp) = require_groups_capability(&state, &identity) {
+        return resp.into_response();
+    }
+    let conn = state.conn.lock().await;
+    let now_str = Utc::now().to_rfc3339();
+    let spec = RevalidationSpec {
+        stale_user_id: &identity.user.user_id,
+        cookie_header: cookie_header(&headers),
+        now: &now_str,
+        cap: Capability::SystemGroupsManage,
+        project: None,
+    };
+    let (parsed, _principal) = match perm_gates::read_body_and_revalidate(&conn, &body, &spec) {
+        Ok(v) => v,
+        Err(resp) => return resp.into_response(),
+    };
+    let parsed_value = serde_json::Value::Object(parsed);
+    let outcome = match admin_groups::decide_create_group(
+        &conn,
+        identity.is_sysadmin,
+        &identity.user.username,
+        &parsed_value,
+        &now_str,
+    ) {
+        Ok(o) => o,
+        Err(e) => return HandlerResponse::from(e).into_response(),
+    };
+    match outcome {
+        CreateGroupOutcome::Created(group) => admin_users_gate::success_envelope(
+            serde_json::json!({"group": admin_groups::group_public_json(&group, 0)}),
+            201,
+        )
+        .into_response(),
+        CreateGroupOutcome::Rejected(resp) => resp.into_response(),
+    }
+}
+
+/// Port of `edit_group_handler`.
+pub async fn edit_group_handler(
+    State(state): State<Arc<RouterState>>,
+    Extension(identity): Extension<GateIdentity>,
+    Path(group_id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(resp) = require_groups_capability(&state, &identity) {
+        return resp.into_response();
+    }
+    let mut conn = state.conn.lock().await;
+    let now_str = Utc::now().to_rfc3339();
+    let spec = RevalidationSpec {
+        stale_user_id: &identity.user.user_id,
+        cookie_header: cookie_header(&headers),
+        now: &now_str,
+        cap: Capability::SystemGroupsManage,
+        project: None,
+    };
+    let (parsed, _principal) = match perm_gates::read_body_and_revalidate(&conn, &body, &spec) {
+        Ok(v) => v,
+        Err(resp) => return resp.into_response(),
+    };
+    let parsed_value = serde_json::Value::Object(parsed);
+    let outcome = match admin_groups::decide_edit_group(
+        &mut conn,
+        identity.is_sysadmin,
+        &identity.user.username,
+        &group_id,
+        &parsed_value,
+    ) {
+        Ok(o) => o,
+        Err(e) => return HandlerResponse::from(e).into_response(),
+    };
+    match outcome {
+        EditGroupOutcome::Updated(group, member_count) => admin_users_gate::success_envelope(
+            serde_json::json!({"group": admin_groups::group_public_json(&group, member_count)}),
+            200,
+        )
+        .into_response(),
+        EditGroupOutcome::Rejected(resp) => resp.into_response(),
+    }
+}
+
+/// Port of `delete_group_handler`. No body, entry-time check only.
+pub async fn delete_group_handler(
+    State(state): State<Arc<RouterState>>,
+    Extension(identity): Extension<GateIdentity>,
+    Path(group_id): Path<String>,
+) -> Response {
+    if let Err(resp) = require_groups_capability(&state, &identity) {
+        return resp.into_response();
+    }
+    let mut conn = state.conn.lock().await;
+    let outcome = match admin_groups::decide_delete_group(
+        &mut conn,
+        identity.is_sysadmin,
+        &identity.user.username,
+        &group_id,
+    ) {
+        Ok(o) => o,
+        Err(e) => return HandlerResponse::from(e).into_response(),
+    };
+    match outcome {
+        DeleteGroupOutcome::Deleted(group_id) => {
+            admin_users_gate::success_envelope(serde_json::json!({"deleted": group_id}), 200)
+                .into_response()
+        }
+        DeleteGroupOutcome::Rejected(resp) => resp.into_response(),
     }
 }
