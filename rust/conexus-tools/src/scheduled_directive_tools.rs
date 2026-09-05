@@ -273,7 +273,14 @@ fn validate_count(raw: Option<&Value>) -> Result<Option<i64>, ToolResult> {
     Ok(Some(count))
 }
 
-fn serialize(row: &ScheduledDirectiveRow) -> Value {
+/// Public-facing directive shape, shared by every tool's `Ok.data`
+/// AND by `GET /api/schedules` (Phase E1) -- that REST endpoint reads
+/// `conexus_db::scheduled_directive_repository::list_all` directly
+/// (an operator-only, cross-agent, unscoped view; the MCP
+/// `list_scheduled_directives` tool below is scoped to the caller's
+/// own schedules) rather than dispatching through a tool, but reuses
+/// this exact serialization so the two surfaces render identically.
+pub fn serialize(row: &ScheduledDirectiveRow) -> Value {
     serde_json::json!({
         "directive_id": row.directive_id,
         "agent_id": row.agent_id,

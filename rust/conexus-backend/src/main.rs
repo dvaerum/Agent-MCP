@@ -160,6 +160,14 @@ async fn main() -> Result<()> {
             "/memories/{*context_key}",
             put(rest_handlers::update_memory).delete(rest_handlers::delete_memory),
         )
+        .route(
+            "/schedules",
+            get(rest_handlers::list_schedules).post(rest_handlers::create_schedule),
+        )
+        .route(
+            "/schedules/{directive_id}",
+            put(rest_handlers::update_schedule).delete(rest_handlers::delete_schedule),
+        )
         .fallback(api_not_found)
         .layer(middleware::from_fn_with_state(
             shared.clone(),
