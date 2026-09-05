@@ -14,6 +14,7 @@ use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
 
 use conexus_core::settings_schema::SETTINGS_SCHEMA;
@@ -54,7 +55,16 @@ fn memory_key_error() -> serde_json::Value {
 /// separately.
 fn require_str(value: Option<&serde_json::Value>, field: &str) -> Option<Response> {
     match value {
-        Some(v) if !v.is_string() => Some(
+        // A JSON `null` and an absent key are the SAME thing here,
+        // matching Python's `data.get(field)` -- both a missing key and
+        // an explicit `"field": null` decode to Python `None`, and
+        // `_require_str` only rejects `value is not None and not
+        // isinstance(value, str)`. Treating `Value::Null` as present-
+        // and-wrong-typed (an earlier draft of this function did) would
+        // 400 a caller's explicit `null` for an optional field, and
+        // ALSO 400 any handler that defaults an absent field to
+        // `Value::Null` before calling this check.
+        Some(v) if !v.is_string() && !v.is_null() => Some(
             (
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": format!("{field} must be a string")})),
@@ -569,6 +579,381 @@ async fn dispatch_schedule_tool(
             }
         }
         return Json(body).into_response();
+    }
+    let (status, http_body) = result.to_http();
+    let message = http_body
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("Request rejected");
+    (
+        StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        Json(json!({"error": message})),
+    )
+        .into_response()
+}
+
+// -- /api/tasks (Phase E1 PR 6/14, conexus-rest-tasks) ---------------
+
+fn task_row_to_json(row: &conexus_db::task_repository::TaskRow) -> Value {
+    json!({
+        "task_id": row.task_id,
+        "title": row.title,
+        "description": row.description,
+        "assigned_to": row.assigned_to,
+        "created_by": row.created_by,
+        "status": row.status,
+        "priority": row.priority,
+        "created_at": row.created_at,
+        "updated_at": row.updated_at,
+        "parent_task": row.parent_task,
+        "child_tasks": row.child_tasks,
+        "depends_on_tasks": row.depends_on_tasks,
+        "notes": row.notes,
+    })
+}
+
+/// `GET /api/tasks[?assigned_to=][?unassigned=][?assigned=][?status=]
+/// [?created_by=][?limit=]` -- matches `all_tasks_api_route` exactly,
+/// including its NO-AUTH-by-design gate (Python's own docstring: "the
+/// router-level gate is deferred to a follow-up PR"). Reads a bounded
+/// SQL superset (`?limit`, shared clamp), then AND-combines the
+/// discovery filters in-process -- the same bound-then-filter shape
+/// Python uses, not a second independent implementation.
+pub async fn list_tasks(
+    State(shared): State<Arc<SharedState>>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let is_truthy = |key: &str| {
+        params
+            .get(key)
+            .map(|v| matches!(v.to_lowercase().as_str(), "true" | "1" | "yes"))
+            .unwrap_or(false)
+    };
+    let assigned_to_filter = params.get("assigned_to");
+    let unassigned_filter = is_truthy("unassigned");
+    let assigned_filter = is_truthy("assigned");
+    let status_filter = params.get("status");
+    let created_by_filter = params.get("created_by");
+    let limit = crate::read_limits::clamp_section_limit(params.get("limit").map(String::as_str));
+
+    let guard = shared.conn.lock().await;
+    let candidates = match assigned_to_filter {
+        Some(agent_id) => {
+            conexus_db::task_repository::list_by_agent(&guard, agent_id, None, Some(limit))
+        }
+        None => conexus_db::task_repository::list_all(&guard, Some(limit)),
+    };
+    let candidates = match candidates {
+        Ok(rows) => rows,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Failed to fetch all tasks"})),
+            )
+                .into_response()
+        }
+    };
+    drop(guard);
+
+    let keep = |t: &conexus_db::task_repository::TaskRow| -> bool {
+        if unassigned_filter && !conexus_tools::task_query_engine::is_claimable_task(t) {
+            return false;
+        }
+        if assigned_filter && t.assigned_to.as_deref().unwrap_or("").is_empty() {
+            return false;
+        }
+        if let Some(cb) = created_by_filter {
+            if &t.created_by != cb {
+                return false;
+            }
+        }
+        if let Some(sf) = status_filter {
+            if !conexus_tools::task_tools::status_filter_matches(sf, Some(&t.status)) {
+                return false;
+            }
+        }
+        true
+    };
+
+    let tasks: Vec<_> = candidates
+        .iter()
+        .filter(|t| keep(t))
+        .map(task_row_to_json)
+        .collect();
+    Json(tasks).into_response()
+}
+
+/// `POST /api/tasks` -- thin adapter over the `create_task` MCP tool,
+/// matching `create_task_api_route`.
+pub async fn create_task(
+    State(shared): State<Arc<SharedState>>,
+    Extension(resolved): Extension<ResolvedRestPrincipal>,
+    body: Bytes,
+) -> Response {
+    let data = match decode_untrusted_body(&body) {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
+    };
+
+    let raw_title = data.get("task_title");
+    let description = data
+        .get("task_description")
+        .cloned()
+        .unwrap_or(Value::String(String::new()));
+    let priority = data
+        .get("priority")
+        .cloned()
+        .unwrap_or(Value::String("medium".to_string()));
+    let assigned_to = data.get("assigned_to").cloned().unwrap_or(Value::Null);
+    let parent_task = data.get("parent_task").cloned().unwrap_or(Value::Null);
+
+    for (val, name) in [
+        (Some(&description), "task_description"),
+        (Some(&priority), "priority"),
+        (Some(&assigned_to), "assigned_to"),
+        (Some(&parent_task), "parent_task"),
+    ] {
+        if let Some(resp) = require_str(val, name) {
+            return resp;
+        }
+    }
+
+    let Some(raw_title) = raw_title else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "task_title is required"})),
+        )
+            .into_response();
+    };
+    let title = raw_title.as_str().unwrap_or("").trim().to_string();
+    if title.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "task_title_empty_after_strip",
+                "message": "task_title contains only whitespace or non-printable characters after sanitization",
+            })),
+        )
+            .into_response();
+    }
+
+    let arguments = json!({
+        "task_title": title,
+        "task_description": description,
+        "priority": priority,
+        "assigned_to": assigned_to,
+        "parent_task": parent_task,
+    });
+    let principal = resolved.dispatch_principal.clone();
+    let result = match dispatch_rest_tool(&shared, "create_task", arguments, Some(&principal)).await
+    {
+        Ok(r) => r,
+        Err(()) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Failed to create task"})),
+            )
+                .into_response()
+        }
+    };
+
+    if let ToolResult::Ok { data, message } = &result {
+        let task_id = data
+            .as_ref()
+            .and_then(|d| d.get("task_id"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        return Json(json!({
+            "success": true,
+            "task_id": task_id,
+            "message": message.clone().unwrap_or_else(|| format!("Task '{title}' created successfully")),
+        }))
+        .into_response();
+    }
+    let (status, _) = result.to_http();
+    let message = result.error_message("Failed to create task", Some("Parent task"));
+    (
+        StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        Json(json!({"error": message})),
+    )
+        .into_response()
+}
+
+/// `GET /api/tasks/{task_id}/delete-preview` -- blast-radius preview
+/// before a delete, matching `delete_task_preview_api_route`. Reuses
+/// `collect_task_descendants` (the same authoritative walk the delete
+/// cascade itself uses) plus two direct queries for the other two
+/// refusal conditions (dependents, blocking agents).
+pub async fn task_delete_preview(
+    Path(task_id): Path<String>,
+    State(shared): State<Arc<SharedState>>,
+) -> Response {
+    let guard = shared.conn.lock().await;
+
+    let title: Option<String> = guard
+        .query_row(
+            "SELECT title FROM tasks WHERE task_id = ?1",
+            [&task_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap_or(None);
+    let Some(title) = title else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("Task '{task_id}' not found")})),
+        )
+            .into_response();
+    };
+
+    let descendants =
+        conexus_tools::task_tools::collect_task_descendants(&guard, &task_id).unwrap_or_default();
+    let descendant_rows: Vec<Value> = descendants
+        .iter()
+        .map(|(descendant_id, assigned_to)| {
+            let (d_title, d_status): (String, String) = guard
+                .query_row(
+                    "SELECT title, status FROM tasks WHERE task_id = ?1",
+                    [descendant_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap_or_default();
+            json!({
+                "task_id": descendant_id,
+                "title": d_title,
+                "status": d_status,
+                "assigned_to": assigned_to,
+            })
+        })
+        .collect();
+
+    let mut dependents: Vec<Value> = Vec::new();
+    {
+        let pattern = format!("%\"{task_id}\"%");
+        let mut stmt = guard
+            .prepare("SELECT task_id, title FROM tasks WHERE json_extract(depends_on_tasks, '$') LIKE ?1")
+            .expect("valid SQL");
+        let rows = stmt
+            .query_map([&pattern], |r| {
+                Ok(json!({"task_id": r.get::<_, String>(0)?, "title": r.get::<_, String>(1)?}))
+            })
+            .expect("valid query");
+        for row in rows.flatten() {
+            dependents.push(row);
+        }
+    }
+
+    let mut blocking_agents: Vec<String> = Vec::new();
+    {
+        let mut stmt = guard
+            .prepare("SELECT agent_id FROM agents WHERE current_task = ?1")
+            .expect("valid SQL");
+        let rows = stmt
+            .query_map([&task_id], |r| r.get::<_, String>(0))
+            .expect("valid query");
+        for row in rows.flatten() {
+            blocking_agents.push(row);
+        }
+    }
+    drop(guard);
+
+    let requires_force =
+        !descendant_rows.is_empty() || !dependents.is_empty() || !blocking_agents.is_empty();
+    Json(json!({
+        "task_id": task_id,
+        "title": title,
+        "descendant_count": descendant_rows.len(),
+        "descendants": descendant_rows,
+        "dependent_count": dependents.len(),
+        "dependents": dependents,
+        "blocking_agents": blocking_agents,
+        "requires_force": requires_force,
+    }))
+    .into_response()
+}
+
+/// `DELETE /api/tasks/{task_id}` -- admin deletes a task, matching
+/// `delete_task_api_route`. `force_delete` is client-supplied (default
+/// `false`) -- a real backstop, not wire-compat theater: the tool's
+/// own cascade guard (children/dependents/an agent's `current_task`)
+/// only bites when this is `false`, so the operator must have actually
+/// seen the delete-preview's blast radius before force-confirming.
+pub async fn delete_task(
+    Path(task_id): Path<String>,
+    State(shared): State<Arc<SharedState>>,
+    Extension(resolved): Extension<ResolvedRestPrincipal>,
+    body: Bytes,
+) -> Response {
+    let force_delete = if body.is_empty() {
+        false
+    } else {
+        match decode_untrusted_body(&body) {
+            Ok(data) => data
+                .get("force_delete")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            Err(_) => false,
+        }
+    };
+    let arguments = json!({"task_id": task_id, "force_delete": force_delete});
+    let principal = resolved.dispatch_principal.clone();
+    dispatch_through_tool(
+        &shared,
+        "delete_task",
+        arguments,
+        &principal,
+        Some(format!("Task '{task_id}' deleted successfully")),
+    )
+    .await
+}
+
+/// Generic REST->tool dispatch envelope. Port of
+/// `_dispatch_helpers._dispatch_through_tool`'s response-shaping half
+/// (the auth/dispatch half is `dispatch_rest_tool`): `Ok` ->
+/// `{"success": true, "message": <success_message or the tool's own
+/// Ok.message>, ["data": ...if present]}`; every other variant -> the
+/// shared `to_http` status with `tool_result_error_message`'s wording.
+/// The 201-for-create heuristic matches Python's own
+/// `tool_name.startswith("create_")` naming convention.
+async fn dispatch_through_tool(
+    shared: &Arc<SharedState>,
+    tool_name: &str,
+    arguments: Value,
+    principal: &conexus_core::principal::Principal,
+    success_message: Option<String>,
+) -> Response {
+    let result = match dispatch_rest_tool(shared, tool_name, arguments, Some(principal)).await {
+        Ok(r) => r,
+        Err(()) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Tool dispatch failed"})),
+            )
+                .into_response()
+        }
+    };
+    if let ToolResult::Ok { data, message } = &result {
+        let mut body = json!({
+            "success": true,
+            "message": success_message.unwrap_or_else(|| message.clone().unwrap_or_default()),
+        });
+        if let Some(d) = data {
+            if let Value::Object(map) = &mut body {
+                map.insert("data".to_string(), d.clone());
+            }
+        }
+        let status = if tool_name.starts_with("create_") && data.is_some() {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        };
+        return (status, Json(body)).into_response();
     }
     let (status, http_body) = result.to_http();
     let message = http_body

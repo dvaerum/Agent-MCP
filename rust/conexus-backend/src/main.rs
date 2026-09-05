@@ -23,6 +23,7 @@ mod boot;
 mod instructions;
 mod json_sanitize;
 mod principal_resolve;
+mod read_limits;
 mod rest_gate;
 mod rest_handlers;
 mod rest_principal;
@@ -152,7 +153,17 @@ async fn main() -> Result<()> {
     async fn api_not_found() -> axum::http::StatusCode {
         axum::http::StatusCode::NOT_FOUND
     }
-    let api_public = Router::new().route("/prompts/catalog", get(rest_handlers::prompts_catalog));
+    // GET /api/tasks is a confirmed no-auth-by-design endpoint (Python's
+    // own docstring: "the router-level gate is deferred to a follow-up
+    // PR"); every other /api/tasks method is operator-tier. Mounted as
+    // its own single-method route on `api_public` rather than
+    // `.route("/tasks", get(...))` merged with `api_authenticated`'s
+    // `post(...)` on the identical path -- keeps the auth split
+    // unambiguous rather than relying on axum's cross-router
+    // same-path-different-method merge semantics.
+    let api_public = Router::new()
+        .route("/prompts/catalog", get(rest_handlers::prompts_catalog))
+        .route("/tasks", get(rest_handlers::list_tasks));
     let api_authenticated = Router::new()
         .route("/settings-schema", get(rest_handlers::settings_schema))
         .route("/memories", post(rest_handlers::create_memory))
@@ -167,6 +178,15 @@ async fn main() -> Result<()> {
         .route(
             "/schedules/{directive_id}",
             put(rest_handlers::update_schedule).delete(rest_handlers::delete_schedule),
+        )
+        .route("/tasks", post(rest_handlers::create_task))
+        .route(
+            "/tasks/{task_id}/delete-preview",
+            get(rest_handlers::task_delete_preview),
+        )
+        .route(
+            "/tasks/{task_id}",
+            axum::routing::delete(rest_handlers::delete_task),
         )
         .fallback(api_not_found)
         .layer(middleware::from_fn_with_state(
