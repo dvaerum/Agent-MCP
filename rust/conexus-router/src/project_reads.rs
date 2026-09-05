@@ -277,6 +277,73 @@ pub fn decide_alias_usage(
     })
 }
 
+#[derive(Debug)]
+pub enum RemoveAliasOutcome {
+    Removed(HandlerResponse),
+    Rejected(HandlerResponse),
+}
+
+/// Port of `remove_alias_handler`'s full decision (PR23 step 6, gap
+/// 10 -- no prior Rust coverage at all). Unlike the read-only
+/// `alias_usage_handler` above, this is a MUTATION: `min_role:
+/// Some("operator")`, mirroring rename/delete/stop (a mere
+/// `viewer`-tier member must not expire an alias). `expire_alias` is
+/// idempotent (a no-op on an already-gone alias or project), matching
+/// Python's own `_REGISTRY.expire_alias` -- there is no separate
+/// "alias not found" branch to port; only the project's own
+/// existence is checked. The success body is a BARE JSON object
+/// (`{"removed", "project", "remaining_aliases"}`, no `"success"`
+/// wrapper) -- Python's real handler calls `web.json_response`
+/// directly here, not `_success_envelope`, matching
+/// `alias_usage_handler`'s own bare-response precedent.
+pub fn decide_remove_alias(
+    conn: &Connection,
+    registry: &ProjectRegistry,
+    is_sysadmin: bool,
+    caller_user_id: Option<&str>,
+    name: &str,
+    alias: &str,
+) -> Result<RemoveAliasOutcome, GateError> {
+    match deny_cross_tenant_project_read(
+        conn,
+        registry,
+        is_sysadmin,
+        caller_user_id,
+        name,
+        Some("operator"),
+    )? {
+        CrossTenantOutcome::Admit => {}
+        CrossTenantOutcome::NotFound => {
+            return Ok(RemoveAliasOutcome::Rejected(plain_status(404)));
+        }
+        CrossTenantOutcome::Forbidden { .. } => {
+            return Ok(RemoveAliasOutcome::Rejected(plain_status(403)));
+        }
+    }
+    if registry.get(name)?.is_none() {
+        return Ok(RemoveAliasOutcome::Rejected(plain_status(404)));
+    }
+    registry.expire_alias(name, alias)?;
+    let remaining: Vec<serde_json::Value> = registry
+        .get(name)?
+        .map(|row| {
+            row.aliases
+                .into_iter()
+                .map(|a| serde_json::json!({"name": a.name, "expires_at": a.expires_at}))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(RemoveAliasOutcome::Removed(HandlerResponse {
+        status: 200,
+        headers: vec![("Cache-Control".to_string(), "no-store".to_string())],
+        body: HandlerBody::Json(serde_json::json!({
+            "removed": alias,
+            "project": name,
+            "remaining_aliases": remaining,
+        })),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -579,5 +646,172 @@ mod tests {
             panic!("expected Rejected");
         };
         assert_eq!(resp.status, 404);
+    }
+
+    // -- decide_remove_alias ----------------------------------------------
+
+    #[test]
+    fn decide_remove_alias_expires_the_alias_and_lists_what_remains() {
+        let mut c = conn();
+        let uid = identity::create_user(
+            &mut c,
+            "alice",
+            "correct horse battery staple",
+            None,
+            false,
+            true,
+            &[],
+            NOW_STR,
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let registry = registry_with(dir.path(), "proj-a", "/ws/proj-a");
+        registry
+            .add_alias("proj-a", "old-name", None, Some(30), now_dt())
+            .unwrap();
+        registry
+            .add_alias("proj-a", "older-name", None, Some(30), now_dt())
+            .unwrap();
+
+        let outcome =
+            decide_remove_alias(&c, &registry, true, Some(&uid), "proj-a", "old-name").unwrap();
+        let RemoveAliasOutcome::Removed(resp) = outcome else {
+            panic!("expected Removed");
+        };
+        assert_eq!(resp.status, 200);
+        let HandlerBody::Json(body) = resp.body else {
+            panic!("expected JSON");
+        };
+        assert_eq!(body["removed"], "old-name");
+        assert_eq!(body["project"], "proj-a");
+        let remaining = body["remaining_aliases"].as_array().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0]["name"], "older-name");
+    }
+
+    #[test]
+    fn decide_remove_alias_is_idempotent_on_an_already_gone_alias() {
+        let mut c = conn();
+        let uid = identity::create_user(
+            &mut c,
+            "alice",
+            "correct horse battery staple",
+            None,
+            false,
+            true,
+            &[],
+            NOW_STR,
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let registry = registry_with(dir.path(), "proj-a", "/ws/proj-a");
+
+        let outcome =
+            decide_remove_alias(&c, &registry, true, Some(&uid), "proj-a", "never-existed")
+                .unwrap();
+        let RemoveAliasOutcome::Removed(resp) = outcome else {
+            panic!("expected Removed even for an absent alias -- matches expire_alias's own idempotent no-op");
+        };
+        let HandlerBody::Json(body) = resp.body else {
+            panic!("expected JSON");
+        };
+        assert!(body["remaining_aliases"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn decide_remove_alias_404s_a_nonexistent_project() {
+        let c = conn();
+        let dir = tempfile::tempdir().unwrap();
+        let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
+        let outcome = decide_remove_alias(
+            &c,
+            &registry,
+            true,
+            Some("u1"),
+            "does-not-exist",
+            "old-name",
+        )
+        .unwrap();
+        let RemoveAliasOutcome::Rejected(resp) = outcome else {
+            panic!("expected Rejected");
+        };
+        assert_eq!(resp.status, 404);
+    }
+
+    #[test]
+    fn decide_remove_alias_closes_the_cross_tenant_oracle_for_a_non_member() {
+        let mut c = conn();
+        identity::create_user(
+            &mut c,
+            "alice",
+            "correct horse battery staple",
+            None,
+            false,
+            true,
+            &[],
+            NOW_STR,
+        )
+        .unwrap();
+        let bob = identity::create_user(
+            &mut c,
+            "bob",
+            "correct horse battery staple",
+            None,
+            false,
+            false,
+            &[],
+            NOW_STR,
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let registry = registry_with(dir.path(), "proj-a", "/ws/proj-a");
+
+        let outcome =
+            decide_remove_alias(&c, &registry, false, Some(&bob), "proj-a", "old-name").unwrap();
+        let RemoveAliasOutcome::Rejected(resp) = outcome else {
+            panic!("expected Rejected");
+        };
+        assert_eq!(resp.status, 404);
+    }
+
+    #[test]
+    fn decide_remove_alias_denies_a_viewer_tier_member_as_forbidden() {
+        let mut c = conn();
+        identity::create_user(
+            &mut c,
+            "alice",
+            "correct horse battery staple",
+            None,
+            false,
+            true,
+            &[],
+            NOW_STR,
+        )
+        .unwrap();
+        let bob = identity::create_user(
+            &mut c,
+            "bob",
+            "correct horse battery staple",
+            None,
+            false,
+            false,
+            &[],
+            NOW_STR,
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO project_membership (project_name, user_id, role) VALUES ('proj-a', ?1, 'viewer')",
+            [&bob],
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let registry = registry_with(dir.path(), "proj-a", "/ws/proj-a");
+
+        let outcome =
+            decide_remove_alias(&c, &registry, false, Some(&bob), "proj-a", "old-name").unwrap();
+        let RemoveAliasOutcome::Rejected(resp) = outcome else {
+            panic!("expected Rejected");
+        };
+        assert_eq!(resp.status, 403);
     }
 }

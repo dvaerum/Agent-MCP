@@ -532,3 +532,70 @@ pub async fn rename_project_handler(
         Err(e) => HandlerResponse::from(e).into_response(),
     }
 }
+
+/// Port of `alias_usage_handler`. Read-only, no capability check
+/// (session-gated + membership-scoped only, matching Python).
+pub async fn alias_usage_handler(
+    State(state): State<Arc<RouterState>>,
+    Extension(identity): Extension<GateIdentity>,
+    Path(name): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let alias = params.get("alias").map(String::as_str).unwrap_or("");
+    let conn = state.conn.lock().await;
+    match project_reads::decide_alias_usage(
+        &conn,
+        &state.registry,
+        identity.is_sysadmin,
+        Some(&identity.user.user_id),
+        &name,
+        alias,
+        Utc::now(),
+    ) {
+        Ok(project_reads::AliasUsageOutcome::Found {
+            alias,
+            project,
+            expires_at,
+            agents,
+        }) => HandlerResponse {
+            status: 200,
+            headers: vec![("Cache-Control".to_string(), "no-store".to_string())],
+            body: HandlerBody::Json(serde_json::json!({
+                "alias": alias,
+                "project": project,
+                "expires_at": expires_at,
+                "agents": agents,
+            })),
+        }
+        .into_response(),
+        Ok(project_reads::AliasUsageOutcome::Rejected(resp)) => resp.into_response(),
+        Err(e) => HandlerResponse::from(e).into_response(),
+    }
+}
+
+/// Port of `remove_alias_handler` -- closes gap 10 (no prior Rust
+/// coverage at all) via the new `project_reads::decide_remove_alias`.
+pub async fn remove_alias_handler(
+    State(state): State<Arc<RouterState>>,
+    Extension(identity): Extension<GateIdentity>,
+    Path((name, alias)): Path<(String, String)>,
+) -> Response {
+    let single_tenant_name = state.mcp_handler_config.single_tenant_name.as_deref();
+    if crate::single_tenant::disables_write_endpoint(single_tenant_name) {
+        return crate::single_tenant::single_tenant_disabled_response(single_tenant_name)
+            .into_response();
+    }
+    let conn = state.conn.lock().await;
+    match project_reads::decide_remove_alias(
+        &conn,
+        &state.registry,
+        identity.is_sysadmin,
+        Some(&identity.user.user_id),
+        &name,
+        &alias,
+    ) {
+        Ok(project_reads::RemoveAliasOutcome::Removed(resp)) => resp.into_response(),
+        Ok(project_reads::RemoveAliasOutcome::Rejected(resp)) => resp.into_response(),
+        Err(e) => HandlerResponse::from(e).into_response(),
+    }
+}
