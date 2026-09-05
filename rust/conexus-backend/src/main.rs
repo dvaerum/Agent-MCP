@@ -23,6 +23,7 @@ mod boot;
 mod instructions;
 mod principal_resolve;
 mod rest_gate;
+mod rest_handlers;
 mod rest_principal;
 mod server;
 mod uds;
@@ -32,6 +33,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use axum::middleware;
+use axum::routing::get;
 use axum::Router;
 use clap::Parser;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
@@ -124,35 +126,40 @@ async fn main() -> Result<()> {
                 shared.clone(),
                 auth_gate::require_identity,
             ));
-    // `/api` scaffold (Phase E1 PR 1, prancy-napping-pie): the identity
-    // gate mounts now, ahead of any real REST route, so the auth-door
-    // decision is exercised for real from the first PR rather than
-    // deferred until a business endpoint lands. No routes are
-    // registered yet -- see `rest_gate`/`rest_principal` module docs.
-    // A request that clears the gate still 404s (no matching route);
-    // an unadmitted request 401s from the gate itself, before axum's
-    // own routing ever runs -- both are real, live-verifiable
-    // behaviors of this scaffold alone.
+    // `/api` mount (Phase E1, prancy-napping-pie), split into two
+    // sub-routers so a handful of confirmed no-auth-by-design
+    // endpoints (Python's own docstrings: "the router-level gate is
+    // deferred to a follow-up PR" -- GET /agents, /tasks,
+    // /prompts/catalog) can bypass `rest_gate` WITHOUT weakening the
+    // default for every other route. `api_authenticated`'s fallback
+    // makes "require auth" the default for anything not explicitly
+    // listed on `api_public` -- a route added to the wrong router is a
+    // 401 to fix, never a silent open door.
     //
-    // An explicit `.fallback()` is required here, not cosmetic: an
-    // otherwise-empty `Router` contributes NO matchable path at all
-    // when `.nest()`ed, so `/api/*` would fall through to the OUTER
-    // router's fallback instead -- which `Router::merge` had already
-    // set to `mcp_router`'s own auth_gate-wrapped one, silently
+    // An explicit `.fallback()` is required on `api_authenticated`,
+    // not cosmetic: an otherwise-empty `Router` contributes NO
+    // matchable path at all when `.nest()`ed, so unmatched `/api/*`
+    // requests would fall through to the OUTER router's fallback
+    // instead -- which `Router::merge` had already set to
+    // `mcp_router`'s own auth_gate-wrapped one in PR 1, silently
     // routing every `/api/*` request through `/mcp`'s (wrong, wider)
-    // door. Caught live: an unauthenticated `/api/*` probe returned
-    // `/mcp`'s JSON-RPC error shape, and a WORKER bearer (rejected by
-    // `rest_gate`, admitted by `auth_gate`) was let through -- both
-    // pointed at the same root cause before this fallback was added.
+    // door. Caught live during PR 1: an unauthenticated `/api/*` probe
+    // returned `/mcp`'s JSON-RPC error shape, and a WORKER bearer
+    // (rejected by `rest_gate`, admitted by `auth_gate`) was let
+    // through -- both pointed at the same root cause before this
+    // fallback was added.
     async fn api_not_found() -> axum::http::StatusCode {
         axum::http::StatusCode::NOT_FOUND
     }
-    let api_router = Router::new()
+    let api_public = Router::new().route("/prompts/catalog", get(rest_handlers::prompts_catalog));
+    let api_authenticated = Router::new()
+        .route("/settings-schema", get(rest_handlers::settings_schema))
         .fallback(api_not_found)
         .layer(middleware::from_fn_with_state(
             shared.clone(),
             rest_gate::require_rest_identity,
         ));
+    let api_router = Router::new().merge(api_public).merge(api_authenticated);
     let app = Router::new()
         .merge(mcp_router)
         .nest("/api", api_router)
