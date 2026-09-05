@@ -33,6 +33,7 @@ mod orchestrator;
 mod path_policy;
 mod project_gate;
 mod project_registry;
+mod project_rename;
 mod project_teardown;
 mod proxy_client;
 mod proxy_core;
