@@ -180,6 +180,19 @@ pub fn get(id: &str) -> Option<&'static PromptEntry> {
     CATALOG.iter().find(|entry| entry.id == id)
 }
 
+/// The raw, unparsed `catalog.json` text this module embeds. Exposed
+/// for `GET /api/prompts/catalog` (Phase E1) -- Python's
+/// `prompts_catalog_api_route` serves the raw catalog dict verbatim,
+/// unauthenticated, with no visibility filtering at all (unlike
+/// `list_visible`/`render` above, which gate on `CatalogRole` for the
+/// MCP `prompts/list`/`prompts/get` surface). Reusing this embed
+/// point rather than a second `include_str!` in `conexus-backend`
+/// avoids duplicating the cross-language Nix-packaging coupling PR
+/// #850 already fixed for exactly this one relative path.
+pub fn raw_catalog_json() -> &'static str {
+    CATALOG_JSON
+}
+
 /// Why [`render`] refused to render `entry`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NotVisible;
