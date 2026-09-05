@@ -71,6 +71,20 @@ pub fn list_all(conn: &Connection) -> Result<Vec<ProjectContextRow>> {
     rows.collect()
 }
 
+/// The newest `limit` rows by `updated_at`, for a bounded dashboard
+/// read (`GET /api/context-data`, `/api/all-data`'s context section).
+/// A SQL-level `ORDER BY ... LIMIT`, not `list_all` truncated
+/// afterward -- pentest R2-F2's whole point is that a project with
+/// thousands of context rows must never materialise the full table on
+/// a dashboard poll just to keep the newest `limit`.
+pub fn list_recent(conn: &Connection, limit: i64) -> Result<Vec<ProjectContextRow>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {COLUMNS} FROM project_context ORDER BY updated_at DESC LIMIT ?1"
+    ))?;
+    let rows = stmt.query_map([limit], row_to_context)?;
+    rows.collect()
+}
+
 fn insert_new(
     conn: &Connection,
     context_key: &str,
@@ -386,6 +400,49 @@ mod tests {
         let rows = list_all(&conn).unwrap();
         let keys: Vec<&str> = rows.iter().map(|r| r.context_key.as_str()).collect();
         assert_eq!(keys, vec!["alpha", "mu", "zeta"]);
+    }
+
+    #[test]
+    fn list_recent_orders_newest_updated_first_and_respects_the_limit() {
+        let conn = test_conn();
+        upsert(
+            &conn,
+            "oldest",
+            "v",
+            None,
+            true,
+            "alice",
+            "2026-01-01T00:00:00Z",
+        )
+        .unwrap();
+        upsert(
+            &conn,
+            "middle",
+            "v",
+            None,
+            true,
+            "alice",
+            "2026-01-02T00:00:00Z",
+        )
+        .unwrap();
+        upsert(
+            &conn,
+            "newest",
+            "v",
+            None,
+            true,
+            "alice",
+            "2026-01-03T00:00:00Z",
+        )
+        .unwrap();
+
+        let all = list_recent(&conn, 10).unwrap();
+        let keys: Vec<&str> = all.iter().map(|r| r.context_key.as_str()).collect();
+        assert_eq!(keys, vec!["newest", "middle", "oldest"]);
+
+        let capped = list_recent(&conn, 2).unwrap();
+        let capped_keys: Vec<&str> = capped.iter().map(|r| r.context_key.as_str()).collect();
+        assert_eq!(capped_keys, vec!["newest", "middle"]);
     }
 
     #[test]

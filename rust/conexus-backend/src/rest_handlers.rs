@@ -1275,3 +1275,315 @@ pub async fn delete_setting(
     )
         .into_response()
 }
+
+// -- /api/status, /api/context-data, /api/terminate-agent,
+// /api/update-task-dashboard, /api/create-sample-memories
+// (Phase E1 PR 8/14, conexus-rest-composition-status) -----------------
+
+/// `GET /api/status` -- aggregate agent/task counts, matching
+/// `simple_status_api_route`. SQL `GROUP BY` aggregates
+/// (`count_by_status`/`count_active_by_status`), never a full-table
+/// materialise-then-count (pentest R4-F1).
+///
+/// `last_updated` is UTC RFC3339, not Python's naive local-clock
+/// `datetime.now().isoformat()` -- a deliberate divergence, matching
+/// every other timestamp this Rust port produces (always explicit UTC
+/// RFC3339), rather than introducing this crate's first local-
+/// timezone read for one informational field nothing depends on for
+/// correctness.
+pub async fn simple_status(State(shared): State<Arc<SharedState>>) -> Response {
+    let guard = shared.conn.lock().await;
+    let task_counts = conexus_db::task_repository::count_by_status(&guard);
+    let agent_counts =
+        conexus_db::agent_repository::AgentRepository::count_active_by_status(&guard);
+    drop(guard);
+    let (task_counts, agent_counts) = match (task_counts, agent_counts) {
+        (Ok(t), Ok(a)) => (t, a),
+        _ => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Failed to get simple status."})),
+            )
+                .into_response()
+        }
+    };
+    Json(json!({
+        "server_running": true,
+        "total_agents": agent_counts.values().sum::<i64>(),
+        "active_agents": agent_counts.get("active").copied().unwrap_or(0),
+        "total_tasks": task_counts.values().sum::<i64>(),
+        "pending_tasks": task_counts.get("pending").copied().unwrap_or(0),
+        "completed_tasks": task_counts.get("completed").copied().unwrap_or(0),
+        "last_updated": chrono::Utc::now().to_rfc3339(),
+    }))
+    .into_response()
+}
+
+fn context_row_to_json(row: &conexus_db::project_context_repository::ProjectContextRow) -> Value {
+    json!({
+        "context_key": row.context_key,
+        "value": row.value,
+        "updated_at": row.updated_at,
+        "updated_by": row.updated_by,
+        "created_at": row.created_at,
+        "created_by": row.created_by,
+        "description": row.description,
+    })
+}
+
+/// `GET /api/context-data` -- project_context rows only, matching
+/// `context_data_api_route`. ADR-0017: shared project knowledge,
+/// returned AS-IS, no content-based redaction. Bounded via the same
+/// `?limit` clamp `/api/tasks`/`/api/all-data` share (pentest R2-F2).
+pub async fn context_data(
+    State(shared): State<Arc<SharedState>>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let limit = crate::read_limits::clamp_section_limit(params.get("limit").map(String::as_str));
+    let guard = shared.conn.lock().await;
+    let rows = conexus_db::project_context_repository::list_recent(&guard, limit);
+    drop(guard);
+    match rows {
+        Ok(rows) => {
+            let data: Vec<_> = rows.iter().map(context_row_to_json).collect();
+            Json(data).into_response()
+        }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "Failed to fetch context data."})),
+        )
+            .into_response(),
+    }
+}
+
+/// `POST /api/terminate-agent` -- thin adapter over the `terminate_agent`
+/// MCP tool, matching `terminate_agent_dashboard_api_route`.
+pub async fn terminate_agent_dashboard(
+    State(shared): State<Arc<SharedState>>,
+    Extension(resolved): Extension<ResolvedRestPrincipal>,
+    body: Bytes,
+) -> Response {
+    let data = match decode_untrusted_body(&body) {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"message": e.to_string()})),
+            )
+                .into_response()
+        }
+    };
+    let agent_id = data.get("agent_id").and_then(Value::as_str);
+    let arguments = match agent_id {
+        Some(id) => json!({"agent_id": id}),
+        None => json!({}),
+    };
+    let principal = resolved.dispatch_principal.clone();
+    dispatch_through_tool(
+        &shared,
+        "terminate_agent",
+        arguments,
+        &principal,
+        agent_id.map(|id| format!("Agent '{id}' terminated successfully via dashboard API.")),
+    )
+    .await
+}
+
+/// Human-readable error string for `update_task_dashboard`'s legacy
+/// `{"error": ...}` envelope. Port of `_update_task_error_detail`.
+fn update_task_error_detail(result: &ToolResult) -> String {
+    match result {
+        ToolResult::NotFound { .. } => "Task not found".to_string(),
+        ToolResult::Conflict { reason } | ToolResult::PermissionDenied { reason } => reason.clone(),
+        ToolResult::Invalid { message, .. } => message.clone(),
+        _ => "Failed to update task.".to_string(),
+    }
+}
+
+/// `POST /api/update-task-dashboard` -- thin adapter over `update_task`,
+/// matching `update_task_details_api_route`. Wire-level rules
+/// (unchanged from the pre-refactor route): `task_id` required; at
+/// least one editable field required; `assigned_to: null`/`""`/
+/// `"unassigned"` all normalize to the tool's own clear sentinel
+/// (`"unassigned"`) so the clear intent survives
+/// `decode_untrusted_body`'s null handling, distinct from omitting the
+/// field entirely (leave unchanged).
+pub async fn update_task_dashboard(
+    State(shared): State<Arc<SharedState>>,
+    Extension(resolved): Extension<ResolvedRestPrincipal>,
+    body: Bytes,
+) -> Response {
+    let data = match decode_untrusted_body(&body) {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
+    };
+
+    let task_id = data
+        .get("task_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+    let Some(task_id) = task_id else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "task_id is a required field."})),
+        )
+            .into_response();
+    };
+
+    const EDITABLE_KEYS: [&str; 6] = [
+        "status",
+        "title",
+        "description",
+        "priority",
+        "notes",
+        "assigned_to",
+    ];
+    if !EDITABLE_KEYS.iter().any(|k| data.contains_key(*k)) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "at least one editable field is required (status, title, description, priority, notes, assigned_to).",
+            })),
+        )
+            .into_response();
+    }
+
+    for field in [
+        "task_id",
+        "status",
+        "title",
+        "description",
+        "priority",
+        "assigned_to",
+    ] {
+        if let Some(resp) = require_str(data.get(field), field) {
+            return resp;
+        }
+    }
+
+    let assigned_to_arg: Value = if let Some(raw) = data.get("assigned_to") {
+        let clears = raw.is_null()
+            || matches!(raw, Value::String(s) if matches!(s.trim(), "" | "unassigned"));
+        if clears {
+            Value::String("unassigned".to_string())
+        } else {
+            raw.clone()
+        }
+    } else {
+        Value::Null
+    };
+
+    let arguments = json!({
+        "task_id": task_id,
+        "status": data.get("status").cloned().unwrap_or(Value::Null),
+        "title": data.get("title").cloned().unwrap_or(Value::Null),
+        "description": data.get("description").cloned().unwrap_or(Value::Null),
+        "priority": data.get("priority").cloned().unwrap_or(Value::Null),
+        "assigned_to": assigned_to_arg,
+        "notes": data.get("notes").cloned().unwrap_or(Value::Null),
+    });
+
+    let principal = resolved.dispatch_principal.clone();
+    let result = match dispatch_rest_tool(&shared, "update_task", arguments, Some(&principal)).await
+    {
+        Ok(r) => r,
+        Err(()) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Failed to update task."})),
+            )
+                .into_response()
+        }
+    };
+
+    if let ToolResult::Ok { message, .. } = &result {
+        return Json(json!({
+            "success": true,
+            "message": message.clone().unwrap_or_else(|| "Task updated successfully via dashboard.".to_string()),
+        }))
+        .into_response();
+    }
+    let (status, _) = result.to_http();
+    let message = if matches!(result, ToolResult::Failed { .. }) {
+        "Failed to update task.".to_string()
+    } else {
+        update_task_error_detail(&result)
+    };
+    (
+        StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        Json(json!({"error": message})),
+    )
+        .into_response()
+}
+
+/// `POST /api/create-sample-memories` -- seeds 4 hard-coded demo
+/// `project_context` rows, matching `create_sample_memories_route`.
+/// Dispatches through the gated `bulk_update_project_context` tool
+/// (R9-F2: not an ORM-direct write) so viewer-tier callers are denied
+/// and the rows are attributed to the real operator.
+pub async fn create_sample_memories(
+    State(shared): State<Arc<SharedState>>,
+    Extension(resolved): Extension<ResolvedRestPrincipal>,
+) -> Response {
+    let sample_memories = json!([
+        {
+            "context_key": "api.config.base_url",
+            "context_value": "https://api.example.com",
+            "description": "Main API base URL for external services",
+        },
+        {
+            "context_key": "app.settings.theme",
+            "context_value": {"theme": "dark", "accent": "blue"},
+            "description": "Application theme preferences",
+        },
+        {
+            "context_key": "database.connection.timeout",
+            "context_value": 30,
+            "description": "Database connection timeout in seconds",
+        },
+        {
+            "context_key": "cache.redis.config",
+            "context_value": {"host": "localhost", "port": 6379, "ttl": 3600},
+            "description": "Redis cache configuration",
+        },
+    ]);
+    let created_count = sample_memories.as_array().map(Vec::len).unwrap_or(0);
+    let principal = resolved.dispatch_principal.clone();
+    let result = match dispatch_rest_tool(
+        &shared,
+        "bulk_update_project_context",
+        json!({"updates": sample_memories}),
+        Some(&principal),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(()) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"success": false, "error": "Failed to create sample memories."})),
+            )
+                .into_response()
+        }
+    };
+    if matches!(result, ToolResult::Ok { .. }) {
+        return Json(json!({
+            "success": true,
+            "message": format!("Created {created_count} sample memory entries"),
+            "created_count": created_count,
+        }))
+        .into_response();
+    }
+    let (status, body) = result.to_http();
+    (
+        StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        Json(body),
+    )
+        .into_response()
+}
