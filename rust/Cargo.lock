@@ -322,6 +322,7 @@ dependencies = [
  "conexus-db",
  "conexus-tools",
  "conexus-wakeloop",
+ "futures-util",
  "hyper",
  "hyper-util",
  "rmcp",

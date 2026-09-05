@@ -22,6 +22,7 @@ mod auth_gate;
 mod boot;
 mod instructions;
 mod json_sanitize;
+mod operator_events;
 mod principal_resolve;
 mod read_limits;
 mod rest_gate;
@@ -104,6 +105,7 @@ async fn main() -> Result<()> {
         waiter_registry: conexus_wakeloop::waiter_registry::WaiterRegistry::new(),
         file_map: conexus_wakeloop::file_map::FileMap::new(),
         project_dir: cli.project_dir.clone(),
+        operator_events: operator_events::OperatorEventsHub::new(),
     });
 
     let shared_for_factory = shared.clone();
@@ -266,6 +268,8 @@ async fn main() -> Result<()> {
             "/agents/{agent_id}/directive",
             post(rest_handlers::poke_agent_directive),
         )
+        .route("/events", get(rest_handlers::operator_events_stream))
+        .route("/events/status", get(rest_handlers::operator_events_status))
         .fallback(api_not_found)
         .layer(middleware::from_fn_with_state(
             shared.clone(),
