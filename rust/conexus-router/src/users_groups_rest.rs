@@ -31,8 +31,10 @@ use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use chrono::Utc;
-use conexus_core::capability::Capability;
+use conexus_core::capability::{Capabilities, Capability};
+use conexus_core::principal::Principal;
 
+use crate::admin_group_members::{self, AddGroupMemberOutcome, RemoveGroupMemberOutcome};
 use crate::admin_groups::{self, CreateGroupOutcome, DeleteGroupOutcome, EditGroupOutcome};
 use crate::admin_users_gate;
 use crate::admin_users_users::{self, CreateUserOutcome, DeleteUserOutcome, EditUserOutcome};
@@ -69,6 +71,29 @@ impl From<rusqlite::Error> for HandlerResponse {
 
 fn cookie_header(headers: &HeaderMap) -> Option<&str> {
     headers.get("cookie").and_then(|v| v.to_str().ok())
+}
+
+/// Port of `_caller_is_sysadmin(req)`'s post-revalidation read.
+///
+/// **Found-and-fixed real TOCTOU gap (this PR)**: every mutating
+/// handler that reads a body ALSO re-validates via
+/// `perm_gates::read_body_and_revalidate`, which returns a FRESH
+/// `Principal` specifically so the caller's sysadmin-grant guard sees
+/// post-yield state (Python's own `_caller_is_sysadmin(req)` reads
+/// `req['principal']`, which `read_body_and_revalidate`'s real
+/// implementation mutates in place -- `perm_gates.py:185`). The
+/// original `create_user_handler`/`edit_user_handler`/
+/// `create_group_handler`/`edit_group_handler` wiring discarded that
+/// returned principal (`let (parsed, _principal) = ...`) and used the
+/// STALE `identity.is_sysadmin` captured at session-gate time instead
+/// -- reopening exactly the TOCTOU window `read_body_and_revalidate`
+/// exists to close: a caller whose sysadmin status was revoked
+/// between session-gate resolution and this handler's body-read
+/// could still pass the "granting sysadmin is sysadmin-only"
+/// self-escalation guard. Fixed by deriving `is_sysadmin` from the
+/// returned `Principal` instead of the stale `GateIdentity`.
+fn fresh_is_sysadmin(principal: &Principal) -> bool {
+    matches!(principal.capabilities, Capabilities::Sysadmin)
 }
 
 fn require_users_capability(
@@ -118,14 +143,14 @@ pub async fn create_user_handler(
         cap: Capability::SystemUsersManage,
         project: None,
     };
-    let (parsed, _principal) = match perm_gates::read_body_and_revalidate(&conn, &body, &spec) {
+    let (parsed, principal) = match perm_gates::read_body_and_revalidate(&conn, &body, &spec) {
         Ok(v) => v,
         Err(resp) => return resp.into_response(),
     };
     let parsed_value = serde_json::Value::Object(parsed);
     let outcome = match admin_users_users::decide_create_user(
         &conn,
-        identity.is_sysadmin,
+        fresh_is_sysadmin(&principal),
         &identity.user.username,
         &parsed_value,
         &now_str,
@@ -163,14 +188,14 @@ pub async fn edit_user_handler(
         cap: Capability::SystemUsersManage,
         project: None,
     };
-    let (parsed, _principal) = match perm_gates::read_body_and_revalidate(&conn, &body, &spec) {
+    let (parsed, principal) = match perm_gates::read_body_and_revalidate(&conn, &body, &spec) {
         Ok(v) => v,
         Err(resp) => return resp.into_response(),
     };
     let parsed_value = serde_json::Value::Object(parsed);
     let outcome = match admin_users_users::decide_edit_user(
         &mut conn,
-        identity.is_sysadmin,
+        fresh_is_sysadmin(&principal),
         &identity.user.username,
         &user_id,
         &parsed_value,
@@ -262,14 +287,14 @@ pub async fn create_group_handler(
         cap: Capability::SystemGroupsManage,
         project: None,
     };
-    let (parsed, _principal) = match perm_gates::read_body_and_revalidate(&conn, &body, &spec) {
+    let (parsed, principal) = match perm_gates::read_body_and_revalidate(&conn, &body, &spec) {
         Ok(v) => v,
         Err(resp) => return resp.into_response(),
     };
     let parsed_value = serde_json::Value::Object(parsed);
     let outcome = match admin_groups::decide_create_group(
         &conn,
-        identity.is_sysadmin,
+        fresh_is_sysadmin(&principal),
         &identity.user.username,
         &parsed_value,
         &now_str,
@@ -307,14 +332,14 @@ pub async fn edit_group_handler(
         cap: Capability::SystemGroupsManage,
         project: None,
     };
-    let (parsed, _principal) = match perm_gates::read_body_and_revalidate(&conn, &body, &spec) {
+    let (parsed, principal) = match perm_gates::read_body_and_revalidate(&conn, &body, &spec) {
         Ok(v) => v,
         Err(resp) => return resp.into_response(),
     };
     let parsed_value = serde_json::Value::Object(parsed);
     let outcome = match admin_groups::decide_edit_group(
         &mut conn,
-        identity.is_sysadmin,
+        fresh_is_sysadmin(&principal),
         &identity.user.username,
         &group_id,
         &parsed_value,
@@ -357,5 +382,106 @@ pub async fn delete_group_handler(
                 .into_response()
         }
         DeleteGroupOutcome::Rejected(resp) => resp.into_response(),
+    }
+}
+
+/// Port of `list_group_members_handler`. No body, entry-time check
+/// only. Same capability as groups CRUD (`system.groups.manage`) --
+/// confirmed against the real Python registration, which reuses the
+/// identical `groups_gate` variable for every group-member route too.
+pub async fn list_group_members_handler(
+    State(state): State<Arc<RouterState>>,
+    Extension(identity): Extension<GateIdentity>,
+    Path(group_id): Path<String>,
+) -> Response {
+    if let Err(resp) = require_groups_capability(&state, &identity) {
+        return resp.into_response();
+    }
+    let conn = state.conn.lock().await;
+    match admin_group_members::list_group_members_response(&conn, &group_id) {
+        Ok(resp) => resp.into_response(),
+        Err(e) => HandlerResponse::from(e).into_response(),
+    }
+}
+
+/// Port of `add_group_member_handler`.
+pub async fn add_group_member_handler(
+    State(state): State<Arc<RouterState>>,
+    Extension(identity): Extension<GateIdentity>,
+    Path(group_id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(resp) = require_groups_capability(&state, &identity) {
+        return resp.into_response();
+    }
+    let mut conn = state.conn.lock().await;
+    let now_str = Utc::now().to_rfc3339();
+    let spec = RevalidationSpec {
+        stale_user_id: &identity.user.user_id,
+        cookie_header: cookie_header(&headers),
+        now: &now_str,
+        cap: Capability::SystemGroupsManage,
+        project: None,
+    };
+    let (parsed, principal) = match perm_gates::read_body_and_revalidate(&conn, &body, &spec) {
+        Ok(v) => v,
+        Err(resp) => return resp.into_response(),
+    };
+    let parsed_value = serde_json::Value::Object(parsed);
+    let outcome = match admin_group_members::decide_add_group_member(
+        &mut conn,
+        fresh_is_sysadmin(&principal),
+        &identity.user.username,
+        Some(&identity.user.user_id),
+        Some(&principal),
+        &group_id,
+        &parsed_value,
+        &now_str,
+    ) {
+        Ok(o) => o,
+        Err(e) => return HandlerResponse::from(e).into_response(),
+    };
+    match outcome {
+        AddGroupMemberOutcome::Added(member) => {
+            admin_users_gate::success_envelope(serde_json::json!({"member": member}), 201)
+                .into_response()
+        }
+        AddGroupMemberOutcome::Rejected(resp) => resp.into_response(),
+    }
+}
+
+/// Port of `remove_group_member_handler`. No body, so `caller_principal`
+/// is the session-gate-resolved identity's own principal (there is no
+/// later revalidation to make it "become" stale relative to, matching
+/// Python's `_caller_is_sysadmin(req)` reading whatever `req['principal']`
+/// the auth middleware set for this request).
+pub async fn remove_group_member_handler(
+    State(state): State<Arc<RouterState>>,
+    Extension(identity): Extension<GateIdentity>,
+    Path((group_id, member_id)): Path<(String, String)>,
+) -> Response {
+    if let Err(resp) = require_groups_capability(&state, &identity) {
+        return resp.into_response();
+    }
+    let mut conn = state.conn.lock().await;
+    let outcome = match admin_group_members::decide_remove_group_member(
+        &mut conn,
+        identity.is_sysadmin,
+        &identity.user.username,
+        Some(&identity.user.user_id),
+        Some(&identity.principal),
+        &group_id,
+        &member_id,
+    ) {
+        Ok(o) => o,
+        Err(e) => return HandlerResponse::from(e).into_response(),
+    };
+    match outcome {
+        RemoveGroupMemberOutcome::Removed(member_id) => {
+            admin_users_gate::success_envelope(serde_json::json!({"removed": member_id}), 200)
+                .into_response()
+        }
+        RemoveGroupMemberOutcome::Rejected(resp) => resp.into_response(),
     }
 }
