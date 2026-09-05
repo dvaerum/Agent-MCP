@@ -103,7 +103,10 @@ fn validation_error(message: &str) -> HandlerResponse {
 /// [`project_gate::revalidate_capability_and_membership`] (a project
 /// is named), depending on `spec.project` -- the ONE place a caller
 /// needs to know which of the two underlying primitives applies.
-fn revalidate(conn: &Connection, spec: &RevalidationSpec) -> Result<Box<Principal>, HandlerResponse> {
+fn revalidate(
+    conn: &Connection,
+    spec: &RevalidationSpec,
+) -> Result<Box<Principal>, HandlerResponse> {
     match spec.project {
         None => {
             match project_gate::revalidate_capability(
