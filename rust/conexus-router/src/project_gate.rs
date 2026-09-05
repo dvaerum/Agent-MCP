@@ -114,6 +114,70 @@ pub enum CrossTenantOutcome {
     Forbidden { role: String, min_role: String },
 }
 
+/// Port of `revalidate_capability_or_403` (the project-LESS half of
+/// `perm_gates.py` -- `admin_users_api.py`'s own handlers gate on a
+/// bare `system.*` capability with no `project_name` at all, so
+/// `read_body_and_revalidate(req, parse_body, cap)` calls this
+/// directly rather than [`revalidate_capability_and_membership`]
+/// below, which ALWAYS requires a real project and denies with no
+/// membership row -- wrong for a caller who simply isn't scoped to
+/// any project). Session-liveness + a fresh capability re-derivation
+/// only; no membership/rank check exists to run without a project.
+#[derive(Debug)]
+pub enum RevalidateCapabilityOutcome {
+    Allow(Box<Principal>),
+    DeniedSessionInvalid,
+    DeniedCapability,
+}
+
+pub fn revalidate_capability(
+    conn: &Connection,
+    stale_user_id: &str,
+    cookie_header: Option<&str>,
+    now: &str,
+    cap: Capability,
+) -> Result<RevalidateCapabilityOutcome, GateError> {
+    if let Some(header) = cookie_header {
+        if login::parse_cookie_header(header, login::SESSION_COOKIE_NAME).is_some() {
+            match login::resolve_current_user(conn, Some(header), now) {
+                Ok(Some(_)) => {}
+                _ => return Ok(RevalidateCapabilityOutcome::DeniedSessionInvalid),
+            }
+        }
+    }
+
+    let groups = group_membership_repository::resolve_user_groups(conn, stale_user_id).ok();
+    let is_sysadmin =
+        group_membership_repository::resolve_user_is_sysadmin(conn, stale_user_id, groups.as_ref())
+            .unwrap_or(false);
+    let capabilities = resolve_capabilities(
+        Some(conn),
+        ResolveCapabilitiesInput {
+            sysadmin: is_sysadmin,
+            kind: PrincipalKind::OperatorSession,
+            agent_role: None,
+            user_id: Some(stale_user_id),
+            project_role: None,
+            groups: groups.as_ref(),
+        },
+    )?;
+    let principal = Principal {
+        kind: PrincipalKind::OperatorSession,
+        user_id: Some(stale_user_id.to_string()),
+        agent_id: None,
+        project_name: None,
+        project_role: None,
+        agent_role: None,
+        can_wake_loop: false,
+        source_token: None,
+        capabilities,
+    };
+    if !principal.has_capability(cap) {
+        return Ok(RevalidateCapabilityOutcome::DeniedCapability);
+    }
+    Ok(RevalidateCapabilityOutcome::Allow(Box::new(principal)))
+}
+
 /// Port of `_revalidate_capability_and_membership_or_403`: a FRESH
 /// re-derivation of session liveness, capability, and (when
 /// `project_name` matters) membership+rank -- called after a genuine
@@ -553,6 +617,81 @@ mod tests {
         // bob has no group-granted capability at all here, so this
         // denies on capability first -- proves the fail-closed default.
         assert!(matches!(outcome, RevalidateOutcome::DeniedCapability));
+    }
+
+    // -- revalidate_capability (project-less) -----------------------------
+
+    #[test]
+    fn revalidate_capability_denies_when_the_session_cookie_no_longer_resolves() {
+        let mut c = conn();
+        let uid = seed_user(&mut c, "alice");
+        let cookie = format!("{}=nonexistent-session-id", login::SESSION_COOKIE_NAME);
+        let outcome = revalidate_capability(
+            &c,
+            &uid,
+            Some(&cookie),
+            NOW_STR,
+            Capability::SystemUsersManage,
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            RevalidateCapabilityOutcome::DeniedSessionInvalid
+        ));
+    }
+
+    #[test]
+    fn revalidate_capability_allows_a_sysadmin_with_a_live_session() {
+        let mut c = conn();
+        let uid = seed_user(&mut c, "alice"); // first user -> sysadmin
+        let sid =
+            crate::identity::create_session(&c, &uid, NOW_STR, "2026-02-01T00:00:00.000+00:00")
+                .unwrap();
+        let cookie = format!("{}={}", login::SESSION_COOKIE_NAME, sid);
+        let outcome = revalidate_capability(
+            &c,
+            &uid,
+            Some(&cookie),
+            NOW_STR,
+            Capability::SystemUsersManage,
+        )
+        .unwrap();
+        assert!(matches!(outcome, RevalidateCapabilityOutcome::Allow(_)));
+    }
+
+    #[test]
+    fn revalidate_capability_denies_a_non_sysadmin_lacking_the_capability() {
+        let mut c = conn();
+        seed_user(&mut c, "alice"); // sysadmin, irrelevant here
+        let bob = crate::identity::create_user(
+            &mut c,
+            "bob",
+            "correct horse battery staple",
+            None,
+            false,
+            true,
+            &[],
+            NOW_STR,
+        )
+        .unwrap();
+        let outcome =
+            revalidate_capability(&c, &bob, None, NOW_STR, Capability::SystemUsersManage).unwrap();
+        assert!(matches!(
+            outcome,
+            RevalidateCapabilityOutcome::DeniedCapability
+        ));
+    }
+
+    #[test]
+    fn revalidate_capability_admits_with_no_cookie_at_all() {
+        // A forwarding-header/bearer caller has no session cookie to
+        // revalidate at all -- the liveness check must be skipped
+        // entirely, not treated as an automatic denial.
+        let mut c = conn();
+        let uid = seed_user(&mut c, "alice"); // sysadmin
+        let outcome =
+            revalidate_capability(&c, &uid, None, NOW_STR, Capability::SystemUsersManage).unwrap();
+        assert!(matches!(outcome, RevalidateCapabilityOutcome::Allow(_)));
     }
 
     // -- decide_create_project --------------------------------------------
