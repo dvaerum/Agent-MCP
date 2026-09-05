@@ -281,6 +281,44 @@ impl AgentRepository {
         rows.collect()
     }
 
+    /// `GET /api/agents`'s real query, faithfully -- every status
+    /// EXCEPT `tombstone` (a DB-internal FK artefact, never operator-
+    /// queryable), optionally narrowed to one exact `status`, newest-
+    /// created first, capped at `limit`. A THIRD status-filter shape
+    /// alongside `list_active`/`list_all_bounded`: unlike
+    /// `list_active`'s multi-status `NOT_TERMINAL_SQL` exclusion, this
+    /// endpoint's dashboard listing deliberately INCLUDES `terminated`
+    /// rows (an operator still wants to see/restore them) -- only
+    /// `tombstone` is excluded. The tombstone exclusion is applied in
+    /// SQL, not filtered client-side after `LIMIT`, so a project with
+    /// tombstones interleaved near the top of `created_at DESC` still
+    /// returns a full `limit` of real rows, matching Python's real
+    /// two-branch WHERE clause exactly.
+    pub fn list_for_dashboard(
+        conn: &Connection,
+        status_filter: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<AgentRow>> {
+        match status_filter {
+            None => {
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {AGENT_COLUMNS} FROM agents WHERE status != 'tombstone' \
+                     ORDER BY created_at DESC LIMIT ?1"
+                ))?;
+                let rows = stmt.query_map([limit], row_to_agent)?;
+                rows.collect()
+            }
+            Some(status) => {
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {AGENT_COLUMNS} FROM agents WHERE status = ?1 AND status != 'tombstone' \
+                     ORDER BY created_at DESC LIMIT ?2"
+                ))?;
+                let rows = stmt.query_map(rusqlite::params![status, limit], row_to_agent)?;
+                rows.collect()
+            }
+        }
+    }
+
     /// True iff a live (non-terminated, non-tombstone) agent row exists
     /// for `agent_id`. Reuses [`NOT_TERMINAL_SQL`] so this predicate can
     /// never drift from the other converged "live agent" sites
@@ -1132,6 +1170,42 @@ mod tests {
 
         let capped = AgentRepository::list_all_bounded(&conn, 2).unwrap();
         assert_eq!(capped.len(), 2);
+    }
+
+    #[test]
+    fn list_for_dashboard_excludes_only_tombstone_and_the_limit_applies_after_that_filter() {
+        let conn = test_conn();
+        seed(&conn, "live1", "t1", "active");
+        seed(&conn, "dead1", "t2", "terminated");
+        seed(&conn, "tomb1", "t3", "tombstone");
+
+        let unfiltered = AgentRepository::list_for_dashboard(&conn, None, 10).unwrap();
+        let mut ids: Vec<_> = unfiltered.iter().map(|a| a.agent_id.as_str()).collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["dead1", "live1"],
+            "terminated stays visible (an operator can still restore it); only tombstone drops"
+        );
+
+        // The LIMIT must apply AFTER the tombstone exclusion, in SQL --
+        // not a client-side filter over an already-capped read, which
+        // could silently return fewer than `limit` real rows if a
+        // tombstone sorts ahead of them.
+        let capped = AgentRepository::list_for_dashboard(&conn, None, 1).unwrap();
+        assert_eq!(capped.len(), 1);
+
+        let status_scoped =
+            AgentRepository::list_for_dashboard(&conn, Some("terminated"), 10).unwrap();
+        assert_eq!(status_scoped.len(), 1);
+        assert_eq!(status_scoped[0].agent_id, "dead1");
+
+        let tombstone_scoped =
+            AgentRepository::list_for_dashboard(&conn, Some("tombstone"), 10).unwrap();
+        assert!(
+            tombstone_scoped.is_empty(),
+            "an explicit status=tombstone query must still return nothing"
+        );
     }
 
     #[test]
