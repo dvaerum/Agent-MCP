@@ -56,6 +56,7 @@ mod session_gate;
 mod single_tenant;
 mod sso;
 mod state;
+mod users_groups_rest;
 
 use std::net::SocketAddr;
 
@@ -289,6 +290,15 @@ async fn main() -> Result<()> {
         .route(
             "/agent-mcp/api/router/overview",
             get(lifecycle_rest::overview_handler),
+        )
+        .route(
+            "/agent-mcp/api/router/users",
+            get(users_groups_rest::list_users_handler).post(users_groups_rest::create_user_handler),
+        )
+        .route(
+            "/agent-mcp/api/router/users/{user_id}",
+            axum::routing::patch(users_groups_rest::edit_user_handler)
+                .delete(users_groups_rest::delete_user_handler),
         )
         .layer(axum::middleware::from_fn_with_state(
             std::sync::Arc::clone(&state),

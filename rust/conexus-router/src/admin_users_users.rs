@@ -26,7 +26,10 @@ use crate::admin_users_gate::{self, AdminUsersError};
 use crate::identity::{self, IdentityError};
 use crate::mcp_handler::HandlerResponse;
 
-fn user_public_json(u: &identity::UserPublicRow) -> serde_json::Value {
+/// `pub(crate)`, not private -- the axum wiring layer (a different
+/// module) needs this to render `CreateUserOutcome::Created`/
+/// `EditUserOutcome::Updated`'s success envelope.
+pub(crate) fn user_public_json(u: &identity::UserPublicRow) -> serde_json::Value {
     serde_json::json!({
         "user_id": u.user_id,
         "username": u.username,
