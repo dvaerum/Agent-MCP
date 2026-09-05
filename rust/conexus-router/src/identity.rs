@@ -452,6 +452,82 @@ pub fn add_project_membership(
     Ok(())
 }
 
+/// Grant EXACTLY ONE of `user_id`/`group_id` `role` on `project_name`
+/// -- port of `RouterStore.add_project_membership`'s real call shape
+/// from `add_project_membership_handler` (a plain INSERT, never `OR
+/// IGNORE` -- that handler wants a duplicate to fail, mapped to a 409
+/// by the caller). Distinct from [`add_project_membership`] above
+/// (which is the narrower, idempotent, user-only, default-role grant
+/// `create_project_handler`'s own bootstrap needs) -- named
+/// differently so the two deliberately different contracts (idempotent
+/// vs. fail-on-duplicate; user-only vs. user-or-group; DB-default role
+/// vs. explicit role) can never be confused at a call site.
+pub fn grant_project_membership(
+    conn: &Connection,
+    project_name: &str,
+    user_id: Option<&str>,
+    group_id: Option<&str>,
+    role: &str,
+) -> Result<(), IdentityError> {
+    debug_assert!(
+        user_id.is_some() != group_id.is_some(),
+        "grant_project_membership requires exactly one of user_id or group_id"
+    );
+    conn.execute(
+        "INSERT INTO project_membership (project_name, user_id, group_id, role) VALUES (?1, ?2, ?3, ?4)",
+        (project_name, user_id, group_id, role),
+    )?;
+    Ok(())
+}
+
+/// The current role for exactly one of `user_id`/`group_id` on
+/// `project_name`, or `None` if no such row exists -- port of
+/// `change_project_membership_role_handler`'s existing-role lookup
+/// (AZ-R12-1's revoke-mirror guard needs the PRE-change role to apply
+/// the grant guard symmetrically).
+pub fn project_membership_role(
+    conn: &Connection,
+    project_name: &str,
+    user_id: Option<&str>,
+    group_id: Option<&str>,
+) -> Result<Option<String>, IdentityError> {
+    let id = user_id
+        .or(group_id)
+        .expect("project_membership_role requires exactly one of user_id or group_id");
+    let sql = if user_id.is_some() {
+        "SELECT role FROM project_membership WHERE project_name = ?1 AND user_id = ?2"
+    } else {
+        "SELECT role FROM project_membership WHERE project_name = ?1 AND group_id = ?2"
+    };
+    Ok(conn
+        .query_row(sql, (project_name, id), |r| r.get(0))
+        .optional()?)
+}
+
+/// Change the role for exactly one of `user_id`/`group_id` on
+/// `project_name` -- port of `change_project_membership_role_handler`'s
+/// `UPDATE`. A no-op (no error) if the row doesn't exist -- the
+/// caller re-checks existence via [`project_membership_role`] first
+/// and 404s before ever calling this.
+pub fn update_project_membership_role(
+    conn: &Connection,
+    project_name: &str,
+    user_id: Option<&str>,
+    group_id: Option<&str>,
+    role: &str,
+) -> Result<(), IdentityError> {
+    let id = user_id
+        .or(group_id)
+        .expect("update_project_membership_role requires exactly one of user_id or group_id");
+    let sql = if user_id.is_some() {
+        "UPDATE project_membership SET role = ?1 WHERE project_name = ?2 AND user_id = ?3"
+    } else {
+        "UPDATE project_membership SET role = ?1 WHERE project_name = ?2 AND group_id = ?3"
+    };
+    conn.execute(sql, (role, project_name, id))?;
+    Ok(())
+}
+
 /// Re-key every `project_membership` row from `old_name` to
 /// `new_name` -- port of `rename_project_handler`'s inline
 /// best-effort `UPDATE` (AZ-R13-1). A project rename is registry-
@@ -898,6 +974,122 @@ mod tests {
     fn remove_project_membership_by_project_on_an_unknown_project_is_a_noop() {
         let c = conn();
         remove_project_membership_by_project(&c, "never-existed").unwrap();
+    }
+
+    #[test]
+    fn grant_project_membership_grants_a_user_an_explicit_role() {
+        let mut c = conn();
+        let uid = create_user(
+            &mut c,
+            "alice",
+            "correct horse battery staple",
+            None,
+            false,
+            true,
+            &[],
+            NOW,
+        )
+        .unwrap();
+        grant_project_membership(&c, "proj-a", Some(&uid), None, "viewer").unwrap();
+        let role: String = c
+            .query_row(
+                "SELECT role FROM project_membership WHERE project_name = 'proj-a' AND user_id = ?1",
+                [&uid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(role, "viewer");
+    }
+
+    #[test]
+    fn grant_project_membership_grants_a_group_an_explicit_role() {
+        let c = conn();
+        c.execute(
+            "INSERT INTO groups (group_id, name, is_sysadmin, created_at) VALUES ('g1', 'g1', 0, ?1)",
+            [NOW],
+        )
+        .unwrap();
+        grant_project_membership(&c, "proj-a", None, Some("g1"), "operator").unwrap();
+        let role: String = c
+            .query_row(
+                "SELECT role FROM project_membership WHERE project_name = 'proj-a' AND group_id = 'g1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(role, "operator");
+    }
+
+    #[test]
+    fn grant_project_membership_rejects_a_duplicate() {
+        let mut c = conn();
+        let uid = create_user(
+            &mut c,
+            "alice",
+            "correct horse battery staple",
+            None,
+            false,
+            true,
+            &[],
+            NOW,
+        )
+        .unwrap();
+        grant_project_membership(&c, "proj-a", Some(&uid), None, "operator").unwrap();
+        let err = grant_project_membership(&c, "proj-a", Some(&uid), None, "operator").unwrap_err();
+        assert!(matches!(err, IdentityError::Db(_)));
+    }
+
+    #[test]
+    fn project_membership_role_reads_back_the_granted_role() {
+        let mut c = conn();
+        let uid = create_user(
+            &mut c,
+            "alice",
+            "correct horse battery staple",
+            None,
+            false,
+            true,
+            &[],
+            NOW,
+        )
+        .unwrap();
+        grant_project_membership(&c, "proj-a", Some(&uid), None, "viewer").unwrap();
+        let role = project_membership_role(&c, "proj-a", Some(&uid), None).unwrap();
+        assert_eq!(role.as_deref(), Some("viewer"));
+    }
+
+    #[test]
+    fn project_membership_role_is_none_for_a_missing_row() {
+        let c = conn();
+        assert!(project_membership_role(&c, "proj-a", Some("nobody"), None)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn update_project_membership_role_changes_an_existing_grant() {
+        let mut c = conn();
+        let uid = create_user(
+            &mut c,
+            "alice",
+            "correct horse battery staple",
+            None,
+            false,
+            true,
+            &[],
+            NOW,
+        )
+        .unwrap();
+        grant_project_membership(&c, "proj-a", Some(&uid), None, "viewer").unwrap();
+        update_project_membership_role(&c, "proj-a", Some(&uid), None, "operator").unwrap();
+        let role = project_membership_role(&c, "proj-a", Some(&uid), None).unwrap();
+        assert_eq!(role.as_deref(), Some("operator"));
+    }
+
+    #[test]
+    fn update_project_membership_role_on_a_missing_row_is_a_noop() {
+        let c = conn();
+        update_project_membership_role(&c, "proj-a", Some("nobody"), None, "operator").unwrap();
     }
 
     #[test]
