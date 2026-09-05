@@ -25,6 +25,7 @@
 mod admin_group_capabilities;
 mod admin_group_members;
 mod admin_groups;
+mod admin_project_memberships;
 mod admin_users_gate;
 mod admin_users_users;
 mod asset_prefix;
