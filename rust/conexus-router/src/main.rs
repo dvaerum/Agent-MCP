@@ -22,6 +22,9 @@
 //! a per-project backend as an opaque process is enforced at compile
 //! time here, not just by convention.
 
+mod mount;
+mod path_policy;
+
 use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
