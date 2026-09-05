@@ -38,6 +38,18 @@ let
   commonArgs = {
     src = craneLib.cleanCargoSource "${src}/rust";
     strictDeps = true;
+    # conexus-tools/src/prompts.rs reaches out of the rust/ workspace
+    # via `include_str!("../../../agent_mcp/prompts/catalog.json")` (a
+    # deliberate, temporary cross-language coupling per the migration
+    # plan, retired only in Phase F) — cleanCargoSource above scopes
+    # the build to rust/ alone, so that sibling file is missing from
+    # the sandbox unless copied in at the same relative path the
+    # include_str! resolves against (one directory above $sourceRoot,
+    # matching rust/ and agent_mcp/ being siblings in a real checkout).
+    postUnpack = ''
+      mkdir -p "$sourceRoot/../agent_mcp/prompts"
+      cp ${src}/agent_mcp/prompts/catalog.json "$sourceRoot/../agent_mcp/prompts/catalog.json"
+    '';
     # rust/Cargo.toml is a virtual workspace manifest (no [package]
     # section of its own — see the crate list in rust/Cargo.toml), so
     # crane can't infer a name/version from it the way it can for a
