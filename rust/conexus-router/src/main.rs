@@ -25,6 +25,7 @@
 mod asset_prefix;
 mod client_disconnect;
 mod identity;
+mod lifecycle;
 mod login;
 mod mcp_handler;
 mod mount;
@@ -36,6 +37,7 @@ mod proxy_core;
 mod rate_limit;
 mod security_headers;
 mod session_gate;
+mod single_tenant;
 
 use std::net::SocketAddr;
 
