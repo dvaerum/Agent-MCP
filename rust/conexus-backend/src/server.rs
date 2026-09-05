@@ -179,6 +179,56 @@ fn tool_result_to_call_tool_result(result: &ToolResult) -> CallToolResult {
     call_result
 }
 
+/// Run a named tool from a NON-MCP caller (the `/api` REST surface) --
+/// the same tool-lookup + `SnapshotPolicySource` + `dispatch` dance
+/// `call_tool` runs for `/mcp`, factored out so both surfaces share
+/// one dispatch mechanism rather than drifting apart. Deliberately a
+/// SEPARATE function rather than a refactor of `call_tool` itself: the
+/// two `ToolCallContext`s are shaped differently by construction (REST
+/// has no `rmcp::RequestContext` to source `client_name`/
+/// `progress_sink` from -- it fills those `None`, matching what a
+/// non-MCP caller genuinely doesn't have) and `call_tool` is
+/// already-tested, already-live production code this port doesn't
+/// touch just to share ~15 lines.
+///
+/// Returns `Err` only for "no such tool" (a REST handler maps that to
+/// its own 404, not a `ToolResult` shape) -- capability/policy denial
+/// and every other outcome are ordinary `ToolResult` variants, exactly
+/// like the MCP path.
+pub(crate) async fn dispatch_rest_tool(
+    shared: &Arc<SharedState>,
+    tool_name: &str,
+    arguments: serde_json::Value,
+    principal: Option<&Principal>,
+) -> Result<ToolResult, ()> {
+    let Some(descriptor) = conexus_tools::all_tools()
+        .iter()
+        .find(|t| t.name == tool_name)
+    else {
+        return Err(());
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    let ctx = ToolCallContext {
+        progress_token_present: false,
+        client_name: None,
+        progress_sink: None,
+        waiter_registry: &shared.waiter_registry,
+        file_map: &shared.file_map,
+        project_dir: &shared.project_dir,
+    };
+    let policy_source = SnapshotPolicySource::resolve(&shared.conn, &descriptor.required).await;
+    Ok(conexus_auth::dispatch(
+        descriptor,
+        principal,
+        &policy_source,
+        &arguments,
+        &shared.conn,
+        &now,
+        &ctx,
+    )
+    .await)
+}
+
 impl ServerHandler for ConexusServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(

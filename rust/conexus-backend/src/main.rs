@@ -34,7 +34,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use axum::middleware;
-use axum::routing::get;
+use axum::routing::{get, post, put};
 use axum::Router;
 use clap::Parser;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
@@ -155,6 +155,11 @@ async fn main() -> Result<()> {
     let api_public = Router::new().route("/prompts/catalog", get(rest_handlers::prompts_catalog));
     let api_authenticated = Router::new()
         .route("/settings-schema", get(rest_handlers::settings_schema))
+        .route("/memories", post(rest_handlers::create_memory))
+        .route(
+            "/memories/{*context_key}",
+            put(rest_handlers::update_memory).delete(rest_handlers::delete_memory),
+        )
         .fallback(api_not_found)
         .layer(middleware::from_fn_with_state(
             shared.clone(),

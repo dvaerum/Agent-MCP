@@ -91,6 +91,37 @@ pub fn is_valid_memory_key(value: &str) -> bool {
     !value.is_empty() && MEMORY_KEY_RE.is_match(value)
 }
 
+/// Port of `utils/string_utils.py::has_unsafe_unicode_for_identifier`
+/// (F005 verify-all-v6 MUTATING #3) — a narrower denylist than
+/// [`is_valid_memory_key`]'s ASCII allowlist above (every character
+/// this rejects is ALSO rejected by that allowlist), kept as its own
+/// check purely so the REST create/update handlers can give a more
+/// specific spoofing-aware message for this subset before falling
+/// back to the generic allowlist message for everything else --
+/// `tests/test_memories_unsafe_unicode_key.py` pins the distinct
+/// wording, so this is a real, tested contract, not a redundant
+/// no-op. Written as explicit codepoint-range matches rather than a
+/// regex over literal invisible/bidi characters embedded in source
+/// (which the Python module deliberately avoids too, spelling out the
+/// exact ranges in a comment for the same reason: an invisible
+/// character sitting in source code is itself a spoofing risk for
+/// whoever next edits the file).
+pub fn has_unsafe_unicode_for_identifier(value: &str) -> bool {
+    value.chars().any(|ch| {
+        let cp = ch as u32;
+        matches!(cp,
+            0x00..=0x1F | 0x7F                     // C0 controls + DEL
+            | 0x200B..=0x200F                       // ZWSP/ZWNJ/ZWJ/LRM/RLM
+            | 0x2028..=0x2029                       // line/paragraph separator
+            | 0x202A..=0x202E                       // PDF/LRE/RLE/LRO/RLO bidi overrides
+            | 0x2060..=0x2064                       // word joiner, function application, ...
+            | 0x2066..=0x2069                       // LRI/RLI/FSI/PDI bidi isolates
+            | 0x206A..=0x206F                       // deprecated bidi controls
+            | 0xFEFF                                // BOM / zero-width no-break space
+        )
+    })
+}
+
 /// Port of `_requires_authenticated_caller`'s predicate form
 /// (`_is_authenticated_caller`): any principal at all (agent-bearer or
 /// either operator-path kind).
@@ -2167,6 +2198,18 @@ mod tests {
         assert!(!is_valid_memory_key(""));
         assert!(!is_valid_memory_key("has spaces"));
         assert!(!is_valid_memory_key("emoji🎉"));
+    }
+
+    #[test]
+    fn unsafe_unicode_denylist_catches_the_canonical_spoofing_example() {
+        // config<RLO>drowssap renders as "configpassword" in a UI --
+        // the exact F005 verify-all-v6 MUTATING #3 exploit string.
+        assert!(has_unsafe_unicode_for_identifier("config\u{202e}drowssap"));
+        assert!(has_unsafe_unicode_for_identifier("a\u{0000}b"));
+        assert!(has_unsafe_unicode_for_identifier("a\u{feff}b"));
+        assert!(!has_unsafe_unicode_for_identifier("normal_key"));
+        assert!(!has_unsafe_unicode_for_identifier("café.config"));
+        assert!(!has_unsafe_unicode_for_identifier("emoji.🚀.key"));
     }
 
     #[test]
