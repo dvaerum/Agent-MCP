@@ -23,6 +23,7 @@
 //! time here, not just by convention.
 
 mod identity;
+mod mcp_handler;
 mod mount;
 mod orchestrator;
 mod path_policy;
