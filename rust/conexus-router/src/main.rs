@@ -300,6 +300,16 @@ async fn main() -> Result<()> {
             axum::routing::patch(users_groups_rest::edit_user_handler)
                 .delete(users_groups_rest::delete_user_handler),
         )
+        .route(
+            "/agent-mcp/api/router/groups",
+            get(users_groups_rest::list_groups_handler)
+                .post(users_groups_rest::create_group_handler),
+        )
+        .route(
+            "/agent-mcp/api/router/groups/{group_id}",
+            axum::routing::patch(users_groups_rest::edit_group_handler)
+                .delete(users_groups_rest::delete_group_handler),
+        )
         .layer(axum::middleware::from_fn_with_state(
             std::sync::Arc::clone(&state),
             middleware::session_gate_layer,

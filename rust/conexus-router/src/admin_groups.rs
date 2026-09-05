@@ -18,7 +18,9 @@ use rusqlite::{Connection, TransactionBehavior};
 use crate::admin_users_gate::{self, AdminUsersError};
 use crate::mcp_handler::HandlerResponse;
 
-fn group_public_json(group: &GroupRow, member_count: i64) -> serde_json::Value {
+/// `pub(crate)`, not private -- the axum wiring layer needs this to
+/// render `Created`/`Updated`'s success envelope.
+pub(crate) fn group_public_json(group: &GroupRow, member_count: i64) -> serde_json::Value {
     serde_json::json!({
         "group_id": group.group_id,
         "name": group.name,
