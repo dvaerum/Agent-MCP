@@ -35,6 +35,7 @@ mod identity;
 mod lifecycle;
 mod login;
 mod mcp_handler;
+mod middleware;
 mod mount;
 mod orchestrator;
 mod path_policy;
@@ -203,15 +204,43 @@ async fn main() -> Result<()> {
 
     spawn_background_tasks(std::sync::Arc::clone(&state));
 
-    let app = Router::new().route("/health", get(health));
+    // Layer order matches Python's real app.py middleware chain
+    // exactly: security headers outermost (touches every response,
+    // even one an inner layer rejects) -> rate-limit -> empty-users-
+    // redirect -> session-gate (innermost, closest to the real
+    // handler). `Router::layer` wraps the CURRENT service, so the
+    // LAST `.layer()` call becomes the OUTERMOST layer -- these four
+    // are added in REVERSE of the request's own traversal order.
+    let app = Router::new()
+        .route("/health", get(health))
+        .layer(axum::middleware::from_fn_with_state(
+            std::sync::Arc::clone(&state),
+            middleware::session_gate_layer,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            std::sync::Arc::clone(&state),
+            middleware::empty_users_redirect_layer,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            std::sync::Arc::clone(&state),
+            middleware::rate_limit_layer,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            std::sync::Arc::clone(&state),
+            middleware::security_headers_layer,
+        ));
+
     let addr = SocketAddr::from(([0, 0, 0, 0], cli.port));
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("bind {addr}"))?;
     eprintln!("conexus-router: listening on {addr} (app-wiring in progress -- no proxying yet)");
-    axum::serve(listener, app)
-        .await
-        .context("serve conexus-router")
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .context("serve conexus-router")
 }
 
 /// Port of `app.py`'s `on_startup` reconciliation pass + the two
