@@ -23,6 +23,7 @@
 //! time here, not just by convention.
 
 mod admin_users_gate;
+mod admin_users_users;
 mod asset_prefix;
 mod client_disconnect;
 mod identity;

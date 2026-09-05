@@ -214,6 +214,104 @@ pub fn get_user_by_id(conn: &Connection, user_id: &str) -> Result<Option<UserRow
         .optional()?)
 }
 
+/// A `users` row with every SENSITIVE column excluded (`password_hash`,
+/// `sso_subject`) -- port of the exact column list
+/// `admin_users_api.py`'s `list_users_handler`/`create_user_handler`/
+/// `edit_user_handler` SELECT. Deliberately a SEPARATE struct/query
+/// from [`UserRow`], never fetching the hash at all, rather than
+/// fetching the full row and dropping the field at the JSON-response
+/// layer -- the same "don't even pull the secret across the boundary"
+/// posture `admin_tools.rs`'s `redact_agent_row` established for
+/// agent rows in the tool-catalogue layer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UserPublicRow {
+    pub user_id: String,
+    pub username: String,
+    pub email: Option<String>,
+    pub is_sysadmin: bool,
+    pub created_at: String,
+    pub last_login_at: Option<String>,
+}
+
+const USER_PUBLIC_COLUMNS: &str =
+    "user_id, username, email, is_sysadmin, created_at, last_login_at";
+
+fn row_to_user_public(row: &rusqlite::Row) -> rusqlite::Result<UserPublicRow> {
+    Ok(UserPublicRow {
+        user_id: row.get(0)?,
+        username: row.get(1)?,
+        email: row.get(2)?,
+        is_sysadmin: row.get(3)?,
+        created_at: row.get(4)?,
+        last_login_at: row.get(5)?,
+    })
+}
+
+/// Port of `list_users_handler`: every user, public projection,
+/// ordered by username.
+pub fn list_users(conn: &Connection) -> Result<Vec<UserPublicRow>, IdentityError> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {USER_PUBLIC_COLUMNS} FROM users ORDER BY username"
+    ))?;
+    let rows = stmt.query_map([], row_to_user_public)?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+pub fn get_user_public_by_id(
+    conn: &Connection,
+    user_id: &str,
+) -> Result<Option<UserPublicRow>, IdentityError> {
+    Ok(conn
+        .query_row(
+            &format!("SELECT {USER_PUBLIC_COLUMNS} FROM users WHERE user_id = ?1"),
+            [user_id],
+            row_to_user_public,
+        )
+        .optional()?)
+}
+
+/// Port of `create_user_handler`'s own raw INSERT -- deliberately
+/// NOT [`create_user`] below: this is the ADMIN-facing create path
+/// (an already-authenticated operator minting another user), which
+/// must apply EXACTLY the `is_sysadmin` value the caller requested,
+/// with NO first-user-bootstrap side effect. Reaching this endpoint
+/// at all requires an existing operator session, so `users` can never
+/// be empty here in practice -- but the two INSERTs stay genuinely
+/// separate functions (matching Python's own two separate code
+/// paths) rather than reusing [`create_user`] and relying on that
+/// invariant to keep its bootstrap branch dead. No explicit
+/// username/email sanitization here, matching the real Python
+/// handler exactly -- it relies solely on the shared JSON-body-decode
+/// chokepoint (PR 23's job), not a second local pass.
+pub fn admin_create_user(
+    conn: &Connection,
+    username: &str,
+    password: &str,
+    email: Option<&str>,
+    is_sysadmin: bool,
+    now: &str,
+) -> Result<UserPublicRow, IdentityError> {
+    let user_id = random_id(8);
+    let password_hash = hash_password(password);
+    let insert_result = conn.execute(
+        "INSERT INTO users (user_id, username, email, password_hash, created_at, last_login_at, is_sysadmin) \
+         VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6)",
+        (&user_id, username, email, &password_hash, now, is_sysadmin),
+    );
+    if let Err(e) = insert_result {
+        if matches!(
+            &e,
+            rusqlite::Error::SqliteFailure(err, _)
+                if err.code == rusqlite::ErrorCode::ConstraintViolation
+        ) {
+            return Err(IdentityError::UsernameAlreadyExists(username.to_string()));
+        }
+        return Err(IdentityError::Db(e));
+    }
+    get_user_public_by_id(conn, &user_id)?
+        .ok_or_else(|| IdentityError::Db(rusqlite::Error::QueryReturnedNoRows))
+}
+
 /// Apply the first-operator bootstrap invariant to `user_id` -- port
 /// of `bootstrap_first_operator`. THE single routine for the
 /// security-critical rule "the first user on an otherwise-empty users
