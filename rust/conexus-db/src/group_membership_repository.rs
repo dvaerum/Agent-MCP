@@ -491,6 +491,164 @@ pub fn user_group_memberships_by_name_prefix(
     Ok(out)
 }
 
+/// Public projection of a `groups` row (Phase E2, `admin_users_api.py`
+/// groups-CRUD PR). Every field is safe to return to a caller --
+/// `groups` carries no secret column, unlike `users`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GroupRow {
+    pub group_id: String,
+    pub name: String,
+    pub is_sysadmin: bool,
+    pub created_at: String,
+}
+
+const GROUP_COLUMNS: &str = "group_id, name, is_sysadmin, created_at";
+
+fn row_to_group(row: &rusqlite::Row) -> rusqlite::Result<GroupRow> {
+    Ok(GroupRow {
+        group_id: row.get(0)?,
+        name: row.get(1)?,
+        is_sysadmin: row.get(2)?,
+        created_at: row.get(3)?,
+    })
+}
+
+/// Port of `_group_member_count`.
+pub fn group_member_count(conn: &Connection, group_id: &str) -> Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM group_membership WHERE group_id = ?1",
+        [group_id],
+        |r| r.get(0),
+    )
+}
+
+/// Port of `list_groups_handler`: every group with its denormalised
+/// member count, ordered by name.
+pub fn list_groups_with_member_counts(conn: &Connection) -> Result<Vec<(GroupRow, i64)>> {
+    let mut stmt = conn.prepare(&format!("SELECT {GROUP_COLUMNS} FROM groups ORDER BY name"))?;
+    let rows = stmt.query_map([], row_to_group)?;
+    let mut out = Vec::new();
+    for row in rows {
+        let group = row?;
+        let count = group_member_count(conn, &group.group_id)?;
+        out.push((group, count));
+    }
+    Ok(out)
+}
+
+pub fn get_group(conn: &Connection, group_id: &str) -> Result<Option<GroupRow>> {
+    conn.query_row(
+        &format!("SELECT {GROUP_COLUMNS} FROM groups WHERE group_id = ?1"),
+        [group_id],
+        row_to_group,
+    )
+    .optional()
+}
+
+/// Errors from [`create_group`]/[`update_group_fields`] -- a distinct
+/// enum from [`GroupMembershipError`] since these are plain-CRUD
+/// failures (a UNIQUE(name) collision), not membership-graph
+/// failures.
+#[derive(Debug)]
+pub enum GroupCrudError {
+    NameConflict,
+    Db(rusqlite::Error),
+}
+
+impl From<rusqlite::Error> for GroupCrudError {
+    fn from(e: rusqlite::Error) -> Self {
+        GroupCrudError::Db(e)
+    }
+}
+
+/// Port of `create_group_handler`'s own raw INSERT -- deliberately
+/// NOT [`ensure_group`] above: that function is an idempotent
+/// get-or-create with a fixed `is_sysadmin=0` and no explicit `now`,
+/// used only by the SSO-group-reconcile path; this one always
+/// INSERTs fresh, accepts an explicit `is_sysadmin`, takes an
+/// explicit `now`, and surfaces a UNIQUE(name) collision as a real
+/// error rather than silently returning the existing row.
+pub fn create_group(
+    conn: &Connection,
+    name: &str,
+    is_sysadmin: bool,
+    now: &str,
+) -> std::result::Result<GroupRow, GroupCrudError> {
+    let mut buf = [0u8; 8];
+    getrandom::fill(&mut buf).expect("OS RNG must be available to mint a group_id");
+    let group_id: String = buf.iter().map(|b| format!("{b:02x}")).collect();
+    let insert_result = conn.execute(
+        "INSERT INTO groups (group_id, name, is_sysadmin, created_at) VALUES (?1, ?2, ?3, ?4)",
+        (&group_id, name, is_sysadmin, now),
+    );
+    if let Err(e) = insert_result {
+        if matches!(&e, rusqlite::Error::SqliteFailure(err, _) if err.code == rusqlite::ErrorCode::ConstraintViolation)
+        {
+            return Err(GroupCrudError::NameConflict);
+        }
+        return Err(GroupCrudError::Db(e));
+    }
+    get_group(conn, &group_id)?
+        .ok_or_else(|| GroupCrudError::Db(rusqlite::Error::QueryReturnedNoRows))
+}
+
+/// Partial update for [`update_group_fields`] -- `None` means "leave
+/// this field untouched", mirroring `edit_group_handler`'s
+/// presence-in-body check (never conflated with "explicitly clear",
+/// since neither field is nullable).
+#[derive(Debug, Clone, Default)]
+pub struct GroupFieldUpdate<'a> {
+    pub name: Option<&'a str>,
+    pub is_sysadmin: Option<bool>,
+}
+
+/// Port of `edit_group_handler`'s own `UPDATE` -- applied as one
+/// single-column `UPDATE` per supplied field (rather than one
+/// dynamically-built multi-column statement) inside the CALLER's own
+/// transaction, matching this migration's `decide_edit_user`
+/// precedent (`admin_users_users.rs`) for the identical reason.
+/// Returns `Ok(false)` if `group_id` doesn't exist (caller decides
+/// the 404); a UNIQUE(name) collision surfaces as
+/// `GroupCrudError::NameConflict`.
+pub fn update_group_fields(
+    conn: &Connection,
+    group_id: &str,
+    update: &GroupFieldUpdate,
+) -> std::result::Result<bool, GroupCrudError> {
+    if get_group(conn, group_id)?.is_none() {
+        return Ok(false);
+    }
+    if let Some(name) = update.name {
+        let result = conn.execute(
+            "UPDATE groups SET name = ?1 WHERE group_id = ?2",
+            (name, group_id),
+        );
+        if let Err(e) = result {
+            if matches!(&e, rusqlite::Error::SqliteFailure(err, _) if err.code == rusqlite::ErrorCode::ConstraintViolation)
+            {
+                return Err(GroupCrudError::NameConflict);
+            }
+            return Err(GroupCrudError::Db(e));
+        }
+    }
+    if let Some(is_sysadmin) = update.is_sysadmin {
+        conn.execute(
+            "UPDATE groups SET is_sysadmin = ?1 WHERE group_id = ?2",
+            (is_sysadmin, group_id),
+        )?;
+    }
+    Ok(true)
+}
+
+/// Port of `delete_group_handler`'s own `DELETE` -- `group_membership`
+/// rows where this group is either the parent OR a member cascade via
+/// `ON DELETE CASCADE`, matching Python's own cascade. Returns
+/// `false` if `group_id` doesn't exist (caller decides the 404).
+pub fn delete_group(conn: &Connection, group_id: &str) -> Result<bool> {
+    let n = conn.execute("DELETE FROM groups WHERE group_id = ?1", [group_id])?;
+    Ok(n > 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1035,5 +1193,154 @@ mod tests {
             matches,
             HashMap::from([("oidc:engineers".to_string(), "oidc:engineers".to_string())])
         );
+    }
+
+    const NOW: &str = "2026-01-01T00:00:00.000+00:00";
+
+    #[test]
+    fn create_group_inserts_a_fresh_row() {
+        let conn = test_conn();
+        let group = create_group(&conn, "engineers", false, NOW).unwrap();
+        assert_eq!(group.name, "engineers");
+        assert!(!group.is_sysadmin);
+        assert_eq!(group.created_at, NOW);
+    }
+
+    #[test]
+    fn create_group_rejects_a_duplicate_name() {
+        let conn = test_conn();
+        create_group(&conn, "engineers", false, NOW).unwrap();
+        let err = create_group(&conn, "engineers", false, NOW).unwrap_err();
+        assert!(matches!(err, GroupCrudError::NameConflict));
+    }
+
+    #[test]
+    fn create_group_is_a_separate_contract_from_ensure_group() {
+        // ensure_group is idempotent get-or-create; create_group always
+        // inserts fresh and errors on a collision -- confirm they don't
+        // silently converge.
+        let conn = test_conn();
+        let via_ensure = ensure_group(&conn, "shared-name").unwrap();
+        let err = create_group(&conn, "shared-name", false, NOW).unwrap_err();
+        assert!(matches!(err, GroupCrudError::NameConflict));
+        assert!(get_group(&conn, &via_ensure).unwrap().is_some());
+    }
+
+    #[test]
+    fn get_group_returns_none_for_an_unknown_id() {
+        let conn = test_conn();
+        assert!(get_group(&conn, "nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn group_member_count_reflects_real_membership() {
+        let conn = test_conn();
+        let group = create_group(&conn, "engineers", false, NOW).unwrap();
+        assert_eq!(group_member_count(&conn, &group.group_id).unwrap(), 0);
+        add_user_member(&conn, &group.group_id, "alice");
+        assert_eq!(group_member_count(&conn, &group.group_id).unwrap(), 1);
+    }
+
+    #[test]
+    fn list_groups_with_member_counts_is_ordered_by_name() {
+        let conn = test_conn();
+        create_group(&conn, "zebra", false, NOW).unwrap();
+        let engineers = create_group(&conn, "engineers", false, NOW).unwrap();
+        add_user_member(&conn, &engineers.group_id, "alice");
+        let groups = list_groups_with_member_counts(&conn).unwrap();
+        let names: Vec<&str> = groups.iter().map(|(g, _)| g.name.as_str()).collect();
+        assert_eq!(names, vec!["engineers", "zebra"]);
+        assert_eq!(groups[0].1, 1);
+    }
+
+    #[test]
+    fn update_group_fields_renames_a_group() {
+        let conn = test_conn();
+        let group = create_group(&conn, "old-name", false, NOW).unwrap();
+        let ok = update_group_fields(
+            &conn,
+            &group.group_id,
+            &GroupFieldUpdate {
+                name: Some("new-name"),
+                is_sysadmin: None,
+            },
+        )
+        .unwrap();
+        assert!(ok);
+        assert_eq!(
+            get_group(&conn, &group.group_id).unwrap().unwrap().name,
+            "new-name"
+        );
+    }
+
+    #[test]
+    fn update_group_fields_flips_is_sysadmin() {
+        let conn = test_conn();
+        let group = create_group(&conn, "engineers", false, NOW).unwrap();
+        update_group_fields(
+            &conn,
+            &group.group_id,
+            &GroupFieldUpdate {
+                name: None,
+                is_sysadmin: Some(true),
+            },
+        )
+        .unwrap();
+        assert!(
+            get_group(&conn, &group.group_id)
+                .unwrap()
+                .unwrap()
+                .is_sysadmin
+        );
+    }
+
+    #[test]
+    fn update_group_fields_rejects_a_name_collision() {
+        let conn = test_conn();
+        create_group(&conn, "taken", false, NOW).unwrap();
+        let group = create_group(&conn, "other", false, NOW).unwrap();
+        let err = update_group_fields(
+            &conn,
+            &group.group_id,
+            &GroupFieldUpdate {
+                name: Some("taken"),
+                is_sysadmin: None,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, GroupCrudError::NameConflict));
+    }
+
+    #[test]
+    fn update_group_fields_returns_false_for_an_unknown_group() {
+        let conn = test_conn();
+        let ok = update_group_fields(
+            &conn,
+            "nope",
+            &GroupFieldUpdate {
+                name: Some("x"),
+                is_sysadmin: None,
+            },
+        )
+        .unwrap();
+        assert!(!ok);
+    }
+
+    #[test]
+    fn delete_group_removes_the_row_and_reports_whether_one_existed() {
+        let conn = test_conn();
+        let group = create_group(&conn, "engineers", false, NOW).unwrap();
+        assert!(delete_group(&conn, &group.group_id).unwrap());
+        assert!(get_group(&conn, &group.group_id).unwrap().is_none());
+        assert!(!delete_group(&conn, &group.group_id).unwrap());
+    }
+
+    #[test]
+    fn delete_group_cascades_to_group_membership_rows() {
+        let conn = test_conn();
+        let group = create_group(&conn, "engineers", false, NOW).unwrap();
+        add_user_member(&conn, &group.group_id, "alice");
+        assert!(delete_group(&conn, &group.group_id).unwrap());
+        assert_eq!(group_member_count(&conn, &group.group_id).unwrap(), 0);
     }
 }
