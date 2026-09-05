@@ -209,6 +209,7 @@ async fn main() -> Result<()> {
             "/create-sample-memories",
             post(rest_handlers::create_sample_memories),
         )
+        .route("/all-data", get(rest_handlers::all_data))
         .fallback(api_not_found)
         .layer(middleware::from_fn_with_state(
             shared.clone(),

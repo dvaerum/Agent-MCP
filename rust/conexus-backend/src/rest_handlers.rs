@@ -1587,3 +1587,196 @@ pub async fn create_sample_memories(
     )
         .into_response()
 }
+
+// -- /api/all-data (Phase E1 PR 9/14, conexus-rest-all-data) ---------
+
+/// `GET /api/all-data` -- the single-call dashboard hydration blob
+/// (agents, tasks, context, recent actions, file metadata, file map),
+/// matching `all_data_api_route`. The largest aggregation endpoint in
+/// this REST surface -- isolated into its own PR deliberately, per
+/// the migration plan's own note, since it's the one most likely to
+/// hide a byte-shape drift.
+///
+/// **Documented scope gap, not a silent omission**: Python's presence
+/// merge (`_mcp_presence_for`) combines TWO signals -- a parked
+/// `wait_for_events` long-poll (the PRIMARY signal, Python's own
+/// comment: "the in-memory waiter registry... is the authoritative,
+/// zero-persistence record") and a live `GET /mcp` SSE stream via
+/// `core.session_registry` (the SECONDARY signal, also the source of
+/// `last_mcp_connection`). This port implements ONLY the primary
+/// signal (`WaiterRegistry::waiter_count`) -- `session_registry` has
+/// no Rust equivalent anywhere in this workspace yet; it belongs to
+/// the SSE/pub-sub subsystem Phase E1's own remaining PRs (`/api/
+/// events`, `/api/delivery`) will build. An agent connected via SSE
+/// only (not currently parked in a wait_for_events poll) shows offline
+/// here where Python would show online via the secondary signal --
+/// tracked as a real, bounded gap to close once `session_registry`'s
+/// Rust equivalent exists, not guessed at or stubbed early.
+pub async fn all_data(
+    State(shared): State<Arc<SharedState>>,
+    Extension(resolved): Extension<ResolvedRestPrincipal>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let section_limit =
+        crate::read_limits::clamp_section_limit(params.get("limit").map(String::as_str));
+    let expose_tokens = resolved.confirmed_operator_tier;
+
+    let guard = shared.conn.lock().await;
+
+    let global_loop_on = conexus_db::project_settings_repository::get_bool(
+        &guard,
+        "config_auto_event_loop_global",
+        true,
+    );
+
+    let active_token_by_agent: std::collections::HashMap<String, String> = if expose_tokens {
+        match conexus_db::agent_repository::AgentRepository::list_active(&guard) {
+            Ok(rows) => rows
+                .into_iter()
+                .filter(|a| a.status != "terminated")
+                .map(|a| (a.agent_id, a.token))
+                .collect(),
+            Err(_) => std::collections::HashMap::new(),
+        }
+    } else {
+        std::collections::HashMap::new()
+    };
+
+    // `SELECT * FROM agents` (every row, not just live ones -- Python's
+    // real query has no WHERE clause at all) via a bounded, newest-first
+    // read matching the SQL Python actually runs here.
+    let agent_rows = match conexus_db::agent_repository::AgentRepository::list_all_bounded(
+        &guard,
+        section_limit,
+    ) {
+        Ok(rows) => rows,
+        Err(_) => {
+            drop(guard);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Failed to fetch all data."})),
+            )
+                .into_response();
+        }
+    };
+
+    let agents_data: Vec<Value> = agent_rows
+        .iter()
+        .filter(|a| a.agent_id != "admin" && a.status != "tombstone")
+        .map(|a| {
+            let auto_event_loop = a.auto_event_loop;
+            // Authoritative Disconnect: a paused agent (per-agent OFF
+            // or global OFF) always reads offline, regardless of the
+            // waiter signal -- matches `_mcp_presence_for` exactly.
+            let paused = !auto_event_loop || !global_loop_on;
+            let online = !paused && shared.waiter_registry.waiter_count(&a.agent_id) > 0;
+            json!({
+                "agent_id": a.agent_id,
+                "created_at": a.created_at,
+                "status": a.status,
+                "current_task": a.current_task,
+                "working_directory": a.working_directory,
+                "color": a.color,
+                "terminated_at": a.terminated_at,
+                "updated_at": a.updated_at,
+                "auto_event_loop": auto_event_loop,
+                "last_event_seen_at": a.last_event_seen_at,
+                "last_activity_at": a.last_activity_at,
+                "agent_role": a.agent_role,
+                "profile": a.profile,
+                "profile_updated_at": a.profile_updated_at,
+                "profile_reviewed_at": a.profile_reviewed_at,
+                "profile_updated_by": a.profile_updated_by,
+                "auth_token": active_token_by_agent.get(&a.agent_id),
+                "wait_for_events_in_flight": shared.waiter_registry.waiter_count(&a.agent_id) > 0,
+                "online": online,
+                // Deferred (see fn doc): no session_registry yet, so
+                // there is no SSE-derived connection timestamp to
+                // report -- always None, not a guessed value.
+                "last_mcp_connection": Option::<String>::None,
+            })
+        })
+        .collect();
+
+    let tasks = match conexus_db::task_repository::list_all(&guard, Some(section_limit)) {
+        Ok(rows) => rows,
+        Err(_) => {
+            drop(guard);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Failed to fetch all data."})),
+            )
+                .into_response();
+        }
+    };
+    let tasks_data: Vec<Value> = tasks.iter().map(task_row_to_json).collect();
+
+    let context_rows = conexus_db::project_context_repository::list_recent(&guard, section_limit)
+        .unwrap_or_default();
+    let context_data: Vec<Value> = context_rows.iter().map(context_row_to_json).collect();
+
+    // "last 100" cap, further narrowed by a smaller `?limit` -- matches
+    // Python's `min(100, section_limit)` exactly.
+    let actions_cap = section_limit.min(100);
+    let actions_rows =
+        conexus_db::agent_action_repository::list_recent(&guard, None, None, actions_cap)
+            .unwrap_or_default();
+    let actions_data: Vec<Value> = actions_rows
+        .iter()
+        .map(|a| {
+            json!({
+                "action_id": a.action_id,
+                "agent_id": a.agent_id,
+                "action_type": a.action_type,
+                "task_id": a.task_id,
+                "timestamp": a.timestamp,
+                "details": a.details,
+            })
+        })
+        .collect();
+
+    let file_metadata_rows =
+        conexus_db::file_metadata_repository::list_bounded(&guard, section_limit)
+            .unwrap_or_default();
+    let file_metadata_data: Vec<Value> = file_metadata_rows
+        .iter()
+        .map(|f| {
+            json!({
+                "filepath": f.filepath,
+                "metadata": f.metadata,
+                "last_updated": f.last_updated,
+                "updated_by": f.updated_by,
+                "content_hash": f.content_hash,
+            })
+        })
+        .collect();
+
+    drop(guard);
+
+    let file_map: std::collections::HashMap<String, Value> = shared
+        .file_map
+        .preview(usize::MAX)
+        .into_iter()
+        .map(|(path, entry)| {
+            (
+                path,
+                json!({
+                    "agent_id": entry.agent_id,
+                    "timestamp": entry.timestamp,
+                    "status": entry.status,
+                }),
+            )
+        })
+        .collect();
+
+    Json(json!({
+        "agents": agents_data,
+        "tasks": tasks_data,
+        "context": context_data,
+        "actions": actions_data,
+        "file_metadata": file_metadata_data,
+        "file_map": file_map,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    }))
+    .into_response()
+}

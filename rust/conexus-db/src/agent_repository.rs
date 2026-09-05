@@ -266,6 +266,21 @@ impl AgentRepository {
         rows.collect()
     }
 
+    /// EVERY row (no status filter at all -- including terminated and
+    /// tombstone), newest-created first, capped at `limit`. Matches
+    /// `GET /api/all-data`'s real query (`SELECT * FROM agents ORDER
+    /// BY created_at DESC LIMIT ?`) exactly: that endpoint filters out
+    /// the admin/tombstone rows itself, in the caller, not here --
+    /// this is a faithful bounded-read primitive, not a second
+    /// `list_active`.
+    pub fn list_all_bounded(conn: &Connection, limit: i64) -> Result<Vec<AgentRow>> {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {AGENT_COLUMNS} FROM agents ORDER BY created_at DESC LIMIT ?1"
+        ))?;
+        let rows = stmt.query_map([limit], row_to_agent)?;
+        rows.collect()
+    }
+
     /// True iff a live (non-terminated, non-tombstone) agent row exists
     /// for `agent_id`. Reuses [`NOT_TERMINAL_SQL`] so this predicate can
     /// never drift from the other converged "live agent" sites
@@ -1097,6 +1112,26 @@ mod tests {
             .collect();
         ids.sort();
         assert_eq!(ids, vec!["live1", "live2"]);
+    }
+
+    #[test]
+    fn list_all_bounded_includes_every_status_and_respects_the_limit() {
+        let conn = test_conn();
+        seed(&conn, "live1", "t1", "active");
+        seed(&conn, "dead1", "t2", "terminated");
+        seed(&conn, "tomb1", "t3", "tombstone");
+
+        let all = AgentRepository::list_all_bounded(&conn, 10).unwrap();
+        let mut ids: Vec<_> = all.iter().map(|a| a.agent_id.as_str()).collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["dead1", "live1", "tomb1"],
+            "unlike list_active, every status must be included"
+        );
+
+        let capped = AgentRepository::list_all_bounded(&conn, 2).unwrap();
+        assert_eq!(capped.len(), 2);
     }
 
     #[test]
