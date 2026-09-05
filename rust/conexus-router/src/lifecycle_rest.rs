@@ -38,6 +38,7 @@ use crate::orchestrator::primitives::{backend_impl_for, run_systemctl, unit_name
 use crate::perm_gates::{self, RevalidationProject, RevalidationSpec};
 use crate::project_gate::{self, CreateProjectOutcome, GateError};
 use crate::project_reads;
+use crate::project_rename;
 use crate::project_teardown::{self, MutationPrecheck};
 use crate::session_gate::GateIdentity;
 use crate::state::RouterState;
@@ -394,4 +395,140 @@ async fn systemctl_is_active(state: &RouterState, name: &str) -> bool {
         .await
         .map(|r| r.success())
         .unwrap_or(false)
+}
+
+/// Port of `rename_project_handler` -- the largest single handler in
+/// `admin_api.py` (~470 LOC). TWO real yield points, both already
+/// fully decided by `project_rename.rs` (PR 19): a body-read
+/// (`read_body_and_revalidate`, project-scoped on `old_name` this
+/// time -- unlike `create_project_handler`'s project-less call) and
+/// an in-lock `systemctl stop` (`revalidated_lock`/`revalidate_after`,
+/// identical shape to delete/stop above). `rename_precheck` re-runs
+/// its OWN `deny_cross_tenant_project_read` internally -- the same
+/// gap-5 duplicate-check pattern already documented on
+/// `create_project_handler`, harmless since no yield point separates
+/// the two calls.
+pub async fn rename_project_handler(
+    State(state): State<Arc<RouterState>>,
+    Extension(identity): Extension<GateIdentity>,
+    Path(old_name): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let single_tenant_name = state.mcp_handler_config.single_tenant_name.as_deref();
+    if crate::single_tenant::disables_write_endpoint(single_tenant_name) {
+        return crate::single_tenant::single_tenant_disabled_response(single_tenant_name)
+            .into_response();
+    }
+
+    let now = Utc::now();
+    let now_str = now.to_rfc3339();
+    let spec = RevalidationSpec {
+        stale_user_id: &identity.user.user_id,
+        cookie_header: cookie_header(&headers),
+        now: &now_str,
+        cap: Capability::SystemProjectsManage,
+        project: Some(RevalidationProject {
+            project_name: &old_name,
+            min_role: Some("operator"),
+        }),
+    };
+
+    let precheck_ok = {
+        let conn = state.conn.lock().await;
+        let (parsed, _principal) = match perm_gates::read_body_and_revalidate(&conn, &body, &spec) {
+            Ok(v) => v,
+            Err(resp) => return resp.into_response(),
+        };
+        match project_rename::rename_precheck(
+            &conn,
+            &state.registry,
+            &state.runtime,
+            identity.is_sysadmin,
+            Some(&identity.user.user_id),
+            &old_name,
+            parsed.get("name"),
+            parsed.get("grace_days"),
+            now,
+        ) {
+            Ok(project_rename::RenamePrecheck::Rejected(resp)) => return resp.into_response(),
+            Ok(project_rename::RenamePrecheck::Proceed(ok)) => ok,
+            Err(e) => return HandlerResponse::from(e).into_response(),
+        }
+    };
+    let new_name = precheck_ok.new_name;
+    let grace_days = precheck_ok.grace_days;
+
+    let (_lock_guard, _principal) = match perm_gates::revalidated_lock(
+        &state.runtime,
+        &state.conn,
+        &old_name,
+        "backend",
+        &spec,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(resp) => return resp.into_response(),
+    };
+
+    let old_row = {
+        let conn = state.conn.lock().await;
+        match project_rename::rename_toctou_recheck(
+            &conn,
+            &state.registry,
+            &state.runtime,
+            identity.is_sysadmin,
+            Some(&identity.user.user_id),
+            &old_name,
+            &new_name,
+            now,
+        ) {
+            Ok(project_rename::RenameToctou::Rejected(resp)) => return resp.into_response(),
+            Ok(project_rename::RenameToctou::Proceed(ok)) => ok.old_row,
+            Err(e) => return HandlerResponse::from(e).into_response(),
+        }
+    };
+
+    let stop_awaitable = systemctl_stop_ignoring_result(&state, &old_name);
+    let (_ignored, revalidate_result) =
+        perm_gates::revalidate_after(stop_awaitable, &state.conn, &spec).await;
+    if let Err(resp) = revalidate_result {
+        return resp.into_response();
+    }
+
+    let outcome = {
+        let conn = state.conn.lock().await;
+        project_rename::finish_rename_project(
+            &conn,
+            &state.registry,
+            &state.runtime,
+            identity.is_sysadmin,
+            Some(&identity.user.user_id),
+            &old_name,
+            &new_name,
+            grace_days,
+            &old_row,
+            &state.sock_dir,
+            state.token_dir.as_deref(),
+            now,
+        )
+    };
+    match outcome {
+        Ok(project_rename::RenameOutcome::Renamed {
+            from,
+            to,
+            grace_days,
+            alias_expires_at,
+        }) => lifecycle::success_envelope(
+            serde_json::json!({
+                "renamed": {"from": from, "to": to},
+                "alias": {"name": from, "grace_days": grace_days, "expires_at": alias_expires_at},
+            }),
+            200,
+        )
+        .into_response(),
+        Ok(project_rename::RenameOutcome::Rejected(resp)) => resp.into_response(),
+        Err(e) => HandlerResponse::from(e).into_response(),
+    }
 }
