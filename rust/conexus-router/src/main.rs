@@ -48,6 +48,7 @@ mod rate_limit;
 mod security_headers;
 mod session_gate;
 mod single_tenant;
+mod sso;
 
 use std::net::SocketAddr;
 

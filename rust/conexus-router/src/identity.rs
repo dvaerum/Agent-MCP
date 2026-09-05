@@ -214,6 +214,74 @@ pub fn get_user_by_id(conn: &Connection, user_id: &str) -> Result<Option<UserRow
         .optional()?)
 }
 
+/// Port of `_find_user_by_subject` (SSO). Direct subject-reconciliation
+/// lookup -- the FIRST step of `find_or_create_sso_user`'s 3-step
+/// algorithm, and what makes repeated calls with the SAME subject
+/// resolve to the SAME row (no session cookie exists in proxy-header
+/// mode, so this runs on every request).
+pub fn find_user_by_sso_subject(
+    conn: &Connection,
+    subject: &str,
+) -> Result<Option<UserRow>, IdentityError> {
+    Ok(conn
+        .query_row(
+            &format!("SELECT {USER_COLUMNS} FROM users WHERE sso_subject = ?1"),
+            [subject],
+            row_to_user,
+        )
+        .optional()?)
+}
+
+/// Port of `_find_linkable_user_by_email` (SSO). A verified-email
+/// claim links to an EXISTING password-authenticated account in
+/// preference to a legacy passwordless-SSO row sharing the same
+/// address (`ORDER BY (password_hash IS NULL) ASC` -- a row WITH a
+/// password sorts first). Case-insensitive per the real column
+/// comparison Python's own query uses.
+pub fn find_linkable_user_by_email(
+    conn: &Connection,
+    email: &str,
+) -> Result<Option<UserRow>, IdentityError> {
+    Ok(conn
+        .query_row(
+            &format!(
+                "SELECT {USER_COLUMNS} FROM users \
+                 WHERE LOWER(email) = LOWER(?1) AND (password_hash IS NOT NULL OR sso_subject IS NULL) \
+                 ORDER BY (password_hash IS NULL) ASC \
+                 LIMIT 1"
+            ),
+            [email],
+            row_to_user,
+        )
+        .optional()?)
+}
+
+/// Port of `_stamp_subject_if_absent` (SSO). The `sso_subject IS NULL`
+/// guard is load-bearing, not defensive: it's what makes this
+/// race-safe under a concurrent double-bind attempt together with
+/// `idx_users_sso_subject` (the partial UNIQUE index in `schema.rs`)
+/// -- never simplify this to an unconditional UPDATE/upsert.
+pub fn stamp_sso_subject_if_absent(
+    conn: &Connection,
+    user_id: &str,
+    subject: &str,
+) -> Result<(), IdentityError> {
+    conn.execute(
+        "UPDATE users SET sso_subject = ?1 WHERE user_id = ?2 AND sso_subject IS NULL",
+        (subject, user_id),
+    )?;
+    Ok(())
+}
+
+/// Port of `touch_last_login`.
+pub fn touch_last_login(conn: &Connection, user_id: &str, now: &str) -> Result<(), IdentityError> {
+    conn.execute(
+        "UPDATE users SET last_login_at = ?1 WHERE user_id = ?2",
+        (now, user_id),
+    )?;
+    Ok(())
+}
+
 /// A `users` row with every SENSITIVE column excluded (`password_hash`,
 /// `sso_subject`) -- port of the exact column list
 /// `admin_users_api.py`'s `list_users_handler`/`create_user_handler`/
@@ -397,10 +465,107 @@ pub fn create_user(
     registered_projects: &[String],
     now: &str,
 ) -> Result<String, IdentityError> {
+    let password_hash = hash_password(password);
+    create_user_row(
+        conn,
+        username,
+        Some(&password_hash),
+        None,
+        email,
+        is_sysadmin,
+        bootstrap_sysadmin,
+        registered_projects,
+        now,
+    )
+}
+
+/// Create a passwordless SSO-JIT user row -- port of `find_or_create_
+/// sso_user`'s own create step (`identity.py`'s unified `create_user`,
+/// scoped here to the `sso_subject`-bearing half [`create_user`]
+/// above deliberately doesn't cover). A genuinely separate PUBLIC
+/// function rather than widening [`create_user`]'s own signature: the
+/// latter already has 34 call sites across this crate, and Rust has
+/// no default-argument mechanism to add an optional `sso_subject`
+/// without touching every one of them for zero behavioral gain --
+/// both functions instead share the SAME atomicity-critical
+/// [`create_user_row`] inner helper, so the `BEGIN IMMEDIATE`/
+/// dual-sysadmin-race protection is written exactly once regardless
+/// of which public entry point a caller uses (Python's own real
+/// motivation for unifying `create_user`/`_create_passwordless_user`
+/// in the first place -- see `identity.py`'s own comment on that
+/// unification).
+pub fn create_sso_user(
+    conn: &mut Connection,
+    username: &str,
+    sso_subject: &str,
+    email: Option<&str>,
+    is_sysadmin: bool,
+    bootstrap_sysadmin: bool,
+    now: &str,
+) -> Result<String, IdentityError> {
+    create_user_row(
+        conn,
+        username,
+        None,
+        Some(sso_subject),
+        email,
+        is_sysadmin,
+        bootstrap_sysadmin,
+        &[],
+        now,
+    )
+}
+
+/// Shared inner implementation for [`create_user`]/[`create_sso_user`]
+/// -- exactly one of `password_hash`/`sso_subject` is ever set by a
+/// real caller (never enforced here since both current callers are
+/// this module's own trusted code, not untrusted input).
+///
+/// **The BEGIN IMMEDIATE transaction is load-bearing, not incidental**:
+/// Python's own docstring documents a real historical race --
+/// SQLite's default deferred-transaction mode lets the empty-table
+/// PROBE, the INSERT, and the sysadmin/membership bootstrap grant
+/// interleave with a concurrent `create_user` call, so two racing
+/// callers on an empty table could BOTH read `was_empty=true` and
+/// BOTH bootstrap a sysadmin (dual-sysadmin). `TransactionBehavior::
+/// Immediate` takes the write-lock up front (matching SQLite's own
+/// `BEGIN IMMEDIATE`), so a concurrent second creator blocks, then
+/// re-reads `was_empty=false` once it acquires the lock and is
+/// neither crowned nor bootstrapped.
+///
+/// `username`/`email` are sanitized through the SAME hidden-Unicode/
+/// control-byte stripper `conexus-backend`'s `/api` body-decode
+/// chokepoint uses (`conexus_core::string_sanitize::sanitize_string_leaf`)
+/// -- Python's real `create_user` reuses `_strip_control_bytes` for
+/// exactly this reason (an IdP-claim-derived `email` never passes
+/// through the REST body sanitizer). Sanitizing on the WRITE side
+/// only, deliberately: [`get_user_by_username`] (the login lookup)
+/// keeps matching EXACTLY, so a submitted `ad\u{200B}min` still fails
+/// to authenticate as the stored `admin` rather than being silently
+/// folded onto it.
+///
+/// Python's `InvalidEmailError` (raised on a `UnicodeEncodeError` at
+/// the SQLite bind site) has NO Rust equivalent to port: a Rust
+/// `&str` is a valid UTF-8 byte sequence by construction, so there is
+/// no `email: &str` value that could ever fail to bind -- the whole
+/// failure class is structurally impossible here, the same class of
+/// finding this migration already made for `json_sanitize`'s own
+/// `Cs`/surrogate case.
+#[allow(clippy::too_many_arguments)]
+fn create_user_row(
+    conn: &mut Connection,
+    username: &str,
+    password_hash: Option<&str>,
+    sso_subject: Option<&str>,
+    email: Option<&str>,
+    is_sysadmin: bool,
+    bootstrap_sysadmin: bool,
+    registered_projects: &[String],
+    now: &str,
+) -> Result<String, IdentityError> {
     let username = conexus_core::string_sanitize::sanitize_string_leaf(username);
     let email = email.map(conexus_core::string_sanitize::sanitize_string_leaf);
     let user_id = random_id(8); // 16 hex chars, matches Python's secrets.token_hex(8)
-    let password_hash = hash_password(password);
 
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let was_empty = users_table_is_empty(&tx)?;
@@ -408,7 +573,7 @@ pub fn create_user(
     let insert_result = tx.execute(
         "INSERT INTO users \
              (user_id, username, email, password_hash, created_at, last_login_at, is_sysadmin, sso_subject) \
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, NULL)",
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7)",
         (
             &user_id,
             &username,
@@ -416,6 +581,7 @@ pub fn create_user(
             &password_hash,
             now,
             is_sysadmin,
+            &sso_subject,
         ),
     );
     if let Err(e) = insert_result {
@@ -809,6 +975,172 @@ mod tests {
         ));
         let by_username = get_user_by_username(&c, "alice").unwrap().unwrap();
         assert_eq!(by_username.user_id, uid);
+    }
+
+    #[test]
+    fn create_sso_user_persists_a_passwordless_row() {
+        let mut c = conn();
+        let uid = create_sso_user(&mut c, "alice", "proxy:alice", None, false, true, NOW).unwrap();
+        let row = get_user_by_id(&c, &uid).unwrap().unwrap();
+        assert_eq!(row.username, "alice");
+        assert!(row.password_hash.is_none());
+        assert_eq!(row.sso_subject.as_deref(), Some("proxy:alice"));
+    }
+
+    #[test]
+    fn create_sso_user_bootstraps_the_first_operator_as_sysadmin() {
+        let mut c = conn();
+        let uid = create_sso_user(&mut c, "alice", "proxy:alice", None, false, true, NOW).unwrap();
+        assert!(get_user_by_id(&c, &uid).unwrap().unwrap().is_sysadmin);
+    }
+
+    #[test]
+    fn create_sso_user_rejects_a_duplicate_username() {
+        let mut c = conn();
+        create_sso_user(&mut c, "alice", "proxy:alice", None, false, true, NOW).unwrap();
+        let err =
+            create_sso_user(&mut c, "alice", "proxy:alice2", None, false, false, NOW).unwrap_err();
+        assert!(matches!(err, IdentityError::UsernameAlreadyExists(u) if u == "alice"));
+    }
+
+    #[test]
+    fn find_user_by_sso_subject_reconciles_to_the_same_row_on_every_call() {
+        let mut c = conn();
+        let uid = create_sso_user(&mut c, "alice", "proxy:alice", None, false, true, NOW).unwrap();
+        let first = find_user_by_sso_subject(&c, "proxy:alice")
+            .unwrap()
+            .unwrap();
+        let second = find_user_by_sso_subject(&c, "proxy:alice")
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.user_id, uid);
+        assert_eq!(second.user_id, uid);
+    }
+
+    #[test]
+    fn find_user_by_sso_subject_is_none_for_an_unknown_subject() {
+        let c = conn();
+        assert!(find_user_by_sso_subject(&c, "proxy:nobody")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn find_linkable_user_by_email_prefers_a_password_authenticated_row() {
+        let mut c = conn();
+        // A legacy passwordless SSO row shares the email...
+        create_sso_user(
+            &mut c,
+            "alice-sso",
+            "proxy:alice-legacy",
+            Some("alice@example.test"),
+            false,
+            true,
+            NOW,
+        )
+        .unwrap();
+        // ...but a real password-authenticated account takes priority.
+        let password_uid = create_user(
+            &mut c,
+            "alice",
+            "correct horse battery staple",
+            Some("alice@example.test"),
+            false,
+            false,
+            &[],
+            NOW,
+        )
+        .unwrap();
+        let linked = find_linkable_user_by_email(&c, "alice@example.test")
+            .unwrap()
+            .unwrap();
+        assert_eq!(linked.user_id, password_uid);
+    }
+
+    #[test]
+    fn find_linkable_user_by_email_is_case_insensitive() {
+        let mut c = conn();
+        let uid = create_user(
+            &mut c,
+            "alice",
+            "correct horse battery staple",
+            Some("Alice@Example.Test"),
+            false,
+            true,
+            &[],
+            NOW,
+        )
+        .unwrap();
+        let linked = find_linkable_user_by_email(&c, "alice@example.test")
+            .unwrap()
+            .unwrap();
+        assert_eq!(linked.user_id, uid);
+    }
+
+    #[test]
+    fn stamp_sso_subject_if_absent_binds_once_and_never_overwrites() {
+        let mut c = conn();
+        let uid = create_user(
+            &mut c,
+            "alice",
+            "correct horse battery staple",
+            None,
+            false,
+            true,
+            &[],
+            NOW,
+        )
+        .unwrap();
+        stamp_sso_subject_if_absent(&c, &uid, "proxy:alice").unwrap();
+        assert_eq!(
+            get_user_by_id(&c, &uid)
+                .unwrap()
+                .unwrap()
+                .sso_subject
+                .as_deref(),
+            Some("proxy:alice")
+        );
+        // A second stamp attempt with a DIFFERENT subject must not
+        // overwrite the already-bound one.
+        stamp_sso_subject_if_absent(&c, &uid, "proxy:someone-else").unwrap();
+        assert_eq!(
+            get_user_by_id(&c, &uid)
+                .unwrap()
+                .unwrap()
+                .sso_subject
+                .as_deref(),
+            Some("proxy:alice")
+        );
+    }
+
+    #[test]
+    fn touch_last_login_updates_the_timestamp() {
+        let mut c = conn();
+        let uid = create_user(
+            &mut c,
+            "alice",
+            "correct horse battery staple",
+            None,
+            false,
+            true,
+            &[],
+            NOW,
+        )
+        .unwrap();
+        assert!(get_user_by_id(&c, &uid)
+            .unwrap()
+            .unwrap()
+            .last_login_at
+            .is_none());
+        touch_last_login(&c, &uid, "2026-06-01T00:00:00.000+00:00").unwrap();
+        assert_eq!(
+            get_user_by_id(&c, &uid)
+                .unwrap()
+                .unwrap()
+                .last_login_at
+                .as_deref(),
+            Some("2026-06-01T00:00:00.000+00:00")
+        );
     }
 
     #[test]
