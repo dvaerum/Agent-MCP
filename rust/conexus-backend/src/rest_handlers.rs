@@ -90,9 +90,26 @@ pub async fn prompts_catalog() -> Response {
 /// render policy toggles and know whether it may show secret values.
 /// Behind `rest_gate` (operator-tier only, matching Python's
 /// `Depends(require_operator_session)` + inline confirmed-tier gate).
-pub async fn settings_schema(
-    Extension(resolved): Extension<ResolvedRestPrincipal>,
-) -> impl IntoResponse {
+pub async fn settings_schema(Extension(resolved): Extension<ResolvedRestPrincipal>) -> Response {
+    // BUG FIX (found while researching PR 7): Python's real handler
+    // 403s the WHOLE response for a non-confirmed caller -- this gate
+    // was missing here since this endpoint's first PR (#852), which
+    // only surfaced `confirmed_operator` as an informational response
+    // field without ever checking it. A forwarding-header caller
+    // (never confirmed on REST, by PR 1's own design) could read the
+    // schema when Python would reject it. Reproduced live before this
+    // fix (200 for a forwarding-operator caller), confirmed 403 after.
+    if !resolved.confirmed_operator_tier {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "forbidden",
+                "message": "The settings schema is operator-tier only. Use an \
+                    operator-tier session or bearer to read it.",
+            })),
+        )
+            .into_response();
+    }
     let schema: Vec<_> = SETTINGS_SCHEMA
         .iter()
         .map(|s| {
@@ -122,6 +139,7 @@ pub async fn settings_schema(
             "confirmed_operator": resolved.confirmed_operator_tier,
         },
     }))
+    .into_response()
 }
 
 // -- /api/memories (Phase E1 PR 4/14, conexus-rest-memories) --------
