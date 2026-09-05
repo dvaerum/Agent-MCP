@@ -899,6 +899,58 @@ const REPLY_HINT_TEXT: &str = "This looks like a reply — to thread it correctl
     function by passing `parent_message_id` (the message you're replying to) instead of putting \
     'RE:' in the subject.";
 
+/// Perform the write core + the two commit-adjacent side effects a
+/// real send needs: the durable `agent_actions` audit row and the
+/// recipient's `wait_for_events` wake. Both `SendAgentMessageTool` and
+/// `BroadcastAdminMessageTool` route their per-recipient send through
+/// this one function -- Python's own broadcast fan-out calls the FULL
+/// `send_agent_message_tool_impl` per recipient (not just its write
+/// core, confirmed by reading `broadcast_admin_message_tool_impl`
+/// directly), so each broadcast recipient gets its own individual
+/// "send_message" durable audit row exactly the way a direct send
+/// would -- on top of, not instead of, the broadcast's own top-level
+/// entry (which is in-memory-only and NOT ported, same precedent as
+/// every prior tool's `log_audit` trail).
+async fn send_with_side_effects(
+    conn: &AsyncMutex<Connection>,
+    principal: &Principal,
+    args: crate::agent_messaging::SendMessageArgs<'_>,
+    ctx: &ToolCallContext<'_>,
+    now: &str,
+) -> Result<crate::agent_messaging::SendOutcome, rusqlite::Error> {
+    let recipient_id = args.recipient_id.to_string();
+    let message_type = args.message_type.to_string();
+    let priority = args.priority.to_string();
+
+    let outcome = {
+        let guard = conn.lock().await;
+        crate::agent_messaging::send_agent_message(&guard, principal, args)
+    }?;
+
+    if let crate::agent_messaging::SendOutcome::Sent { ref message_id } = outcome {
+        {
+            let guard = conn.lock().await;
+            let _ = conexus_db::agent_action_repository::log_agent_action(
+                &guard,
+                &crate::agent_messaging::sender_label(principal),
+                "send_message",
+                None,
+                Some(&serde_json::json!({
+                    "recipient": recipient_id,
+                    "message_type": message_type,
+                    "priority": priority,
+                    "delivery_status": "stored",
+                    "message_id": message_id,
+                })),
+                now,
+            );
+        }
+        ctx.waiter_registry.notify(&recipient_id);
+    }
+
+    Ok(outcome)
+}
+
 /// Send a message from one agent to another, with permission checks.
 /// Port of `send_agent_message_tool_impl`.
 pub struct SendAgentMessageTool;
@@ -963,22 +1015,22 @@ impl conexus_auth::Tool for SendAgentMessageTool {
                 };
             };
 
-            let outcome = {
-                let guard = conn.lock().await;
-                crate::agent_messaging::send_agent_message(
-                    &guard,
-                    principal,
-                    crate::agent_messaging::SendMessageArgs {
-                        recipient_id,
-                        message_content,
-                        message_type,
-                        priority,
-                        subject: explicit_subject,
-                        parent_message_id,
-                        now,
-                    },
-                )
-            };
+            let outcome = send_with_side_effects(
+                conn,
+                principal,
+                crate::agent_messaging::SendMessageArgs {
+                    recipient_id,
+                    message_content,
+                    message_type,
+                    priority,
+                    subject: explicit_subject,
+                    parent_message_id,
+                    now,
+                },
+                ctx,
+                now,
+            )
+            .await;
             let outcome = match outcome {
                 Ok(o) => o,
                 Err(e) => {
@@ -1006,33 +1058,6 @@ impl conexus_auth::Tool for SendAgentMessageTool {
                 }
                 crate::agent_messaging::SendOutcome::Sent { message_id } => message_id,
             };
-
-            // Durable audit row -- Python's unified `u.audit(...)` call,
-            // registered to fire only after the message commit (already
-            // happened above, since `send_agent_message` writes directly
-            // on `conn`, not a caller-managed transaction here).
-            {
-                let guard = conn.lock().await;
-                let _ = conexus_db::agent_action_repository::log_agent_action(
-                    &guard,
-                    &crate::agent_messaging::sender_label(principal),
-                    "send_message",
-                    None,
-                    Some(&serde_json::json!({
-                        "recipient": recipient_id,
-                        "message_type": message_type,
-                        "priority": priority,
-                        "delivery_status": "stored",
-                        "message_id": message_id,
-                    })),
-                    now,
-                );
-            }
-
-            // Wake the recipient's `wait_for_events` waiter (and, via
-            // the same registry, any future per-recipient stream fan-
-            // out) -- post-commit, matching Python's `u.on_commit(...)`.
-            ctx.waiter_registry.notify(recipient_id);
 
             let mut response_text = format!(
                 "Message sent to {recipient_id}. Message stored for recipient (Message ID: \
@@ -1078,6 +1103,167 @@ impl conexus_auth::Tool for SendAgentMessageTool {
             ToolResult::Ok {
                 data: Some(data),
                 message: Some(response_text),
+            }
+        })
+    }
+}
+
+const BROADCAST_DENIED: &str = "Unauthorized: operator role required to broadcast";
+
+/// Port of the decorator's `lambda p: p is not None and
+/// _is_operator_tier(p)`.
+fn is_operator_tier_caller(principal: Option<&Principal>) -> bool {
+    principal.is_some_and(conexus_core::principal::is_operator_tier)
+}
+
+/// Admin-only fan-out: broadcast a message to every active agent.
+/// Port of `broadcast_admin_message_tool_impl`.
+///
+/// Each recipient goes through the SAME [`send_with_side_effects`]
+/// helper `SendAgentMessageTool` uses (not just the write core) --
+/// confirmed by reading Python's own fan-out, which calls the FULL
+/// `send_agent_message_tool_impl` per recipient, not a bare write
+/// function. Each successful send therefore gets its own individual
+/// durable `agent_actions` "send_message" row AND its own recipient
+/// wake, exactly as if that recipient had been messaged directly.
+/// The broadcast's own top-level `log_audit(..., "broadcast_message",
+/// ...)` call is in-memory-only in Python and deliberately NOT
+/// ported, same precedent as every prior tool's dropped `g.audit_log`
+/// trail.
+///
+/// `g.active_agents` (Python's in-memory cache) has no Rust
+/// equivalent -- re-derived from `AgentRepository::list_active`
+/// (DB-fresh), matching every prior "which agents are active" query
+/// this migration has ported. Additionally excludes `status ==
+/// "system"` (the synthetic system pseudo-agent `list_active` alone
+/// doesn't filter, but which a real `g.active_agents` snapshot would
+/// never contain either, since only `register_agent` populates it --
+/// the same re-derivation `ViewStatusTool`/`ViewAgentsTool` already
+/// made). `agent_id != "admin"` is deliberately an EXACT, case-
+/// SENSITIVE match here -- Python's own `recipient_id != "admin"` in
+/// this function, NOT the case-insensitive `.lower() == "admin"`
+/// `can_agents_communicate` uses elsewhere; preserved as a real,
+/// documented Python asymmetry, not reconciled.
+pub struct BroadcastAdminMessageTool;
+
+impl conexus_auth::Tool for BroadcastAdminMessageTool {
+    const NAME: &'static str = "broadcast_admin_message";
+    const REQUIRED: conexus_auth::Requirement = conexus_auth::Requirement::Predicate {
+        check: is_operator_tier_caller,
+        reason: BROADCAST_DENIED,
+    };
+    const DESCRIPTION: &'static str =
+        "Admin-only tool to broadcast a message to all active agents.";
+    const SCHEMA: &'static str = r#"{
+        "type": "object",
+        "properties": {
+            "message": {"type": "string", "description": "Message content to broadcast", "maxLength": 4000},
+            "message_type": {"type": "string", "description": "Type of broadcast message", "enum": ["broadcast", "announcement", "system_alert"], "default": "broadcast"},
+            "priority": {"type": "string", "description": "Message priority", "enum": ["low", "normal", "high", "urgent"], "default": "high"},
+            "subject": {"type": ["string", "null"], "description": "Optional subject applied to every fan-out root message. Omit to let each per-recipient send go through the standard truncated-body preview path."}
+        },
+        "required": ["message"],
+        "additionalProperties": false
+    }"#;
+
+    fn call<'a>(
+        principal: Option<&'a Principal>,
+        arguments: &'a Value,
+        conn: &'a AsyncMutex<Connection>,
+        now: &'a str,
+        ctx: &'a ToolCallContext<'a>,
+    ) -> conexus_auth::BoxFuture<'a, ToolResult> {
+        Box::pin(async move {
+            let principal =
+                principal.expect("Requirement::Predicate already enforced Some(principal)");
+
+            let message_content = arguments.get("message").and_then(Value::as_str);
+            let message_type = arguments
+                .get("message_type")
+                .and_then(Value::as_str)
+                .unwrap_or("broadcast");
+            let priority = arguments
+                .get("priority")
+                .and_then(Value::as_str)
+                .unwrap_or("high");
+            let explicit_subject = arguments.get("subject").and_then(Value::as_str);
+
+            let Some(message_content) = message_content.filter(|s| !s.is_empty()) else {
+                return ToolResult::Invalid {
+                    field: Some("message".to_string()),
+                    message: "message is required".to_string(),
+                };
+            };
+
+            let active_agents = {
+                let guard = conn.lock().await;
+                AgentRepository::list_active(&guard)
+            };
+            let active_agents = match active_agents {
+                Ok(rows) => rows,
+                Err(e) => {
+                    return ToolResult::Failed {
+                        message: format!("Database error listing active agents: {e}"),
+                    }
+                }
+            };
+
+            let recipient_ids: Vec<String> = active_agents
+                .into_iter()
+                .filter(|row| row.status != "system" && row.agent_id != "admin")
+                .map(|row| row.agent_id)
+                .collect();
+
+            if recipient_ids.is_empty() {
+                return ToolResult::Ok {
+                    data: Some(serde_json::json!({
+                        "sent_count": 0, "failed_count": 0, "recipients": []
+                    })),
+                    message: Some("No active agents to broadcast to".to_string()),
+                };
+            }
+
+            let mut sent_count = 0i64;
+            let mut failed_count = 0i64;
+            let mut recipients: Vec<String> = Vec::new();
+
+            for recipient_id in &recipient_ids {
+                let outcome = send_with_side_effects(
+                    conn,
+                    principal,
+                    crate::agent_messaging::SendMessageArgs {
+                        recipient_id,
+                        message_content,
+                        message_type,
+                        priority,
+                        subject: explicit_subject,
+                        parent_message_id: None,
+                        now,
+                    },
+                    ctx,
+                    now,
+                )
+                .await;
+                match outcome {
+                    Ok(crate::agent_messaging::SendOutcome::Sent { .. }) => {
+                        sent_count += 1;
+                        recipients.push(recipient_id.clone());
+                    }
+                    _ => failed_count += 1,
+                }
+            }
+
+            ToolResult::Ok {
+                data: Some(serde_json::json!({
+                    "sent_count": sent_count,
+                    "failed_count": failed_count,
+                    "recipients": recipients,
+                    "message_type": message_type,
+                    "priority": priority,
+                })),
+                message: Some(format!(
+                    "Broadcast sent to {sent_count} agents. {failed_count} failed."
+                )),
             }
         })
     }
@@ -2384,5 +2570,159 @@ mod tests {
         let data = data.unwrap();
         assert!(data.get("reply_hint").is_none());
         assert_eq!(data["subject"], serde_json::Value::Null);
+    }
+
+    // -- broadcast_admin_message ---------------------------------------
+
+    fn operator_principal() -> Principal {
+        Principal {
+            kind: PrincipalKind::ForwardingHeader,
+            user_id: Some("op1".to_string()),
+            agent_id: None,
+            project_name: None,
+            project_role: Some(conexus_core::capability::ProjectRole::Operator),
+            agent_role: None,
+            can_wake_loop: false,
+            source_token: None,
+            capabilities: Capabilities::Sysadmin,
+        }
+    }
+
+    #[tokio::test]
+    async fn broadcast_admin_message_denies_a_plain_worker() {
+        let conn = test_conn();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let worker = agent_bearer("alice");
+        let descriptor = conexus_auth::ToolDescriptor::of::<BroadcastAdminMessageTool>();
+
+        let result = conexus_auth::dispatch(
+            &descriptor,
+            Some(&worker),
+            &conexus_auth::NoPolicyOverrides,
+            &json!({"message": "hi everyone"}),
+            &conn,
+            NOW,
+            &ctx,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::PermissionDenied { .. }));
+    }
+
+    #[tokio::test]
+    async fn broadcast_admin_message_requires_message() {
+        use conexus_auth::Tool;
+        let conn = test_conn();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let operator = operator_principal();
+
+        let result =
+            BroadcastAdminMessageTool::call(Some(&operator), &json!({}), &conn, NOW, &ctx).await;
+        assert!(
+            matches!(result, ToolResult::Invalid { field, .. } if field.as_deref() == Some("message"))
+        );
+    }
+
+    #[tokio::test]
+    async fn broadcast_admin_message_with_no_active_agents_reports_zero_sent() {
+        use conexus_auth::Tool;
+        let conn = test_conn();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let operator = operator_principal();
+
+        let result = BroadcastAdminMessageTool::call(
+            Some(&operator),
+            &json!({"message": "hi everyone"}),
+            &conn,
+            NOW,
+            &ctx,
+        )
+        .await;
+        let ToolResult::Ok { message, data } = result else {
+            panic!("expected Ok, got {result:?}");
+        };
+        assert_eq!(message.as_deref(), Some("No active agents to broadcast to"));
+        assert_eq!(data.unwrap()["sent_count"], 0);
+    }
+
+    #[tokio::test]
+    async fn broadcast_admin_message_sends_to_every_active_agent_except_admin_and_wakes_each() {
+        use conexus_auth::Tool;
+        let conn = test_conn();
+        seed_agent(&conn, "alice").await;
+        seed_agent(&conn, "bob").await;
+        {
+            // "admin" can't go through `AgentRepository::create`
+            // (rejected as a reserved agent_id) -- inserted via raw
+            // SQL purely to exercise the exclusion defensively, the
+            // same way Python's own comment notes "the legacy 'admin'
+            // pseudo-agent label the test harness seeds" as a state
+            // real production data can't otherwise reach.
+            let guard = conn.lock().await;
+            guard
+                .execute(
+                    "INSERT INTO agents (token, agent_id, created_at, status, working_directory, agent_role) \
+                     VALUES ('tok-admin', 'admin', '2026-01-01T00:00:00Z', 'active', '/tmp', 'manager')",
+                    [],
+                )
+                .unwrap();
+        }
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let operator = operator_principal();
+        let (_a_sender, mut a_receiver) = registry.register("alice");
+        let (_b_sender, mut b_receiver) = registry.register("bob");
+
+        let result = BroadcastAdminMessageTool::call(
+            Some(&operator),
+            &json!({"message": "system maintenance tonight"}),
+            &conn,
+            NOW,
+            &ctx,
+        )
+        .await;
+        let ToolResult::Ok { message, data } = result else {
+            panic!("expected Ok, got {result:?}");
+        };
+        let data = data.unwrap();
+        assert_eq!(data["sent_count"], 2, "alice and bob, never admin itself");
+        assert_eq!(data["failed_count"], 0);
+        let recipients: Vec<String> = data["recipients"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(recipients.contains(&"alice".to_string()));
+        assert!(recipients.contains(&"bob".to_string()));
+        assert!(!recipients.contains(&"admin".to_string()));
+        assert!(message.unwrap().contains("Broadcast sent to 2 agents"));
+
+        assert!(a_receiver.try_recv().is_ok(), "alice must be woken");
+        assert!(b_receiver.try_recv().is_ok(), "bob must be woken");
+
+        // Each recipient gets its OWN durable "send_message" audit row
+        // (Python's fan-out calls the full send tool impl per
+        // recipient, not just a bare write) -- confirmed here, not
+        // assumed.
+        let guard = conn.lock().await;
+        let action_count: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM agent_actions WHERE action_type = 'send_message'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(action_count, 2);
+        let message_count: i64 = guard
+            .query_row("SELECT COUNT(*) FROM agent_messages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(message_count, 2);
     }
 }
