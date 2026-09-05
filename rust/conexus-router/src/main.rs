@@ -286,6 +286,10 @@ async fn main() -> Result<()> {
             "/agent-mcp/api/router/projects/{name}/aliases/{alias}",
             axum::routing::delete(lifecycle_rest::remove_alias_handler),
         )
+        .route(
+            "/agent-mcp/api/router/overview",
+            get(lifecycle_rest::overview_handler),
+        )
         .layer(axum::middleware::from_fn_with_state(
             std::sync::Arc::clone(&state),
             middleware::session_gate_layer,

@@ -160,6 +160,71 @@ pub fn project_counts(workspace: &str) -> ProjectCounts {
     }
 }
 
+/// Port of `_derive_status` (S2): collapse `(systemd state,
+/// last-activity bucket)` to a dashboard chip enum. `failed` is
+/// reserved for a future enhancement (systemd-side failure detection)
+/// -- Python's own comment: never synthesized from any input today,
+/// so this closed set has no `Failed` variant to port either.
+/// `last_activity` in the future (clock skew) degrades to `Active`
+/// (a `SystemTime::duration_since` error floors the age at zero),
+/// matching Python's own `now - ts` going negative and still passing
+/// its `<= 5*60` check.
+pub fn derive_status(
+    running: bool,
+    last_activity: Option<std::time::SystemTime>,
+    now: std::time::SystemTime,
+) -> &'static str {
+    if !running {
+        return "stopped";
+    }
+    let Some(ts) = last_activity else {
+        return "starting";
+    };
+    let age = now.duration_since(ts).unwrap_or(std::time::Duration::ZERO);
+    if age <= std::time::Duration::from_secs(5 * 60) {
+        "active"
+    } else if age <= std::time::Duration::from_secs(4 * 60 * 60) {
+        "idle"
+    } else {
+        "sleeping"
+    }
+}
+
+/// One project's row in the overview envelope -- port of
+/// `_build_overview_envelope`'s per-project dict, minus `running`
+/// (the caller already resolved it via a real `is_active` await; this
+/// function is the fully-synchronous remainder). `alias` carries the
+/// SAME shape `finish_rename_project`'s response already uses
+/// (`{"name", "expires_at"}` per entry).
+pub fn build_project_summary(
+    row: &crate::project_registry::ProjectRow,
+    default_workspace_parent: &std::path::Path,
+    running: bool,
+    last_activity: Option<std::time::SystemTime>,
+    now: std::time::SystemTime,
+) -> serde_json::Value {
+    let counts = project_counts(&row.workspace);
+    let last_activity_ts = last_activity.and_then(|t| {
+        t.duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs_f64())
+    });
+    serde_json::json!({
+        "name": row.name,
+        "workspace": lifecycle::workspace_label(&row.workspace, default_workspace_parent),
+        "status": derive_status(running, last_activity, now),
+        "last_activity_ts": last_activity_ts,
+        "agents": counts.agents,
+        "tasks": counts.tasks,
+        "open_messages": counts.open_messages,
+        "alias": row
+            .aliases
+            .iter()
+            .map(|a| serde_json::json!({"name": a.name, "expires_at": a.expires_at}))
+            .collect::<Vec<_>>(),
+    })
+}
+
 /// Port of `alias_usage_handler`'s DB read: every distinct `agent_id`
 /// that has used `alias` against this project's own `mcp_sessions`
 /// table. Degrades to an empty list on any error (missing DB, missing
@@ -374,6 +439,95 @@ mod tests {
         assert_eq!(body["ok"], true);
         assert_eq!(body["service"], "agent-mcp-router");
         assert_eq!(body["mode"], "multi-tenant");
+    }
+
+    // -- derive_status ------------------------------------------------------
+
+    #[test]
+    fn derive_status_a_not_running_unit_is_stopped_regardless_of_activity() {
+        let now = std::time::SystemTime::now();
+        assert_eq!(derive_status(false, Some(now), now), "stopped");
+        assert_eq!(derive_status(false, None, now), "stopped");
+    }
+
+    #[test]
+    fn derive_status_running_with_no_activity_timestamp_yet_is_starting() {
+        let now = std::time::SystemTime::now();
+        assert_eq!(derive_status(true, None, now), "starting");
+    }
+
+    #[test]
+    fn derive_status_running_recent_activity_is_active() {
+        let now = std::time::SystemTime::now();
+        let ts = now - std::time::Duration::from_secs(60);
+        assert_eq!(derive_status(true, Some(ts), now), "active");
+        // Exactly at the 5-minute boundary is still active.
+        let boundary = now - std::time::Duration::from_secs(5 * 60);
+        assert_eq!(derive_status(true, Some(boundary), now), "active");
+    }
+
+    #[test]
+    fn derive_status_running_stale_activity_is_idle_then_sleeping() {
+        let now = std::time::SystemTime::now();
+        let idle_ts = now - std::time::Duration::from_secs(30 * 60);
+        assert_eq!(derive_status(true, Some(idle_ts), now), "idle");
+        let sleeping_ts = now - std::time::Duration::from_secs(5 * 60 * 60);
+        assert_eq!(derive_status(true, Some(sleeping_ts), now), "sleeping");
+    }
+
+    #[test]
+    fn derive_status_a_future_timestamp_degrades_to_active_not_an_error() {
+        let now = std::time::SystemTime::now();
+        let future = now + std::time::Duration::from_secs(60);
+        assert_eq!(derive_status(true, Some(future), now), "active");
+    }
+
+    // -- build_project_summary -----------------------------------------------
+
+    #[test]
+    fn build_project_summary_assembles_the_real_per_project_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("projects");
+        let workspace = parent.join("proj-a");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let row = crate::project_registry::ProjectRow {
+            name: "proj-a".to_string(),
+            workspace: workspace.to_string_lossy().to_string(),
+            aliases: vec![crate::project_registry::Alias {
+                name: "old-name".to_string(),
+                expires_at: "2026-02-01T00:00:00Z".to_string(),
+            }],
+            backend_impl: "python".to_string(),
+        };
+        let now = std::time::SystemTime::now();
+        let summary = build_project_summary(&row, &parent, true, Some(now), now);
+        assert_eq!(summary["name"], "proj-a");
+        assert_eq!(summary["workspace"], "proj-a");
+        assert_eq!(summary["status"], "active");
+        assert!(summary["last_activity_ts"].as_f64().is_some());
+        assert_eq!(summary["agents"], 0);
+        assert_eq!(summary["tasks"], 0);
+        assert_eq!(summary["open_messages"], 0);
+        let alias = &summary["alias"][0];
+        assert_eq!(alias["name"], "old-name");
+        assert_eq!(alias["expires_at"], "2026-02-01T00:00:00Z");
+    }
+
+    #[test]
+    fn build_project_summary_has_no_last_activity_ts_when_never_active() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("projects");
+        let row = crate::project_registry::ProjectRow {
+            name: "proj-a".to_string(),
+            workspace: parent.join("proj-a").to_string_lossy().to_string(),
+            aliases: vec![],
+            backend_impl: "python".to_string(),
+        };
+        let now = std::time::SystemTime::now();
+        let summary = build_project_summary(&row, &parent, false, None, now);
+        assert_eq!(summary["status"], "stopped");
+        assert!(summary["last_activity_ts"].is_null());
+        assert_eq!(summary["alias"].as_array().unwrap().len(), 0);
     }
 
     #[test]
