@@ -7,13 +7,63 @@
 //! follow-up PR" -- one of the 3 confirmed no-auth-by-design REST
 //! endpoints), `settings-schema` requires the `rest_gate` door.
 
-use axum::extract::Extension;
+use std::sync::Arc;
+
+use axum::body::Bytes;
+use axum::extract::{Extension, Path, State};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use serde_json::json;
 
 use conexus_core::settings_schema::SETTINGS_SCHEMA;
+use conexus_core::tool_result::ToolResult;
+use conexus_tools::project_context_tools::{
+    has_unsafe_unicode_for_identifier, is_valid_memory_key,
+};
 
+use crate::json_sanitize::decode_untrusted_body;
 use crate::rest_gate::ResolvedRestPrincipal;
+use crate::server::{dispatch_rest_tool, SharedState};
+
+/// Port of `agent_mcp/utils/string_utils.py::UNSAFE_KEY_ERROR`.
+fn unsafe_key_error() -> serde_json::Value {
+    json!({
+        "error": "invalid_key_character",
+        "message": "Memory key contains a disallowed character \
+            (Unicode control / bidi-override / invisible). \
+            Allowed: printable Unicode except \
+            U+0000-U+001F, U+007F, \
+            U+200B-U+200F, U+2028-U+2029, U+202A-U+202E, \
+            U+2060-U+2064, U+2066-U+2069, U+206A-U+206F, U+FEFF.",
+    })
+}
+
+/// Port of `agent_mcp/utils/string_utils.py::MEMORY_KEY_ERROR`.
+fn memory_key_error() -> serde_json::Value {
+    json!({
+        "error": "invalid_key_character",
+        "message": "Memory key may contain only letters, digits, and . _ / - \
+            (A-Z a-z 0-9 . _ / -).",
+    })
+}
+
+/// Port of `agent_mcp/app/routers/_wire_validation.py::require_str`:
+/// 400 iff `value` is present (`Some`) but not a JSON string. Absent
+/// (`None`) is allowed -- callers check presence/truthiness
+/// separately.
+fn require_str(value: Option<&serde_json::Value>, field: &str) -> Option<Response> {
+    match value {
+        Some(v) if !v.is_string() => Some(
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("{field} must be a string")})),
+            )
+                .into_response(),
+        ),
+        _ => None,
+    }
+}
 
 /// `GET /api/prompts/catalog` -- the raw Prompt Book catalogue, served
 /// verbatim with no visibility filtering (unlike `conexus_tools::
@@ -72,4 +122,304 @@ pub async fn settings_schema(
             "confirmed_operator": resolved.confirmed_operator_tier,
         },
     }))
+}
+
+// -- /api/memories (Phase E1 PR 4/14, conexus-rest-memories) --------
+
+/// `POST /api/memories` -- thin adapter over `create_project_context`,
+/// matching `agent_mcp/app/routers/memories.py::create_memory_api_route`.
+/// R9-F2 (pentest): dispatches through the gated MCP tool rather than
+/// writing the table directly, so the tool-layer authorization gates
+/// (viewer-tier write guard, per-key creator-ownership matrix) apply
+/// to this REST surface too -- ONE enforcement path, not a second
+/// bypassable one.
+pub async fn create_memory(
+    State(shared): State<Arc<SharedState>>,
+    Extension(resolved): Extension<ResolvedRestPrincipal>,
+    body: Bytes,
+) -> Response {
+    let data = match decode_untrusted_body(&body) {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
+    };
+
+    let context_key_value = data.get("context_key");
+    let context_value = data
+        .get("context_value")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let description = data.get("description");
+
+    // Matches Python's `if not context_key: ...` -- a JSON-truthiness
+    // check (missing / null / false / 0 / "" / [] / {}), checked
+    // BEFORE the type guard below, so e.g. a bare `0` hits "required"
+    // the same way Python's `not 0` does, while a non-empty non-string
+    // value (a number, a list) falls through to the type guard instead
+    // -- collapsing these two checks into one (as an earlier draft of
+    // this handler did) would misreport a wrong-typed-but-truthy value
+    // as "required" instead of "must be a string".
+    if is_json_falsy(context_key_value) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "context_key is required"})),
+        )
+            .into_response();
+    }
+    if let Some(resp) = require_str(context_key_value, "context_key") {
+        return resp;
+    }
+    if let Some(resp) = require_str(description, "description") {
+        return resp;
+    }
+    // Safe: `require_str` above already confirmed this is a string.
+    let context_key = context_key_value.and_then(|v| v.as_str()).unwrap();
+
+    // NOTE, verified live + against `tests/test_memories_unsafe_unicode_key.py`:
+    // this check is effectively a no-op HERE (not dead code to delete --
+    // a documented, tested contract). `context_key` arrived through
+    // `decode_untrusted_body` above, which already silently stripped
+    // every hidden-format/control character this denylist checks for
+    // (R13-F2/R14-F3) -- a JSON-body request carrying e.g. an RTL
+    // override key succeeds with the SANITIZED key stored, it never
+    // 400s here. The check earns its keep on `update_memory`'s PATH
+    // parameter below instead, which is never routed through the JSON
+    // sanitizer at all -- that's the one path where a raw disallowed
+    // character can still reach this validator intact.
+    if has_unsafe_unicode_for_identifier(context_key) {
+        return (StatusCode::BAD_REQUEST, Json(unsafe_key_error())).into_response();
+    }
+    if !is_valid_memory_key(context_key) {
+        return (StatusCode::BAD_REQUEST, Json(memory_key_error())).into_response();
+    }
+
+    let arguments = json!({
+        "context_key": context_key,
+        "context_value": context_value,
+        "description": description,
+    });
+    let principal = resolved.dispatch_principal.clone();
+    let result = match dispatch_rest_tool(
+        &shared,
+        "create_project_context",
+        arguments,
+        Some(&principal),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(()) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Failed to create memory"})),
+            )
+                .into_response()
+        }
+    };
+
+    render_memory_result(
+        result,
+        || format!("Memory '{context_key}' created successfully"),
+        "Failed to create memory",
+        None,
+    )
+}
+
+/// `PUT /api/memories/{context_key}` -- thin adapter over
+/// `update_project_context`, matching
+/// `agent_mcp/app/routers/memories.py::update_memory_api_route`.
+pub async fn update_memory(
+    Path(context_key): Path<String>,
+    State(shared): State<Arc<SharedState>>,
+    Extension(resolved): Extension<ResolvedRestPrincipal>,
+    body: Bytes,
+) -> Response {
+    // Unlike `create_memory`'s identical-looking check, this one is
+    // LIVE: `context_key` here is an axum `Path` extraction (URL-
+    // decoded by axum, never passed through `decode_untrusted_body`),
+    // so a raw disallowed character (e.g. a URL-encoded RTL override)
+    // reaches this validator intact -- verified live against
+    // `tests/test_update_memory_rejects_unsafe_unicode_key_in_url`'s
+    // exact payload, which 400s here, not silently sanitized.
+    if has_unsafe_unicode_for_identifier(&context_key) {
+        return (StatusCode::BAD_REQUEST, Json(unsafe_key_error())).into_response();
+    }
+    if !is_valid_memory_key(&context_key) {
+        return (StatusCode::BAD_REQUEST, Json(memory_key_error())).into_response();
+    }
+
+    let data = match decode_untrusted_body(&body) {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
+    };
+
+    let context_value = data
+        .get("context_value")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let description = data.get("description");
+
+    if let Some(resp) = require_str(description, "description") {
+        return resp;
+    }
+
+    // BL-R22-1: only thread `description` when the caller supplied it,
+    // so the tool's partial-update semantics preserve an existing
+    // description when this field is omitted entirely.
+    let mut arguments = json!({
+        "context_key": context_key,
+        "context_value": context_value,
+    });
+    if let Some(desc) = description {
+        arguments["description"] = desc.clone();
+    }
+
+    let principal = resolved.dispatch_principal.clone();
+    let result = match dispatch_rest_tool(
+        &shared,
+        "update_project_context",
+        arguments,
+        Some(&principal),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(()) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Failed to update memory"})),
+            )
+                .into_response()
+        }
+    };
+
+    render_memory_result(
+        result,
+        || format!("Memory '{context_key}' updated successfully"),
+        "Failed to update memory",
+        None,
+    )
+}
+
+/// `DELETE /api/memories/{context_key}` -- thin adapter over
+/// `delete_project_context`, matching
+/// `agent_mcp/app/routers/memories.py::delete_memory_api_route`.
+/// `force_delete` is read from the JSON body (default `false`); an
+/// empty/absent body is treated as `{}` here (Python:
+/// `bool(data.get("force_delete", False)) if isinstance(data, dict)
+/// else False` -- this handler's body is ALWAYS a dict once
+/// `decode_untrusted_body` accepts it, so the `isinstance` branch is
+/// unreachable in practice, matching the note left in PR2's
+/// `settings_schema` module about literal-not-stubbed values).
+pub async fn delete_memory(
+    Path(context_key): Path<String>,
+    State(shared): State<Arc<SharedState>>,
+    Extension(resolved): Extension<ResolvedRestPrincipal>,
+    body: Bytes,
+) -> Response {
+    // DELETE commonly carries no body at all; an empty body is treated
+    // as "no force_delete" rather than the 400 create/update would give
+    // -- matches Python's own `isinstance(data, dict) else False`
+    // fallback, which never actually raises here since a malformed body
+    // simply degrades to `force_delete=False`, not a rejected request.
+    let force_delete = if body.is_empty() {
+        false
+    } else {
+        match decode_untrusted_body(&body) {
+            Ok(data) => data
+                .get("force_delete")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            Err(_) => false,
+        }
+    };
+
+    let arguments = json!({
+        "context_key": context_key,
+        "force_delete": force_delete,
+    });
+    let principal = resolved.dispatch_principal.clone();
+    let result = match dispatch_rest_tool(
+        &shared,
+        "delete_project_context",
+        arguments,
+        Some(&principal),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(()) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Failed to delete memory"})),
+            )
+                .into_response()
+        }
+    };
+
+    render_memory_result(
+        result,
+        || format!("Memory '{context_key}' deleted successfully"),
+        "Failed to delete memory",
+        Some("Memory"),
+    )
+}
+
+/// Shared success/error envelope for the 3 memory handlers above --
+/// `{"success": true, "message": ...}` on `Ok` (custom message
+/// always, matching Python's own per-handler `f"Memory '{key}' ...
+/// successfully"` literals, not the tool's own `Ok.message`), or
+/// `{"error": ...}` with the status `ToolResult::to_http` assigns and
+/// the wording `ToolResult::error_message` assigns, on every other
+/// variant. This is Python's OWN bespoke envelope for this router
+/// (thinner than the generic `_dispatch_through_tool` shape other
+/// routers use -- no `data` field, a fixed success message) -- not a
+/// blanket call to `to_http()`.
+fn render_memory_result(
+    result: ToolResult,
+    success_message: impl FnOnce() -> String,
+    fallback: &str,
+    not_found_label: Option<&str>,
+) -> Response {
+    if matches!(result, ToolResult::Ok { .. }) {
+        return Json(json!({"success": true, "message": success_message()})).into_response();
+    }
+    let (status, _) = result.to_http();
+    let message = result.error_message(fallback, not_found_label);
+    (
+        StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        Json(json!({"error": message})),
+    )
+        .into_response()
+}
+
+/// Python `if not value:` truthiness over a JSON value pulled from a
+/// decoded request body -- `None` (missing key), `null`, `false`,
+/// `0`/`0.0`, `""`, `[]`, and `{}` are all falsy; everything else
+/// (including a non-empty string/array/object, or any nonzero number)
+/// is truthy. Needed because `create_memory`'s "is this field present
+/// at all" check is a truthiness check in Python, not a presence
+/// check -- see that call site for why collapsing it with the
+/// type-guard below would misreport a wrong-typed-but-truthy value.
+fn is_json_falsy(value: Option<&serde_json::Value>) -> bool {
+    match value {
+        None => true,
+        Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::Bool(b)) => !b,
+        Some(serde_json::Value::String(s)) => s.is_empty(),
+        Some(serde_json::Value::Number(n)) => n.as_f64() == Some(0.0),
+        Some(serde_json::Value::Array(a)) => a.is_empty(),
+        Some(serde_json::Value::Object(o)) => o.is_empty(),
+    }
 }
