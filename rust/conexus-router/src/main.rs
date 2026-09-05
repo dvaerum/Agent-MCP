@@ -22,6 +22,7 @@
 //! a per-project backend as an opaque process is enforced at compile
 //! time here, not just by convention.
 
+mod admin_users_gate;
 mod asset_prefix;
 mod client_disconnect;
 mod identity;
