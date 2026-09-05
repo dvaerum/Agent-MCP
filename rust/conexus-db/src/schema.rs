@@ -272,6 +272,27 @@ pub fn init_rag_embeddings_table(conn: &Connection, dimension: u32) -> Result<()
 pub fn init_router_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
+        -- Operator accounts. Final shape after all 3 Alembic migrations
+        -- that touch `users` (0001 baseline, 0002 `is_sysadmin`, 0003
+        -- relaxes `password_hash` to nullable for SSO-only rows, 0005
+        -- `sso_subject`) -- ported directly to the FINAL shape, not the
+        -- intermediate ones, matching this crate's own precedent
+        -- (`project_membership` below does the same).
+        CREATE TABLE IF NOT EXISTS users (
+            user_id        TEXT PRIMARY KEY,
+            username       TEXT UNIQUE NOT NULL,
+            email          TEXT,
+            password_hash  TEXT,
+            created_at     TEXT NOT NULL,
+            last_login_at  TEXT,
+            is_sysadmin    INTEGER NOT NULL DEFAULT 0,
+            sso_subject    TEXT
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_users_sso_subject
+            ON users(sso_subject)
+            WHERE sso_subject IS NOT NULL;
+
         CREATE TABLE IF NOT EXISTS groups (
             group_id     TEXT PRIMARY KEY,
             name         TEXT NOT NULL UNIQUE,
@@ -292,14 +313,13 @@ pub fn init_router_schema(conn: &Connection) -> Result<()> {
         -- `conexus-auth`'s `resolve_capabilities`. Each edge is EITHER a
         -- user-into-group or a group-into-group membership; the CHECK
         -- constraint enforces exactly-one-set at the storage layer, same
-        -- as Python. `member_user_id` deliberately has NO `REFERENCES
-        -- users(user_id)` here (unlike the real Alembic migration) --
-        -- the `users` table itself isn't ported to this crate yet (it
-        -- belongs to Phase E2's router port); add the FK back when it
-        -- is.
+        -- as Python. `member_user_id` now carries the real
+        -- `REFERENCES users(user_id)` FK (Phase E2 PR 3 backfilled this
+        -- once `users` existed -- see the git history for the
+        -- users-doesn't-exist-yet placeholder this replaces).
         CREATE TABLE IF NOT EXISTS group_membership (
             group_id         TEXT NOT NULL REFERENCES groups(group_id) ON DELETE CASCADE,
-            member_user_id   TEXT,
+            member_user_id   TEXT REFERENCES users(user_id) ON DELETE CASCADE,
             member_group_id  TEXT REFERENCES groups(group_id) ON DELETE CASCADE,
             added_at         TEXT NOT NULL,
             CHECK ((member_user_id IS NOT NULL) <> (member_group_id IS NOT NULL))
@@ -318,6 +338,50 @@ pub fn init_router_schema(conn: &Connection) -> Result<()> {
         CREATE UNIQUE INDEX IF NOT EXISTS uq_group_membership_group
             ON group_membership(group_id, member_group_id)
             WHERE member_group_id IS NOT NULL;
+
+        -- Opaque-cookie session store. `last_used_at` slides on each
+        -- successful `get_session`; the periodic prune sweep removes
+        -- rows whose `expires_at` is in the past. Unchanged since the
+        -- 0001 baseline migration.
+        CREATE TABLE IF NOT EXISTS sessions (
+            session_id    TEXT PRIMARY KEY,
+            user_id       TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+            created_at    TEXT NOT NULL,
+            expires_at    TEXT NOT NULL,
+            last_used_at  TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
+        CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at);
+
+        -- Which operator (or group) can administer which project. Final
+        -- shape after the 0002 rebuild-and-swap (0001's original
+        -- 2-column/composite-PK shape is superseded) -- ported directly
+        -- to the final shape, matching `users`' own precedent above.
+        -- `project_name` is denormalised (no FK): the canonical project
+        -- registry lives in `projects.local.json`, not `router.db`.
+        CREATE TABLE IF NOT EXISTS project_membership (
+            project_name  TEXT NOT NULL,
+            user_id       TEXT REFERENCES users(user_id) ON DELETE CASCADE,
+            group_id      TEXT REFERENCES groups(group_id) ON DELETE CASCADE,
+            role          TEXT NOT NULL DEFAULT 'operator'
+                          CHECK (role IN ('operator', 'viewer')),
+            CHECK ((user_id IS NOT NULL) <> (group_id IS NOT NULL))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_project_membership_user_id
+            ON project_membership(user_id);
+        CREATE INDEX IF NOT EXISTS idx_project_membership_group_id
+            ON project_membership(group_id);
+        CREATE INDEX IF NOT EXISTS idx_project_membership_project_name
+            ON project_membership(project_name);
+
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_project_membership_user
+            ON project_membership(project_name, user_id)
+            WHERE user_id IS NOT NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_project_membership_group
+            ON project_membership(project_name, group_id)
+            WHERE group_id IS NOT NULL;
         "#,
     )
 }

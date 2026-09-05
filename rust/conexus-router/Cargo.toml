@@ -11,16 +11,35 @@ name = "conexus-router"
 path = "src/main.rs"
 
 [dependencies]
-# Guiding Principle 2 / ADR-0020: this crate will depend on
-# conexus-auth (forwarding_header signing, already ported) and
-# conexus-core once a later PR wires real request signing/forwarding
-# -- but NEVER conexus-tools or conexus-mcp, so the router stays
-# structurally incapable of importing a tool type (a compile-time
-# guarantee of "the router is mount-agnostic", not just a convention).
-# Not added yet: this scaffold has no real consumer for either, and
-# this migration's own convention is a dependency lands with the PR
-# that actually needs it, not speculatively ahead of one.
+# Guiding Principle 2 / ADR-0020: NEVER conexus-tools or conexus-mcp,
+# so the router stays structurally incapable of importing a tool type
+# (a compile-time guarantee of "the router is mount-agnostic", not
+# just a convention). conexus-auth (forwarding_header signing) isn't
+# a dependency yet -- no real consumer until the proxy-core PR.
+conexus-core = { path = "../conexus-core" }
+conexus-db = { path = "../conexus-db" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 axum = "0.8"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# identity.rs's password hashing (Phase E2 PR 3) -- the RustCrypto
+# project's own argon2 crate, matching Python's argon2-cffi's library
+# defaults (argon2id, t=2, m=64MiB, p=4) and producing/parsing the
+# same PHC string format, so a hash minted by one implementation
+# verifies under the other. No existing workspace precedent for this
+# choice (same "genuinely new, no fork to resolve" shape as the
+# crane-vs-buildRustPackage pick in Phase D1).
+argon2 = "0.6"
+# session_id/user_id generation -- same OS-CSPRNG source
+# `conexus-tools::admin_tools::generate_token` already uses.
+getrandom = "0.4"
+
+[dev-dependencies]
+# identity.rs's create_user race test needs two real OS-level SQLite
+# connections against the SAME on-disk file (an in-memory connection
+# can't be shared across threads) to exercise the BEGIN IMMEDIATE
+# locking for real -- same crate+version conexus-backend/conexus-tools
+# already use for their own tempfile-backed tests.
+tempfile = "3"
