@@ -1790,6 +1790,289 @@ impl Tool for PurgeAgentTool {
     }
 }
 
+/// Wording for a denied capability check outside the `Tool`/
+/// `Requirement` machinery -- port of `_OPERATOR_REQUIRED_REASON`,
+/// verbatim. Only the 4 lifecycle functions below need this: unlike
+/// every OTHER function in this module, they're never registered MCP
+/// tools (Python calls their `*_tool_impl` directly from the REST
+/// router, never through `dispatch_tool_call`), so there's no
+/// `Requirement::Cap` gate to lean on -- the capability check has to
+/// be inline, matching Python's own `_require_capability` shape
+/// exactly.
+const OPERATOR_REQUIRED_REASON: &str = "Operator session or system token required for admin tools.";
+
+fn require_agents_terminate_capability(principal: Option<&Principal>) -> Option<ToolResult> {
+    match principal {
+        Some(p) if p.has_capability(Capability::AgentsTerminate) => None,
+        _ => Some(ToolResult::PermissionDenied {
+            reason: OPERATOR_REQUIRED_REASON.to_string(),
+        }),
+    }
+}
+
+/// Port of `disconnect_agent_tool_impl`'s DB-portable half. Flips
+/// `auto_event_loop` OFF and wakes the parked long-poll immediately
+/// (post-write, matching Python's emit-iff-write `on_commit`
+/// ordering -- this crate's single-transaction-per-call design makes
+/// "after the write succeeds" the equivalent moment).
+///
+/// **Documented, bounded scope gap (same shape as PR9/PR11's)**:
+/// Python's `session_registry.close_streams_for_agent` closes any
+/// live `GET /mcp` SSE push stream so presence flips OFFLINE
+/// immediately; `session_registry` has no Rust equivalent anywhere in
+/// this workspace yet (Phase D5's own admin_tools research already
+/// deferred this -- decision 2). `closed_streams` is therefore always
+/// `0` here -- the key is still PRESENT (matching Python's own
+/// `.get("closed_streams", 0)`-shaped response, not a missing field),
+/// and the auto_event_loop flip + waiter-wake this function DOES
+/// perform already correctly flips a WAITING agent's presence via the
+/// wake-loop's own flag-recheck arm; only an SSE-only-connected,
+/// currently-non-parked agent keeps its stream open until its own
+/// natural reconnect.
+pub fn disconnect_agent(
+    conn: &Connection,
+    waiter_registry: &conexus_wakeloop::waiter_registry::WaiterRegistry,
+    principal: Option<&Principal>,
+    agent_id: &str,
+    now: &str,
+) -> ToolResult {
+    if let Some(denial) = require_agents_terminate_capability(principal) {
+        return denial;
+    }
+
+    let Ok(row) = conexus_db::agent_repository::AgentRepository::get_by_id(conn, agent_id) else {
+        return ToolResult::Failed {
+            message: "A database error occurred; it has been logged. Retry, or ask an operator \
+                to check logs."
+                .to_string(),
+        };
+    };
+    if row.filter(|r| r.status != "terminated").is_none() {
+        return ToolResult::NotFound {
+            resource: "agent".to_string(),
+            identifier: agent_id.to_string(),
+            hint: None,
+        };
+    }
+
+    use conexus_db::agent_repository::{AgentField, AgentRepository, FieldValue};
+    if AgentRepository::update_field(
+        conn,
+        agent_id,
+        AgentField::AutoEventLoop,
+        FieldValue::Bool(false),
+        now,
+    )
+    .is_err()
+    {
+        return ToolResult::Failed {
+            message: "Failed to set auto_event_loop".to_string(),
+        };
+    }
+
+    let actor_label = principal.map(Principal::actor_label).unwrap_or("operator");
+    let _ = agent_action_repository::log_agent_action(
+        conn,
+        actor_label,
+        "disconnected_agent",
+        None,
+        Some(&serde_json::json!({"agent_id": agent_id})),
+        now,
+    );
+
+    waiter_registry.notify(agent_id);
+
+    ToolResult::Ok {
+        data: Some(serde_json::json!({
+            "agent_id": agent_id,
+            "auto_event_loop": false,
+            "closed_streams": 0,
+        })),
+        message: Some(format!(
+            "Agent '{agent_id}' disconnected — monitoring paused; 0 live stream(s) closed. \
+             Reconnect to resume."
+        )),
+    }
+}
+
+/// Port of `reconnect_agent_tool_impl`'s DB-portable half (the whole
+/// thing -- unlike disconnect, reconnect has no stream to close at
+/// all in Python either). Flips `auto_event_loop` ON and wakes the
+/// parked long-poll so a still-listening waiter re-checks and resumes.
+pub fn reconnect_agent(
+    conn: &Connection,
+    waiter_registry: &conexus_wakeloop::waiter_registry::WaiterRegistry,
+    principal: Option<&Principal>,
+    agent_id: &str,
+    now: &str,
+) -> ToolResult {
+    if let Some(denial) = require_agents_terminate_capability(principal) {
+        return denial;
+    }
+
+    let Ok(row) = conexus_db::agent_repository::AgentRepository::get_by_id(conn, agent_id) else {
+        return ToolResult::Failed {
+            message: "A database error occurred; it has been logged. Retry, or ask an operator \
+                to check logs."
+                .to_string(),
+        };
+    };
+    if row.filter(|r| r.status != "terminated").is_none() {
+        return ToolResult::NotFound {
+            resource: "agent".to_string(),
+            identifier: agent_id.to_string(),
+            hint: None,
+        };
+    }
+
+    use conexus_db::agent_repository::{AgentField, AgentRepository, FieldValue};
+    if AgentRepository::update_field(
+        conn,
+        agent_id,
+        AgentField::AutoEventLoop,
+        FieldValue::Bool(true),
+        now,
+    )
+    .is_err()
+    {
+        return ToolResult::Failed {
+            message: "Failed to set auto_event_loop".to_string(),
+        };
+    }
+
+    let actor_label = principal.map(Principal::actor_label).unwrap_or("operator");
+    let _ = agent_action_repository::log_agent_action(
+        conn,
+        actor_label,
+        "reconnected_agent",
+        None,
+        Some(&serde_json::json!({"agent_id": agent_id})),
+        now,
+    );
+
+    waiter_registry.notify(agent_id);
+
+    ToolResult::Ok {
+        data: Some(serde_json::json!({"agent_id": agent_id, "auto_event_loop": true})),
+        message: Some(format!(
+            "Agent '{agent_id}' reconnected — monitoring re-enabled."
+        )),
+    }
+}
+
+/// Port of `disconnect_all_agents_tool_impl`'s DB-portable half: flips
+/// the GLOBAL `config_auto_event_loop_global` toggle OFF (every
+/// agent's `wait_for_events` starts returning `stop_listening`
+/// regardless of its own per-agent flag) and wakes every currently-
+/// active agent's parked waiter -- the same broadcast idiom
+/// `PurgeAgentTool`/`create_task` already establish (`list_active()`
+/// then `notify()` each). `closed_streams` is always `0` -- see
+/// [`disconnect_agent`]'s doc for the documented session_registry gap,
+/// which applies fleet-wide here too.
+pub fn disconnect_all_agents(
+    conn: &Connection,
+    waiter_registry: &conexus_wakeloop::waiter_registry::WaiterRegistry,
+    principal: Option<&Principal>,
+    now: &str,
+) -> ToolResult {
+    if let Some(denial) = require_agents_terminate_capability(principal) {
+        return denial;
+    }
+
+    if conexus_db::project_settings_repository::upsert(
+        conn,
+        "config_auto_event_loop_global",
+        "false",
+        None,
+        false,
+        principal.map(Principal::actor_label).unwrap_or("operator"),
+        now,
+    )
+    .is_err()
+    {
+        return ToolResult::Failed {
+            message: "Database error on disconnect-all".to_string(),
+        };
+    }
+
+    let actor_label = principal.map(Principal::actor_label).unwrap_or("operator");
+    let _ = agent_action_repository::log_agent_action(
+        conn,
+        actor_label,
+        "disconnected_all_agents",
+        None,
+        Some(&serde_json::json!({})),
+        now,
+    );
+
+    if let Ok(active) = conexus_db::agent_repository::AgentRepository::list_active(conn) {
+        for agent in active {
+            waiter_registry.notify(&agent.agent_id);
+        }
+    }
+
+    ToolResult::Ok {
+        data: Some(serde_json::json!({"closed_streams": 0})),
+        message: Some(
+            "All agents disconnected — global monitoring paused; 0 live stream(s) closed. \
+             Reconnect-all to resume."
+                .to_string(),
+        ),
+    }
+}
+
+/// Port of `reconnect_all_agents_tool_impl`'s DB-portable half (the
+/// whole thing). Flips the global toggle back ON; an agent whose OWN
+/// per-agent `auto_event_loop` is still OFF stays paused, matching
+/// Python's documented precedence exactly.
+pub fn reconnect_all_agents(
+    conn: &Connection,
+    waiter_registry: &conexus_wakeloop::waiter_registry::WaiterRegistry,
+    principal: Option<&Principal>,
+    now: &str,
+) -> ToolResult {
+    if let Some(denial) = require_agents_terminate_capability(principal) {
+        return denial;
+    }
+
+    if conexus_db::project_settings_repository::upsert(
+        conn,
+        "config_auto_event_loop_global",
+        "true",
+        None,
+        false,
+        principal.map(Principal::actor_label).unwrap_or("operator"),
+        now,
+    )
+    .is_err()
+    {
+        return ToolResult::Failed {
+            message: "Database error on reconnect-all".to_string(),
+        };
+    }
+
+    let actor_label = principal.map(Principal::actor_label).unwrap_or("operator");
+    let _ = agent_action_repository::log_agent_action(
+        conn,
+        actor_label,
+        "reconnected_all_agents",
+        None,
+        Some(&serde_json::json!({})),
+        now,
+    );
+
+    if let Ok(active) = conexus_db::agent_repository::AgentRepository::list_active(conn) {
+        for agent in active {
+            waiter_registry.notify(&agent.agent_id);
+        }
+    }
+
+    ToolResult::Ok {
+        data: Some(serde_json::json!({})),
+        message: Some("All agents reconnected — global monitoring re-enabled.".to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

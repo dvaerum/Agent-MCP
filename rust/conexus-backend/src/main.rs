@@ -246,6 +246,26 @@ async fn main() -> Result<()> {
             "/agents/{agent_id}",
             axum::routing::delete(rest_handlers::purge_agent),
         )
+        .route(
+            "/agents/disconnect-all",
+            post(rest_handlers::disconnect_all_agents),
+        )
+        .route(
+            "/agents/reconnect-all",
+            post(rest_handlers::reconnect_all_agents),
+        )
+        .route(
+            "/agents/{agent_id}/disconnect",
+            post(rest_handlers::disconnect_agent),
+        )
+        .route(
+            "/agents/{agent_id}/reconnect",
+            post(rest_handlers::reconnect_agent),
+        )
+        .route(
+            "/agents/{agent_id}/directive",
+            post(rest_handlers::poke_agent_directive),
+        )
         .fallback(api_not_found)
         .layer(middleware::from_fn_with_state(
             shared.clone(),

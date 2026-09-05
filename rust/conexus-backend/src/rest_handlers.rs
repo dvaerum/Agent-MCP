@@ -1880,12 +1880,17 @@ fn coerce_int_field(value: Option<&Value>, default: i64) -> Result<i64, ()> {
 /// capability); duplicated rather than exported across the crate
 /// boundary for one nine-line helper.
 fn random_message_id() -> String {
+    format!("msg_{:016x}", random_id_u64())
+}
+
+/// Shared non-cryptographic random-id source for [`random_message_id`]
+/// and [`poke_agent_directive`]'s poke ids -- neither is a security
+/// boundary (both are primary keys), same rationale as
+/// `agent_messaging::rand_u64`.
+fn random_id_u64() -> u64 {
     use std::collections::hash_map::RandomState;
     use std::hash::BuildHasher;
-    format!(
-        "msg_{:016x}",
-        RandomState::new().hash_one(std::time::Instant::now())
-    )
+    RandomState::new().hash_one(std::time::Instant::now())
 }
 
 /// `POST /api/messages/query` -- rich-filter listing, matching
@@ -3121,4 +3126,325 @@ pub async fn purge_agent(
         Json(json!({"error": message})),
     )
         .into_response()
+}
+
+// -- /api/agents lifecycle (Phase E1 PR 12/14, conexus-rest-agents-lifecycle) --
+//
+// `agents.py`'s remaining surface: disconnect/reconnect (fleet-wide and
+// per-agent) + the ad-hoc directive poke. None of these are registered
+// MCP tools -- Python calls their `*_tool_impl` functions directly from
+// the REST router, never through `dispatch_tool_call`; the Rust port
+// mirrors that shape exactly, calling the new unregistered
+// `conexus_tools::admin_tools::{disconnect_agent, reconnect_agent,
+// disconnect_all_agents, reconnect_all_agents}` functions directly
+// rather than inventing a `dispatch_rest_tool`-style lookup for
+// functions that were never meant to be dispatchable by name.
+
+/// `POST /api/agents/disconnect-all` -- pause the whole fleet, matching
+/// `disconnect_all_agents_api_route`.
+pub async fn disconnect_all_agents(
+    State(shared): State<Arc<SharedState>>,
+    Extension(resolved): Extension<ResolvedRestPrincipal>,
+    body: Bytes,
+) -> Response {
+    if let Err(e) = decode_untrusted_body(&body) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let principal = resolved.dispatch_principal.clone();
+    let guard = shared.conn.lock().await;
+    let result = conexus_tools::admin_tools::disconnect_all_agents(
+        &guard,
+        &shared.waiter_registry,
+        Some(&principal),
+        &now,
+    );
+    drop(guard);
+    if let ToolResult::Ok { data, message } = &result {
+        let payload = data.clone().unwrap_or(Value::Null);
+        return Json(json!({
+            "success": true,
+            "closed_streams": payload.get("closed_streams").cloned().unwrap_or(json!(0)),
+            "message": message.clone().unwrap_or_else(|| "All agents disconnected".to_string()),
+        }))
+        .into_response();
+    }
+    let (status, _) = result.to_http();
+    let message = result.error_message("Failed to disconnect all agents", Some("Agent"));
+    (
+        StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        Json(json!({"error": message})),
+    )
+        .into_response()
+}
+
+/// `POST /api/agents/reconnect-all` -- re-enable the global loop,
+/// matching `reconnect_all_agents_api_route`.
+pub async fn reconnect_all_agents(
+    State(shared): State<Arc<SharedState>>,
+    Extension(resolved): Extension<ResolvedRestPrincipal>,
+    body: Bytes,
+) -> Response {
+    if let Err(e) = decode_untrusted_body(&body) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let principal = resolved.dispatch_principal.clone();
+    let guard = shared.conn.lock().await;
+    let result = conexus_tools::admin_tools::reconnect_all_agents(
+        &guard,
+        &shared.waiter_registry,
+        Some(&principal),
+        &now,
+    );
+    drop(guard);
+    if let ToolResult::Ok { message, .. } = &result {
+        return Json(json!({
+            "success": true,
+            "message": message.clone().unwrap_or_else(|| "All agents reconnected".to_string()),
+        }))
+        .into_response();
+    }
+    let (status, _) = result.to_http();
+    let message = result.error_message("Failed to reconnect all agents", Some("Agent"));
+    (
+        StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        Json(json!({"error": message})),
+    )
+        .into_response()
+}
+
+/// `POST /api/agents/{id}/disconnect` -- pause one agent's monitoring,
+/// matching `disconnect_agent_api_route`.
+pub async fn disconnect_agent(
+    Path(agent_id): Path<String>,
+    State(shared): State<Arc<SharedState>>,
+    Extension(resolved): Extension<ResolvedRestPrincipal>,
+    body: Bytes,
+) -> Response {
+    if let Err(e) = decode_untrusted_body(&body) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let principal = resolved.dispatch_principal.clone();
+    let guard = shared.conn.lock().await;
+    let result = conexus_tools::admin_tools::disconnect_agent(
+        &guard,
+        &shared.waiter_registry,
+        Some(&principal),
+        &agent_id,
+        &now,
+    );
+    drop(guard);
+    if let ToolResult::Ok { data, message } = &result {
+        let payload = data.clone().unwrap_or(Value::Null);
+        return Json(json!({
+            "success": true,
+            "agent_id": payload.get("agent_id"),
+            "closed_streams": payload.get("closed_streams").cloned().unwrap_or(json!(0)),
+            "message": message.clone().unwrap_or_else(|| format!("Agent '{agent_id}' disconnected")),
+        }))
+        .into_response();
+    }
+    let (status, _) = result.to_http();
+    let message = result.error_message("Failed to disconnect agent", Some("Agent"));
+    (
+        StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        Json(json!({"error": message})),
+    )
+        .into_response()
+}
+
+/// `POST /api/agents/{id}/reconnect` -- re-enable one agent's loop,
+/// matching `reconnect_agent_api_route`.
+pub async fn reconnect_agent(
+    Path(agent_id): Path<String>,
+    State(shared): State<Arc<SharedState>>,
+    Extension(resolved): Extension<ResolvedRestPrincipal>,
+    body: Bytes,
+) -> Response {
+    if let Err(e) = decode_untrusted_body(&body) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let principal = resolved.dispatch_principal.clone();
+    let guard = shared.conn.lock().await;
+    let result = conexus_tools::admin_tools::reconnect_agent(
+        &guard,
+        &shared.waiter_registry,
+        Some(&principal),
+        &agent_id,
+        &now,
+    );
+    drop(guard);
+    if let ToolResult::Ok { data, message } = &result {
+        let payload = data.clone().unwrap_or(Value::Null);
+        return Json(json!({
+            "success": true,
+            "agent_id": payload.get("agent_id"),
+            "message": message.clone().unwrap_or_else(|| format!("Agent '{agent_id}' reconnected")),
+        }))
+        .into_response();
+    }
+    let (status, _) = result.to_http();
+    let message = result.error_message("Failed to reconnect agent", Some("Agent"));
+    (
+        StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        Json(json!({"error": message})),
+    )
+        .into_response()
+}
+
+const POKE_PRIORITIES: [&str; 4] = ["low", "normal", "high", "urgent"];
+
+/// `POST /api/agents/{id}/directive` -- operator/admin ad-hoc poke,
+/// matching `poke_agent_directive_api_route`. Inserts a
+/// `pending_directive` row and fires a waiter-wake so a listening
+/// agent gets it immediately; a busy agent picks it up on its next
+/// check-in.
+///
+/// **Documented scope gap**: Python's `_dt.push(...)` (the
+/// `delivery_transport` channel -- a chat-style session connected via
+/// aoe-bridge but not currently blocked in `wait_for_events`) is
+/// fired "IN ADDITION TO" the waiter-wake this port already performs.
+/// `delivery_transport` has no Rust equivalent yet (same SSE/pub-sub
+/// subsystem gap as `session_registry`); the `pending_directive` row +
+/// waiter-wake this function DOES perform is the PRIMARY delivery
+/// path and fully functional -- an agent with only a delivery-
+/// transport connection (no parked waiter) won't see the poke until
+/// its next natural check-in, where Python would push it immediately.
+pub async fn poke_agent_directive(
+    Path(agent_id): Path<String>,
+    State(shared): State<Arc<SharedState>>,
+    Extension(resolved): Extension<ResolvedRestPrincipal>,
+    body: Bytes,
+) -> Response {
+    let data = match decode_untrusted_body(&body) {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
+    };
+
+    let prompt = data.get("prompt");
+    if let Some(resp) = require_str(prompt, "prompt") {
+        return resp;
+    }
+    let Some(prompt) = prompt.and_then(Value::as_str).filter(|s| !s.is_empty()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "prompt is required"})),
+        )
+            .into_response();
+    };
+    if prompt.chars().count() > 4000 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "prompt too long (max 4000 characters)"})),
+        )
+            .into_response();
+    }
+    let priority = data
+        .get("priority")
+        .and_then(Value::as_str)
+        .unwrap_or("urgent");
+    if !POKE_PRIORITIES.contains(&priority) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("priority must be one of {POKE_PRIORITIES:?}")})),
+        )
+            .into_response();
+    }
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let operator_id = resolved.admission.caller_identity();
+    let guard = shared.conn.lock().await;
+
+    let target = conexus_db::agent_repository::AgentRepository::get_by_id(&guard, &agent_id);
+    let live =
+        matches!(&target, Ok(Some(a)) if a.status != "terminated" && a.status != "tombstone");
+    if !live {
+        drop(guard);
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "Agent not found"})),
+        )
+            .into_response();
+    }
+
+    let poke_id = format!("poke_{:016x}", random_id_u64());
+    let created = (|| -> bool {
+        let tx = match guard.unchecked_transaction() {
+            Ok(tx) => tx,
+            Err(_) => return false,
+        };
+        if conexus_db::pending_directive_repository::create_poke(
+            &tx,
+            &poke_id,
+            &agent_id,
+            prompt,
+            Some(priority),
+            Some(&operator_id),
+            &now,
+        )
+        .is_err()
+        {
+            return false;
+        }
+        let details = json!({"poke_id": poke_id, "agent_id": agent_id, "priority": priority});
+        let log_result = conexus_db::agent_action_repository::log_agent_action(
+            &tx,
+            &operator_id,
+            "poke_agent_directive",
+            None,
+            Some(&details),
+            &now,
+        );
+        log_result.is_ok() && tx.commit().is_ok()
+    })();
+    drop(guard);
+
+    if !created {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "Failed to send directive"})),
+        )
+            .into_response();
+    }
+
+    shared.waiter_registry.notify(&agent_id);
+    let delivered = shared.waiter_registry.waiter_count(&agent_id) > 0;
+
+    Json(json!({
+        "success": true,
+        "poke_id": poke_id,
+        "agent_id": agent_id,
+        "delivered": delivered,
+        "message": if delivered {
+            format!("Directive delivered to {agent_id}")
+        } else {
+            format!("Directive queued for {agent_id}")
+        },
+    }))
+    .into_response()
 }
