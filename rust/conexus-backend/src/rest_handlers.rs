@@ -25,6 +25,7 @@ use conexus_tools::project_context_tools::{
 
 use crate::json_sanitize::decode_untrusted_body;
 use crate::rest_gate::ResolvedRestPrincipal;
+use crate::rest_principal::RestPrincipal;
 use crate::server::{dispatch_rest_tool, SharedState};
 
 /// Port of `agent_mcp/utils/string_utils.py::UNSAFE_KEY_ERROR`.
@@ -3445,6 +3446,152 @@ pub async fn poke_agent_directive(
         } else {
             format!("Directive queued for {agent_id}")
         },
+    }))
+    .into_response()
+}
+
+// -- /api/events (Phase E1 PR 13/14, conexus-rest-sse-events) ------
+//
+// Operator dashboard live-update SSE channel. Port of
+// `agent_mcp/app/routers/events.py` -- the new
+// `crate::operator_events::OperatorEventsHub` pub/sub primitive is
+// this port's genuinely new piece (Python's `features.operator_events`
+// module); the stream loop itself reuses the already-ported
+// `conexus_wakeloop::stream_gates::RevalidatingStream` (Phase D3) --
+// the SAME bounded-wait + re-validation seam `wait_for_events` uses,
+// matching Python's own "four streams, one shared gate" design even
+// though this is a genuinely different STREAM (the operator dashboard
+// channel, not an agent's event feed -- never conflated with
+// `conexus-wakeloop::waiter_registry`, which stays agent-scoped).
+
+/// How often sse-starlette's Python equivalent pings AND how often
+/// this port re-validates -- kept equal (matching Python's own
+/// `REVALIDATE_SECONDS = PING_SECONDS`) so revocation latency never
+/// exceeds one keepalive interval.
+const EVENTS_PING_SECONDS: u64 = 15;
+
+/// RAII cleanup for one operator SSE subscription -- unsubscribes the
+/// moment the stream is dropped for ANY reason (client disconnect,
+/// stream error, or a clean end), which axum/hyper guarantee happens
+/// when the response body stops being polled. A genuine improvement
+/// over Python's hand-written `try/finally`: there is no exit path
+/// this can forget to run on, because it isn't a path at all -- it's
+/// the destructor.
+struct EventsUnsubscribeGuard {
+    shared: Arc<SharedState>,
+    id: u64,
+}
+
+impl Drop for EventsUnsubscribeGuard {
+    fn drop(&mut self) {
+        self.shared.operator_events.unsubscribe(self.id);
+    }
+}
+
+/// True iff `admission` would still be admitted at `/api/events` right
+/// now -- the R5-F1 re-validation `_still_authorized` performs.
+///
+/// **A genuine re-derivation, not a literal port**: Python re-runs the
+/// SAME `require_operator_session` dependency against the connection's
+/// ORIGINAL request headers, which only does real work for its THIRD
+/// door (a session cookie, checked against a live `router.db` row) --
+/// this port's two REMAINING doors (per the operator's own "no cookie
+/// door" decision, Phase E1 PR1) have no cookie-shaped analogue:
+/// - `Forwarding`: a signed grant with an intentionally SHORT TTL
+///   (`DEFAULT_REPLAY_WINDOW_SEC`, ~30s) meant to bound replay of a
+///   CAPTURED header value for one proxied request -- not a
+///   persistent, revocable session. It was already fully verified
+///   once, at connect time; re-checking its own embedded expiry here
+///   would revoke every forwarding-admitted stream within ~30 SECONDS
+///   of opening, which is not what R5-F1 is protecting against.
+///   Stays live for the life of the connection once admitted.
+/// - `OperatorBearer`: DOES have real, persistent revocation state --
+///   `rotate_agent_token`/`purge_agent` can invalidate it mid-stream,
+///   exactly the "a revoked credential must not survive it" case
+///   R5-F1 exists for. Re-checked for real: the token must still
+///   resolve to a live, non-terminated, manager-role `agents` row.
+async fn events_still_authorized(shared: &Arc<SharedState>, admission: &RestPrincipal) -> bool {
+    match admission {
+        RestPrincipal::Forwarding { .. } => true,
+        RestPrincipal::OperatorBearer { bearer_token } => {
+            let guard = shared.conn.lock().await;
+            let row =
+                conexus_db::agent_repository::AgentRepository::get_by_token(&guard, bearer_token);
+            matches!(
+                row,
+                Ok(Some(r)) if r.agent_role == "manager" && r.status != "terminated" && r.status != "tombstone"
+            )
+        }
+    }
+}
+
+/// `GET /api/events` -- a long-lived `text/event-stream` the dashboard
+/// opens; every dashboard-scoped mutation (REST or MCP, see
+/// `server.rs::publish_dashboard_change`) publishes a
+/// `notifications/resources/updated` envelope onto the hub this drains.
+pub async fn operator_events_stream(
+    State(shared): State<Arc<SharedState>>,
+    Extension(resolved): Extension<ResolvedRestPrincipal>,
+) -> impl IntoResponse {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use conexus_wakeloop::stream_gates::{Liveness, RevalidatingStream, StreamSlice};
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let user_id = resolved.admission.caller_identity();
+    let sub = shared.operator_events.subscribe(Some(user_id), &now);
+    let guard = EventsUnsubscribeGuard {
+        shared: shared.clone(),
+        id: sub.id,
+    };
+
+    let admission = resolved.admission.clone();
+    let shared_for_liveness = shared.clone();
+    let gate = RevalidatingStream::new(
+        sub.receiver,
+        move || {
+            let shared = shared_for_liveness.clone();
+            let admission = admission.clone();
+            Box::pin(async move {
+                if events_still_authorized(&shared, &admission).await {
+                    Liveness::live()
+                } else {
+                    Liveness::revoked("operator session no longer valid")
+                }
+            })
+        },
+        || EVENTS_PING_SECONDS as f64,
+    );
+
+    let stream = futures_util::stream::unfold((gate, guard), move |(mut gate, guard)| async move {
+        loop {
+            match gate.next_slice(None).await {
+                Ok(StreamSlice::Idle) => continue,
+                Ok(StreamSlice::Item(payload)) => {
+                    let event = Event::default().data(payload.to_string());
+                    return Some((Ok::<Event, std::convert::Infallible>(event), (gate, guard)));
+                }
+                // Revoked -- end the stream. `guard` drops here,
+                // unsubscribing; sse-starlette's Python equivalent
+                // relies on a hand-written `finally` for the same
+                // effect (see `EventsUnsubscribeGuard`'s own doc).
+                Err(_revoked) => return None,
+            }
+        }
+    });
+
+    Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(EVENTS_PING_SECONDS)))
+}
+
+/// `GET /api/events/status` -- operator observability for the
+/// live-update channel: the count of live dashboard SSE streams plus a
+/// per-stream snapshot (`user_id`/`connected_at`/`age_seconds`/
+/// `queue_depth`). A JSON REST endpoint, unlike the `events` stream
+/// itself.
+pub async fn operator_events_status(State(shared): State<Arc<SharedState>>) -> Response {
+    Json(json!({
+        "connected": shared.operator_events.subscriber_count(),
+        "subscribers": shared.operator_events.snapshot(chrono::Utc::now()),
     }))
     .into_response()
 }

@@ -69,6 +69,15 @@ pub struct SharedState {
     /// into every `ToolCallContext` (Phase D5, `backup_project_context`
     /// is the first real consumer).
     pub project_dir: PathBuf,
+    /// The operator-dashboard SSE pub/sub hub (Phase E1 PR 13/14,
+    /// `GET /api/events`) -- one instance per backend process, same
+    /// scope as `waiter_registry` above. Unlike `waiter_registry`
+    /// (agent-scoped, reached from `Tool::call` via `ToolCallContext`),
+    /// this is REST/dashboard-only and reached directly off
+    /// `SharedState` from `server.rs`'s two tool-dispatch call sites
+    /// and the handful of REST handlers that write without going
+    /// through a tool at all.
+    pub operator_events: crate::operator_events::OperatorEventsHub,
 }
 
 /// [`ProgressSink`] backed by a real MCP [`Peer`]/[`ProgressToken`]
@@ -195,6 +204,111 @@ fn tool_result_to_call_tool_result(result: &ToolResult) -> CallToolResult {
 /// its own 404, not a `ToolResult` shape) -- capability/policy denial
 /// and every other outcome are ordinary `ToolResult` variants, exactly
 /// like the MCP path.
+/// (substring, dashboard scope) -- first match wins. Port of
+/// `_ACTION_SCOPE_HINTS`, re-derived against the TOOL NAME rather than
+/// the logged `action_type` string: `dispatch_rest_tool`/`call_tool`
+/// are the one place both REST and MCP tool calls converge, but
+/// neither sees which `action_type` string a tool's own body happened
+/// to log (that's private to each `Tool::call` impl) -- the tool name
+/// is a close, well-justified proxy (`"create_task"` still contains
+/// "task", `"send_agent_message"` still contains "message", etc.),
+/// documented here rather than assumed silently correct.
+const DASHBOARD_SCOPE_HINTS: &[(&str, &str)] = &[
+    ("task", "tasks"),
+    ("schedule", "schedules"),
+    ("directive", "tasks"),
+    ("message", "messages"),
+    ("broadcast", "messages"),
+    ("agent", "agents"),
+    ("context", "memories"),
+    ("memory", "memories"),
+    ("config", "settings"),
+    ("setting", "settings"),
+    ("file", "agents"),
+];
+
+fn dashboard_scope_for_tool(tool_name: &str) -> &'static str {
+    let lower = tool_name.to_ascii_lowercase();
+    DASHBOARD_SCOPE_HINTS
+        .iter()
+        .find(|(needle, _)| lower.contains(needle))
+        .map(|(_, scope)| *scope)
+        .unwrap_or("activity")
+}
+
+/// Tool names whose real Python counterpart calls
+/// `log_agent_action_to_db` -- Python's actual `_push_dashboard_data_
+/// changed` chokepoint. Hand-reviewed by grepping every `Tool` impl in
+/// `conexus-tools` for `agent_action_repository::log_agent_action`
+/// (directly, or via a shared helper -- `send_agent_message`/
+/// `broadcast_admin_message` both reach it through
+/// `send_with_side_effects` rather than inline), matching this
+/// migration's own `PUBLIC_TOOL_ALLOWLIST`/`TIER_OVERRIDES` precedent
+/// for "can't derive automatically, one reviewed table instead" --
+/// NOT auto-derived at runtime (a `Tool::call` body's own control flow
+/// isn't introspectable from here). A stale entry here only affects
+/// the dashboard-refetch HINT (idempotent, backstopped by the
+/// existing slow-poll per this feature's own module doc) -- never
+/// security, never data -- so an occasional miss is low-severity and
+/// correctable in a follow-up, not a reason to withhold this feature.
+const MUTATING_TOOL_NAMES: &[&str] = &[
+    "get_agent_tokens",
+    "register_agent",
+    "rotate_agent_token",
+    "restore_agent",
+    "edit_agent",
+    "terminate_agent",
+    "purge_agent",
+    "send_agent_message",
+    "broadcast_admin_message",
+    "assign_task",
+    "create_self_task",
+    "update_file_metadata",
+    "create_project_context",
+    "delete_project_context",
+    "backup_project_context",
+    "update_project_settings",
+    "delete_project_settings",
+    "create_scheduled_directive",
+    "update_scheduled_directive",
+    "delete_scheduled_directive",
+    "view_tasks",
+    "search_tasks",
+    "create_task",
+    "update_task_status",
+    "update_task",
+    "delete_task",
+    "request_assistance",
+    "bulk_task_operations",
+];
+
+/// Port of `_push_dashboard_data_changed`'s operator-hub half (the
+/// OTHER fan-out target, `session_registry.fanout_to_all` -- agent-
+/// scoped `GET /mcp` SSE streams -- has no Rust equivalent yet, same
+/// documented gap as `/api/agents`'s presence signal). Called from
+/// BOTH `dispatch_rest_tool` and `call_tool` (below) after a
+/// SUCCESSFUL dispatch -- the one point both REST and MCP tool calls
+/// converge, so a single call here covers a REST-composed mutation
+/// AND an agent's own MCP tool call driving the same dashboard
+/// refetch, matching Python's real behavior (its chokepoint,
+/// `log_agent_action_to_db`, is called from both transports too).
+/// Best-effort: `OperatorEventsHub::publish` never panics or errors,
+/// matching Python's own bare `except Exception: pass`.
+fn publish_dashboard_change(shared: &Arc<SharedState>, tool_name: &str, result: &ToolResult) {
+    if !matches!(result, ToolResult::Ok { .. }) {
+        return;
+    }
+    if !MUTATING_TOOL_NAMES.contains(&tool_name) {
+        return;
+    }
+    let scope = dashboard_scope_for_tool(tool_name);
+    shared.operator_events.publish(serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/resources/updated",
+        "params": {"uri": format!("agent-mcp://{scope}"), "action_type": tool_name},
+    }));
+}
+
 pub(crate) async fn dispatch_rest_tool(
     shared: &Arc<SharedState>,
     tool_name: &str,
@@ -217,7 +331,7 @@ pub(crate) async fn dispatch_rest_tool(
         project_dir: &shared.project_dir,
     };
     let policy_source = SnapshotPolicySource::resolve(&shared.conn, &descriptor.required).await;
-    Ok(conexus_auth::dispatch(
+    let result = conexus_auth::dispatch(
         descriptor,
         principal,
         &policy_source,
@@ -226,7 +340,9 @@ pub(crate) async fn dispatch_rest_tool(
         &now,
         &ctx,
     )
-    .await)
+    .await;
+    publish_dashboard_change(shared, tool_name, &result);
+    Ok(result)
 }
 
 impl ServerHandler for ConexusServer {
@@ -391,6 +507,7 @@ impl ServerHandler for ConexusServer {
             &ctx,
         )
         .await;
+        publish_dashboard_change(&self.shared, &name, &result);
         Ok(tool_result_to_call_tool_result(&result).into())
     }
 

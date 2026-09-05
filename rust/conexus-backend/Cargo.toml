@@ -51,6 +51,14 @@ hyper-util = { version = "0.1", features = ["tokio", "server", "service"] }
 # sanitize_for_pane (the Rust reference this port mirrors), not a new
 # choice for this repo.
 unicode-general-category = "1.1.0"
+# GET /api/events's SSE loop (Phase E1 PR 13/14, operator_events) --
+# `stream::unfold` builds the pull-based Stream axum::response::sse::Sse
+# needs from RevalidatingStream::next_slice's own pull-based API,
+# without a proc-macro (async-stream) this workspace has no other use
+# for. Already resolved workspace-wide at 0.3.34 (a transitive dep of
+# tokio/hyper/rmcp) -- adding it directly changes no version, just the
+# dependency edge.
+futures-util = "0.3"
 
 [dev-dependencies]
 tempfile = "3"
