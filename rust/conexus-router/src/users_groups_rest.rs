@@ -34,6 +34,9 @@ use chrono::Utc;
 use conexus_core::capability::{Capabilities, Capability};
 use conexus_core::principal::Principal;
 
+use crate::admin_group_capabilities::{
+    self, ListGroupCapabilitiesOutcome, ReplaceGroupCapabilitiesOutcome,
+};
 use crate::admin_group_members::{self, AddGroupMemberOutcome, RemoveGroupMemberOutcome};
 use crate::admin_groups::{self, CreateGroupOutcome, DeleteGroupOutcome, EditGroupOutcome};
 use crate::admin_users_gate;
@@ -483,5 +486,98 @@ pub async fn remove_group_member_handler(
                 .into_response()
         }
         RemoveGroupMemberOutcome::Rejected(resp) => resp.into_response(),
+    }
+}
+
+fn require_group_caps_capability(
+    state: &RouterState,
+    identity: &GateIdentity,
+) -> Result<(), HandlerResponse> {
+    project_gate::require_capability(
+        identity,
+        state.mcp_handler_config.single_tenant_name.as_deref(),
+        Capability::SystemGroupsCapabilitiesManage,
+    )
+}
+
+/// Port of `list_group_capabilities_handler`. No body, entry-time
+/// check only -- a genuinely separate capability
+/// (`system.groups.capabilities.manage`) from groups/group-members'
+/// `system.groups.manage`, confirmed against the real Python
+/// registration.
+pub async fn list_group_capabilities_handler(
+    State(state): State<Arc<RouterState>>,
+    Extension(identity): Extension<GateIdentity>,
+    Path(group_id): Path<String>,
+) -> Response {
+    if let Err(resp) = require_group_caps_capability(&state, &identity) {
+        return resp.into_response();
+    }
+    let conn = state.conn.lock().await;
+    let outcome = match admin_group_capabilities::decide_list_group_capabilities(&conn, &group_id) {
+        Ok(o) => o,
+        Err(e) => return HandlerResponse::from(e).into_response(),
+    };
+    match outcome {
+        ListGroupCapabilitiesOutcome::Found(caps) => {
+            admin_users_gate::success_envelope(serde_json::json!({"capabilities": caps}), 200)
+                .into_response()
+        }
+        ListGroupCapabilitiesOutcome::Rejected(resp) => resp.into_response(),
+    }
+}
+
+/// Port of `replace_group_capabilities_handler`. Has a body-read yield
+/// point, so -- per the TOCTOU fix already applied to every sibling
+/// mutating handler in this module -- `caller_is_sysadmin` is derived
+/// from the FRESH, revalidated `Principal`
+/// `perm_gates::read_body_and_revalidate` returns, never the stale
+/// `identity.is_sysadmin` captured at session-gate time. This handler
+/// was never wired before this PR, so there was no retroactive fix to
+/// make here -- `decide_replace_group_capabilities` already took an
+/// explicit `caller_principal` parameter from when it was first
+/// built, matching the same pattern `admin_group_members.rs`'s
+/// decision functions use.
+pub async fn replace_group_capabilities_handler(
+    State(state): State<Arc<RouterState>>,
+    Extension(identity): Extension<GateIdentity>,
+    Path(group_id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(resp) = require_group_caps_capability(&state, &identity) {
+        return resp.into_response();
+    }
+    let conn = state.conn.lock().await;
+    let now_str = Utc::now().to_rfc3339();
+    let spec = RevalidationSpec {
+        stale_user_id: &identity.user.user_id,
+        cookie_header: cookie_header(&headers),
+        now: &now_str,
+        cap: Capability::SystemGroupsCapabilitiesManage,
+        project: None,
+    };
+    let (parsed, principal) = match perm_gates::read_body_and_revalidate(&conn, &body, &spec) {
+        Ok(v) => v,
+        Err(resp) => return resp.into_response(),
+    };
+    let parsed_value = serde_json::Value::Object(parsed);
+    let outcome = match admin_group_capabilities::decide_replace_group_capabilities(
+        &conn,
+        &group_id,
+        fresh_is_sysadmin(&principal),
+        &identity.user.username,
+        Some(&principal),
+        &parsed_value,
+    ) {
+        Ok(o) => o,
+        Err(e) => return HandlerResponse::from(e).into_response(),
+    };
+    match outcome {
+        ReplaceGroupCapabilitiesOutcome::Replaced(caps) => {
+            admin_users_gate::success_envelope(serde_json::json!({"capabilities": caps}), 200)
+                .into_response()
+        }
+        ReplaceGroupCapabilitiesOutcome::Rejected(resp) => resp.into_response(),
     }
 }
