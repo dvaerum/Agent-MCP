@@ -716,6 +716,21 @@ impl ProjectRegistry {
         maybe_alias: &str,
         now: DateTime<Utc>,
     ) -> Result<Option<String>, RegistryError> {
+        Ok(self
+            .resolve_alias_entry(maybe_alias, now)?
+            .map(|(real_name, _expires_at)| real_name))
+    }
+
+    /// Same as [`Self::resolve_alias`], but also returns the alias
+    /// entry's `expires_at` -- `proxy_core.rs` (Phase E2 PR 8) needs
+    /// both halves to reconstruct Python's `alias_info` tuple
+    /// (`"<alias_name>,<expires_at>"`, the `X-Agent-MCP-Alias` header
+    /// value), which `resolve_alias` alone can't provide.
+    pub fn resolve_alias_entry(
+        &self,
+        maybe_alias: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<(String, String)>, RegistryError> {
         let data = self.read_locked()?;
         for (real_name, payload) in data.iter() {
             for entry in scannable_aliases(payload) {
@@ -724,7 +739,7 @@ impl ProjectRegistry {
                 }
                 if let Ok(exp) = parse_flexible(&entry.expires_at) {
                     if exp > now {
-                        return Ok(Some(real_name.clone()));
+                        return Ok(Some((real_name.clone(), entry.expires_at.clone())));
                     }
                 }
             }
@@ -1074,6 +1089,20 @@ mod tests {
             reg.resolve_alias("alias-a", now()).unwrap(),
             Some("proj-a".to_string())
         );
+    }
+
+    #[test]
+    fn resolve_alias_entry_also_returns_the_expires_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = registry_at(&dir);
+        reg.register("proj-a", "/ws/proj-a", "python", now())
+            .unwrap();
+        reg.add_alias("proj-a", "alias-a", None, Some(30), now())
+            .unwrap();
+
+        let (real_name, expires_at) = reg.resolve_alias_entry("alias-a", now()).unwrap().unwrap();
+        assert_eq!(real_name, "proj-a");
+        assert_eq!(expires_at, stamp(later(30)));
     }
 
     #[test]

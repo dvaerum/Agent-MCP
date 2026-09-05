@@ -411,6 +411,7 @@ dependencies = [
  "conexus-db",
  "dashmap",
  "fd-lock",
+ "futures-util",
  "getrandom 0.4.3",
  "http-body-util",
  "hyper",
@@ -418,6 +419,7 @@ dependencies = [
  "regex",
  "rusqlite",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
 ]

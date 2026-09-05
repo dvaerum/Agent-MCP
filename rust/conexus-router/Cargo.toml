@@ -83,7 +83,16 @@ dashmap = "6"
 # Unix sockets without an extra connector crate. `hyper-util`/
 # `http-body-util`/`bytes` are all already resolved workspace-wide
 # (transitive deps of axum/hyper), added here as direct edges only.
-hyper = { version = "1", features = ["http1", "client"] }
+hyper = { version = "1", features = ["http1", "client", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 bytes = "1"
+# proxy_core.rs (Phase E2 PR 8) -- the stream-cap admission key hashes
+# a bearer token the same way `conexus-db`'s repositories already hash
+# things elsewhere in this workspace; same crate+version.
+sha2 = "0.10"
+# Adapts hyper::body::Incoming's frame stream into a plain byte
+# stream for SSE pass-through -- already resolved workspace-wide
+# (conexus-backend's own GET /api/events SSE loop uses stream::unfold
+# from the same crate).
+futures-util = "0.3"
