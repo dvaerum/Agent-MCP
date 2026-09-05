@@ -241,6 +241,18 @@ pub async fn is_active(mode: SystemctlMode, unit: &str, timeout: Duration) -> bo
         .success()
 }
 
+/// `true` iff `path` exists AND is genuinely a Unix domain socket --
+/// port of Python's `sock.exists() and sock.is_socket()` (`ensure()`'s
+/// readiness check, PR 6c). Follows symlinks (`std::fs::metadata`,
+/// not `symlink_metadata`), matching `Path.exists()`/`Path.is_socket()`
+/// which both stat through a symlink by default.
+pub fn is_real_socket(path: &Path) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    std::fs::metadata(path)
+        .map(|m| m.file_type().is_socket())
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
