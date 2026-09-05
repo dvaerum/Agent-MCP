@@ -573,6 +573,83 @@ pub async fn alias_usage_handler(
     }
 }
 
+/// Port of `overview_handler` -- the last piece of PR23 step 6 (gap
+/// 11). Genuinely new logic, not just wiring: for each project
+/// visible to the caller, resolves a REAL `systemctl is-active` await
+/// (this crate's own established async-yield-point pattern, matching
+/// `systemctl_on_backend` above) then assembles
+/// `project_reads::build_project_summary`'s fully-synchronous
+/// remainder.
+///
+/// **Deliberate, documented gap**: the process-local
+/// `_overview_cache` (a `(expiry, envelope)` tuple coalescing
+/// dashboard first-paint fan-out) has NO Rust equivalent here --
+/// this handler always rebuilds fresh. Not silently dropped: caching
+/// is a pure latency optimization Python needed because it filters
+/// membership AFTER building the full cross-tenant envelope (so one
+/// cached build serves every caller regardless of their own
+/// visibility); this port instead filters to the caller's visible
+/// projects FIRST and only resolves `is_active`/counts for THOSE, a
+/// real efficiency gain the cache existed to approximate for Python.
+/// Revisit only if a real production request-volume measurement
+/// shows the per-request systemctl fan-out is a genuine bottleneck --
+/// not assumed speculatively.
+pub async fn overview_handler(
+    State(state): State<Arc<RouterState>>,
+    Extension(identity): Extension<GateIdentity>,
+) -> Response {
+    let single_tenant_name = state.mcp_handler_config.single_tenant_name.as_deref();
+    let rows = match state.registry.list() {
+        Ok(rows) => rows,
+        Err(e) => return HandlerResponse::from(GateError::from(e)).into_response(),
+    };
+    let names: Vec<String> = rows.iter().map(|r| r.name.clone()).collect();
+    let visible = {
+        let conn = state.conn.lock().await;
+        project_reads::visible_project_names(
+            &conn,
+            single_tenant_name,
+            identity.is_sysadmin,
+            Some(&identity.user.user_id),
+            &names,
+        )
+    };
+
+    let now = std::time::SystemTime::now();
+    let mut projects_out = Vec::new();
+    for row in rows.iter().filter(|r| visible.contains(&r.name)) {
+        let running = systemctl_on_backend(&state, &row.name, &["is-active"])
+            .await
+            .map(|r| r.success())
+            .unwrap_or(false);
+        let last_activity = state
+            .runtime
+            .snapshot(&row.name)
+            .and_then(|rt| rt.last_active.get("backend").copied());
+        projects_out.push(project_reads::build_project_summary(
+            row,
+            &state.default_workspace_parent,
+            running,
+            last_activity,
+            now,
+        ));
+    }
+
+    let mut envelope = serde_json::json!({
+        "projects": projects_out,
+        "multi_tenant": single_tenant_name.is_none(),
+    });
+    if let Some(name) = single_tenant_name {
+        envelope["single_tenant_name"] = serde_json::Value::String(name.to_string());
+    }
+    HandlerResponse {
+        status: 200,
+        headers: vec![("Cache-Control".to_string(), "no-store".to_string())],
+        body: HandlerBody::Json(envelope),
+    }
+    .into_response()
+}
+
 /// Port of `remove_alias_handler` -- closes gap 10 (no prior Rust
 /// coverage at all) via the new `project_reads::decide_remove_alias`.
 pub async fn remove_alias_handler(
