@@ -397,6 +397,104 @@ pub fn create_first_operator(
     Ok(user_id)
 }
 
+// ---------------------------------------------------------------------
+// Setup-wizard route flow (Phase E2 PR 11, `conexus-router-setup-wizard`)
+// ---------------------------------------------------------------------
+//
+// The remaining `setup_wizard.py` surface PR 10 didn't already cover:
+// `empty_users_redirect_middleware`'s own redirect-or-passthrough
+// decision, and the thin route-level flow wrapping
+// [`create_first_operator`] (the "wizard already completed" precheck +
+// folding the `UsernameAlreadyExists` race into the same
+// redirect-to-login outcome Python uses). Framework-agnostic like
+// everything else in this module -- the real `web.HTTPSeeOther`/
+// `web.Response` construction is PR 23's job.
+
+/// Port of `empty_users_redirect_middleware`'s own decision (the
+/// `mount.canonical_path`/`path_policy.is_redirect_exempt` calls
+/// themselves are the caller's job -- `path` here is ALREADY the
+/// canonical `/agent-mcp/...` form, matching `path_policy.rs`'s own
+/// "canonical form in, canonical form out" convention). `true` means
+/// "redirect this request to `/setup`".
+pub fn should_redirect_to_setup(path: &str, users_table_empty: bool) -> bool {
+    if !path.starts_with(crate::mount::INTERNAL_MOUNT) {
+        return false;
+    }
+    if crate::path_policy::is_redirect_exempt(path) {
+        return false;
+    }
+    users_table_empty
+}
+
+/// `GET /agent-mcp/setup`'s only real decision -- port of
+/// `setup_get_handler`. Once the wizard has been completed there is
+/// nothing left to render; the caller 303s to `/login` instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetupGetOutcome {
+    RenderForm,
+    RedirectToLogin,
+}
+
+pub fn setup_get_outcome(users_table_empty: bool) -> SetupGetOutcome {
+    if users_table_empty {
+        SetupGetOutcome::RenderForm
+    } else {
+        SetupGetOutcome::RedirectToLogin
+    }
+}
+
+/// `POST /agent-mcp/setup`'s outcome -- port of `setup_post_handler`'s
+/// own flow around [`create_first_operator`]. Two Python code paths
+/// collapse onto the SAME [`SetupPostOutcome::AlreadySetUp`] variant,
+/// deliberately: a POST arriving after the wizard is already done (a
+/// back-button replay, checked BEFORE parsing the form) and the
+/// `UsernameAlreadyExistsError` race carve-out (someone else won the
+/// wizard between the caller's own empty-table check and this call's
+/// INSERT) -- Python routes both to the identical 303-to-`/login`,
+/// never a 409, so a caller here can't accidentally give one path
+/// different treatment than the other.
+#[derive(Debug)]
+pub enum SetupPostOutcome {
+    Created(String),
+    AlreadySetUp,
+    Invalid(SetupError),
+}
+
+/// `enforce_same_origin` (R9-F1's login-CSRF guard -- this POST mints
+/// a session cookie exactly like `/login`'s does) is the CALLER's job,
+/// run before this function per Python's own ordering: same-origin
+/// check first, then the users-empty precheck, then validation. This
+/// function starts at the users-empty precheck since same-origin
+/// rejection has nothing to do with wizard/database state.
+#[allow(clippy::too_many_arguments)]
+pub fn attempt_setup(
+    conn: &mut Connection,
+    users_table_empty: bool,
+    username: &str,
+    password: &str,
+    password_confirm: &str,
+    email: Option<&str>,
+    registered_projects: &[String],
+    now: &str,
+) -> SetupPostOutcome {
+    if !users_table_empty {
+        return SetupPostOutcome::AlreadySetUp;
+    }
+    match create_first_operator(
+        conn,
+        username,
+        password,
+        password_confirm,
+        email,
+        registered_projects,
+        now,
+    ) {
+        Ok(user_id) => SetupPostOutcome::Created(user_id),
+        Err(SetupError::UsernameAlreadyExists) => SetupPostOutcome::AlreadySetUp,
+        Err(other) => SetupPostOutcome::Invalid(other),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -799,5 +897,137 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, SetupError::UsernameAlreadyExists));
+    }
+
+    // -- should_redirect_to_setup (empty_users_redirect_middleware) -------
+
+    #[test]
+    fn should_redirect_to_setup_when_the_users_table_is_empty() {
+        assert!(should_redirect_to_setup("/agent-mcp/", true));
+        assert!(should_redirect_to_setup("/agent-mcp/login", true));
+    }
+
+    #[test]
+    fn should_redirect_to_setup_never_fires_once_users_exist() {
+        assert!(!should_redirect_to_setup("/agent-mcp/login", false));
+    }
+
+    #[test]
+    fn should_redirect_to_setup_is_exempt_for_setup_assets_api_mcp_and_sso() {
+        assert!(!should_redirect_to_setup("/agent-mcp/setup", true));
+        assert!(!should_redirect_to_setup("/agent-mcp/assets/app.css", true));
+        assert!(!should_redirect_to_setup("/agent-mcp/api/tasks", true));
+        assert!(!should_redirect_to_setup("/agent-mcp/mcp/proj", true));
+        assert!(!should_redirect_to_setup("/agent-mcp/sso/callback", true));
+    }
+
+    #[test]
+    fn should_redirect_to_setup_ignores_paths_outside_the_mount() {
+        // Never reachable in practice (the caller always passes a
+        // mount::canonical_path result), but proves the guard is real.
+        assert!(!should_redirect_to_setup("/other-app/foo", true));
+    }
+
+    #[test]
+    fn should_redirect_to_setup_does_not_exempt_login_or_logout() {
+        // login/logout are auth-bypass-only (path_policy.rs's own
+        // documented divergence) -- an empty-database operator must
+        // still be bounced to /setup even when hitting /login.
+        assert!(should_redirect_to_setup("/agent-mcp/login", true));
+        assert!(should_redirect_to_setup("/agent-mcp/logout", true));
+    }
+
+    // -- setup_get_outcome --------------------------------------------------
+
+    #[test]
+    fn setup_get_outcome_renders_the_form_while_the_wizard_is_open() {
+        assert_eq!(setup_get_outcome(true), SetupGetOutcome::RenderForm);
+    }
+
+    #[test]
+    fn setup_get_outcome_redirects_to_login_once_a_user_exists() {
+        assert_eq!(setup_get_outcome(false), SetupGetOutcome::RedirectToLogin);
+    }
+
+    // -- attempt_setup --------------------------------------------------------
+
+    #[test]
+    fn attempt_setup_refuses_when_the_wizard_is_already_completed() {
+        let mut c = conn();
+        let outcome = attempt_setup(
+            &mut c,
+            false,
+            "alice",
+            "correct horse battery staple",
+            "correct horse battery staple",
+            None,
+            &[],
+            NOW,
+        );
+        assert!(matches!(outcome, SetupPostOutcome::AlreadySetUp));
+    }
+
+    #[test]
+    fn attempt_setup_creates_the_first_operator_when_the_wizard_is_open() {
+        let mut c = conn();
+        let outcome = attempt_setup(
+            &mut c,
+            true,
+            "alice",
+            "correct horse battery staple",
+            "correct horse battery staple",
+            None,
+            &[],
+            NOW,
+        );
+        let SetupPostOutcome::Created(uid) = outcome else {
+            panic!("expected Created, got {outcome:?}");
+        };
+        assert!(
+            identity::get_user_by_id(&c, &uid)
+                .unwrap()
+                .unwrap()
+                .is_sysadmin
+        );
+    }
+
+    #[test]
+    fn attempt_setup_folds_the_race_carve_out_into_already_set_up() {
+        let mut c = conn();
+        // Simulate the race: the table is no longer empty by the time
+        // this call's own INSERT runs, but the caller's stale
+        // `users_table_empty` snapshot still says `true`.
+        create_first_operator(
+            &mut c,
+            "bob",
+            "correct horse battery staple",
+            "correct horse battery staple",
+            None,
+            &[],
+            NOW,
+        )
+        .unwrap();
+
+        let outcome = attempt_setup(
+            &mut c,
+            true,
+            "bob",
+            "another password entirely",
+            "another password entirely",
+            None,
+            &[],
+            NOW,
+        );
+        assert!(matches!(outcome, SetupPostOutcome::AlreadySetUp));
+    }
+
+    #[test]
+    fn attempt_setup_surfaces_validation_failures_as_invalid() {
+        let mut c = conn();
+        let outcome = attempt_setup(&mut c, true, "alice", "short", "short", None, &[], NOW);
+        assert!(matches!(
+            outcome,
+            SetupPostOutcome::Invalid(SetupError::WeakPassword(_))
+        ));
     }
 }
