@@ -47,7 +47,10 @@ use crate::mcp_handler::{HandlerBody, HandlerResponse};
 
 const DEFAULT_TRUSTED_PROXIES: &str = "127.0.0.1,::1";
 
-fn env_truthy(value: Option<&str>) -> bool {
+// pub(crate): reused verbatim by sso.rs's own `_env_truthy` port
+// (identical logic, second real call site -- promoted per this
+// migration's own "promote once a second caller needs it" rule).
+pub(crate) fn env_truthy(value: Option<&str>) -> bool {
     matches!(
         value.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
         Some("1" | "true" | "yes" | "on")
@@ -73,7 +76,10 @@ fn env_u64(get_env: &impl Fn(&str) -> Option<String>, key: &str, default: u64) -
 /// Comma-separated IP list -> canonical set (garbage dropped, no
 /// logging -- see this module's own doc; a typo'd IP is a diagnostic
 /// concern, not a security one).
-fn parse_trusted_proxies(raw: &str) -> HashSet<IpAddr> {
+// pub(crate): reused verbatim by sso.rs's `_parse_trusted_ips` port
+// (identical shape -- comma-split, trim, drop-with-no-log-here on a
+// bad address -- promoted rather than duplicated).
+pub(crate) fn parse_trusted_proxies(raw: &str) -> HashSet<IpAddr> {
     raw.split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
