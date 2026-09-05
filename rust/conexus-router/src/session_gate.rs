@@ -149,7 +149,11 @@ pub fn wants_html(accept_header: Option<&str>) -> bool {
 /// safe="/")`: everything `NON_ALPHANUMERIC` encodes, MINUS the
 /// characters Python's `quote` always treats as safe regardless of
 /// `safe=` (`_`, `.`, `-`, `~`) and the explicit `safe="/"` override.
-const QUOTE_SAFE: &AsciiSet = &NON_ALPHANUMERIC
+/// `pub(crate)`, not private -- `dashboard_handlers.rs::index_handler`
+/// needs the identical `quote()`-safe set to percent-encode
+/// `single_tenant_name` into its `/app/<name>/` redirect target,
+/// matching Python's own `quote(SINGLE_TENANT_NAME)` call.
+pub(crate) const QUOTE_SAFE: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'/')
     .remove(b'_')
     .remove(b'.')

@@ -31,6 +31,7 @@ mod admin_users_users;
 mod asset_prefix;
 mod boot;
 mod client_disconnect;
+mod dashboard_handlers;
 mod dashboard_static;
 mod identity;
 mod json_sanitize;
@@ -334,6 +335,39 @@ async fn main() -> Result<()> {
             "/agent-mcp/api/router/projects/{name}/memberships/{membership_id}",
             axum::routing::patch(users_groups_rest::change_project_membership_role_handler)
                 .delete(users_groups_rest::delete_project_membership_handler),
+        )
+        .route("/agent-mcp/", get(dashboard_handlers::index_handler))
+        .route(
+            "/agent-mcp",
+            get(|| async { dashboard_handlers::moved_permanently("/agent-mcp/") }),
+        )
+        .route(
+            "/agent-mcp/assets/{*rest}",
+            get(dashboard_handlers::dashboard_assets_handler),
+        )
+        .route(
+            "/agent-mcp/app/",
+            get(dashboard_handlers::overview_dashboard_handler),
+        )
+        .route(
+            "/agent-mcp/app",
+            get(|| async { dashboard_handlers::moved_permanently("/agent-mcp/app/") }),
+        )
+        .route(
+            "/agent-mcp/app/{name}",
+            get(
+                |axum::extract::Path(name): axum::extract::Path<String>| async move {
+                    dashboard_handlers::moved_permanently(&format!("/agent-mcp/app/{name}/"))
+                },
+            ),
+        )
+        .route(
+            "/agent-mcp/app/{name}/",
+            get(dashboard_handlers::dashboard_index_handler),
+        )
+        .route(
+            "/agent-mcp/app/{name}/{*rest}",
+            get(dashboard_handlers::dashboard_handler),
         )
         .layer(axum::middleware::from_fn_with_state(
             std::sync::Arc::clone(&state),
