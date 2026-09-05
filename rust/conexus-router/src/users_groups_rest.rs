@@ -33,18 +33,24 @@ use bytes::Bytes;
 use chrono::Utc;
 use conexus_core::capability::{Capabilities, Capability};
 use conexus_core::principal::Principal;
+use conexus_db::group_membership_repository;
+use rusqlite::Connection;
 
 use crate::admin_group_capabilities::{
     self, ListGroupCapabilitiesOutcome, ReplaceGroupCapabilitiesOutcome,
 };
 use crate::admin_group_members::{self, AddGroupMemberOutcome, RemoveGroupMemberOutcome};
 use crate::admin_groups::{self, CreateGroupOutcome, DeleteGroupOutcome, EditGroupOutcome};
+use crate::admin_project_memberships::{
+    self, AddProjectMembershipOutcome, ChangeProjectMembershipRoleOutcome,
+    DeleteProjectMembershipOutcome,
+};
 use crate::admin_users_gate;
 use crate::admin_users_users::{self, CreateUserOutcome, DeleteUserOutcome, EditUserOutcome};
 use crate::identity::IdentityError;
 use crate::mcp_handler::{HandlerBody, HandlerResponse};
 use crate::perm_gates::{self, RevalidationSpec};
-use crate::project_gate;
+use crate::project_gate::{self, GateError};
 use crate::session_gate::GateIdentity;
 use crate::state::RouterState;
 
@@ -579,5 +585,239 @@ pub async fn replace_group_capabilities_handler(
                 .into_response()
         }
         ReplaceGroupCapabilitiesOutcome::Rejected(resp) => resp.into_response(),
+    }
+}
+
+fn require_project_memberships_capability(
+    state: &RouterState,
+    identity: &GateIdentity,
+) -> Result<(), HandlerResponse> {
+    project_gate::require_capability(
+        identity,
+        state.mcp_handler_config.single_tenant_name.as_deref(),
+        Capability::SystemProjectsManage,
+    )
+}
+
+/// Port of `_membership_grant_denied`'s own `caller_role` resolution:
+/// a FRESH, explicit per-project lookup via
+/// `group_membership_repository::resolve_user_project_role`, never a
+/// value read off `Principal.project_role`. Confirmed by direct
+/// comparison with the real Python source
+/// (`store.resolve_user_project_role(caller_id, project_name)`,
+/// called fresh inside `_membership_grant_denied` itself) --
+/// `Principal.project_role` is populated by `session_gate`/
+/// revalidation for whatever project scope THAT machinery resolved
+/// (meaningless for these admin-namespace routes, which never thread
+/// the `{name}` path segment through session-gate's own project
+/// resolution), not a general-purpose "the caller's role on any
+/// project I ask about" fact.
+fn resolve_caller_role_on_project(
+    conn: &Connection,
+    caller_user_id: &str,
+    project_name: &str,
+) -> Result<Option<String>, GateError> {
+    Ok(group_membership_repository::resolve_user_project_role(
+        conn,
+        caller_user_id,
+        project_name,
+        None,
+    )?)
+}
+
+/// Port of `list_project_memberships_handler`. No body -- its own
+/// two-step existence-then-role check (NOT
+/// `deny_cross_tenant_project_read`, per `admin_project_memberships.rs`'s
+/// own doc: even a sysadmin gets a real 404 for a genuinely
+/// nonexistent project here, closing R3-F1's 200-roster/404 existence
+/// differential) runs on the stale, session-gate-resolved identity --
+/// there is no later yield point for it to become stale relative to.
+pub async fn list_project_memberships_handler(
+    State(state): State<Arc<RouterState>>,
+    Extension(identity): Extension<GateIdentity>,
+    Path(name): Path<String>,
+) -> Response {
+    if let Err(resp) = require_project_memberships_capability(&state, &identity) {
+        return resp.into_response();
+    }
+    let conn = state.conn.lock().await;
+    match admin_project_memberships::decide_list_project_memberships(
+        &conn,
+        &state.registry,
+        identity.is_sysadmin,
+        Some(&identity.user.user_id),
+        &name,
+    ) {
+        Ok(resp) => resp.into_response(),
+        Err(e) => HandlerResponse::from(e).into_response(),
+    }
+}
+
+/// Port of `add_project_membership_handler`. Has a body-read yield
+/// point -- Python's own `read_body_and_revalidate` call for this
+/// handler ALSO carries `project_name` (R9-F3), fusing the fresh
+/// re-check over BOTH capability AND membership, not just capability
+/// -- `caller_is_sysadmin` derives from the REVALIDATED `Principal`
+/// this fusion returns, mirroring PR7c's TOCTOU fix for the
+/// sysadmin-grant guard. `caller_role`, however, is a SEPARATE, fresh
+/// per-project lookup (`resolve_caller_role_on_project`) rather than
+/// anything read off the `Principal` -- see that helper's own doc for
+/// why `Principal.project_role` was never the right source for this
+/// admin-namespace route regardless of freshness (a real, found-and-
+/// fixed bug in this PR's own first draft, caught by live-testing the
+/// AZ-R12-1 role-rank guard against a genuine non-sysadmin delegate).
+pub async fn add_project_membership_handler(
+    State(state): State<Arc<RouterState>>,
+    Extension(identity): Extension<GateIdentity>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(resp) = require_project_memberships_capability(&state, &identity) {
+        return resp.into_response();
+    }
+    let conn = state.conn.lock().await;
+    let now_str = Utc::now().to_rfc3339();
+    let spec = RevalidationSpec {
+        stale_user_id: &identity.user.user_id,
+        cookie_header: cookie_header(&headers),
+        now: &now_str,
+        cap: Capability::SystemProjectsManage,
+        project: Some(perm_gates::RevalidationProject {
+            project_name: &name,
+            min_role: None,
+        }),
+    };
+    let (parsed, principal) = match perm_gates::read_body_and_revalidate(&conn, &body, &spec) {
+        Ok(v) => v,
+        Err(resp) => return resp.into_response(),
+    };
+    let parsed_value = serde_json::Value::Object(parsed);
+    let caller_role = match resolve_caller_role_on_project(&conn, &identity.user.user_id, &name) {
+        Ok(r) => r,
+        Err(e) => return HandlerResponse::from(e).into_response(),
+    };
+    let outcome = match admin_project_memberships::decide_add_project_membership(
+        &conn,
+        &state.registry,
+        fresh_is_sysadmin(&principal),
+        &identity.user.username,
+        Some(&identity.user.user_id),
+        caller_role.as_deref(),
+        &name,
+        &parsed_value,
+    ) {
+        Ok(o) => o,
+        Err(e) => return HandlerResponse::from(e).into_response(),
+    };
+    match outcome {
+        AddProjectMembershipOutcome::Added(member) => {
+            admin_users_gate::success_envelope(serde_json::json!({"membership": member}), 201)
+                .into_response()
+        }
+        AddProjectMembershipOutcome::Rejected(resp) => resp.into_response(),
+    }
+}
+
+/// Port of `change_project_membership_role_handler`. Same shape as
+/// `add_project_membership_handler` above -- fresh-principal-derived
+/// `caller_is_sysadmin` (its body-read yield point carries the
+/// identical `project_name`-scoped revalidation), separately fresh
+/// per-project `caller_role` via `resolve_caller_role_on_project`.
+pub async fn change_project_membership_role_handler(
+    State(state): State<Arc<RouterState>>,
+    Extension(identity): Extension<GateIdentity>,
+    Path((name, membership_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(resp) = require_project_memberships_capability(&state, &identity) {
+        return resp.into_response();
+    }
+    let conn = state.conn.lock().await;
+    let now_str = Utc::now().to_rfc3339();
+    let spec = RevalidationSpec {
+        stale_user_id: &identity.user.user_id,
+        cookie_header: cookie_header(&headers),
+        now: &now_str,
+        cap: Capability::SystemProjectsManage,
+        project: Some(perm_gates::RevalidationProject {
+            project_name: &name,
+            min_role: None,
+        }),
+    };
+    let (parsed, principal) = match perm_gates::read_body_and_revalidate(&conn, &body, &spec) {
+        Ok(v) => v,
+        Err(resp) => return resp.into_response(),
+    };
+    let parsed_value = serde_json::Value::Object(parsed);
+    let caller_role = match resolve_caller_role_on_project(&conn, &identity.user.user_id, &name) {
+        Ok(r) => r,
+        Err(e) => return HandlerResponse::from(e).into_response(),
+    };
+    let outcome = match admin_project_memberships::decide_change_project_membership_role(
+        &conn,
+        &state.registry,
+        fresh_is_sysadmin(&principal),
+        &identity.user.username,
+        Some(&identity.user.user_id),
+        caller_role.as_deref(),
+        &name,
+        &membership_id,
+        &parsed_value,
+    ) {
+        Ok(o) => o,
+        Err(e) => return HandlerResponse::from(e).into_response(),
+    };
+    match outcome {
+        ChangeProjectMembershipRoleOutcome::Changed(member) => {
+            admin_users_gate::success_envelope(serde_json::json!({"membership": member}), 200)
+                .into_response()
+        }
+        ChangeProjectMembershipRoleOutcome::Rejected(resp) => resp.into_response(),
+    }
+}
+
+/// Port of `delete_project_membership_handler`. No body-read at all
+/// in the real Python source (confirmed directly, not assumed
+/// symmetric with its siblings) -- so `identity.is_sysadmin` is used
+/// AS-IS, correctly matching Python's own `req['principal']` never
+/// being touched by a revalidation call for this one handler.
+/// `caller_role`, however, is STILL a fresh per-project lookup, same
+/// as every sibling -- see `resolve_caller_role_on_project`'s own doc
+/// for why `Principal.project_role` was never the right source here
+/// regardless of staleness.
+pub async fn delete_project_membership_handler(
+    State(state): State<Arc<RouterState>>,
+    Extension(identity): Extension<GateIdentity>,
+    Path((name, membership_id)): Path<(String, String)>,
+) -> Response {
+    if let Err(resp) = require_project_memberships_capability(&state, &identity) {
+        return resp.into_response();
+    }
+    let conn = state.conn.lock().await;
+    let caller_role = match resolve_caller_role_on_project(&conn, &identity.user.user_id, &name) {
+        Ok(r) => r,
+        Err(e) => return HandlerResponse::from(e).into_response(),
+    };
+    let outcome = match admin_project_memberships::decide_delete_project_membership(
+        &conn,
+        &state.registry,
+        identity.is_sysadmin,
+        &identity.user.username,
+        Some(&identity.user.user_id),
+        caller_role.as_deref(),
+        &name,
+        &membership_id,
+    ) {
+        Ok(o) => o,
+        Err(e) => return HandlerResponse::from(e).into_response(),
+    };
+    match outcome {
+        DeleteProjectMembershipOutcome::Deleted(membership_id) => {
+            admin_users_gate::success_envelope(serde_json::json!({"removed": membership_id}), 200)
+                .into_response()
+        }
+        DeleteProjectMembershipOutcome::Rejected(resp) => resp.into_response(),
     }
 }

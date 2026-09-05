@@ -324,6 +324,16 @@ async fn main() -> Result<()> {
             get(users_groups_rest::list_group_capabilities_handler)
                 .put(users_groups_rest::replace_group_capabilities_handler),
         )
+        .route(
+            "/agent-mcp/api/router/projects/{name}/memberships",
+            get(users_groups_rest::list_project_memberships_handler)
+                .post(users_groups_rest::add_project_membership_handler),
+        )
+        .route(
+            "/agent-mcp/api/router/projects/{name}/memberships/{membership_id}",
+            axum::routing::patch(users_groups_rest::change_project_membership_role_handler)
+                .delete(users_groups_rest::delete_project_membership_handler),
+        )
         .layer(axum::middleware::from_fn_with_state(
             std::sync::Arc::clone(&state),
             middleware::session_gate_layer,
