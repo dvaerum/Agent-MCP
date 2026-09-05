@@ -46,6 +46,11 @@ rmcp = { version = "=3.1.4", features = ["server", "transport-streamable-http-se
 axum = "0.8"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio", "server", "service"] }
+# json_sanitize's hidden-Unicode/combining-mark classification -- same
+# crate + version aoe-bridge/src/render.rs already uses for its own
+# sanitize_for_pane (the Rust reference this port mirrors), not a new
+# choice for this repo.
+unicode-general-category = "1.1.0"
 
 [dev-dependencies]
 tempfile = "3"
