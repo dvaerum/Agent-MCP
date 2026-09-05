@@ -35,11 +35,24 @@ argon2 = "0.6"
 # session_id/user_id generation -- same OS-CSPRNG source
 # `conexus-tools::admin_tools::generate_token` already uses.
 getrandom = "0.4"
-
-[dev-dependencies]
-# identity.rs's create_user race test needs two real OS-level SQLite
-# connections against the SAME on-disk file (an in-memory connection
-# can't be shared across threads) to exercise the BEGIN IMMEDIATE
-# locking for real -- same crate+version conexus-backend/conexus-tools
-# already use for their own tempfile-backed tests.
+# project_registry.rs (Phase E2 PR 5) needs the raw JSON map shape
+# Python's `dict[str, Any]` gives it (to round-trip opaque `extra`
+# fields on a read-modify-write cycle without a schema) plus its slug
+# validation regex -- both already workspace dependencies elsewhere
+# (conexus-core/conexus-tools use serde_json; conexus-db uses regex),
+# added here directly rather than routed through another crate's
+# private re-export.
+serde_json = "1"
+regex = "1"
+# Advisory cross-process file locking for the registry's sidecar
+# lockfile (`<path>.lock`) -- ports `fcntl.flock`'s LOCK_EX/LOCK_SH
+# semantics. No existing workspace precedent for this choice (same
+# "genuinely new, no fork to resolve" shape as the argon2 pick in
+# PR 3): `fd-lock` is small, actively maintained, and its `RwLock`
+# read/write split maps directly onto LOCK_SH/LOCK_EX.
+fd-lock = "4"
+# Atomic registry-file rewrite (tmp-in-same-dir + fsync + rename) --
+# same crate+version already used by identity.rs's own create_user
+# race test (see below), here as a REAL (not dev) dependency since
+# production code needs it, not just tests.
 tempfile = "3"
