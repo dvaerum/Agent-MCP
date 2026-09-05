@@ -24,6 +24,8 @@
 //! was already inactive" fix).
 #![allow(dead_code)]
 
+use std::path::Path;
+
 use rusqlite::Connection;
 
 use crate::lifecycle::{self, LifecycleError};
@@ -111,19 +113,59 @@ pub fn project_mutation_precheck(
 /// is idempotent), clear runtime state (`keep_lock: true` -- the
 /// caller pops its own `ensure_locks` entry once the surrounding lock
 /// is released, matching Python's `ensure_locks.pop((name, "backend"),
-/// None)` running AFTER the `async with` block exits), and best-effort
+/// None)` running AFTER the `async with` block exits), best-effort
 /// purge the project's `project_membership` rows (AZ-R13-1 parity --
-/// never fails the delete itself).
+/// never fails the delete itself), best-effort delete the project's
+/// token files (`admin_api.py:1000-1005`), and best-effort purge the
+/// per-project runtime dir under `sock_dir` (`admin_api.py:1013-1023`,
+/// SC-3: `RuntimeDirectoryPreserve=yes` means systemd won't do this
+/// for us on a delete). **Found-and-fixed bug**: this function
+/// originally did NEITHER purge, an asymmetry with
+/// `project_rename::finish_rename_project`'s equivalent (correct)
+/// purge from the SAME phase, not a documented scope decision.
 pub fn finish_delete_project(
     conn: &Connection,
     registry: &ProjectRegistry,
     store: &RuntimeStore,
     name: &str,
+    sock_dir: &Path,
+    token_dir: Option<&Path>,
 ) -> Result<(), GateError> {
     registry.unregister(name)?;
     store.forget(name, false, true);
     let _ = crate::identity::remove_project_membership_by_project(conn, name);
+    purge_token_files(token_dir, name);
+    if lifecycle::SLUG_RE.is_match(name) {
+        let runtime_dir = sock_dir.join(name);
+        if runtime_dir.is_dir() {
+            let _ = std::fs::remove_dir_all(&runtime_dir);
+        }
+    }
     Ok(())
+}
+
+/// Port of the `token_dir.glob(f"{name}--*.token")` unlink loop
+/// (`admin_api.py:1000-1005`) -- unlike rename's sibling
+/// `rename_token_files` (which renames the matched files), a delete
+/// unlinks them outright. Best-effort: an absent `token_dir` or a
+/// per-file `unlink` failure is silently ignored, matching Python's
+/// own `except OSError: pass`.
+fn purge_token_files(token_dir: Option<&Path>, name: &str) {
+    let Some(dir) = token_dir else { return };
+    if !dir.is_dir() {
+        return;
+    }
+    let prefix = format!("{name}--");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let fname = entry.file_name();
+        let fname_str = fname.to_string_lossy();
+        if fname_str.starts_with(&prefix) && fname_str.ends_with(".token") {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Port of `stop_project_handler`'s post-`systemctl stop` mutation:
@@ -341,7 +383,15 @@ mod tests {
         store.with_runtime_mut("proj-a", |rt| rt.active_conns = 0);
         store.ensure_lock("proj-a", "backend"); // simulate a held lock
 
-        finish_delete_project(&c, &registry, &store, "proj-a").unwrap();
+        finish_delete_project(
+            &c,
+            &registry,
+            &store,
+            "proj-a",
+            &dir.path().join("sock"),
+            None,
+        )
+        .unwrap();
 
         assert!(registry.get("proj-a").unwrap().is_none());
         assert!(store.snapshot("proj-a").is_none());
@@ -362,7 +412,85 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
         let store = RuntimeStore::default();
-        finish_delete_project(&c, &registry, &store, "never-existed").unwrap();
+        finish_delete_project(
+            &c,
+            &registry,
+            &store,
+            "never-existed",
+            &dir.path().join("sock"),
+            None,
+        )
+        .unwrap();
+    }
+
+    // -- found-bug regression: token-file + runtime-dir purge -----------
+
+    #[test]
+    fn finish_delete_project_purges_matching_token_files_but_leaves_others() {
+        let c = conn();
+        let dir = tempfile::tempdir().unwrap();
+        let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
+        let store = RuntimeStore::default();
+        let token_dir = dir.path().join("tokens");
+        std::fs::create_dir_all(&token_dir).unwrap();
+        std::fs::write(token_dir.join("proj-a--worker1.token"), b"secret").unwrap();
+        std::fs::write(token_dir.join("proj-a--worker2.token"), b"secret").unwrap();
+        std::fs::write(token_dir.join("proj-b--worker1.token"), b"secret").unwrap();
+
+        finish_delete_project(
+            &c,
+            &registry,
+            &store,
+            "proj-a",
+            &dir.path().join("sock"),
+            Some(&token_dir),
+        )
+        .unwrap();
+
+        assert!(!token_dir.join("proj-a--worker1.token").exists());
+        assert!(!token_dir.join("proj-a--worker2.token").exists());
+        assert!(
+            token_dir.join("proj-b--worker1.token").exists(),
+            "a different project's token must survive"
+        );
+    }
+
+    #[test]
+    fn finish_delete_project_purges_the_runtime_dir_under_sock_dir() {
+        let c = conn();
+        let dir = tempfile::tempdir().unwrap();
+        let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
+        let store = RuntimeStore::default();
+        let sock_dir = dir.path().join("sock");
+        let runtime_dir = sock_dir.join("proj-a");
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        std::fs::write(runtime_dir.join("backend.sock"), b"").unwrap();
+        std::fs::write(runtime_dir.join("forwarding_hmac"), b"key").unwrap();
+
+        finish_delete_project(&c, &registry, &store, "proj-a", &sock_dir, None).unwrap();
+
+        assert!(
+            !runtime_dir.exists(),
+            "the per-project runtime dir must be purged on delete"
+        );
+    }
+
+    #[test]
+    fn finish_delete_project_is_a_noop_when_neither_token_dir_nor_runtime_dir_exist() {
+        let c = conn();
+        let dir = tempfile::tempdir().unwrap();
+        let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
+        let store = RuntimeStore::default();
+        // No token_dir, no pre-existing sock_dir/proj-a -- must not error.
+        finish_delete_project(
+            &c,
+            &registry,
+            &store,
+            "proj-a",
+            &dir.path().join("sock"),
+            Some(&dir.path().join("nonexistent-tokens")),
+        )
+        .unwrap();
     }
 
     #[test]
