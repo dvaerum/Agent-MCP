@@ -60,7 +60,13 @@ pub struct RouterState {
     pub conn: AsyncMutex<rusqlite::Connection>,
     pub registry: ProjectRegistry,
     pub runtime: RuntimeStore,
-    pub stream_caps: StreamCapRegistry,
+    /// `Arc`-wrapped (rather than bare, like every other field here)
+    /// because `mcp_handler::backend_mcp_handler`/`backend_api_handler`
+    /// take it by `&Arc<StreamCapRegistry>` -- their own admission-
+    /// guard type (`StreamCapGuard`) is held across the request's
+    /// whole streaming lifetime and needs to outlive a single
+    /// borrowed reference to `RouterState`.
+    pub stream_caps: std::sync::Arc<StreamCapRegistry>,
     pub asset_prefix_cache: AssetPrefixCache,
     pub rate_limit_config: RateLimitConfig,
     pub rate_limit_state: std::sync::Mutex<RateLimitState>,
@@ -94,10 +100,10 @@ impl RouterState {
             conn: AsyncMutex::new(conn),
             registry,
             runtime: RuntimeStore::new(),
-            stream_caps: StreamCapRegistry::new(
+            stream_caps: std::sync::Arc::new(StreamCapRegistry::new(
                 config.max_streams_per_agent,
                 config.max_streams_global,
-            ),
+            )),
             asset_prefix_cache: AssetPrefixCache::new(),
             rate_limit_config,
             rate_limit_state: std::sync::Mutex::new(rate_limit_state),
