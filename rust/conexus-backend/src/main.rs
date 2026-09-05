@@ -22,6 +22,8 @@ mod auth_gate;
 mod boot;
 mod instructions;
 mod principal_resolve;
+mod rest_gate;
+mod rest_principal;
 mod server;
 mod uds;
 
@@ -122,7 +124,39 @@ async fn main() -> Result<()> {
                 shared.clone(),
                 auth_gate::require_identity,
             ));
-    let app = Router::new().merge(mcp_router).with_state(shared.clone());
+    // `/api` scaffold (Phase E1 PR 1, prancy-napping-pie): the identity
+    // gate mounts now, ahead of any real REST route, so the auth-door
+    // decision is exercised for real from the first PR rather than
+    // deferred until a business endpoint lands. No routes are
+    // registered yet -- see `rest_gate`/`rest_principal` module docs.
+    // A request that clears the gate still 404s (no matching route);
+    // an unadmitted request 401s from the gate itself, before axum's
+    // own routing ever runs -- both are real, live-verifiable
+    // behaviors of this scaffold alone.
+    //
+    // An explicit `.fallback()` is required here, not cosmetic: an
+    // otherwise-empty `Router` contributes NO matchable path at all
+    // when `.nest()`ed, so `/api/*` would fall through to the OUTER
+    // router's fallback instead -- which `Router::merge` had already
+    // set to `mcp_router`'s own auth_gate-wrapped one, silently
+    // routing every `/api/*` request through `/mcp`'s (wrong, wider)
+    // door. Caught live: an unauthenticated `/api/*` probe returned
+    // `/mcp`'s JSON-RPC error shape, and a WORKER bearer (rejected by
+    // `rest_gate`, admitted by `auth_gate`) was let through -- both
+    // pointed at the same root cause before this fallback was added.
+    async fn api_not_found() -> axum::http::StatusCode {
+        axum::http::StatusCode::NOT_FOUND
+    }
+    let api_router = Router::new()
+        .fallback(api_not_found)
+        .layer(middleware::from_fn_with_state(
+            shared.clone(),
+            rest_gate::require_rest_identity,
+        ));
+    let app = Router::new()
+        .merge(mcp_router)
+        .nest("/api", api_router)
+        .with_state(shared.clone());
 
     uds::serve_router_unix(&cli.uds, app)
         .await
