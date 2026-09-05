@@ -35,7 +35,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use axum::middleware;
-use axum::routing::{get, post, put};
+use axum::routing::{get, patch, post, put};
 use axum::Router;
 use clap::Parser;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
@@ -210,6 +210,20 @@ async fn main() -> Result<()> {
             post(rest_handlers::create_sample_memories),
         )
         .route("/all-data", get(rest_handlers::all_data))
+        .route("/messages/query", post(rest_handlers::list_messages))
+        .route(
+            "/messages/participants",
+            post(rest_handlers::list_participants),
+        )
+        .route("/messages", post(rest_handlers::create_message))
+        .route(
+            "/messages/{message_id}/thread",
+            get(rest_handlers::get_message_thread),
+        )
+        .route(
+            "/messages/{message_id}",
+            patch(rest_handlers::patch_message).delete(rest_handlers::delete_message),
+        )
         .fallback(api_not_found)
         .layer(middleware::from_fn_with_state(
             shared.clone(),
