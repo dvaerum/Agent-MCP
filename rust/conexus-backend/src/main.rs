@@ -195,6 +195,20 @@ async fn main() -> Result<()> {
             "/settings/{context_key}",
             put(rest_handlers::update_setting).delete(rest_handlers::delete_setting),
         )
+        .route("/status", get(rest_handlers::simple_status))
+        .route("/context-data", get(rest_handlers::context_data))
+        .route(
+            "/terminate-agent",
+            post(rest_handlers::terminate_agent_dashboard),
+        )
+        .route(
+            "/update-task-dashboard",
+            post(rest_handlers::update_task_dashboard),
+        )
+        .route(
+            "/create-sample-memories",
+            post(rest_handlers::create_sample_memories),
+        )
         .fallback(api_not_found)
         .layer(middleware::from_fn_with_state(
             shared.clone(),
