@@ -146,6 +146,45 @@ fn default_projects_file(get_env: impl Fn(&str) -> Option<String>) -> std::path:
         .join("projects.local.json")
 }
 
+/// Port of `app.py`'s `DEFAULT_WORKSPACE_PARENT`: `$AGENT_MCP_DEFAULT_WORKSPACE`,
+/// falling back to `$HOME/.local/share/agent-mcp/projects` -- unlike
+/// `default_projects_file` above, Python's own default here is NOT
+/// XDG-aware (`Path.home()` directly), so this deliberately does not
+/// reuse that helper's `$XDG_CONFIG_HOME` branch.
+fn default_workspace_parent(get_env: impl Fn(&str) -> Option<String>) -> std::path::PathBuf {
+    if let Some(v) = get_env("AGENT_MCP_DEFAULT_WORKSPACE").filter(|s| !s.is_empty()) {
+        return std::path::PathBuf::from(v);
+    }
+    let home = get_env("HOME").filter(|s| !s.is_empty());
+    match home {
+        Some(h) => std::path::PathBuf::from(h)
+            .join(".local")
+            .join("share")
+            .join("agent-mcp")
+            .join("projects"),
+        None => std::path::PathBuf::from(".local/share/agent-mcp/projects"),
+    }
+}
+
+/// Port of `admin_api.py::_token_dir()`: `$AGENT_MCP_TOKENS_DIR`,
+/// falling back to `$HOME/.config/agent-mcp/tokens`. Branches on the
+/// env var's PRESENCE explicitly (SEC FINDING 5's own fix -- an
+/// unset var must not resolve to `Path("")`, which is truthy and
+/// silently points at the process CWD). Returns `None` only when
+/// there is no `$HOME` to fall back to either (never expected in a
+/// real production boot).
+fn resolve_token_dir(get_env: impl Fn(&str) -> Option<String>) -> Option<std::path::PathBuf> {
+    if let Some(v) = get_env("AGENT_MCP_TOKENS_DIR").filter(|s| !s.is_empty()) {
+        return Some(std::path::PathBuf::from(v));
+    }
+    get_env("HOME").filter(|s| !s.is_empty()).map(|h| {
+        std::path::PathBuf::from(h)
+            .join(".config")
+            .join("agent-mcp")
+            .join("tokens")
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -202,6 +241,8 @@ async fn main() -> Result<()> {
             single_tenant_workspace: cli.single_workspace.clone(),
             max_streams_per_agent,
             max_streams_global,
+            default_workspace_parent: default_workspace_parent(get_env),
+            token_dir: resolve_token_dir(get_env),
         },
     ));
 

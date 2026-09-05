@@ -26,6 +26,7 @@ use rusqlite::Connection;
 
 use crate::lifecycle::{self, LifecycleError};
 use crate::login;
+use crate::mcp_handler::HandlerResponse;
 use crate::project_registry::{ProjectRegistry, RegistryError};
 use crate::session_gate::parse_project_role;
 
@@ -61,6 +62,42 @@ impl std::fmt::Display for GateError {
 }
 
 impl std::error::Error for GateError {}
+
+/// Port of `perm_gates.py::require_capability`'s decision half -- the
+/// capability-shaped entry gate `admin_api.py`'s non-project-scoped
+/// handlers (`list_projects`, `create_project`) and every handler
+/// this crate's own `require_capability`-equivalent axum wrapper will
+/// call before their own project-scoped checks. Single-tenant mode
+/// (ADR-0008) bypasses unconditionally, matching
+/// `bypasses_operator_gate`'s own precedent elsewhere in this crate.
+///
+/// Returns `Ok(())` to admit, `Err(HandlerResponse)` (403,
+/// `LifecycleError::Forbidden`'s shared discriminator) to reject --
+/// deliberately NOT axum middleware (this crate has no shared
+/// "require a capability" extractor yet, and `GateIdentity`'s already-
+/// resolved `Principal` makes a plain function call sufficient; a
+/// handler calls this as its own first line).
+pub fn require_capability(
+    identity: &crate::session_gate::GateIdentity,
+    single_tenant_name: Option<&str>,
+    cap: Capability,
+) -> Result<(), HandlerResponse> {
+    if crate::single_tenant::bypasses_operator_gate(single_tenant_name) {
+        return Ok(());
+    }
+    if identity.principal.has_capability(cap) {
+        return Ok(());
+    }
+    let username = &identity.user.username;
+    Err(lifecycle::error_envelope(
+        LifecycleError::Forbidden,
+        &format!(
+            "operator '{username}' lacks capability '{}'; this action requires it",
+            cap.as_str()
+        ),
+        None,
+    ))
+}
 
 /// Port of `_deny_cross_tenant_project_read`'s decision (R4-F3/R6-F2/
 /// R9-F2): a sysadmin OR a caller with a resolved role admits;
@@ -419,8 +456,84 @@ pub fn decide_create_project(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::UserRow;
     use crate::mcp_handler::HandlerBody;
+    use crate::session_gate::GateIdentity;
+    use conexus_core::capability::Capabilities;
+    use conexus_core::principal::PrincipalKind;
     use conexus_db::schema::init_router_schema;
+
+    fn identity_with(username: &str, caps: Capabilities) -> GateIdentity {
+        GateIdentity {
+            user: UserRow {
+                user_id: "u1".to_string(),
+                username: username.to_string(),
+                email: None,
+                password_hash: None,
+                created_at: NOW_STR.to_string(),
+                last_login_at: None,
+                is_sysadmin: matches!(caps, Capabilities::Sysadmin),
+                sso_subject: None,
+            },
+            is_sysadmin: matches!(caps, Capabilities::Sysadmin),
+            project: None,
+            project_role: None,
+            principal: Principal {
+                kind: PrincipalKind::OperatorSession,
+                user_id: Some("u1".to_string()),
+                agent_id: None,
+                project_name: None,
+                project_role: None,
+                agent_role: None,
+                can_wake_loop: false,
+                source_token: None,
+                capabilities: caps,
+            },
+        }
+    }
+
+    // -- require_capability ----------------------------------------------
+
+    #[test]
+    fn require_capability_admits_a_caller_with_the_capability() {
+        let identity = identity_with(
+            "alice",
+            Capabilities::Set([Capability::SystemProjectsManage].into_iter().collect()),
+        );
+        assert!(require_capability(&identity, None, Capability::SystemProjectsManage).is_ok());
+    }
+
+    #[test]
+    fn require_capability_denies_a_caller_lacking_the_capability() {
+        let identity = identity_with("alice", Capabilities::Set(HashSet::new()));
+        let resp =
+            require_capability(&identity, None, Capability::SystemProjectsManage).unwrap_err();
+        assert_eq!(resp.status, 403);
+        let HandlerBody::Json(body) = resp.body else {
+            panic!("expected JSON");
+        };
+        assert_eq!(body["error"], "forbidden");
+        let message = body["message"].as_str().unwrap();
+        assert!(message.contains("'alice'"));
+        assert!(message.contains("'system.projects.manage'"));
+    }
+
+    #[test]
+    fn require_capability_admits_a_sysadmin_unconditionally() {
+        let identity = identity_with("alice", Capabilities::Sysadmin);
+        assert!(require_capability(&identity, None, Capability::SystemProjectsManage).is_ok());
+    }
+
+    #[test]
+    fn require_capability_bypasses_in_single_tenant_mode_even_without_the_capability() {
+        let identity = identity_with("alice", Capabilities::Set(HashSet::new()));
+        assert!(require_capability(
+            &identity,
+            Some("solo-project"),
+            Capability::SystemProjectsManage
+        )
+        .is_ok());
+    }
 
     fn conn() -> Connection {
         let c = Connection::open_in_memory().unwrap();

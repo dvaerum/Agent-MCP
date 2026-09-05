@@ -54,6 +54,22 @@ pub struct RouterStateConfig {
     pub single_tenant_workspace: Option<PathBuf>,
     pub max_streams_per_agent: u32,
     pub max_streams_global: u32,
+    /// Parent dir for a new project's workspace when the caller omits
+    /// one -- port of `app.py`'s `DEFAULT_WORKSPACE_PARENT`
+    /// (`$AGENT_MCP_DEFAULT_WORKSPACE`, default `~/.local/share/
+    /// agent-mcp/projects`). Needed by `project_gate::
+    /// decide_create_project`/`lifecycle::workspace_label`.
+    pub default_workspace_parent: PathBuf,
+    /// Agent-token directory -- port of `admin_api.py::_token_dir()`
+    /// (`$AGENT_MCP_TOKENS_DIR`, default `~/.config/agent-mcp/tokens`).
+    /// `None` only in a test/dev context with no real `$HOME` to fall
+    /// back to; a production boot always resolves a concrete path (the
+    /// env-var-presence branch this mirrors is itself a fix for a real
+    /// bug -- `_token_dir()`'s own doc: an unset var must NOT resolve
+    /// to `Path("")`, which is truthy and silently pointed at the
+    /// process CWD). Needed by `project_rename::finish_rename_project`
+    /// and (once fixed) `project_teardown::finish_delete_project`.
+    pub token_dir: Option<PathBuf>,
 }
 
 pub struct RouterState {
@@ -79,6 +95,8 @@ pub struct RouterState {
     pub idle_sec: u64,
     pub asset_prefix: Option<String>,
     pub single_tenant_workspace: Option<PathBuf>,
+    pub default_workspace_parent: PathBuf,
+    pub token_dir: Option<PathBuf>,
 }
 
 impl RouterState {
@@ -114,7 +132,11 @@ impl RouterState {
             },
             session_gate_config: SessionGateConfig {
                 single_tenant_name: config.single_tenant_name,
-                extra_exact_paths: Vec::new(),
+                // Port of `path_policy.py`'s own `public_route`
+                // registration for `GET /agent-mcp/api/router/health`
+                // (`admin_api.py:1723-1728`) -- the ONE lifecycle-rest
+                // route with no session requirement at all.
+                extra_exact_paths: vec!["/agent-mcp/api/router/health".to_string()],
             },
             sock_dir: config.sock_dir,
             dashboard_dir: config.dashboard_dir,
@@ -122,6 +144,8 @@ impl RouterState {
             idle_sec: config.idle_sec,
             asset_prefix: config.asset_prefix,
             single_tenant_workspace: config.single_tenant_workspace,
+            default_workspace_parent: config.default_workspace_parent,
+            token_dir: config.token_dir,
         }
     }
 }
@@ -142,6 +166,8 @@ mod tests {
             single_tenant_workspace: None,
             max_streams_per_agent: 4,
             max_streams_global: 64,
+            default_workspace_parent: PathBuf::from("/tmp/agent-mcp-projects"),
+            token_dir: None,
         }
     }
 
@@ -186,6 +212,37 @@ mod tests {
         assert_eq!(
             state.session_gate_config.single_tenant_name.as_deref(),
             Some("demo")
+        );
+    }
+
+    #[test]
+    fn new_makes_the_health_route_public_and_threads_workspace_and_token_dirs() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_router_schema(&conn).unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
+        let mut config = test_config();
+        config.default_workspace_parent = dir.path().join("workspaces");
+        config.token_dir = Some(dir.path().join("tokens"));
+        let state = RouterState::new(
+            conn,
+            registry,
+            RateLimitConfig::resolve_from_process_env(),
+            EnsureConfig::from_env(|_| None),
+            config,
+        );
+        assert!(state
+            .session_gate_config
+            .extra_exact_paths
+            .iter()
+            .any(|p| p == "/agent-mcp/api/router/health"));
+        assert_eq!(
+            state.default_workspace_parent,
+            dir.path().join("workspaces")
+        );
+        assert_eq!(
+            state.token_dir.as_deref(),
+            Some(dir.path().join("tokens")).as_deref()
         );
     }
 }

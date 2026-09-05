@@ -68,7 +68,10 @@ fn peer_info(addr: SocketAddr) -> PeerInfo {
     }
 }
 
-fn header_str<'a>(req: &'a Request, name: &str) -> Option<&'a str> {
+/// `pub(crate)`, not private -- the lifecycle-rest/users-groups-rest
+/// handlers (a different module) need this to pull the `Cookie`
+/// header for `perm_gates::RevalidationSpec.cookie_header`.
+pub(crate) fn header_str<'a>(req: &'a Request, name: &str) -> Option<&'a str> {
     req.headers().get(name).and_then(|v| v.to_str().ok())
 }
 
@@ -279,6 +282,8 @@ mod tests {
                 single_tenant_workspace: None,
                 max_streams_per_agent: 4,
                 max_streams_global: 64,
+                default_workspace_parent: dir.path().join("projects"),
+                token_dir: None,
             },
         );
         let trusted_peer = peer_info("10.0.0.5:1".parse().unwrap());
