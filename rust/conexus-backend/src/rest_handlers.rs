@@ -7,7 +7,7 @@
 //! follow-up PR" -- one of the 3 confirmed no-auth-by-design REST
 //! endpoints), `settings-schema` requires the `rest_gate` door.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use axum::body::Bytes;
 use axum::extract::{Extension, Path, State};
@@ -1779,4 +1779,773 @@ pub async fn all_data(
         "timestamp": chrono::Utc::now().to_rfc3339(),
     }))
     .into_response()
+}
+
+// -- /api/messages (Phase E1 PR 10/14, conexus-rest-messages) ------
+//
+// Unlike every prior REST surface in this file, messages.py's own
+// handlers do NOT dispatch through the MCP tool layer at all (no
+// registered `send_agent_message`-shaped tool covers broadcast fan-out
+// + a `sender_id` operator-impersonation override + the `unit_of_work`
+// atomicity this router hand-rolls) -- these are thin adapters directly
+// over `conexus_db::message_repository`, reusing only
+// `conexus_tools::agent_messaging::check_send_message_permission` (the
+// ONE shared enforcement path OBS6 requires) rather than the full
+// `send_agent_message` write core, which hardcodes the sender from the
+// calling `Principal` and has no `sender_id` override seam.
+
+/// One process-wide instance, matching Python's module-level
+/// `message_repo` import (a singleton) -- the pagination cache must
+/// survive across calls the same way `admin_tools.rs`'s
+/// `GET_AGENT_TOKENS_REPO` / `task_tools.rs`'s `VIEW_TASKS_ENGINE` do.
+static MESSAGE_REPO: LazyLock<conexus_db::message_repository::MessageRepository> =
+    LazyLock::new(conexus_db::message_repository::MessageRepository::new);
+
+const MESSAGE_TYPES: [&str; 6] = [
+    "text",
+    "system",
+    "notification",
+    "task_update",
+    "assistance_request",
+    "stop_command",
+];
+const MESSAGE_PRIORITIES: [&str; 4] = ["low", "normal", "high", "urgent"];
+
+/// Port of `_message_to_dict`: projects a raw
+/// [`conexus_db::message_repository::MessageRow`] into the DISPLAY
+/// shape every messages.py read endpoint returns -- a reply
+/// (`parent_message_id` set) always shows `subject: null` /
+/// `subject_is_placeholder: false` (threaded, not subject-bearing);
+/// a root message with no stored subject gets a computed 50-char body
+/// preview via `message_subject_view`, flagged as a placeholder so the
+/// UI can style it differently from a real, sender-chosen subject.
+fn message_row_to_json(row: &conexus_db::message_repository::MessageRow) -> Value {
+    let (display_subject, is_placeholder) = if row.parent_message_id.is_some() {
+        (None, false)
+    } else {
+        conexus_db::message_repository::message_subject_view(
+            row.subject.as_deref(),
+            &row.message_content,
+        )
+    };
+    json!({
+        "message_id": row.message_id,
+        "sender_id": row.sender_id,
+        "recipient_id": row.recipient_id,
+        "message_content": row.message_content,
+        "message_type": row.message_type,
+        "priority": row.priority,
+        "timestamp": row.timestamp,
+        "delivered": row.delivered,
+        "read": row.read,
+        "subject": display_subject,
+        "subject_is_placeholder": is_placeholder,
+        "parent_message_id": row.parent_message_id,
+    })
+}
+
+/// Port of `int(data.get(field, default))`'s exact failure surface
+/// (PF-R14-1/PF-R18-1): a JSON `null` (an explicit `"field": null` --
+/// distinct from an ABSENT key, which uses `default`) matches Python's
+/// `data.get(field)` returning `None` then `int(None)` raising
+/// `TypeError`; a list/dict/object value raises the same `TypeError`;
+/// a non-numeric string raises `ValueError`; a non-finite number
+/// (`1e400` parses to `inf`) raises `OverflowError`. Every one of
+/// those 4 exception types maps to the SAME clean 400 at the call
+/// site, so this returns a single `Err(())` for all of them rather
+/// than a typed error the caller would just discard anyway.
+fn coerce_int_field(value: Option<&Value>, default: i64) -> Result<i64, ()> {
+    match value {
+        None => Ok(default),
+        Some(Value::Null) => Err(()),
+        // Python: `bool` is an `int` subclass, so `int(True) == 1`.
+        Some(Value::Bool(b)) => Ok(i64::from(*b)),
+        Some(Value::Number(n)) => n
+            .as_i64()
+            .or_else(|| {
+                n.as_f64()
+                    .filter(|f| f.is_finite())
+                    .map(|f| f.trunc() as i64)
+            })
+            .ok_or(()),
+        Some(Value::String(s)) => s.trim().parse::<i64>().map_err(|_| ()),
+        Some(Value::Array(_)) | Some(Value::Object(_)) => Err(()),
+    }
+}
+
+/// A non-cryptographic random message id -- port of
+/// `secrets.token_hex(8)`'s ID-SPACE (16 hex chars), not its
+/// unpredictability guarantee. Same non-security-boundary rationale as
+/// `agent_messaging::rand_u64` (a message id is a primary key, never a
+/// capability); duplicated rather than exported across the crate
+/// boundary for one nine-line helper.
+fn random_message_id() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::BuildHasher;
+    format!(
+        "msg_{:016x}",
+        RandomState::new().hash_one(std::time::Instant::now())
+    )
+}
+
+/// `POST /api/messages/query` -- rich-filter listing, matching
+/// `list_messages_api_route`. `limit`/`offset` are read from the BODY
+/// here (unlike every other `?limit=` list endpoint in this file) --
+/// a real, deliberate Python asymmetry preserved as-is.
+pub async fn list_messages(State(shared): State<Arc<SharedState>>, body: Bytes) -> Response {
+    let data = match decode_untrusted_body(&body) {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
+    };
+
+    let limit = match coerce_int_field(data.get("limit"), 50) {
+        Ok(v) => v,
+        Err(()) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "limit must be an integer"})),
+            )
+                .into_response()
+        }
+    };
+    let offset = match coerce_int_field(data.get("offset"), 0) {
+        Ok(v) => v,
+        Err(()) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "offset must be an integer"})),
+            )
+                .into_response()
+        }
+    };
+    if !(1..=500).contains(&limit) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "limit must be 1..500"})),
+        )
+            .into_response();
+    }
+    // PF-R14-1: a negative offset is a harmless sqlite no-op, but
+    // clamp to a 0 floor for defense-in-depth.
+    let offset = offset.max(0);
+
+    // Silently ignored, not a 400, when malformed -- matches Python's
+    // `isinstance(filter_between, list) and len(...) == 2 and
+    // all(isinstance(x, str) ...)` guard in `_apply_query_filters`.
+    let between: Option<(&str, &str)> =
+        data.get("between")
+            .and_then(Value::as_array)
+            .and_then(|arr| match (arr.first(), arr.get(1), arr.len()) {
+                (Some(a), Some(b), 2) => Some((a.as_str()?, b.as_str()?)),
+                _ => None,
+            });
+    // Port of `AgentMessage.read.is_(bool(filter_read))` -- present
+    // (including an explicit `null`) means "apply the filter", coerced
+    // via Python truthiness, not a strict-bool check.
+    let read_filter = data.get("read").map(|v| !is_json_falsy(Some(v)));
+
+    let filters = conexus_db::message_repository::MessageQueryFilters {
+        from: data.get("from").and_then(Value::as_str),
+        to: data.get("to").and_then(Value::as_str),
+        between,
+        message_type: data.get("type").and_then(Value::as_str),
+        priority: data.get("priority").and_then(Value::as_str),
+        read: read_filter,
+        since: data.get("since").and_then(Value::as_str),
+        until: data.get("until").and_then(Value::as_str),
+        q: data.get("q").and_then(Value::as_str),
+        limit,
+        offset,
+    };
+
+    let guard = shared.conn.lock().await;
+    let rows = MESSAGE_REPO.query(&guard, &filters, false);
+    let total = MESSAGE_REPO.count_query(&guard, &filters);
+    drop(guard);
+
+    let (rows, total) = match (rows, total) {
+        (Ok(r), Ok(t)) => (r, t),
+        _ => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Failed to list messages"})),
+            )
+                .into_response()
+        }
+    };
+
+    let messages: Vec<Value> = rows.iter().map(message_row_to_json).collect();
+    Json(json!({"messages": messages, "total": total, "limit": limit, "offset": offset}))
+        .into_response()
+}
+
+/// `POST /api/messages/participants` -- Messages-tab filter dropdown
+/// values, matching `list_participants_api_route`. The body is
+/// decoded-and-discarded (must be well-formed JSON, matches Python's
+/// `_ = await get_sanitized_json_body(request)`); `?limit=` (NOT the
+/// body) drives the shared `[1,5000]`/default-500 clamp every other
+/// `/api` list read uses (R4-F2).
+pub async fn list_participants(
+    State(shared): State<Arc<SharedState>>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+    body: Bytes,
+) -> Response {
+    if let Err(e) = decode_untrusted_body(&body) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
+    let limit = crate::read_limits::clamp_section_limit(params.get("limit").map(String::as_str));
+
+    let guard = shared.conn.lock().await;
+    let result = conexus_db::message_repository::list_participants(&guard, limit);
+    drop(guard);
+
+    match result {
+        Ok(p) => {
+            let live: Vec<Value> = p
+                .live
+                .iter()
+                .map(|a| json!({"agent_id": a.agent_id, "status": a.status}))
+                .collect();
+            Json(json!({"live": live, "tombstones": p.tombstones})).into_response()
+        }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "Failed to list participants"})),
+        )
+            .into_response(),
+    }
+}
+
+/// `POST /api/messages` -- admin composes a message, matching
+/// `create_message_api_route`. Covers broadcast fan-out
+/// (`recipient_id: "*"`), the `sender_id` operator-impersonation
+/// override (validated via the same `recipient_exists` check a real
+/// recipient gets), OBS6's shared `check_send_message_permission`
+/// gate run once before either branch, and the post-commit recipient
+/// wake for the single-recipient path only -- Python's broadcast
+/// branch fires no wake at all, preserved as-is (verified by reading
+/// the real handler, not assumed symmetric).
+pub async fn create_message(
+    State(shared): State<Arc<SharedState>>,
+    Extension(resolved): Extension<ResolvedRestPrincipal>,
+    body: Bytes,
+) -> Response {
+    let data = match decode_untrusted_body(&body) {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
+    };
+
+    let recipient_id_val = data.get("recipient_id");
+    let content_val = data.get("message_content");
+    let subject_val = data.get("subject");
+    let parent_val = data.get("parent_message_id");
+    let sender_override_val = data.get("sender_id");
+
+    for (val, name) in [
+        (recipient_id_val, "recipient_id"),
+        (content_val, "message_content"),
+        (subject_val, "subject"),
+        (parent_val, "parent_message_id"),
+        (sender_override_val, "sender_id"),
+    ] {
+        if let Some(resp) = require_str(val, name) {
+            return resp;
+        }
+    }
+
+    let Some(recipient_id) = recipient_id_val
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "recipient_id is required"})),
+        )
+            .into_response();
+    };
+    let Some(content) = content_val
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "message_content is required"})),
+        )
+            .into_response();
+    };
+    let message_type = data
+        .get("message_type")
+        .and_then(Value::as_str)
+        .unwrap_or("text");
+    let priority = data
+        .get("priority")
+        .and_then(Value::as_str)
+        .unwrap_or("normal");
+    if !MESSAGE_TYPES.contains(&message_type) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("message_type must be one of {MESSAGE_TYPES:?}")})),
+        )
+            .into_response();
+    }
+    if !MESSAGE_PRIORITIES.contains(&priority) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("priority must be one of {MESSAGE_PRIORITIES:?}")})),
+        )
+            .into_response();
+    }
+
+    let dispatch_principal = resolved.dispatch_principal.clone();
+    let operator_id = resolved.admission.caller_identity();
+    let now = chrono::Utc::now().to_rfc3339();
+
+    let guard = shared.conn.lock().await;
+
+    if let Some(denial) = conexus_tools::agent_messaging::check_send_message_permission(
+        &guard,
+        &dispatch_principal,
+        recipient_id,
+        content,
+        message_type,
+    ) {
+        drop(guard);
+        let (status, _) = denial.to_http();
+        let message = denial.error_message("Message rejected", None);
+        return (
+            StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            Json(json!({"error": message})),
+        )
+            .into_response();
+    }
+
+    let explicit_subject = subject_val.and_then(Value::as_str);
+    let parent_message_id = parent_val.and_then(Value::as_str);
+    let override_sender = sender_override_val
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+
+    let (sender_id, acting_as): (String, Option<String>) = if let Some(sender) = override_sender {
+        match conexus_db::message_repository::recipient_exists(&guard, sender) {
+            Ok(true) => (sender.to_string(), Some(sender.to_string())),
+            Ok(false) => {
+                drop(guard);
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "sender_id must be an existing agent in this project"})),
+                )
+                    .into_response();
+            }
+            Err(_) => {
+                drop(guard);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "Failed to send message"})),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        (operator_id.clone(), None)
+    };
+
+    if recipient_id == "*" {
+        let active = match conexus_db::agent_repository::AgentRepository::list_active(&guard) {
+            Ok(rows) => rows,
+            Err(_) => {
+                drop(guard);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "Failed to send message"})),
+                )
+                    .into_response();
+            }
+        };
+        // `g.active_agents` re-derived from `list_active` (DB-fresh),
+        // matching every prior "which agents are active" REST/tool
+        // re-derivation this migration has made -- `status == "system"`
+        // additionally excluded since a real `g.active_agents` snapshot
+        // (only `register_agent` populates it) would never contain the
+        // synthetic system pseudo-agent either.
+        let recipients: Vec<String> = active
+            .into_iter()
+            .filter(|a| a.status != "system" && a.agent_id != "admin" && a.agent_id != sender_id)
+            .map(|a| a.agent_id)
+            .collect();
+        let message_ids: Vec<String> = recipients.iter().map(|_| random_message_id()).collect();
+        let rows: Vec<conexus_db::message_repository::NewMessage> = recipients
+            .iter()
+            .zip(message_ids.iter())
+            .map(
+                |(recipient, message_id)| conexus_db::message_repository::NewMessage {
+                    message_id,
+                    sender_id: &sender_id,
+                    recipient_id: recipient,
+                    message_content: content,
+                    message_type,
+                    priority,
+                    timestamp: &now,
+                    delivered: false,
+                    read: false,
+                    subject: None,
+                    parent_message_id: None,
+                },
+            )
+            .collect();
+
+        // The whole transaction is confined to this closure so the
+        // `Transaction`'s borrow of `guard` provably ends when the
+        // closure returns -- letting `guard` drop cleanly right after,
+        // regardless of which branch inside fired. `rusqlite::
+        // Transaction`'s own `Drop` impl (rollback-on-drop) makes the
+        // borrow-checker's conservative liveness region span every
+        // branch of an un-scoped `let tx = ...; if ... { drop(guard);
+        // return ...}` shape -- confining it here avoids that entirely
+        // rather than fighting NLL diagnostics branch by branch.
+        let outcome: Result<usize, ()> = (|| {
+            let tx = guard.unchecked_transaction().map_err(|_| ())?;
+            conexus_db::message_repository::bulk_send(&tx, &rows).map_err(|_| ())?;
+            let mut details = json!({"recipients": recipients, "sent_count": recipients.len()});
+            if let Some(ref acting) = acting_as {
+                details["operator"] = json!(operator_id);
+                details["acting_as"] = json!(acting);
+            }
+            conexus_db::agent_action_repository::log_agent_action(
+                &tx,
+                &operator_id,
+                "broadcast_message_via_dashboard",
+                None,
+                Some(&details),
+                &now,
+            )
+            .map_err(|_| ())?;
+            tx.commit().map_err(|_| ())?;
+            Ok(message_ids.len())
+        })();
+        drop(guard);
+        return match outcome {
+            Ok(sent_count) => Json(json!({
+                "success": true,
+                "broadcast": true,
+                "sent_count": sent_count,
+                "message_ids": message_ids,
+                "message": format!("Broadcast sent to {sent_count} agents"),
+            }))
+            .into_response(),
+            Err(()) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Failed to send message"})),
+            )
+                .into_response(),
+        };
+    }
+
+    // Reply (parent set) always stores subject NULL, matching
+    // `send_agent_message`'s own identical effective-subject rule.
+    let effective_subject = if parent_message_id.is_some() {
+        None
+    } else {
+        explicit_subject
+    };
+    let message_id = random_message_id();
+
+    // Same closure-confinement as the broadcast branch above -- see its
+    // comment for why.
+    enum SingleSendOutcome {
+        Sent,
+        RecipientNotFound,
+        ParentNotFound,
+        Failed,
+    }
+    let outcome: SingleSendOutcome = (|| {
+        let tx = match guard.unchecked_transaction() {
+            Ok(tx) => tx,
+            Err(_) => return SingleSendOutcome::Failed,
+        };
+        let sent = conexus_db::message_repository::send(
+            &tx,
+            conexus_db::message_repository::NewMessage {
+                message_id: &message_id,
+                sender_id: &sender_id,
+                recipient_id,
+                message_content: content,
+                message_type,
+                priority,
+                timestamp: &now,
+                delivered: false,
+                read: false,
+                subject: effective_subject,
+                parent_message_id,
+            },
+        );
+        match sent {
+            Ok(_) => {
+                let mut details = json!({"message_id": message_id, "recipient": recipient_id});
+                if let Some(ref acting) = acting_as {
+                    details["operator"] = json!(operator_id);
+                    details["acting_as"] = json!(acting);
+                }
+                let log_result = conexus_db::agent_action_repository::log_agent_action(
+                    &tx,
+                    &operator_id,
+                    "sent_message_via_dashboard",
+                    None,
+                    Some(&details),
+                    &now,
+                );
+                if log_result.is_err() || tx.commit().is_err() {
+                    return SingleSendOutcome::Failed;
+                }
+                SingleSendOutcome::Sent
+            }
+            Err(conexus_db::message_repository::SendMessageError::RecipientNotFound(_)) => {
+                SingleSendOutcome::RecipientNotFound
+            }
+            Err(conexus_db::message_repository::SendMessageError::ParentMessageNotFound(_)) => {
+                SingleSendOutcome::ParentNotFound
+            }
+            Err(conexus_db::message_repository::SendMessageError::Db(_)) => {
+                SingleSendOutcome::Failed
+            }
+        }
+    })();
+    drop(guard);
+
+    match outcome {
+        SingleSendOutcome::Sent => {
+            // BL-R8-1: the wake fires only AFTER a successful commit --
+            // matches `u.on_commit(_wake_recipient)`'s post-commit-only
+            // registration exactly.
+            shared.waiter_registry.notify(recipient_id);
+            Json(json!({
+                "success": true,
+                "message_id": message_id,
+                "message": format!("Message sent to {recipient_id}"),
+            }))
+            .into_response()
+        }
+        SingleSendOutcome::RecipientNotFound => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "Recipient not found"})),
+        )
+            .into_response(),
+        SingleSendOutcome::ParentNotFound => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "Parent message not found"})),
+        )
+            .into_response(),
+        SingleSendOutcome::Failed => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "Failed to send message"})),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /api/messages/{message_id}/thread` -- the whole conversation,
+/// matching `get_message_thread_api_route`. The repo owns the
+/// root-walk + recursive-CTE collection; this just funnels the path
+/// param through and 404s an empty result (message doesn't exist).
+pub async fn get_message_thread(
+    Path(message_id): Path<String>,
+    State(shared): State<Arc<SharedState>>,
+) -> Response {
+    let guard = shared.conn.lock().await;
+    let thread = conexus_db::message_repository::fetch_thread(&guard, &message_id);
+    drop(guard);
+    match thread {
+        Ok(rows) if !rows.is_empty() => {
+            let thread: Vec<Value> = rows.iter().map(message_row_to_json).collect();
+            Json(json!({"thread": thread})).into_response()
+        }
+        Ok(_) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "Message not found"})),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "Failed to fetch message thread"})),
+        )
+            .into_response(),
+    }
+}
+
+/// `PATCH /api/messages/{message_id}` -- flips `read`/`delivered`,
+/// matching the PATCH branch of Python's combined
+/// `patch_message_api_route`. Shares its generic-error string
+/// ("Failed to patch message") with [`delete_message`] since Python's
+/// two branches share one `except Exception` handler.
+pub async fn patch_message(
+    Path(message_id): Path<String>,
+    State(shared): State<Arc<SharedState>>,
+    Extension(resolved): Extension<ResolvedRestPrincipal>,
+    body: Bytes,
+) -> Response {
+    let data = match decode_untrusted_body(&body) {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
+    };
+
+    let guard = shared.conn.lock().await;
+    if conexus_db::message_repository::get_by_id(&guard, &message_id)
+        .unwrap_or(None)
+        .is_none()
+    {
+        drop(guard);
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "Message not found"})),
+        )
+            .into_response();
+    }
+
+    // `'read' in data` (key PRESENCE, including an explicit `null`) --
+    // not "value is non-null". `data.get("read")` on this crate's
+    // `serde_json::Map` returns `Some(&Value::Null)` for an explicit
+    // `null`, matching that presence check exactly; `is_json_falsy`
+    // then reproduces Python's `bool(None) == False` truthiness.
+    let mut updates: Vec<(&'static str, bool)> = Vec::new();
+    if let Some(v) = data.get("read") {
+        updates.push(("read", !is_json_falsy(Some(v))));
+    }
+    if let Some(v) = data.get("delivered") {
+        updates.push(("delivered", !is_json_falsy(Some(v))));
+    }
+    if updates.is_empty() {
+        drop(guard);
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "no updatable field provided (read, delivered)"})),
+        )
+            .into_response();
+    }
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let operator_id = resolved.admission.caller_identity();
+    let fields: Vec<&str> = updates.iter().map(|(c, _)| *c).collect();
+
+    // Closure-confined transaction -- see `create_message`'s single-send
+    // branch comment for why this shape is needed at all.
+    let ok: bool = (|| -> bool {
+        let tx = match guard.unchecked_transaction() {
+            Ok(tx) => tx,
+            Err(_) => return false,
+        };
+        for (col, val) in &updates {
+            let result = match *col {
+                "delivered" => {
+                    conexus_db::message_repository::mark_delivered(&tx, &message_id, *val)
+                }
+                "read" => conexus_db::message_repository::mark_read(&tx, &message_id, *val),
+                _ => unreachable!("updates only ever pushes \"read\"/\"delivered\""),
+            };
+            if result.is_err() {
+                return false;
+            }
+        }
+        let details = json!({"message_id": message_id, "fields": fields});
+        let log_result = conexus_db::agent_action_repository::log_agent_action(
+            &tx,
+            &operator_id,
+            "updated_message",
+            None,
+            Some(&details),
+            &now,
+        );
+        log_result.is_ok() && tx.commit().is_ok()
+    })();
+    drop(guard);
+
+    if ok {
+        Json(json!({"success": true})).into_response()
+    } else {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "Failed to patch message"})),
+        )
+            .into_response()
+    }
+}
+
+/// `DELETE /api/messages/{message_id}` -- removes the row, matching
+/// the DELETE branch of Python's combined `patch_message_api_route`.
+/// See [`patch_message`]'s doc for why the two are separate axum
+/// handlers despite sharing one Python function.
+pub async fn delete_message(
+    Path(message_id): Path<String>,
+    State(shared): State<Arc<SharedState>>,
+    Extension(resolved): Extension<ResolvedRestPrincipal>,
+) -> Response {
+    let guard = shared.conn.lock().await;
+    if conexus_db::message_repository::get_by_id(&guard, &message_id)
+        .unwrap_or(None)
+        .is_none()
+    {
+        drop(guard);
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "Message not found"})),
+        )
+            .into_response();
+    }
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let operator_id = resolved.admission.caller_identity();
+
+    // Closure-confined transaction -- see `create_message`'s single-send
+    // branch comment for why this shape is needed at all.
+    let ok: bool = (|| -> bool {
+        let tx = match guard.unchecked_transaction() {
+            Ok(tx) => tx,
+            Err(_) => return false,
+        };
+        if conexus_db::message_repository::delete(&tx, &message_id).is_err() {
+            return false;
+        }
+        let details = json!({"message_id": message_id});
+        let log_result = conexus_db::agent_action_repository::log_agent_action(
+            &tx,
+            &operator_id,
+            "deleted_message_via_dashboard",
+            None,
+            Some(&details),
+            &now,
+        );
+        log_result.is_ok() && tx.commit().is_ok()
+    })();
+    drop(guard);
+
+    if ok {
+        Json(json!({"success": true, "deleted": message_id})).into_response()
+    } else {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            // Python's shared except-block wording (see module doc).
+            Json(json!({"error": "Failed to patch message"})),
+        )
+            .into_response()
+    }
 }
