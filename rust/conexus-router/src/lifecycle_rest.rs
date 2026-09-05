@@ -22,9 +22,10 @@
 //! that await -- gap 5 from this PR's own research, confirmed
 //! harmless but real).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::extract::{Extension, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
@@ -33,9 +34,11 @@ use conexus_core::capability::Capability;
 
 use crate::lifecycle;
 use crate::mcp_handler::{HandlerBody, HandlerResponse};
-use crate::perm_gates::{self, RevalidationSpec};
+use crate::orchestrator::primitives::{backend_impl_for, run_systemctl, unit_name};
+use crate::perm_gates::{self, RevalidationProject, RevalidationSpec};
 use crate::project_gate::{self, CreateProjectOutcome, GateError};
 use crate::project_reads;
+use crate::project_teardown::{self, MutationPrecheck};
 use crate::session_gate::GateIdentity;
 use crate::state::RouterState;
 
@@ -90,6 +93,14 @@ pub async fn list_projects_handler(
 }
 
 /// Port of `create_project_handler`.
+///
+/// **Found-and-fixed bug (this PR)**: the original version of this
+/// handler never checked `disables_write_endpoint` at all -- ADR-0008
+/// single-tenant mode disables every project-lifecycle WRITE endpoint
+/// (the deploy's topology is fixed for its lifetime), and Python's
+/// real handler runs this check as its own very first line, before
+/// even the body-read. Confirmed real, not theoretical: a single-
+/// tenant deploy's `create_project` should always 410, and didn't.
 pub async fn create_project_handler(
     State(state): State<Arc<RouterState>>,
     Extension(identity): Extension<GateIdentity>,
@@ -103,6 +114,10 @@ pub async fn create_project_handler(
         Capability::SystemProjectsManage,
     ) {
         return resp.into_response();
+    }
+    if crate::single_tenant::disables_write_endpoint(single_tenant_name) {
+        return crate::single_tenant::single_tenant_disabled_response(single_tenant_name)
+            .into_response();
     }
 
     let conn = state.conn.lock().await;
@@ -144,4 +159,239 @@ pub async fn create_project_handler(
         .into_response(),
         CreateProjectOutcome::Rejected(resp) => resp.into_response(),
     }
+}
+
+/// Resolve the real systemd unit for `name`'s backend and run
+/// `systemctl <args> <unit>` through the router's configured
+/// program/mode/timeout -- the one real yield point both
+/// `delete_project_handler`/`stop_project_handler` fuse via
+/// `perm_gates::revalidate_after`.
+async fn systemctl_on_backend(
+    state: &RouterState,
+    name: &str,
+    args: &[&str],
+) -> Result<crate::orchestrator::primitives::SystemctlResult, HandlerResponse> {
+    let backend_impl = backend_impl_for(&state.registry, name)
+        .map_err(|e| HandlerResponse::from(GateError::from(e)))?;
+    let unit = unit_name(name, "backend", &backend_impl)
+        .map_err(|e| internal_error(format!("could not resolve unit for {name:?}: {e:?}")))?;
+    let mut full_args: Vec<&str> = args.to_vec();
+    full_args.push(&unit);
+    Ok(run_systemctl(
+        &state.ensure_config.systemctl_program,
+        state.ensure_config.systemctl_mode,
+        &full_args,
+        state.ensure_config.systemctl_timeout,
+    )
+    .await)
+}
+
+/// Port of `delete_project_handler`.
+pub async fn delete_project_handler(
+    State(state): State<Arc<RouterState>>,
+    Extension(identity): Extension<GateIdentity>,
+    Path(name): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
+    let single_tenant_name = state.mcp_handler_config.single_tenant_name.as_deref();
+    if crate::single_tenant::disables_write_endpoint(single_tenant_name) {
+        return crate::single_tenant::single_tenant_disabled_response(single_tenant_name)
+            .into_response();
+    }
+
+    let workspace = {
+        let conn = state.conn.lock().await;
+        match project_teardown::project_mutation_precheck(
+            &conn,
+            &state.registry,
+            &state.runtime,
+            identity.is_sysadmin,
+            Some(&identity.user.user_id),
+            &name,
+        ) {
+            Ok(MutationPrecheck::Rejected(resp)) => return resp.into_response(),
+            Ok(MutationPrecheck::Proceed) => {}
+            Err(e) => return HandlerResponse::from(e).into_response(),
+        }
+        match state.registry.get(&name) {
+            Ok(Some(row)) => row.workspace,
+            Ok(None) => {
+                // Unreachable in practice (Proceed already confirmed the
+                // row exists) -- fail closed rather than panic.
+                return lifecycle::error_envelope(
+                    lifecycle::LifecycleError::NotRegistered,
+                    &format!("unknown project: {name:?}"),
+                    None,
+                )
+                .into_response();
+            }
+            Err(e) => return HandlerResponse::from(GateError::from(e)).into_response(),
+        }
+    };
+
+    let want_delete = project_teardown::parse_delete_workspace_flag(
+        params.get("delete_workspace").map(String::as_str),
+    );
+    let workspace_outcome = project_teardown::maybe_delete_workspace(
+        std::path::Path::new(&workspace),
+        &state.default_workspace_parent,
+        want_delete,
+    );
+
+    let now = Utc::now();
+    let now_str = now.to_rfc3339();
+    let spec = RevalidationSpec {
+        stale_user_id: &identity.user.user_id,
+        cookie_header: cookie_header(&headers),
+        now: &now_str,
+        cap: Capability::SystemProjectsManage,
+        project: Some(RevalidationProject {
+            project_name: &name,
+            min_role: Some("operator"),
+        }),
+    };
+
+    let (_lock_guard, _principal) =
+        match perm_gates::revalidated_lock(&state.runtime, &state.conn, &name, "backend", &spec)
+            .await
+        {
+            Ok(v) => v,
+            Err(resp) => return resp.into_response(),
+        };
+    if let Some(resp) = project_teardown::active_sessions_recheck(&state.runtime, &name) {
+        return resp.into_response();
+    }
+
+    // Delete ignores the systemctl-stop RESULT entirely (unlike stop
+    // below) -- the unregister/purge proceeds unconditionally, even if
+    // the unit was already inactive or the stop itself failed. Only
+    // the REVALIDATION half of `revalidate_after` can still deny.
+    let stop_awaitable = systemctl_stop_ignoring_result(&state, &name);
+    let (_ignored, revalidate_result) =
+        perm_gates::revalidate_after(stop_awaitable, &state.conn, &spec).await;
+    if let Err(resp) = revalidate_result {
+        return resp.into_response();
+    }
+
+    let finish_result = {
+        let conn = state.conn.lock().await;
+        project_teardown::finish_delete_project(
+            &conn,
+            &state.registry,
+            &state.runtime,
+            &name,
+            &state.sock_dir,
+            state.token_dir.as_deref(),
+        )
+    };
+    if let Err(e) = finish_result {
+        return HandlerResponse::from(e).into_response();
+    }
+
+    let mut payload = serde_json::json!({
+        "unregistered": name,
+        "workspace_deleted": workspace_outcome.deleted,
+    });
+    if let Some(reason) = workspace_outcome.skipped_reason {
+        payload["workspace_delete_skipped_reason"] = serde_json::Value::String(reason);
+    }
+    lifecycle::success_envelope(payload, 200).into_response()
+}
+
+/// `systemctl stop <unit>`, mapping a resolution failure to `()`
+/// rather than a `HandlerResponse` -- delete's own contract is to
+/// ignore the stop result either way, so there's nothing for its
+/// caller to branch on.
+async fn systemctl_stop_ignoring_result(state: &RouterState, name: &str) {
+    let _ = systemctl_on_backend(state, name, &["stop"]).await;
+}
+
+/// Port of `stop_project_handler`. Unlike delete, this DOES branch on
+/// the systemctl-stop result -- a nonzero return code is a 500 with a
+/// static message (SD-R15-1: never the raw unit path or systemd
+/// stderr), and `finish_stop_project` is never called in that case.
+pub async fn stop_project_handler(
+    State(state): State<Arc<RouterState>>,
+    Extension(identity): Extension<GateIdentity>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let workspace_check = {
+        let conn = state.conn.lock().await;
+        project_teardown::project_mutation_precheck(
+            &conn,
+            &state.registry,
+            &state.runtime,
+            identity.is_sysadmin,
+            Some(&identity.user.user_id),
+            &name,
+        )
+    };
+    match workspace_check {
+        Ok(MutationPrecheck::Rejected(resp)) => return resp.into_response(),
+        Ok(MutationPrecheck::Proceed) => {}
+        Err(e) => return HandlerResponse::from(e).into_response(),
+    }
+
+    let now = Utc::now();
+    let now_str = now.to_rfc3339();
+    let spec = RevalidationSpec {
+        stale_user_id: &identity.user.user_id,
+        cookie_header: cookie_header(&headers),
+        now: &now_str,
+        cap: Capability::SystemProjectsManage,
+        project: Some(RevalidationProject {
+            project_name: &name,
+            min_role: Some("operator"),
+        }),
+    };
+
+    let (_lock_guard, _principal) =
+        match perm_gates::revalidated_lock(&state.runtime, &state.conn, &name, "backend", &spec)
+            .await
+        {
+            Ok(v) => v,
+            Err(resp) => return resp.into_response(),
+        };
+    if let Some(resp) = project_teardown::active_sessions_recheck(&state.runtime, &name) {
+        return resp.into_response();
+    }
+
+    let is_active_awaitable = systemctl_is_active(&state, &name);
+    let (is_active, revalidate_result) =
+        perm_gates::revalidate_after(is_active_awaitable, &state.conn, &spec).await;
+    if let Err(resp) = revalidate_result {
+        return resp.into_response();
+    }
+
+    if is_active {
+        let stop_awaitable = systemctl_on_backend(&state, &name, &["stop"]);
+        let (stop_result, revalidate_result) =
+            perm_gates::revalidate_after(stop_awaitable, &state.conn, &spec).await;
+        if let Err(resp) = revalidate_result {
+            return resp.into_response();
+        }
+        match stop_result {
+            Ok(r) if r.success() => {}
+            Ok(_) | Err(_) => {
+                return internal_error("failed to stop project backend").into_response();
+            }
+        }
+    }
+
+    project_teardown::finish_stop_project(&state.runtime, &name);
+    lifecycle::success_envelope(serde_json::json!({"stopped": name}), 200).into_response()
+}
+
+/// `systemctl is-active <unit>` for `name`'s backend, folding a
+/// unit-resolution failure into `false` (treated as "not active" --
+/// `stop_project_handler` skips the destructive stop call either way,
+/// matching Python's own `_is_active` returning `False` on any
+/// subprocess error).
+async fn systemctl_is_active(state: &RouterState, name: &str) -> bool {
+    systemctl_on_backend(state, name, &["is-active"])
+        .await
+        .map(|r| r.success())
+        .unwrap_or(false)
 }

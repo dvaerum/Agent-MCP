@@ -131,16 +131,52 @@ pub fn workspace_label(workspace: &str, default_workspace_parent: &Path) -> Stri
 /// hard `rm` -- only allowed when the workspace path is rooted inside
 /// `default_workspace_parent`, comparing resolved (symlink-followed)
 /// paths so traversal can't escape the bound. Fails CLOSED (denies
-/// the hard rm) on any resolution error, including an embedded-NUL
-/// path.
+/// the hard rm) on an embedded-NUL path or an unresolvable parent.
+///
+/// **Found-and-fixed bug**: an earlier version of this function
+/// required the WORKSPACE path itself to exist (`Path::canonicalize`
+/// is strict), so `delete_project_handler`'s `?delete_workspace=true`
+/// path for an ALREADY-absent-on-disk workspace (a real, documented
+/// Python branch -- `workspace_delete_skipped_reason = "workspace did
+/// not exist on disk"`) was wrongly rejected as "outside the default
+/// workspace parent" instead. Python's own `Path.resolve()` (no
+/// `strict=True`) tolerates a nonexistent tail; this now matches by
+/// falling back to a pure lexical normalization (dot-segment removal,
+/// no filesystem access) when the strict canonicalize fails for a
+/// reason OTHER than an embedded NUL byte, reusing the same
+/// canonicalize-or-lexical-fallback idiom `conexus_tools::
+/// file_metadata_tools::normalize_filepath` already established for
+/// the identical Python `Path.resolve()`-without-`strict` semantics.
 pub fn is_within_default_workspace(workspace_path: &Path, default_workspace_parent: &Path) -> bool {
-    let Ok(workspace_resolved) = workspace_path.canonicalize() else {
-        return false;
-    };
+    if workspace_path.as_os_str().as_encoded_bytes().contains(&0) {
+        return false; // R6-F3: an embedded NUL byte fails closed, never falls through.
+    }
     let Ok(parent_resolved) = default_workspace_parent.canonicalize() else {
         return false;
     };
+    let workspace_resolved = workspace_path
+        .canonicalize()
+        .unwrap_or_else(|_| normalize_lexically(workspace_path));
     workspace_resolved.starts_with(&parent_resolved)
+}
+
+fn normalize_lexically(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out: Vec<Component> = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match out.last() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                Some(Component::RootDir) => {}
+                _ => out.push(component),
+            },
+            other => out.push(other),
+        }
+    }
+    out.iter().collect()
 }
 
 /// The closed set of lifecycle-REST error discriminators -- port of
@@ -382,7 +418,7 @@ mod tests {
     }
 
     #[test]
-    fn is_within_default_workspace_fails_closed_on_a_nonexistent_path() {
+    fn is_within_default_workspace_denies_a_nonexistent_sibling_outside_the_parent() {
         let dir = tempfile::tempdir().unwrap();
         let parent = dir.path().join("projects");
         std::fs::create_dir_all(&parent).unwrap();
@@ -390,6 +426,31 @@ mod tests {
             &dir.path().join("does-not-exist"),
             &parent
         ));
+    }
+
+    #[test]
+    fn is_within_default_workspace_admits_a_not_yet_existing_child_of_the_parent() {
+        // Found-and-fixed bug regression: delete_project_handler's
+        // "workspace did not exist on disk" branch (a real, documented
+        // Python outcome) requires a not-yet-existing workspace path
+        // to still be recognised as WITHIN the parent -- Python's own
+        // Path.resolve() (no strict=True) tolerates a nonexistent
+        // tail, matching this.
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("projects");
+        std::fs::create_dir_all(&parent).unwrap();
+        let never_created = parent.join("proj-a");
+        assert!(is_within_default_workspace(&never_created, &parent));
+    }
+
+    #[test]
+    fn is_within_default_workspace_denies_an_embedded_nul_byte_even_when_lexically_inside() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("projects");
+        std::fs::create_dir_all(&parent).unwrap();
+        let malformed = parent.join(std::ffi::OsStr::from_bytes(b"proj\0a"));
+        assert!(!is_within_default_workspace(&malformed, &parent));
     }
 
     // -- envelopes --------------------------------------------------------
