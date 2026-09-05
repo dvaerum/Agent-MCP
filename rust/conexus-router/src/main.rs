@@ -34,6 +34,7 @@ mod client_disconnect;
 mod identity;
 mod json_sanitize;
 mod lifecycle;
+mod lifecycle_rest;
 mod login;
 mod mcp_handler;
 mod middleware;
@@ -260,6 +261,14 @@ async fn main() -> Result<()> {
     // enforcement (the admin router has no comparably-sized body yet).
     let admin_router: Router<std::sync::Arc<state::RouterState>> = Router::new()
         .route("/health", get(health))
+        .route(
+            "/agent-mcp/api/router/health",
+            get(lifecycle_rest::health_handler),
+        )
+        .route(
+            "/agent-mcp/api/router/projects",
+            get(lifecycle_rest::list_projects_handler).post(lifecycle_rest::create_project_handler),
+        )
         .layer(axum::middleware::from_fn_with_state(
             std::sync::Arc::clone(&state),
             middleware::session_gate_layer,
