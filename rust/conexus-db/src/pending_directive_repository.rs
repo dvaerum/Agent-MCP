@@ -65,8 +65,12 @@ pub struct DirectiveEventData {
 /// defensive fallback for a stored empty-string priority (the DB
 /// column is `NOT NULL DEFAULT 'urgent'`, but this guards a row that
 /// somehow got an empty string written directly, bypassing
-/// `create_poke`'s own default).
-fn poke_event(poke_id: &str, prompt: &str, priority: &str, timestamp: &str) -> DirectiveEvent {
+/// `create_poke`'s own default). `pub` (not `pub(crate)`): Phase E1 PR
+/// 14 (`conexus-rest-delivery-transport`) needs the identical wire
+/// shape to build the `delivery` frame `POST /api/agents/{id}/
+/// directive` pushes onto an already-connected worker's stream, the
+/// same event this repository's own INSERT path constructs.
+pub fn poke_event(poke_id: &str, prompt: &str, priority: &str, timestamp: &str) -> DirectiveEvent {
     let priority = if priority.is_empty() {
         "urgent"
     } else {

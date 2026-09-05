@@ -78,6 +78,13 @@ pub struct SharedState {
     /// and the handful of REST handlers that write without going
     /// through a tool at all.
     pub operator_events: crate::operator_events::OperatorEventsHub,
+    /// The per-worker delivery-transport registry (ADR-0021, Phase E1
+    /// PR 14/14, `/api/delivery/*`) -- keyed by `agent_id`, one
+    /// instance per backend process. A genuinely separate hub from
+    /// `operator_events` above despite the structural similarity: this
+    /// one is worker-bearer-authed and keyed by `agent_id`, never
+    /// reached from the operator dashboard's own doors.
+    pub delivery_transport: crate::delivery_transport::DeliveryTransportHub,
 }
 
 /// [`ProgressSink`] backed by a real MCP [`Peer`]/[`ProgressToken`]

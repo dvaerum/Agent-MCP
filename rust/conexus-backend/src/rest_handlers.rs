@@ -1695,6 +1695,11 @@ pub async fn all_data(
                 // there is no SSE-derived connection timestamp to
                 // report -- always None, not a guessed value.
                 "last_mcp_connection": Option::<String>::None,
+                // Was missing entirely from this handler's projection
+                // (found while wiring `delivery_transport` in PR 14) --
+                // Python's real `_mcp_presence_for` includes this field
+                // here too, not just on `/api/agents`.
+                "transport_status": shared.delivery_transport.get_status(&a.agent_id),
             })
         })
         .collect();
@@ -2584,12 +2589,11 @@ pub async fn delete_message(
 /// **Documented scope gap, same shape as `/api/all-data`'s (PR 9)**:
 /// Python's `_mcp_presence_for` merges the waiter-registry PRIMARY
 /// signal with a `core.session_registry`-derived SECONDARY signal (live
-/// SSE streams, also `last_mcp_connection`'s source) and a
-/// `features.delivery_transport` status. Neither `session_registry` nor
-/// `delivery_transport` has a Rust equivalent yet -- this port
-/// implements the primary (waiter) signal only; `transport_status` is
-/// always `null`. Tracked to close once that SSE/pub-sub subsystem
-/// exists (this phase's own remaining PRs), not guessed at early.
+/// SSE streams, also `last_mcp_connection`'s source). `session_registry`
+/// has no Rust equivalent yet -- this port implements the primary
+/// (waiter) signal only for `online`/`last_mcp_connection`.
+/// `transport_status` (a THIRD, independent signal) is real as of
+/// PR 14 (`conexus-rest-delivery-transport`)'s `DeliveryTransportHub`.
 pub async fn list_agents_dashboard(
     State(shared): State<Arc<SharedState>>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
@@ -2641,7 +2645,9 @@ pub async fn list_agents_dashboard(
                 "auto_event_loop": a.auto_event_loop,
                 "online": online,
                 "last_mcp_connection": if online { a.last_activity_at.clone() } else { None },
-                "transport_status": Value::Null,
+                // Real as of PR 14 (`conexus-rest-delivery-transport`)
+                // -- was unconditionally null before that hub existed.
+                "transport_status": shared.delivery_transport.get_status(&a.agent_id),
             })
         })
         .collect();
@@ -3318,18 +3324,14 @@ const POKE_PRIORITIES: [&str; 4] = ["low", "normal", "high", "urgent"];
 /// matching `poke_agent_directive_api_route`. Inserts a
 /// `pending_directive` row and fires a waiter-wake so a listening
 /// agent gets it immediately; a busy agent picks it up on its next
-/// check-in.
-///
-/// **Documented scope gap**: Python's `_dt.push(...)` (the
-/// `delivery_transport` channel -- a chat-style session connected via
-/// aoe-bridge but not currently blocked in `wait_for_events`) is
-/// fired "IN ADDITION TO" the waiter-wake this port already performs.
-/// `delivery_transport` has no Rust equivalent yet (same SSE/pub-sub
-/// subsystem gap as `session_registry`); the `pending_directive` row +
-/// waiter-wake this function DOES perform is the PRIMARY delivery
-/// path and fully functional -- an agent with only a delivery-
-/// transport connection (no parked waiter) won't see the poke until
-/// its next natural check-in, where Python would push it immediately.
+/// check-in. As of PR 14 (`conexus-rest-delivery-transport`), ALSO
+/// pushes the identical `directive` frame onto the worker's live
+/// delivery-transport stream if one is open (Python's own "IN
+/// ADDITION TO the waiter-wake above" -- a chat-style session
+/// connected via a runtime like aoe-bridge, but not currently blocked
+/// in `wait_for_events`, now sees the poke immediately too, matching
+/// Python's real behavior byte-for-byte instead of the bounded gap
+/// PRs 9-13 each had to document here).
 pub async fn poke_agent_directive(
     Path(agent_id): Path<String>,
     State(shared): State<Arc<SharedState>>,
@@ -3435,6 +3437,21 @@ pub async fn poke_agent_directive(
 
     shared.waiter_registry.notify(&agent_id);
     let delivered = shared.waiter_registry.waiter_count(&agent_id) > 0;
+
+    // "IN ADDITION TO" the waiter-wake above, independent channels --
+    // a worker can be delivery-transport-connected, have a parked
+    // waiter, both, or neither (matching Python's own comment on this
+    // exact call site).
+    if shared.delivery_transport.is_connected(&agent_id) {
+        let frame = json!({
+            "type": "delivery",
+            "reason": "poke_due",
+            "directive": conexus_db::pending_directive_repository::poke_event(
+                &poke_id, prompt, priority, &now,
+            ),
+        });
+        shared.delivery_transport.push(&agent_id, frame);
+    }
 
     Json(json!({
         "success": true,
@@ -3594,4 +3611,131 @@ pub async fn operator_events_status(State(shared): State<Arc<SharedState>>) -> R
         "subscribers": shared.operator_events.snapshot(chrono::Utc::now()),
     }))
     .into_response()
+}
+
+// -- /api/delivery (Phase E1 PR 14/14, conexus-rest-delivery-transport) --
+//
+// The per-worker fallback push channel (ADR-0021). Gated by
+// `crate::delivery_gate::require_delivery_agent_bearer` -- a THIRD
+// `/api` admission door (see that module's own doc), never
+// `rest_gate` (which explicitly rejects a worker bearer) or
+// `auth_gate` (which also admits a forwarding header, meaningless for
+// a channel keyed by `agent_id`). Mounted as its own sub-router in
+// `main.rs`, outside both `api_public`/`api_authenticated`.
+
+/// How often this stream re-validates its bearer -- kept equal to the
+/// keepalive ping, matching `operator_events`'s own precedent and
+/// Python's identical `REVALIDATE_SECONDS = PING_SECONDS`.
+const DELIVERY_PING_SECONDS: u64 = 15;
+
+/// RAII cleanup for one delivery-stream subscription -- see
+/// `EventsUnsubscribeGuard`'s own doc for why this is the destructor,
+/// not a hand-written `finally`.
+struct DeliveryUnsubscribeGuard {
+    shared: Arc<SharedState>,
+    id: u64,
+}
+
+impl Drop for DeliveryUnsubscribeGuard {
+    fn drop(&mut self) {
+        self.shared.delivery_transport.unsubscribe(self.id);
+    }
+}
+
+/// `GET /api/delivery/stream` -- streams skinny delivery frames to the
+/// worker's runtime as SSE, matching `delivery_stream`. R13-F2: the
+/// re-validation predicate is `AgentRepository::is_live` (the same
+/// canonical `LIVE_AGENT_SQL`/`NOT_TERMINAL_SQL` DB-backed check
+/// `delivery_gate` itself used to admit the connection) -- a stream
+/// opened before revocation must tear down, not survive it
+/// (AC-R29-1's class).
+pub async fn delivery_stream(
+    State(shared): State<Arc<SharedState>>,
+    Extension(identity): Extension<crate::delivery_gate::ResolvedDeliveryIdentity>,
+) -> impl IntoResponse {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use conexus_wakeloop::stream_gates::{Liveness, RevalidatingStream, StreamSlice};
+
+    let agent_id = identity.agent_id;
+    let sub = shared.delivery_transport.subscribe(&agent_id);
+    let guard = DeliveryUnsubscribeGuard {
+        shared: shared.clone(),
+        id: sub.id,
+    };
+
+    let agent_id_for_liveness = agent_id.clone();
+    let shared_for_liveness = shared.clone();
+    let gate = RevalidatingStream::new(
+        sub.receiver,
+        move || {
+            let shared = shared_for_liveness.clone();
+            let agent_id = agent_id_for_liveness.clone();
+            Box::pin(async move {
+                let guard = shared.conn.lock().await;
+                let live =
+                    conexus_db::agent_repository::AgentRepository::is_live(&guard, &agent_id)
+                        .unwrap_or(false);
+                if live {
+                    Liveness::live()
+                } else {
+                    Liveness::revoked("agent bearer no longer live")
+                }
+            })
+        },
+        || DELIVERY_PING_SECONDS as f64,
+    );
+
+    let stream = futures_util::stream::unfold((gate, guard), move |(mut gate, guard)| async move {
+        loop {
+            match gate.next_slice(None).await {
+                Ok(StreamSlice::Idle) => continue,
+                Ok(StreamSlice::Item(payload)) => {
+                    let event = Event::default().data(payload.to_string());
+                    return Some((Ok::<Event, std::convert::Infallible>(event), (gate, guard)));
+                }
+                Err(_revoked) => return None,
+            }
+        }
+    });
+
+    Sse::new(stream).keep_alive(
+        KeepAlive::new().interval(std::time::Duration::from_secs(DELIVERY_PING_SECONDS)),
+    )
+}
+
+/// `POST /api/delivery/status` -- records the worker's runtime-reported
+/// `transport-status`, matching `delivery_status`.
+pub async fn delivery_status(
+    State(shared): State<Arc<SharedState>>,
+    Extension(identity): Extension<crate::delivery_gate::ResolvedDeliveryIdentity>,
+    body: Bytes,
+) -> Response {
+    let data = match decode_untrusted_body(&body) {
+        Ok(d) => d,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"detail": "request body must be a JSON object"})),
+            )
+                .into_response()
+        }
+    };
+    let Some(status) = data.get("status").and_then(Value::as_str) else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"detail": format!("status must be one of {:?}", crate::delivery_transport::VALID_STATUSES)})),
+        )
+            .into_response();
+    };
+    if !crate::delivery_transport::VALID_STATUSES.contains(&status) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"detail": format!("status must be one of {:?}", crate::delivery_transport::VALID_STATUSES)})),
+        )
+            .into_response();
+    }
+    shared
+        .delivery_transport
+        .set_status(&identity.agent_id, status);
+    Json(json!({"ok": true, "agent_id": identity.agent_id, "status": status})).into_response()
 }
