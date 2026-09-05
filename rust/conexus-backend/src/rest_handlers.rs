@@ -984,3 +984,294 @@ async fn dispatch_through_tool(
     )
         .into_response()
 }
+
+// -- /api/tokens, /api/settings-data, /api/settings (Phase E1 PR 7/14,
+// conexus-rest-settings-store) ---------------------------------------
+
+/// `GET /api/tokens` -- every LIVE agent's bearer token, matching
+/// `tokens_api_route`. UNLIKE `/api/settings-data` below, this gates
+/// the WHOLE response on confirmed-operator-tier (plaintext bearers
+/// are the endpoint's entire contract -- there is no non-secret
+/// residue a masked row could return, so a blanket 403 replaces
+/// Python's per-row redaction here). Re-derived from the DB directly
+/// (`AgentRepository::list_active`, excluding `status == "system"`
+/// same as `ViewStatusTool`/`ViewAgentsTool`'s own precedent) rather
+/// than Python's in-memory `g.active_agents` cache, which this
+/// migration never built -- `list_active`'s `NOT_TERMINAL_SQL` filter
+/// is definitionally identical to `is_live_status`.
+pub async fn tokens(
+    State(shared): State<Arc<SharedState>>,
+    Extension(resolved): Extension<ResolvedRestPrincipal>,
+) -> Response {
+    if !resolved.confirmed_operator_tier {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "forbidden",
+                "message": "Agent bearer tokens are operator-tier only. Use an \
+                    operator-tier bearer (agent CLI / admin script) to read this endpoint.",
+            })),
+        )
+            .into_response();
+    }
+    let guard = shared.conn.lock().await;
+    let rows = match conexus_db::agent_repository::AgentRepository::list_active(&guard) {
+        Ok(rows) => rows,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Error retrieving tokens"})),
+            )
+                .into_response()
+        }
+    };
+    drop(guard);
+    let agent_tokens: Vec<_> = rows
+        .iter()
+        .filter(|a| a.status != "system")
+        .map(|a| json!({"agent_id": a.agent_id, "token": a.token}))
+        .collect();
+    Json(json!({"agent_tokens": agent_tokens})).into_response()
+}
+
+fn settings_row_to_json(row: &conexus_db::project_settings_repository::ProjectSettingRow) -> Value {
+    json!({
+        "context_key": row.context_key,
+        "value": row.value,
+        "description": row.description,
+        "created_at": row.created_at,
+        "created_by": row.created_by,
+        "updated_at": row.updated_at,
+        "updated_by": row.updated_by,
+    })
+}
+
+/// `GET /api/settings-data` -- every `project_settings` row, matching
+/// `settings_data_api_route`. CRITICAL (F009, preserved exactly): does
+/// NOT gate the whole response on confirmed-operator-tier -- real
+/// values go out to every admitted operator; only the genuinely-secret
+/// keys (currently none -- `SECRET_SETTING_KEYS` is schema-derived and
+/// empty today) redact per-row via the already-ported
+/// `redact_settings_row`, shared with the MCP view tool so the two
+/// surfaces can't drift.
+pub async fn settings_data(
+    State(shared): State<Arc<SharedState>>,
+    Extension(resolved): Extension<ResolvedRestPrincipal>,
+) -> Response {
+    let guard = shared.conn.lock().await;
+    let rows = match conexus_db::project_settings_repository::list_all(&guard) {
+        Ok(rows) => rows,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Failed to read project settings"})),
+            )
+                .into_response()
+        }
+    };
+    drop(guard);
+    let settings: Vec<_> = rows
+        .iter()
+        .map(|r| {
+            let redacted = conexus_tools::project_settings_tools::redact_settings_row(
+                r,
+                resolved.confirmed_operator_tier,
+            );
+            settings_row_to_json(&redacted)
+        })
+        .collect();
+    Json(json!({"settings": settings})).into_response()
+}
+
+/// Shared upsert adapter for `POST /api/settings` and `PUT
+/// /api/settings/{context_key}` -- both dispatch the gated
+/// `update_project_settings` tool. Matches `_dispatch_settings_write`.
+async fn dispatch_settings_write(
+    shared: &Arc<SharedState>,
+    principal: &conexus_core::principal::Principal,
+    context_key: &str,
+    context_value: Option<&Value>,
+    description: Option<&Value>,
+) -> Response {
+    if let Some(resp) = require_str(Some(&Value::String(context_key.to_string())), "context_key") {
+        return resp;
+    }
+    if let Some(resp) = require_str(description, "description") {
+        return resp;
+    }
+    if has_unsafe_unicode_for_identifier(context_key) {
+        return (StatusCode::BAD_REQUEST, Json(unsafe_key_error())).into_response();
+    }
+    if !is_valid_memory_key(context_key) {
+        return (StatusCode::BAD_REQUEST, Json(setting_key_error())).into_response();
+    }
+
+    let mut arguments = json!({
+        "context_key": context_key,
+        "context_value": context_value.cloned().unwrap_or(Value::Null),
+    });
+    if let Some(desc) = description {
+        arguments["description"] = desc.clone();
+    }
+
+    let result = match dispatch_rest_tool(
+        shared,
+        "update_project_settings",
+        arguments,
+        Some(principal),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(()) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Failed to update setting"})),
+            )
+                .into_response()
+        }
+    };
+    if let ToolResult::Ok { message, .. } = &result {
+        return Json(json!({
+            "success": true,
+            "message": message.clone().unwrap_or_else(|| format!("Setting '{context_key}' updated successfully")),
+        }))
+        .into_response();
+    }
+    let (status, _) = result.to_http();
+    let message = result.error_message("Failed to update setting", None);
+    (
+        StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        Json(json!({"error": message})),
+    )
+        .into_response()
+}
+
+/// Port of `agent_mcp/utils/string_utils.py::SETTING_KEY_ERROR`.
+fn setting_key_error() -> Value {
+    json!({
+        "error": "invalid_key_character",
+        "message": "Setting key may contain only letters, digits, and . _ / - \
+            (A-Z a-z 0-9 . _ / -).",
+    })
+}
+
+/// `POST /api/settings` -- upsert a setting (body carries the key),
+/// matching `create_setting_api_route`.
+pub async fn create_setting(
+    State(shared): State<Arc<SharedState>>,
+    Extension(resolved): Extension<ResolvedRestPrincipal>,
+    body: Bytes,
+) -> Response {
+    let data = match decode_untrusted_body(&body) {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
+    };
+    let context_key_value = data.get("context_key");
+    if is_json_falsy(context_key_value) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "context_key is required"})),
+        )
+            .into_response();
+    }
+    // Matches Python's `if not context_key: ...` short-circuit above --
+    // by this point `context_key_value` is truthy, but might still be
+    // the wrong type; `dispatch_settings_write` runs its own
+    // `require_str` check on it, exactly like Python's shared helper.
+    let context_key = context_key_value
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let principal = resolved.dispatch_principal.clone();
+    dispatch_settings_write(
+        &shared,
+        &principal,
+        context_key,
+        data.get("context_value"),
+        data.get("description"),
+    )
+    .await
+}
+
+/// `PUT /api/settings/{context_key}` -- upsert a setting, matching
+/// `update_setting_api_route`.
+pub async fn update_setting(
+    Path(context_key): Path<String>,
+    State(shared): State<Arc<SharedState>>,
+    Extension(resolved): Extension<ResolvedRestPrincipal>,
+    body: Bytes,
+) -> Response {
+    let data = match decode_untrusted_body(&body) {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
+    };
+    let principal = resolved.dispatch_principal.clone();
+    dispatch_settings_write(
+        &shared,
+        &principal,
+        &context_key,
+        data.get("context_value"),
+        data.get("description"),
+    )
+    .await
+}
+
+/// `DELETE /api/settings/{context_key}` -- thin adapter over the gated
+/// `delete_project_settings` tool, matching `delete_setting_api_route`.
+pub async fn delete_setting(
+    Path(context_key): Path<String>,
+    State(shared): State<Arc<SharedState>>,
+    Extension(resolved): Extension<ResolvedRestPrincipal>,
+) -> Response {
+    if has_unsafe_unicode_for_identifier(&context_key) {
+        return (StatusCode::BAD_REQUEST, Json(unsafe_key_error())).into_response();
+    }
+    if !is_valid_memory_key(&context_key) {
+        return (StatusCode::BAD_REQUEST, Json(setting_key_error())).into_response();
+    }
+    let principal = resolved.dispatch_principal.clone();
+    let arguments = json!({"context_key": context_key});
+    let result = match dispatch_rest_tool(
+        &shared,
+        "delete_project_settings",
+        arguments,
+        Some(&principal),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(()) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Failed to delete setting"})),
+            )
+                .into_response()
+        }
+    };
+    if let ToolResult::Ok { message, .. } = &result {
+        return Json(json!({
+            "success": true,
+            "message": message.clone().unwrap_or_else(|| format!("Setting '{context_key}' deleted successfully")),
+        }))
+        .into_response();
+    }
+    let (status, _) = result.to_http();
+    let message = result.error_message("Failed to delete setting", None);
+    (
+        StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        Json(json!({"error": message})),
+    )
+        .into_response()
+}

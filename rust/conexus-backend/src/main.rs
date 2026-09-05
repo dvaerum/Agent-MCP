@@ -188,6 +188,13 @@ async fn main() -> Result<()> {
             "/tasks/{task_id}",
             axum::routing::delete(rest_handlers::delete_task),
         )
+        .route("/tokens", get(rest_handlers::tokens))
+        .route("/settings-data", get(rest_handlers::settings_data))
+        .route("/settings", post(rest_handlers::create_setting))
+        .route(
+            "/settings/{context_key}",
+            put(rest_handlers::update_setting).delete(rest_handlers::delete_setting),
+        )
         .fallback(api_not_found)
         .layer(middleware::from_fn_with_state(
             shared.clone(),
