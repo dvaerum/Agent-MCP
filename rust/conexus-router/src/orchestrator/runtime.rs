@@ -47,6 +47,33 @@ use std::time::{Instant, SystemTime};
 use dashmap::DashMap;
 use tokio::sync::Mutex as AsyncMutex;
 
+/// The two fixed generic failure reasons `ensure()` (PR 6c) ever
+/// caches -- kept HERE rather than in the `ensure` module since it's
+/// stored directly in [`ProjectRuntime::ensure_failures`], and this
+/// module shouldn't need to import the state-machine module just to
+/// know its own field's value type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnsureFailureReason {
+    /// SC-R8-2: the `systemctl start`/`restart` shell-out failed.
+    SystemctlFailed,
+    /// SC-R9-1: the unit came up but its socket never appeared within
+    /// the poll budget.
+    SocketTimeout,
+}
+
+impl EnsureFailureReason {
+    /// The fixed, generic client-facing message -- SC-R8-2/SC-R9-1:
+    /// never reflects the real systemctl stderr or the absolute
+    /// on-disk socket path back to a caller, regardless of how
+    /// detailed the server-side log for the same failure is.
+    pub fn message(&self) -> &'static str {
+        match self {
+            EnsureFailureReason::SystemctlFailed => "backend failed to start",
+            EnsureFailureReason::SocketTimeout => "backend not ready",
+        }
+    }
+}
+
 /// One project's runtime bookkeeping -- mirrors Python's
 /// `ProjectRuntime` dataclass minus `ensure_locks` (see module doc for
 /// why that field lives in [`RuntimeStore`] instead). Every field here
@@ -64,7 +91,7 @@ pub struct ProjectRuntime {
     /// only ever compared against another `Instant` captured within
     /// the same process lifetime.
     pub unit_start_times: HashMap<String, Instant>,
-    pub ensure_failures: HashMap<String, (Instant, String)>,
+    pub ensure_failures: HashMap<String, (Instant, EnsureFailureReason)>,
     pub forwarding_hmac_key: Option<Vec<u8>>,
     pub warm_inflight: bool,
 }
@@ -193,8 +220,10 @@ mod tests {
             rt.last_active.insert("backend".into(), SystemTime::now());
             rt.active_conns = 3;
             rt.unit_start_times.insert("backend".into(), Instant::now());
-            rt.ensure_failures
-                .insert("backend".into(), (Instant::now(), "boom".into()));
+            rt.ensure_failures.insert(
+                "backend".into(),
+                (Instant::now(), EnsureFailureReason::SystemctlFailed),
+            );
             rt.forwarding_hmac_key = Some(vec![1, 2, 3]);
             rt.warm_inflight = true;
         });
