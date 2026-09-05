@@ -1,18 +1,21 @@
 //! Router-level identity store -- users, sessions, project memberships.
-//! Port of `agent_mcp/router/identity.py` (976 LOC), scoped to this
-//! PR's own foundational slice: schema (see `conexus_db::schema::
-//! init_router_schema`), password hashing, the security-critical
-//! `create_user` bootstrap cluster, and session lifecycle. Deferred to
-//! a follow-up PR (same file, same discipline as splitting
-//! `task_tools.py`/`admin_tools.py` across several PRs): SSO-subject
-//! reconciliation (`find_user_by_sso_subject`/
-//! `find_linkable_user_by_email`/`stamp_sso_subject_if_absent`/
-//! `upgrade_sso_subject` -- only needed once the SSO PRs land) and
-//! project-membership CRUD beyond what `create_user`'s own bootstrap
-//! needs (`add_project_membership`/`remove_project_membership`/
-//! `is_project_member`/`list_user_projects` -- needed by the
-//! group-graph-completion and users/groups REST PRs, not by anything
-//! this early).
+//! Port of `agent_mcp/router/identity.py` (976 LOC), grown across
+//! several PRs (same discipline as splitting `task_tools.py`/
+//! `admin_tools.py` across several PRs): PR 3 shipped schema (see
+//! `conexus_db::schema::init_router_schema`), password hashing, the
+//! security-critical `create_user` bootstrap cluster, and session
+//! lifecycle; PR 16 added the `project_membership` writer slice
+//! `create_project_handler`/`rename_project_handler`/
+//! `delete_project_handler` actually call
+//! (`add_project_membership`/`rename_project_membership_project`/
+//! `remove_project_membership_by_project` -- a deliberately tight
+//! subset of Python's fuller `insert_project_membership`/
+//! `remove_project_membership`/`is_project_member`/`list_user_projects`
+//! surface, scoped to real call sites rather than the whole API).
+//! Still deferred: SSO-subject reconciliation
+//! (`find_user_by_sso_subject`/`find_linkable_user_by_email`/
+//! `stamp_sso_subject_if_absent`/`upgrade_sso_subject` -- only needed
+//! once the SSO PRs land).
 //!
 //! **Threading, not a live connection pool**: every function here
 //! takes an explicit `&Connection` (this crate's own convention,
@@ -430,6 +433,55 @@ pub fn prune_expired_sessions(conn: &Connection, now: &str) -> Result<usize, Ide
     Ok(conn.execute("DELETE FROM sessions WHERE expires_at <= ?1", [now])?)
 }
 
+/// Grant `user_id` (`operator`-tier, the schema `DEFAULT`) access to
+/// `project_name`. Idempotent -- port of `add_project_membership`,
+/// scoped to its own real call site's shape (`(user_id, project_name)`
+/// user grants only; Python's `insert_project_membership`'s fuller
+/// `group_id`/explicit-`role`/`or_ignore` surface has no other caller
+/// in this crate yet, so it isn't ported wholesale -- matches this
+/// module's own "PR 3 ships a deliberately tight slice" precedent).
+pub fn add_project_membership(
+    conn: &Connection,
+    user_id: &str,
+    project_name: &str,
+) -> Result<(), IdentityError> {
+    conn.execute(
+        "INSERT OR IGNORE INTO project_membership (project_name, user_id) VALUES (?1, ?2)",
+        (project_name, user_id),
+    )?;
+    Ok(())
+}
+
+/// Re-key every `project_membership` row from `old_name` to
+/// `new_name` -- port of `rename_project_handler`'s inline
+/// best-effort `UPDATE` (AZ-R13-1). A project rename is registry-
+/// primary; a membership-repoint failure here is the caller's own
+/// best-effort-and-log concern, not this function's.
+pub fn rename_project_membership_project(
+    conn: &Connection,
+    old_name: &str,
+    new_name: &str,
+) -> Result<(), IdentityError> {
+    conn.execute(
+        "UPDATE project_membership SET project_name = ?1 WHERE project_name = ?2",
+        (new_name, old_name),
+    )?;
+    Ok(())
+}
+
+/// Drop every `project_membership` row for `project_name` -- port of
+/// `delete_project_handler`'s inline best-effort `DELETE`.
+pub fn remove_project_membership_by_project(
+    conn: &Connection,
+    project_name: &str,
+) -> Result<(), IdentityError> {
+    conn.execute(
+        "DELETE FROM project_membership WHERE project_name = ?1",
+        [project_name],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -737,6 +789,115 @@ mod tests {
         assert!(get_session(&c, &live, "2026-06-01T00:00:00.000+00:00")
             .unwrap()
             .is_some());
+    }
+
+    fn membership_projects_for(c: &Connection, user_id: &str) -> Vec<String> {
+        c.prepare(
+            "SELECT project_name FROM project_membership WHERE user_id = ?1 ORDER BY project_name",
+        )
+        .unwrap()
+        .query_map([user_id], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+    }
+
+    #[test]
+    fn add_project_membership_grants_and_is_idempotent() {
+        let mut c = conn();
+        let uid = create_user(
+            &mut c,
+            "alice",
+            "correct horse battery staple",
+            None,
+            false,
+            true,
+            &[],
+            NOW,
+        )
+        .unwrap();
+        add_project_membership(&c, &uid, "proj-a").unwrap();
+        add_project_membership(&c, &uid, "proj-a").unwrap(); // idempotent, no error
+        assert_eq!(
+            membership_projects_for(&c, &uid),
+            vec!["proj-a".to_string()]
+        );
+    }
+
+    #[test]
+    fn add_project_membership_defaults_to_the_operator_role() {
+        let mut c = conn();
+        let uid = create_user(
+            &mut c,
+            "alice",
+            "correct horse battery staple",
+            None,
+            false,
+            true,
+            &[],
+            NOW,
+        )
+        .unwrap();
+        add_project_membership(&c, &uid, "proj-a").unwrap();
+        let role: String = c
+            .query_row(
+                "SELECT role FROM project_membership WHERE user_id = ?1 AND project_name = ?2",
+                (&uid, "proj-a"),
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(role, "operator");
+    }
+
+    #[test]
+    fn rename_project_membership_project_rekeys_every_matching_row() {
+        let mut c = conn();
+        let uid = create_user(
+            &mut c,
+            "alice",
+            "correct horse battery staple",
+            None,
+            false,
+            true,
+            &[],
+            NOW,
+        )
+        .unwrap();
+        add_project_membership(&c, &uid, "old-name").unwrap();
+        rename_project_membership_project(&c, "old-name", "new-name").unwrap();
+        assert_eq!(
+            membership_projects_for(&c, &uid),
+            vec!["new-name".to_string()]
+        );
+    }
+
+    #[test]
+    fn remove_project_membership_by_project_drops_every_matching_row() {
+        let mut c = conn();
+        let uid = create_user(
+            &mut c,
+            "alice",
+            "correct horse battery staple",
+            None,
+            false,
+            true,
+            &[],
+            NOW,
+        )
+        .unwrap();
+        add_project_membership(&c, &uid, "proj-a").unwrap();
+        add_project_membership(&c, &uid, "proj-b").unwrap();
+        remove_project_membership_by_project(&c, "proj-a").unwrap();
+        assert_eq!(
+            membership_projects_for(&c, &uid),
+            vec!["proj-b".to_string()]
+        );
+    }
+
+    #[test]
+    fn remove_project_membership_by_project_on_an_unknown_project_is_a_noop() {
+        let c = conn();
+        remove_project_membership_by_project(&c, "never-existed").unwrap();
     }
 
     #[test]

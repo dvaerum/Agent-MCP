@@ -45,6 +45,7 @@ use crate::mcp_handler::{self, HandlerBody, HandlerResponse};
 use crate::orchestrator::resolve as project_resolve;
 use crate::path_policy;
 use crate::project_registry::ProjectRegistry;
+use crate::single_tenant::bypasses_operator_gate;
 
 /// HTTP methods treated as mutations for the per-project operator/
 /// viewer split -- port of `_MUTATION_METHODS`. GET/HEAD/OPTIONS (and
@@ -217,16 +218,7 @@ fn unknown_project_response(method: &str, accept_header: Option<&str>) -> Handle
     }
 }
 
-/// Port of `single_tenant.bypasses_operator_gate` -- `single_tenant.py`'s
-/// own `_configured()` reduces to exactly this boolean fact (see that
-/// module's doc for why the check is named rather than an inline
-/// `is not None`); no separate module needed to port a one-line
-/// predicate.
-fn bypasses_operator_gate(single_tenant_name: Option<&str>) -> bool {
-    single_tenant_name.is_some()
-}
-
-fn parse_project_role(raw: &str) -> Option<ProjectRole> {
+pub(crate) fn parse_project_role(raw: &str) -> Option<ProjectRole> {
     match raw {
         "operator" => Some(ProjectRole::Operator),
         "viewer" => Some(ProjectRole::Viewer),
