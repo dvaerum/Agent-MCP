@@ -20,6 +20,8 @@
 
 mod auth_gate;
 mod boot;
+mod delivery_gate;
+mod delivery_transport;
 mod instructions;
 mod json_sanitize;
 mod operator_events;
@@ -106,6 +108,7 @@ async fn main() -> Result<()> {
         file_map: conexus_wakeloop::file_map::FileMap::new(),
         project_dir: cli.project_dir.clone(),
         operator_events: operator_events::OperatorEventsHub::new(),
+        delivery_transport: delivery_transport::DeliveryTransportHub::new(),
     });
 
     let shared_for_factory = shared.clone();
@@ -275,7 +278,25 @@ async fn main() -> Result<()> {
             shared.clone(),
             rest_gate::require_rest_identity,
         ));
-    let api_router = Router::new().merge(api_public).merge(api_authenticated);
+    // `/api/delivery/*` (Phase E1 PR 14/14) is a THIRD `/api` admission
+    // shape -- worker-bearer-authed (see `delivery_gate`'s own doc for
+    // why it can't reuse `rest_gate`'s operator-tier-only door or
+    // `auth_gate`'s forwarding-header-accepting one). Merging a router
+    // with its own `.layer()` is safe here (each merged sub-router keeps
+    // its own middleware stack; `api_authenticated`'s existing
+    // `.fallback()` only fires when NO merged router's routes match at
+    // all, so it doesn't shadow these two real routes).
+    let api_delivery = Router::new()
+        .route("/delivery/stream", get(rest_handlers::delivery_stream))
+        .route("/delivery/status", post(rest_handlers::delivery_status))
+        .layer(middleware::from_fn_with_state(
+            shared.clone(),
+            delivery_gate::require_delivery_agent_bearer,
+        ));
+    let api_router = Router::new()
+        .merge(api_public)
+        .merge(api_authenticated)
+        .merge(api_delivery);
     let app = Router::new()
         .merge(mcp_router)
         .nest("/api", api_router)
