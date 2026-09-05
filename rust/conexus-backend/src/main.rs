@@ -21,6 +21,7 @@
 mod auth_gate;
 mod boot;
 mod instructions;
+mod json_sanitize;
 mod principal_resolve;
 mod rest_gate;
 mod rest_handlers;
