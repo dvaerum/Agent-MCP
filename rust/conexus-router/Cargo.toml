@@ -14,10 +14,15 @@ path = "src/main.rs"
 # Guiding Principle 2 / ADR-0020: NEVER conexus-tools or conexus-mcp,
 # so the router stays structurally incapable of importing a tool type
 # (a compile-time guarantee of "the router is mount-agnostic", not
-# just a convention). conexus-auth (forwarding_header signing) isn't
-# a dependency yet -- no real consumer until the proxy-core PR.
+# just a convention).
 conexus-core = { path = "../conexus-core" }
 conexus-db = { path = "../conexus-db" }
+# session_gate.rs (Phase E2 PR 12) is the FIRST real consumer:
+# resolve_capabilities()/Principal construction at the operator-
+# session seam, exactly the "conexus-auth ONLY, never conexus-tools/
+# conexus-mcp" dependency this crate's Target Architecture always
+# scoped for -- not a scope creep.
+conexus-auth = { path = "../conexus-auth" }
 # "process" (Phase E2 PR 6b): orchestrator/primitives.rs shells out to
 # `systemctl` via `tokio::process::Command` -- more idiomatic than
 # `std::process::Command` + `spawn_blocking` given this binary is
@@ -96,3 +101,10 @@ sha2 = "0.10"
 # (conexus-backend's own GET /api/events SSE loop uses stream::unfold
 # from the same crate).
 futures-util = "0.3"
+# session_gate.rs (Phase E2 PR 12) -- the login-redirect's `?next=`
+# deep-link needs Python's `urllib.parse.quote(safe="/")` percent-
+# encoding exactly; already resolved workspace-wide (a transitive dep
+# of `url`/`reqwest`), added here as a direct edge rather than
+# hand-rolling a second escaper (this crate's own established
+# "well-maintained library over reinventing it" discipline).
+percent-encoding = "2"

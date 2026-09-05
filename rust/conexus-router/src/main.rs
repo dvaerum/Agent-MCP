@@ -31,6 +31,7 @@ mod path_policy;
 mod project_registry;
 mod proxy_client;
 mod proxy_core;
+mod session_gate;
 
 use std::net::SocketAddr;
 

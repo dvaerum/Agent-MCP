@@ -199,7 +199,13 @@ pub fn accept_includes_strict_api_media(accept_header: &str) -> bool {
 }
 
 /// Port of `_api_version_required_response` -- the 406 body shape.
-fn api_version_required_response() -> HandlerResponse {
+/// `pub(crate)`: `session_gate.rs`'s `unknown_project_response` reuses
+/// this verbatim (Python's own `app.unknown_project_response` docstring
+/// says it "reproduces `backend_api_handler`'s own decision ORDER so
+/// the two cases stay byte-identical" -- reusing the SAME function is
+/// how a Rust port keeps that guarantee, rather than a second,
+/// independently-maintained copy of this JSON shape).
+pub(crate) fn api_version_required_response() -> HandlerResponse {
     HandlerResponse {
         status: 406,
         headers: vec![],
