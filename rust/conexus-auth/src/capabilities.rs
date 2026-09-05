@@ -129,6 +129,15 @@ mod tests {
     }
 
     fn add_user_member(conn: &Connection, group_id: &str, user_id: &str) {
+        // `member_user_id` carries a real FK to `users(user_id)` since
+        // Phase E2 PR 3 backfilled it -- seed a placeholder row first
+        // (`OR IGNORE` since a test can call this more than once for
+        // the same user_id).
+        conn.execute(
+            "INSERT OR IGNORE INTO users (user_id, username, created_at) VALUES (?1, ?1, '2026-01-01T00:00:00Z')",
+            [user_id],
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO group_membership (group_id, member_user_id, added_at) VALUES (?1, ?2, '2026-01-01T00:00:00Z')",
             [group_id, user_id],

@@ -41,7 +41,6 @@
 #![allow(dead_code)]
 
 use serde_json::{Map, Value};
-use unicode_general_category::{get_general_category, GeneralCategory};
 
 /// Matches Python's `PF-R20-1`/`R20-F3` recursion guard intent (chosen
 /// independently for Rust's stack, not copied from a Python constant
@@ -66,98 +65,24 @@ impl std::fmt::Display for UntrustedBodyError {
 impl std::error::Error for UntrustedBodyError {}
 
 // -- Character-class sanitization (R4-F3/R5-F8/R13-F2/R14-F3/R15-F1) --
-
-/// C0 controls (excluding tab/LF/CR, which are legitimate whitespace
-/// in e.g. a multi-line task description) + DEL + the full C1 range.
-/// Matches Python's `_CONTROL_BYTE_RE` exactly (`[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]`).
-fn is_stripped_control_byte(cp: u32) -> bool {
-    matches!(cp, 0x00..=0x08 | 0x0B | 0x0C | 0x0E..=0x1F | 0x7F..=0x9F)
-}
-
-/// Variation Selectors 1-16 (BMP) and 17-256 (supplementary plane).
-fn is_variation_selector(cp: u32) -> bool {
-    (0xFE00..=0xFE0F).contains(&cp) || (0xE0100..=0xE01EF).contains(&cp)
-}
-
-/// Hidden/format Unicode + variation selectors, stripped by general
-/// category (not a hand-enumerated range table) -- matches Python's
-/// `_strip_hidden_unicode`'s `Cf` (Format: bidi overrides, ZWSP, BOM,
-/// word joiner, ...) and `Zl`/`Zp` (line/paragraph separator) classes.
-///
-/// Python's fourth class, `Cs` (Surrogate -- R15-F1: a lone/unpaired
-/// surrogate escape parses as a valid Python `str` character but is
-/// not valid UTF-8, crashing SQLite's TEXT binding downstream), has NO
-/// Rust equivalent to strip: Rust's `char` is defined as a valid
-/// Unicode SCALAR VALUE, which categorically EXCLUDES the surrogate
-/// range (`U+D800..=U+DFFF`) by construction -- there is no `char`
-/// value `get_general_category` could ever classify as `Surrogate` in
-/// the first place. `serde_json` itself refuses to parse a lone
-/// `\uD800`-style escape (confirmed empirically, not assumed --
-/// verified against a live-failing test before this comment was
-/// written): the whole input is rejected as malformed JSON before a
-/// value ever exists to sanitize. R15-F1's entire vulnerability class
-/// is therefore structurally impossible here, a stronger guarantee
-/// than Python's post-hoc strip achieves, not a gap in this port.
-fn is_hidden_format_char(ch: char) -> bool {
-    if is_variation_selector(ch as u32) {
-        return true;
-    }
-    matches!(
-        get_general_category(ch),
-        GeneralCategory::Format
-            | GeneralCategory::LineSeparator
-            | GeneralCategory::ParagraphSeparator
-    )
-}
-
-/// R14-F3: cap on consecutive combining marks (`Mn`/`Me`) per base
-/// character -- limits, not strips, the category: these marks carry
-/// real, load-bearing glyph content for many scripts (Vietnamese tone
-/// marks, Arabic tashkeel, Devanagari vowel signs), so only
-/// pathological run LENGTH ("zalgo" text) is the actual spoofing/
-/// layout-DoS primitive, not the category itself. Matches Python's
-/// `_MAX_COMBINING_MARKS_PER_BASE`.
-const MAX_COMBINING_MARKS_PER_BASE: usize = 4;
-
-fn is_combining_mark(ch: char) -> bool {
-    matches!(
-        get_general_category(ch),
-        GeneralCategory::NonspacingMark | GeneralCategory::EnclosingMark
-    )
-}
-
-/// Strip control bytes + hidden-format Unicode, then cap combining-
-/// mark runs -- the exact order and composition of Python's
-/// `_strip_control_bytes`'s per-leaf pipeline
-/// (`_cap_combining_marks(_strip_hidden_unicode(_CONTROL_BYTE_RE.sub('', value)))`).
-fn sanitize_string_leaf(value: &str) -> String {
-    let stripped: String = value
-        .chars()
-        .filter(|&ch| !is_stripped_control_byte(ch as u32) && !is_hidden_format_char(ch))
-        .collect();
-
-    let mut out = String::with_capacity(stripped.len());
-    let mut run_length = 0usize;
-    for ch in stripped.chars() {
-        if is_combining_mark(ch) {
-            run_length += 1;
-            if run_length > MAX_COMBINING_MARKS_PER_BASE {
-                continue;
-            }
-        } else {
-            run_length = 0;
-        }
-        out.push(ch);
-    }
-    out
-}
+//
+// The actual per-string-leaf stripper moved to
+// `conexus_core::string_sanitize::sanitize_string_leaf` (Phase E2 PR 3)
+// so `conexus-router::identity`'s `create_user` (which needs the
+// IDENTICAL stripper for `username`/`email`) can share it instead of
+// carrying a second, drift-risking copy -- `conexus-backend` and
+// `conexus-router` are separate binary crates that can't depend on
+// each other, so the shared logic lives in the one crate both already
+// depend on. See that function's own doc for the full character-class
+// rationale (control bytes, hidden-format Unicode, the Cs/surrogate
+// structural-impossibility note, the combining-mark run cap).
 
 /// Recursively walk a parsed JSON value, sanitizing every string leaf.
 /// Dict/object keys are left untouched (matches Python's historical
 /// behavior -- only values were ever sanitized).
 fn strip_control_bytes(value: Value) -> Value {
     match value {
-        Value::String(s) => Value::String(sanitize_string_leaf(&s)),
+        Value::String(s) => Value::String(conexus_core::string_sanitize::sanitize_string_leaf(&s)),
         Value::Array(items) => Value::Array(items.into_iter().map(strip_control_bytes).collect()),
         Value::Object(map) => Value::Object(
             map.into_iter()

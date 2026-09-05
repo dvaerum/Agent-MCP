@@ -22,6 +22,7 @@
 //! a per-project backend as an opaque process is enforced at compile
 //! time here, not just by convention.
 
+mod identity;
 mod mount;
 mod path_policy;
 

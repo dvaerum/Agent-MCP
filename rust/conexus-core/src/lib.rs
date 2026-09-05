@@ -2,6 +2,7 @@ pub mod capability;
 pub mod principal;
 pub mod schema_limits;
 pub mod settings_schema;
+pub mod string_sanitize;
 pub mod task_ownership;
 pub mod tool_result;
 pub mod wake_loop_text;
