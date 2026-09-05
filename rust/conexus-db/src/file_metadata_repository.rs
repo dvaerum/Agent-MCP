@@ -50,6 +50,28 @@ pub fn get(conn: &Connection, filepath: &str) -> Result<Option<FileMetadataRow>>
     .optional()
 }
 
+/// The first `limit` rows, in whatever order SQLite returns them --
+/// matches Python's `SELECT * FROM file_metadata LIMIT ?` exactly
+/// (`/api/all-data`'s file_metadata section), which carries no
+/// `ORDER BY` of its own either. A bounded read (pentest R3-F3's
+/// "db review item 2" note: this was unbounded before), not a
+/// recency-sorted one -- unlike `project_context_repository::
+/// list_recent`, there's no Python `ORDER BY updated_at DESC` to
+/// preserve here.
+pub fn list_bounded(conn: &Connection, limit: i64) -> Result<Vec<FileMetadataRow>> {
+    let mut stmt = conn.prepare(&format!("SELECT {COLUMNS} FROM file_metadata LIMIT ?1"))?;
+    let rows = stmt.query_map([limit], |row| {
+        Ok(FileMetadataRow {
+            filepath: row.get(0)?,
+            metadata: row.get(1)?,
+            last_updated: row.get(2)?,
+            updated_by: row.get(3)?,
+            content_hash: row.get(4)?,
+        })
+    })?;
+    rows.collect()
+}
+
 /// Insert or wholesale-replace `filepath`'s metadata row — Python's
 /// `INSERT OR REPLACE INTO file_metadata (...)`. Replaces the ENTIRE
 /// row (including `content_hash`, reset to `NULL` on every call from
@@ -105,6 +127,17 @@ mod tests {
         assert_eq!(row.updated_by, "alice");
         assert_eq!(row.last_updated, "2026-06-01T00:00:00Z");
         assert_eq!(row.content_hash, None);
+    }
+
+    #[test]
+    fn list_bounded_respects_the_limit() {
+        let c = conn();
+        upsert(&c, "/tmp/a.rs", "{}", "alice", "2026-01-01T00:00:00Z").unwrap();
+        upsert(&c, "/tmp/b.rs", "{}", "alice", "2026-01-01T00:00:00Z").unwrap();
+        upsert(&c, "/tmp/c.rs", "{}", "alice", "2026-01-01T00:00:00Z").unwrap();
+
+        assert_eq!(list_bounded(&c, 10).unwrap().len(), 3);
+        assert_eq!(list_bounded(&c, 2).unwrap().len(), 2);
     }
 
     #[test]
