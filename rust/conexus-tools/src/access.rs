@@ -93,6 +93,9 @@ const TIER_OVERRIDES: &[(&str, AccessTier)] = &[
         "send_agent_message",
         AccessTier::WorkerIfToggled(&["config_allow_worker_to_worker"], true),
     ),
+    // Predicate-gated (`_is_operator_tier`, no derivable cap); Python:
+    // `visibility="operator"` -- the sole signal, not a tighten.
+    ("broadcast_admin_message", AccessTier::Operator),
 ];
 
 /// Map a required capability to its visibility tier. Port of
