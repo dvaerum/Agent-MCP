@@ -18,6 +18,24 @@ populated database -- extending the fixtures to seed from a real
 capture is a natural follow-up once more repositories are ported, not
 a redesign of this harness.
 
+Phase F extension: the binary also supports a `--dump-router-tables
+<db_path>` CLI mode, a RAW (untyped) column dump of every `router.db`
+table (`users`/`sessions`/`project_membership`/`groups`/
+`group_capability`/`group_membership`) -- see
+`test_router_db_tables_match_between_python_and_rust` below. Built to
+close a real, previously-unverified gap: `router.db` schema
+compatibility between the two languages had only ever been checked
+SOURCE-vs-SOURCE (the Alembic migrations vs.
+`conexus_db::schema::init_router_schema`), never by actually reading
+real data through Rust's own `rusqlite` bindings. Manually verified
+once, live, against a hot-backed-up copy of this session's own
+production `router.db` (2 real users / 47 real sessions / 5 real
+project_membership rows) -- byte-for-byte identical between Python's
+`sqlite3` and Rust's `rusqlite` reads; that verification is not
+itself a committed test (it touched real production secrets, deleted
+immediately after) -- this test is the durable, schema-only proof the
+CI can run indefinitely.
+
 Timestamp columns (created_at/updated_at/terminated_at/
 profile_updated_at/profile_reviewed_at) are excluded from the diff:
 Python's write paths stamp wall-clock ``datetime.now()`` internally,
@@ -52,6 +70,8 @@ from agent_mcp.db.schema import init_database
 from agent_mcp.db.unit_of_work import unit_of_work
 from agent_mcp.repositories import project_context_repository
 from agent_mcp.repositories.agent_repository import AgentRepository
+from agent_mcp.router import group_resolver, identity
+from agent_mcp.router.migrations_runner import run_router_migrations_upgrade
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -257,3 +277,84 @@ def test_context_delete_many_matches_between_python_and_rust(tmp_path, monkeypat
     assert _normalize_all(py_rows, "context_key") == _normalize_all(rust_dump["project_context"], "context_key")
     # The interesting fact: "a" is gone, "b" survives, on BOTH sides.
     assert [r["context_key"] for r in py_rows] == ["b"]
+
+
+_ROUTER_TABLES = [
+    ("users", "user_id"),
+    ("sessions", "session_id"),
+    ("project_membership", "project_name, user_id, group_id"),
+    ("groups", "group_id"),
+    ("group_capability", "group_id, capability"),
+    ("group_membership", "group_id, member_user_id, member_group_id"),
+]
+
+
+def _run_rust_router_dump(binary: Path, db_path: Path) -> dict:
+    result = subprocess.run(
+        [str(binary), "--dump-router-tables", str(db_path)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, f"conexus-db-differential --dump-router-tables failed: {result.stderr}"
+    return json.loads(result.stdout)
+
+
+def test_router_db_tables_match_between_python_and_rust(tmp_path, monkeypatch, differential_binary):
+    """Real router.db data, seeded through the real Python router
+    code, must read back byte-for-byte identically through Rust's
+    `rusqlite` bindings -- the durable, CI-run proof behind this
+    session's own manual verification against a real production
+    router.db (see this module's docstring).
+    """
+    db_path = tmp_path / "router.db"
+    # Pin every env var identity.py/group_resolver.py read internally
+    # (AGENT_MCP_ROUTER_DB for the connection target,
+    # AGENT_MCP_PROJECTS_FILE so create_user's first-user bootstrap
+    # grant doesn't reach out to this machine's REAL
+    # ~/.config/agent-mcp/projects.local.json -- a real side effect
+    # discovered while first exercising this dump tool manually).
+    monkeypatch.setenv("AGENT_MCP_ROUTER_DB", str(db_path))
+    projects_file = tmp_path / "projects.local.json"
+    projects_file.write_text("{}")
+    monkeypatch.setenv("AGENT_MCP_PROJECTS_FILE", str(projects_file))
+
+    run_router_migrations_upgrade()
+
+    user_id = identity.create_user(
+        "alice", password="CorrectHorseBattery9!", email="alice@example.test", bootstrap_sysadmin=False
+    )
+    identity.create_session(user_id)
+    group_id = group_resolver.ensure_group("engineers")
+    group_resolver.add_group_member(group_id, member_user_id=user_id)
+    identity.add_project_membership(user_id, "demo")
+
+    rust_dump = _run_rust_router_dump(differential_binary, db_path)
+
+    for table, order_by in _ROUTER_TABLES:
+        py_rows = _dump_table(db_path, table, order_by)
+        assert py_rows == rust_dump[table], f"table {table!r} diverged between Python and Rust"
+
+    # The interesting facts, pinned explicitly (not just "dicts equal"):
+    assert len(rust_dump["users"]) == 1
+    assert rust_dump["users"][0]["username"] == "alice"
+    assert rust_dump["users"][0]["password_hash"]  # argon2 hash present, non-empty
+    assert len(rust_dump["sessions"]) == 1
+    assert len(rust_dump["group_membership"]) == 1
+    assert rust_dump["group_membership"][0]["member_user_id"] == user_id
+    assert rust_dump["group_membership"][0]["member_group_id"] is None
+    assert [pm["project_name"] for pm in rust_dump["project_membership"]] == ["demo"]
+
+
+def test_router_db_dump_degrades_gracefully_on_missing_tables(tmp_path, differential_binary):
+    """A router.db with no schema at all (a bare empty SQLite file)
+    dumps every known table as an empty list rather than erroring --
+    the same graceful-degrade contract this migration uses elsewhere
+    for an optional/not-yet-present native dependency."""
+    db_path = tmp_path / "empty.db"
+    sqlite3.connect(str(db_path)).close()
+
+    rust_dump = _run_rust_router_dump(differential_binary, db_path)
+
+    assert rust_dump == {table: [] for table, _ in _ROUTER_TABLES}
