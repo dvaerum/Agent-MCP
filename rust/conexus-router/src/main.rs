@@ -42,6 +42,7 @@ mod login_setup_rest;
 mod mcp_handler;
 mod middleware;
 mod mount;
+mod oidc_reconcile;
 mod orchestrator;
 mod path_policy;
 mod perm_gates;
