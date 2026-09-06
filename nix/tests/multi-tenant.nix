@@ -19,8 +19,17 @@
 #
 # The backend isn't actually exercised here — booting the full
 # embedding pipeline against ollama would balloon the test runtime.
-# Phase 4's E2E in nixos-developer-system covers that path; this
-# test is the cheap CI-friendly half.
+# This is the cheap CI-friendly half; there is no expensive-half
+# counterpart anymore. A deploy-repo E2E suite used to cover the real
+# Ollama/RAG path (home-manager-config, formerly nixos-developer-
+# system) but was deleted 2026-09-06 as clearly outdated — its
+# admin-credential bootstrap tested a mechanism this codebase retired
+# independent of any Rust-migration cutover (PR #206, "delete admin
+# pseudo-agent + disentangle system bearer from agents table"). No
+# real-embedding-pipeline coverage exists anywhere right now; a fresh
+# one would need a real admin-tier bearer (via register_agent) rather
+# than the old journal-scraped admin token, not a revival of the
+# deleted suite.
 #
 # ADR 0014: the admin surface lives at ``/api/router/...`` (was the
 # legacy ``__*`` namespace).
