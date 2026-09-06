@@ -296,7 +296,7 @@ export function ProjectsOverviewDashboard(): React.ReactElement {
   return (
     <div className="h-full overflow-y-auto p-6">
       <div className="max-w-6xl mx-auto space-y-6">
-        <div className="flex items-center justify-between">
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
           <div>
             <h1 className="text-2xl font-semibold tracking-tight">
               Agent MCP — Projects
@@ -307,7 +307,7 @@ export function ProjectsOverviewDashboard(): React.ReactElement {
                 : "All registered projects on this router."}
             </p>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             {multiTenant && (
               <Button
                 variant="default"
