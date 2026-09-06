@@ -43,12 +43,6 @@
 //! `sub` claim. Both are accepted, narrow divergences from the
 //! Python source's own property-fuzz test range, not full wire-format
 //! parity claims for pathological values.
-//!
-//! `#![allow(dead_code)]`: this is a BINARY crate and this PR (1/8 of
-//! PR22's own breakdown) has no real consumer yet -- the
-//! `oidc-reconcile`/`oidc-handlers` PRs later in the sequence are.
-//! Same precedent as `mount.rs`/`login.rs`.
-#![allow(dead_code)]
 
 use serde_json::Value;
 
@@ -279,6 +273,16 @@ impl SsoSubject {
     /// byte-identical to the input -- a stored row can never be
     /// attributed to a subject that would have been persisted under a
     /// different key.
+    ///
+    /// No real production caller yet: `oidc_reconcile.rs` only ever
+    /// WRITES/COMPARES `sso_subject` as an opaque string (`encode()`/
+    /// `legacy_lookup_key()`), never needing to parse a STORED value
+    /// back into a typed `SsoSubject` -- that's a future admin/debug-
+    /// tooling need, not this migration's own real call path. Kept
+    /// (not deleted) since it's genuinely part of this type's public
+    /// contract, proven correct by this module's own extensive
+    /// round-trip/totality tests.
+    #[allow(dead_code)]
     pub fn decode(encoded: &str) -> Option<Self> {
         let body = encoded.strip_prefix(OIDC_SUBJECT_PREFIX)?;
 

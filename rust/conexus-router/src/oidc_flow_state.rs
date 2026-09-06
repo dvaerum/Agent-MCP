@@ -19,7 +19,6 @@
 //! `json_sanitize::decode_untrusted_body` for the untrusted decode
 //! (this cookie is UNSIGNED, hence attacker-craftable like any other
 //! untrusted decode point).
-#![allow(dead_code)]
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;

@@ -26,7 +26,6 @@
 //! manual grant, and an explicit-mapping target group (an arbitrary
 //! local slug an operator bound a claim to), are both left
 //! additive-only -- an SSO login can never remove either.
-#![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet};
 

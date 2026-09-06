@@ -31,7 +31,6 @@
 //! 3. **JIT-create.** A passwordless row (`password_hash` stays
 //!    `NULL`); the username collision-suffix loop only ever engages
 //!    for a genuinely new subject.
-#![allow(dead_code)]
 
 use rusqlite::Connection;
 

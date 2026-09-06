@@ -34,7 +34,6 @@
 //! this migration's own "keep the explicit pentest-derived check"
 //! precedent (PR12's session-gate research made the same call for a
 //! different origin-pin).
-#![allow(dead_code)]
 
 use openidconnect::core::{CoreClient, CoreProviderMetadata};
 use openidconnect::{
@@ -42,22 +41,24 @@ use openidconnect::{
 };
 use url::Url;
 
-/// The exact typestate `openidconnect::core::CoreClient` settles into
-/// after `CoreClient::from_provider_metadata(...)` -- confirmed
-/// against the crate's own `impl` block for that constructor (auth
-/// URL always set from discovery; token/userinfo URLs are `Maybe`-set
-/// since the OIDC spec makes them technically optional at this type
-/// level, even though this router's auth-code flow always needs
-/// `token_endpoint` in practice -- enforced separately by
-/// [`assert_discovery_same_origin`]'s own hard failure on a missing
-/// one). Named here so `build_oidc_client`'s signature doesn't need
-/// to spell out all 6 typestate parameters at every call site.
+/// The exact typestate `build_oidc_client`'s `CoreClient` settles
+/// into: `HasAuthUrl`/`HasTokenUrl` both `EndpointSet` (auth URL from
+/// discovery; token URL promoted explicitly via `set_token_uri` below
+/// -- `exchange_code`'s own `impl` block requires `EndpointSet`, not
+/// the `EndpointMaybeSet` `from_provider_metadata` alone produces,
+/// confirmed against the crate's real source, not assumed from the
+/// OIDC spec's "technically optional" framing). `HasUserInfoUrl`
+/// stays `EndpointMaybeSet` (never promoted -- this router never
+/// calls the userinfo endpoint, matching Python's own OIDC flow,
+/// which reads every claim off the id_token alone). Named here so
+/// `build_oidc_client`'s signature doesn't need to spell out all 6
+/// typestate parameters at every call site.
 pub type BuiltOidcClient = CoreClient<
     EndpointSet,
     EndpointNotSet,
     EndpointNotSet,
     EndpointNotSet,
-    EndpointMaybeSet,
+    EndpointSet,
     EndpointMaybeSet,
 >;
 
@@ -203,12 +204,23 @@ pub fn build_oidc_client(
 ) -> Result<BuiltOidcClient, OidcHttpError> {
     let redirect_uri = RedirectUrl::new(redirect_uri.to_string())
         .map_err(|e| OidcHttpError::DiscoveryFailed(format!("invalid redirect_uri: {e}")))?;
+    // Grabbed before `metadata` moves into `from_provider_metadata` --
+    // guaranteed `Some` by `assert_discovery_same_origin`'s own hard
+    // failure on a missing `token_endpoint` (already run inside
+    // `fetch_oidc_metadata`, the only real caller of this function).
+    let token_uri = metadata
+        .token_endpoint()
+        .cloned()
+        .ok_or(OidcHttpError::MissingEndpoint {
+            endpoint: "token_endpoint",
+        })?;
     Ok(CoreClient::from_provider_metadata(
         metadata,
         ClientId::new(client_id.to_string()),
         Some(ClientSecret::new(client_secret.to_string())),
     )
-    .set_redirect_uri(redirect_uri))
+    .set_redirect_uri(redirect_uri)
+    .set_token_uri(token_uri))
 }
 
 #[cfg(test)]

@@ -151,3 +151,14 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # edge for the same reason as `base64` above.
 url = "2"
 
+[dev-dependencies]
+# oidc_handlers.rs's end-to-end test (Phase E2 PR22 step 7) needs to
+# MINT a real RS256-signed ID token to prove `IdToken::claims()`
+# verification actually succeeds -- `openidconnect` is a relying-
+# party (verify-only) library and exposes no signing API. Dev-only:
+# never shipped in the router binary. Signs against the RFC 7520
+# ("bilbo.baggins@hobbiton.example") test keypair -- a published IETF
+# spec example, not a secret, and the same fixture `openidconnect`'s
+# own test suite uses for its public-key half.
+jsonwebtoken = "9"
+
