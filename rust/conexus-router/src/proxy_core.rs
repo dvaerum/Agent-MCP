@@ -499,6 +499,8 @@ mod tests {
             ensure_failure_cooldown: Duration::from_millis(200),
             boot_grace: Duration::from_millis(150),
             socket_poll_attempts: 5,
+            max_restart_attempts: 5,
+            giveup_cooldown: Duration::from_secs(600),
         }
     }
 
