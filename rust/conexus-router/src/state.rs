@@ -135,8 +135,22 @@ impl RouterState {
                 // Port of `path_policy.py`'s own `public_route`
                 // registration for `GET /agent-mcp/api/router/health`
                 // (`admin_api.py:1723-1728`) -- the ONE lifecycle-rest
-                // route with no session requirement at all.
-                extra_exact_paths: vec!["/agent-mcp/api/router/health".to_string()],
+                // route with no session requirement at all. Both
+                // forms are listed explicitly: Python's real
+                // `derive_public_paths` walks the FULL route table
+                // (including the R5-F6 trailing-slash alias
+                // `main.rs`'s own `admin_api_route` registers), so
+                // the public marking is inherited by that alias too
+                // -- confirmed live (a bare hand-reviewed single-entry
+                // list here left `/agent-mcp/api/router/health/`
+                // 401ing while its canonical twin correctly 200'd).
+                // The 2 root-mounted variants need no separate entry:
+                // `mount::canonical_path` folds them back to one of
+                // these 2 forms before this list is ever checked.
+                extra_exact_paths: vec![
+                    "/agent-mcp/api/router/health".to_string(),
+                    "/agent-mcp/api/router/health/".to_string(),
+                ],
             },
             sock_dir: config.sock_dir,
             dashboard_dir: config.dashboard_dir,
