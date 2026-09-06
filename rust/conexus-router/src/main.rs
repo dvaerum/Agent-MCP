@@ -251,6 +251,50 @@ fn resolve_token_dir(get_env: impl Fn(&str) -> Option<String>) -> Option<std::pa
     })
 }
 
+/// Binds one `TcpListener` per address `host` resolves to. Real,
+/// live-cutover-caught bug this closes: `main()` used to hardcode
+/// `SocketAddr::from(([0, 0, 0, 0], cli.port))` regardless of `host`
+/// -- `boot::resolve_bind_host`/`BindHost` were fully built and
+/// unit-tested (used for the `assert_startup_safe`/
+/// `secure_cookie_warning` fail-closed guards) but never actually
+/// reached the real listener. Harmless on a host with nothing else on
+/// the target port, but a genuinely different failure mode from what
+/// `AGENT_MCP_ROUTER_HOST` promises: a tighter multi-host bind
+/// (`127.0.0.1,10.14.255.10`, this migration's own real production
+/// config) silently became an unrestricted `0.0.0.0` bind instead --
+/// and on a host where an unrelated process already holds a specific
+/// address on that exact port, Linux refuses the wildcard bind
+/// outright (`EADDRINUSE`), which is exactly how this was caught: a
+/// real cutover crash-loop, not a review catch.
+///
+/// `BindHost::AllInterfaces` binds both `0.0.0.0` and `::`, matching
+/// its own doc comment and Python's real `aiohttp`
+/// bind-everything-when-unset behavior (dual-stack, not IPv4-only).
+/// `BindHost::Hosts` resolves each entry via `tokio::net::lookup_host`
+/// (not a bare `SocketAddr` parse) so a literal IP, `localhost`, or
+/// any other resolvable hostname all work identically -- matching
+/// `single_host_is_loopback`'s own tolerance for `"localhost"`.
+async fn bind_listeners(host: &boot::BindHost, port: u16) -> Result<Vec<tokio::net::TcpListener>> {
+    let addrs: Vec<String> = match host {
+        boot::BindHost::AllInterfaces => vec!["0.0.0.0".to_string(), "::".to_string()],
+        boot::BindHost::Hosts(hosts) => hosts.clone(),
+    };
+    let mut listeners = Vec::with_capacity(addrs.len());
+    for h in addrs {
+        let lookup_target = format!("{h}:{port}");
+        let addr = tokio::net::lookup_host(&lookup_target)
+            .await
+            .with_context(|| format!("resolve bind host {lookup_target}"))?
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("no addresses resolved for {lookup_target}"))?;
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("bind {addr}"))?;
+        listeners.push(listener);
+    }
+    Ok(listeners)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -601,17 +645,23 @@ async fn main() -> Result<()> {
         ))
         .with_state(std::sync::Arc::clone(&state));
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], cli.port));
-    let listener = tokio::net::TcpListener::bind(addr)
+    let listeners = bind_listeners(&host, cli.port).await?;
+    for listener in &listeners {
+        let bound = listener
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|_| "<unknown>".to_string());
+        eprintln!("conexus-router: listening on {bound} (MCP/API proxy live; admin REST surface app-wiring in progress)");
+    }
+    let make_service = app.into_make_service_with_connect_info::<SocketAddr>();
+    let serves = listeners.into_iter().map(|listener| {
+        let make_service = make_service.clone();
+        async move { axum::serve(listener, make_service).await }
+    });
+    futures_util::future::try_join_all(serves)
         .await
-        .with_context(|| format!("bind {addr}"))?;
-    eprintln!("conexus-router: listening on {addr} (MCP/API proxy live; admin REST surface app-wiring in progress)");
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await
-    .context("serve conexus-router")
+        .context("serve conexus-router")?;
+    Ok(())
 }
 
 /// Port of `app.py`'s `on_startup` reconciliation pass + the two
@@ -708,5 +758,71 @@ mod tests {
         assert_eq!(cli.idle_sec, 14400);
         assert!(cli.projects_file.is_none());
         assert!(cli.single_tenant.is_none());
+    }
+
+    // -- bind_listeners: the real, live-cutover-caught regression --
+    //
+    // Before the fix, `main()` hardcoded `SocketAddr::from(([0, 0, 0,
+    // 0], cli.port))` regardless of `boot::resolve_bind_host`'s own
+    // resolved value -- these tests pin the FIX, not the historical
+    // bug, by asserting the returned listener's real `local_addr()`
+    // matches what was actually requested rather than a hardcoded
+    // wildcard. Port 0 lets the OS pick a free ephemeral port so
+    // these tests never collide with anything else on the host,
+    // including each other when run in parallel.
+
+    #[tokio::test]
+    async fn bind_listeners_binds_the_explicit_host_requested_not_a_hardcoded_wildcard() {
+        let host = boot::BindHost::Hosts(vec!["127.0.0.1".to_string()]);
+        let listeners = bind_listeners(&host, 0).await.expect("bind succeeds");
+        assert_eq!(listeners.len(), 1);
+        let addr = listeners[0].local_addr().expect("local_addr");
+        assert_eq!(addr.ip(), std::net::IpAddr::from([127, 0, 0, 1]));
+        // The historical bug: this would have been 0.0.0.0 regardless
+        // of the host requested above.
+        assert_ne!(addr.ip(), std::net::IpAddr::from([0, 0, 0, 0]));
+    }
+
+    #[tokio::test]
+    async fn bind_listeners_binds_every_explicit_host_in_a_multi_host_list() {
+        // Mirrors this migration's own real production config
+        // (`AGENT_MCP_ROUTER_HOST=127.0.0.1,10.14.255.10`) in shape --
+        // two real loopback-reachable addresses, port 0 each so they
+        // never collide.
+        let host = boot::BindHost::Hosts(vec!["127.0.0.1".to_string(), "127.0.0.2".to_string()]);
+        let listeners = bind_listeners(&host, 0).await.expect("bind succeeds");
+        assert_eq!(listeners.len(), 2);
+        let ips: Vec<std::net::IpAddr> = listeners
+            .iter()
+            .map(|l| l.local_addr().expect("local_addr").ip())
+            .collect();
+        assert!(ips.contains(&std::net::IpAddr::from([127, 0, 0, 1])));
+        assert!(ips.contains(&std::net::IpAddr::from([127, 0, 0, 2])));
+    }
+
+    #[tokio::test]
+    async fn bind_listeners_all_interfaces_binds_both_ipv4_and_ipv6_wildcards() {
+        let listeners = bind_listeners(&boot::BindHost::AllInterfaces, 0)
+            .await
+            .expect("bind succeeds");
+        assert_eq!(listeners.len(), 2);
+        let ips: Vec<std::net::IpAddr> = listeners
+            .iter()
+            .map(|l| l.local_addr().expect("local_addr").ip())
+            .collect();
+        assert!(ips.contains(&std::net::IpAddr::from([0, 0, 0, 0])));
+        assert!(ips.contains(&std::net::IpAddr::from(std::net::Ipv6Addr::UNSPECIFIED)));
+    }
+
+    #[tokio::test]
+    async fn bind_listeners_accepts_localhost_by_name_not_only_literal_ips() {
+        let host = boot::BindHost::Hosts(vec!["localhost".to_string()]);
+        let listeners = bind_listeners(&host, 0).await.expect("bind succeeds");
+        assert_eq!(listeners.len(), 1);
+        assert!(listeners[0]
+            .local_addr()
+            .expect("local_addr")
+            .ip()
+            .is_loopback());
     }
 }
