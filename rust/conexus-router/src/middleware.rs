@@ -57,6 +57,15 @@ use crate::{identity, login, mount};
 /// SO_PEERCRED parameters, inert for this binary -- see module doc.
 const OWN_UID: u32 = 0;
 
+/// Port of Python's `request["_warm_authorized"]` stash -- carries
+/// `session_gate_layer`'s own authorization decision (see the match
+/// arms below) forward as a request extension so `dashboard_handlers.rs`
+/// can gate the `_schedule_backend_warm` side effect on it without
+/// re-deriving the session-gate decision a second time. `pub(crate)`:
+/// produced here, consumed in a different module.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WarmAuthorized(pub bool);
+
 fn extra_trusted_uids() -> std::collections::HashSet<u32> {
     std::collections::HashSet::new()
 }
@@ -228,11 +237,22 @@ pub async fn session_gate_layer(
     };
 
     match outcome {
-        Ok(SessionGateOutcome::PassThrough { .. }) | Ok(SessionGateOutcome::PublicAppShell) => {
+        Ok(SessionGateOutcome::PassThrough { warm_authorized }) => {
+            req.extensions_mut().insert(WarmAuthorized(warm_authorized));
+            next.run(req).await
+        }
+        Ok(SessionGateOutcome::PublicAppShell) => {
+            req.extensions_mut().insert(WarmAuthorized(false));
             next.run(req).await
         }
         Ok(SessionGateOutcome::Reject(resp)) => resp.into_response(),
         Ok(SessionGateOutcome::Allow(identity)) => {
+            // SC-R6-1: reaching `Allow` means sysadmin or a
+            // sufficient project role -- exactly the two branches
+            // Python's own `request["_warm_authorized"] = True` stash
+            // covers on this path (see `dashboard_static.rs`'s own
+            // module doc for the full mapping).
+            req.extensions_mut().insert(WarmAuthorized(true));
             req.extensions_mut().insert(*identity);
             next.run(req).await
         }
