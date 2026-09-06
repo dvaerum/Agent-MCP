@@ -455,6 +455,25 @@ pub fn ensure_group(conn: &Connection, name: &str) -> Result<String> {
     Ok(group_id)
 }
 
+/// `true` iff `user_id` is already a DIRECT member of `group_id`.
+/// Port of `_add_user_to_group_idempotent`'s own pre-check --
+/// `group_membership` has a UNIQUE index on `(group_id,
+/// member_user_id)`, so a repeated [`add_group_member`] call for an
+/// already-existing edge would hit a constraint violation instead of
+/// silently no-op'ing; this lets a caller preserve the "was it newly
+/// added?" idempotent contract the SSO group-mapping reconcile path
+/// needs.
+pub fn is_direct_user_member(conn: &Connection, group_id: &str, user_id: &str) -> Result<bool> {
+    let exists: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM group_membership WHERE group_id = ?1 AND member_user_id = ?2",
+            [group_id, user_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(exists.is_some())
+}
+
 /// Delete a user->group edge; `true` iff a row was removed.
 pub fn remove_group_member(conn: &Connection, group_id: &str, user_id: &str) -> Result<bool> {
     let n = conn.execute(
@@ -1118,6 +1137,24 @@ mod tests {
             resolve_user_groups(&conn, "alice").unwrap(),
             HashSet::from(["engineers".to_string()])
         );
+    }
+
+    #[test]
+    fn is_direct_user_member_reflects_a_real_edge() {
+        let conn = test_conn();
+        seed_group(&conn, "engineers");
+        seed_user(&conn, "alice");
+        seed_user(&conn, "bob");
+        add_group_member(
+            &conn,
+            "engineers",
+            Some("alice"),
+            None,
+            "2026-01-01T00:00:00Z",
+        )
+        .unwrap();
+        assert!(is_direct_user_member(&conn, "engineers", "alice").unwrap());
+        assert!(!is_direct_user_member(&conn, "engineers", "bob").unwrap());
     }
 
     #[test]
