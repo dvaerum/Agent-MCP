@@ -42,6 +42,7 @@ mod login_setup_rest;
 mod mcp_handler;
 mod middleware;
 mod mount;
+mod oidc_flow_state;
 mod oidc_group_mapping;
 mod oidc_reconcile;
 mod orchestrator;

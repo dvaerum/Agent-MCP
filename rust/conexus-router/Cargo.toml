@@ -123,3 +123,10 @@ minijinja = "2"
 # (a transitive dep of axum/serde_json), added here as a direct edge
 # for the `derive` feature.
 serde = { version = "1", features = ["derive"] }
+# oidc_flow_state.rs (Phase E2 PR22 step 6, `conexus-router-oidc-
+# flow-state`) -- base64url(JSON) encode/decode for the SSO flow-state
+# cookie. Already resolved workspace-wide (a transitive dep of
+# argon2/password-hash), added here as a direct edge rather than
+# hand-rolling a second base64 codec (this crate's own established
+# "well-maintained library over reinventing it" discipline).
+base64 = "0.22"
