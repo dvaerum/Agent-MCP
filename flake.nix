@@ -192,6 +192,13 @@
         conexus-router = conexusPkgs.conexusRouter;
         conexus-router-wrapper = conexusPkgs.conexusRouterWrapper;
 
+        # CoNexus reference daemon-agent (Phase F) — auto-wired via
+        # `conexusDaemonAgentPackage` in the home-manager module
+        # wrapper above; exposed here too so it's independently
+        # buildable/cacheable like every other CoNexus binary.
+        conexus-daemon-agent = conexusPkgs.conexusDaemonAgent;
+        conexus-daemon-agent-wrapper = conexusPkgs.conexusDaemonAgentWrapper;
+
         vm = vmMulti;
         vm-multi = vmMulti;
         vm-single = vmSingle;
@@ -244,16 +251,24 @@
       # (defaults to their own `pkgs`, but is itself overridable) --
       # never this flake's own fixed x86_64-linux `pkgs`, which would
       # silently be wrong for a consumer on a different system.
-      homeModules.default = { config, ... }: {
+      homeModules.default = { config, ... }: let
+        conexusPkgsFor = import ./nix/conexus.nix {
+          pkgs = config.services.agent-mcp.pkgs;
+          inherit lib;
+          src = self;
+          craneLib = crane.mkLib config.services.agent-mcp.pkgs;
+        };
+      in {
         imports = [ ./nix/home-manager-module.nix ];
         services.agent-mcp.source = lib.mkDefault self;
-        services.agent-mcp.conexusLauncherPackage = lib.mkDefault
-          (import ./nix/conexus.nix {
-            pkgs = config.services.agent-mcp.pkgs;
-            inherit lib;
-            src = self;
-            craneLib = crane.mkLib config.services.agent-mcp.pkgs;
-          }).conexusLauncher;
+        services.agent-mcp.conexusLauncherPackage =
+          lib.mkDefault conexusPkgsFor.conexusLauncher;
+        # Auto-wired (unlike conexusRouterPackage below) -- see this
+        # option's own doc in home-manager-module.nix for why a
+        # daemon-agent instance carries none of the router's
+        # port-collision/production-outage risk.
+        services.agent-mcp.conexusDaemonAgentPackage =
+          lib.mkDefault conexusPkgsFor.conexusDaemonAgentWrapper;
       };
       homeModules.agent-mcp = self.homeModules.default;
 
@@ -284,6 +299,9 @@
         # CoNexus Rust router (Phase F packaging prerequisite) — same
         # cheap build-only rationale as conexus-backend above.
         conexus-router = conexusPkgs.conexusRouter;
+        # CoNexus reference daemon-agent (Phase F) — same cheap
+        # build-only rationale as conexus-backend/conexus-router above.
+        conexus-daemon-agent = conexusPkgs.conexusDaemonAgent;
         vm-multi-tenant = import ./nix/tests/multi-tenant.nix {
           inherit pkgs lib self;
         };
