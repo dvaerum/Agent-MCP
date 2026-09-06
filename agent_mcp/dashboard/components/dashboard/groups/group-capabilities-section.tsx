@@ -179,13 +179,18 @@ export function GroupCapabilitiesSection({
   }
 
   const grouped = React.useMemo(() => {
-    // Render every KNOWN cap (sourced from the description registry —
-    // the build-time test ``capability-descriptions-complete`` keeps
-    // it in lockstep with ``core/capabilities.py::KNOWN_CAPABILITIES``).
-    // We bucket by resource so the UI matches the mental model
-    // operators have when reading the bundle table.
-    const allKnown = Object.keys(CAPABILITY_DESCRIPTIONS)
-    return groupCapabilitiesByResource(allKnown)
+    // Only `system.*` caps are offered here — group_capability rows carry
+    // no project_name column (SEC R2-F3, rust/conexus-router/src/
+    // admin_group_capabilities.rs), so the PUT endpoint rejects the whole
+    // atomic replace with 400 resource_capability_not_delegable_to_group
+    // the moment ANY resource-tier cap (e.g. agents.view, tasks.create) is
+    // included. Resource-tier grants exist only via project_membership.role.
+    // Found live via Firefox-MCP dashboard verification 2026-09-06: the
+    // picker offered all 29 known caps and silently 400'd on save.
+    const groupDelegable = Object.keys(CAPABILITY_DESCRIPTIONS).filter((cap) =>
+      cap.startsWith("system."),
+    )
+    return groupCapabilitiesByResource(groupDelegable)
   }, [])
 
   return (
