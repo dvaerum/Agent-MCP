@@ -131,6 +131,59 @@ async fn health() -> &'static str {
     "ok"
 }
 
+/// Redirect target hardcoded to the `/agent-mcp/`-prefixed URL,
+/// regardless of which path (canonical or a root-mounted alias, see
+/// `mount_aliases` below) reached this handler -- ports Python's own
+/// closure-reuse quirk (`_add_root_aliases` re-registers the IDENTICAL
+/// closure object at the alias path, so a root-mounted `/app` request
+/// is still redirected to `/agent-mcp/app/`, never a root-relative
+/// target). A named fn reused at both registration sites is this
+/// crate's equivalent of Python's "same closure object" preservation.
+async fn redirect_to_app_index() -> axum::response::Response {
+    dashboard_handlers::moved_permanently("/agent-mcp/app/")
+}
+
+/// Same hardcoded-target preservation as [`redirect_to_app_index`],
+/// for the per-project `/agent-mcp/app/{name}` -> `/agent-mcp/app/{name}/`
+/// redirect.
+async fn redirect_to_app_page(
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> axum::response::Response {
+    dashboard_handlers::moved_permanently(&format!("/agent-mcp/app/{name}/"))
+}
+
+/// ADR-0020/R5-F6 4-variant alias registration for an
+/// `/agent-mcp/api/router/...` route, as a chainable
+/// `.admin_api_route(...)` -- see `main`'s own comment above
+/// `admin_router` for why all 4 (canonical, trailing-slash, root,
+/// root+trailing-slash) are real, distinct routes Python's two-
+/// mechanism alias pipeline produces, not 2. `MethodRouter` is
+/// `Clone` (an `Arc`-wrapped set of handler fns), so this avoids
+/// hand-duplicating each admin route's method set 4 times.
+trait AdminApiAliasExt {
+    fn admin_api_route(
+        self,
+        canonical: &str,
+        methods: axum::routing::MethodRouter<std::sync::Arc<state::RouterState>>,
+    ) -> Self;
+}
+
+impl AdminApiAliasExt for Router<std::sync::Arc<state::RouterState>> {
+    fn admin_api_route(
+        self,
+        canonical: &str,
+        methods: axum::routing::MethodRouter<std::sync::Arc<state::RouterState>>,
+    ) -> Self {
+        let root = canonical
+            .strip_prefix(mount::INTERNAL_MOUNT)
+            .expect("admin_api_route canonical path must start with /agent-mcp");
+        self.route(canonical, methods.clone())
+            .route(&format!("{canonical}/"), methods.clone())
+            .route(root, methods.clone())
+            .route(&format!("{root}/"), methods)
+    }
+}
+
 /// Port of `router_cmd`'s own `--projects-file` default resolution:
 /// `$XDG_CONFIG_HOME/agent-mcp/projects.local.json`, falling back to
 /// `$HOME/.config/agent-mcp/projects.local.json`. No new dependency
@@ -264,78 +317,112 @@ async fn main() -> Result<()> {
     // enforcement (the admin router has no comparably-sized body yet).
     let admin_router: Router<std::sync::Arc<state::RouterState>> = Router::new()
         .route("/health", get(health))
-        .route(
+        // ── admin_api.py / admin_users_api.py REST surface, plus its
+        // ADR-0020/R5-F6 mount aliases (Phase E2 PR23 step 9) ───────
+        //
+        // `admin_api_route` (defined below `main`) registers all 4
+        // real, distinct routes Python's own two-mechanism alias
+        // pipeline produces for each of these 16 endpoints:
+        // canonical (`/agent-mcp/api/router/...`), its R5-F6
+        // trailing-slash alias, and BOTH of those root-mounted
+        // (ADR-0020) -- `_add_admin_trailing_slash_aliases` runs
+        // BEFORE `_add_root_aliases` in the real `make_app()`, so the
+        // root-alias pass walks a route table that already includes
+        // the trailing-slash alias, producing all 4 for real (not
+        // just the 2 an isolated reading of each mechanism would
+        // suggest). `mount::canonical_path` (already threaded through
+        // `session_gate_layer`/`rate_limit_layer`/
+        // `empty_users_redirect_layer`) normalises a root-mounted
+        // request back to its `/agent-mcp`-prefixed form before any
+        // auth/path-policy check runs, so the 2 root variants gate
+        // identically to their 2 `/agent-mcp`-prefixed twins with no
+        // policy-table change needed -- confirmed live (see the PR
+        // body), not merely assumed.
+        .admin_api_route(
             "/agent-mcp/api/router/health",
             get(lifecycle_rest::health_handler),
         )
-        .route(
+        .admin_api_route(
             "/agent-mcp/api/router/projects",
             get(lifecycle_rest::list_projects_handler).post(lifecycle_rest::create_project_handler),
         )
-        .route(
+        .admin_api_route(
             "/agent-mcp/api/router/projects/{name}",
             axum::routing::delete(lifecycle_rest::delete_project_handler)
                 .patch(lifecycle_rest::rename_project_handler),
         )
-        .route(
+        .admin_api_route(
             "/agent-mcp/api/router/projects/{name}/stop",
             axum::routing::post(lifecycle_rest::stop_project_handler),
         )
-        .route(
+        .admin_api_route(
             "/agent-mcp/api/router/projects/{name}/aliases",
             get(lifecycle_rest::alias_usage_handler),
         )
-        .route(
+        .admin_api_route(
             "/agent-mcp/api/router/projects/{name}/aliases/{alias}",
             axum::routing::delete(lifecycle_rest::remove_alias_handler),
         )
-        .route(
+        .admin_api_route(
             "/agent-mcp/api/router/overview",
             get(lifecycle_rest::overview_handler),
         )
-        .route(
+        .admin_api_route(
             "/agent-mcp/api/router/users",
             get(users_groups_rest::list_users_handler).post(users_groups_rest::create_user_handler),
         )
-        .route(
+        .admin_api_route(
             "/agent-mcp/api/router/users/{user_id}",
             axum::routing::patch(users_groups_rest::edit_user_handler)
                 .delete(users_groups_rest::delete_user_handler),
         )
-        .route(
+        .admin_api_route(
             "/agent-mcp/api/router/groups",
             get(users_groups_rest::list_groups_handler)
                 .post(users_groups_rest::create_group_handler),
         )
-        .route(
+        .admin_api_route(
             "/agent-mcp/api/router/groups/{group_id}",
             axum::routing::patch(users_groups_rest::edit_group_handler)
                 .delete(users_groups_rest::delete_group_handler),
         )
-        .route(
+        .admin_api_route(
             "/agent-mcp/api/router/groups/{group_id}/members",
             get(users_groups_rest::list_group_members_handler)
                 .post(users_groups_rest::add_group_member_handler),
         )
-        .route(
+        .admin_api_route(
             "/agent-mcp/api/router/groups/{group_id}/members/{member_id}",
             axum::routing::delete(users_groups_rest::remove_group_member_handler),
         )
-        .route(
+        .admin_api_route(
             "/agent-mcp/api/router/groups/{group_id}/capabilities",
             get(users_groups_rest::list_group_capabilities_handler)
                 .put(users_groups_rest::replace_group_capabilities_handler),
         )
-        .route(
+        .admin_api_route(
             "/agent-mcp/api/router/projects/{name}/memberships",
             get(users_groups_rest::list_project_memberships_handler)
                 .post(users_groups_rest::add_project_membership_handler),
         )
-        .route(
+        .admin_api_route(
             "/agent-mcp/api/router/projects/{name}/memberships/{membership_id}",
             axum::routing::patch(users_groups_rest::change_project_membership_role_handler)
                 .delete(users_groups_rest::delete_project_membership_handler),
         )
+        // ── Dashboard-static surface (step 8) + its own ADR-0020
+        // root-mount aliases (step 9) ───────────────────────────────
+        //
+        // None of these get mechanism 1 (R5-F6 trailing-slash
+        // aliasing) -- Python's own `_add_admin_trailing_slash_aliases`
+        // scopes to `_ADMIN_API_PREFIX` only (the `/agent-mcp/api/
+        // router/...` routes above), confirmed by direct source
+        // read. Each still gets its ADR-0020 root-mounted alias,
+        // registered by hand below (dashboard routes have no shared
+        // 4-variant shape the way the admin API routes do -- a mix of
+        // exact paths, a single dynamic segment, and 2 wildcard
+        // tail-matches, so `admin_api_route`'s blind `path + "/"`
+        // helper doesn't apply here).
         .route("/agent-mcp/", get(dashboard_handlers::index_handler))
         .route(
             "/agent-mcp",
@@ -349,18 +436,8 @@ async fn main() -> Result<()> {
             "/agent-mcp/app/",
             get(dashboard_handlers::overview_dashboard_handler),
         )
-        .route(
-            "/agent-mcp/app",
-            get(|| async { dashboard_handlers::moved_permanently("/agent-mcp/app/") }),
-        )
-        .route(
-            "/agent-mcp/app/{name}",
-            get(
-                |axum::extract::Path(name): axum::extract::Path<String>| async move {
-                    dashboard_handlers::moved_permanently(&format!("/agent-mcp/app/{name}/"))
-                },
-            ),
-        )
+        .route("/agent-mcp/app", get(redirect_to_app_index))
+        .route("/agent-mcp/app/{name}", get(redirect_to_app_page))
         .route(
             "/agent-mcp/app/{name}/",
             get(dashboard_handlers::dashboard_index_handler),
@@ -369,11 +446,40 @@ async fn main() -> Result<()> {
             "/agent-mcp/app/{name}/{*rest}",
             get(dashboard_handlers::dashboard_handler),
         )
+        // Dedup rule (confirmed against the real Python
+        // `_add_root_aliases` loop): `/agent-mcp` (the bare 301
+        // redirect) and `/agent-mcp/` (`index_handler`) both compute
+        // root_path `/` -- Python's registration-order `seen` set
+        // means `/agent-mcp/`'s `index_handler` wins root `/`, so the
+        // bare-redirect's OWN root alias is silently skipped. Ported
+        // by simply never registering a root alias for the bare
+        // `/agent-mcp` redirect below.
+        .route("/", get(dashboard_handlers::index_handler))
+        .route("/app/", get(dashboard_handlers::overview_dashboard_handler))
+        .route("/app", get(redirect_to_app_index))
+        .route("/app/{name}", get(redirect_to_app_page))
+        .route(
+            "/app/{name}/",
+            get(dashboard_handlers::dashboard_index_handler),
+        )
+        // Explicit tail-match root alias #1/3 (Python hand-lists
+        // these separately since `resource.canonical` strips a
+        // `{rest:.*}`'s regex, which a programmatic re-add would
+        // corrupt -- their `/agent-mcp/`-prefixed canonical paths are
+        // excluded from the plain-prefix-strip set above).
+        .route(
+            "/assets/{*rest}",
+            get(dashboard_handlers::dashboard_assets_handler),
+        )
+        // Explicit tail-match root alias #2/3.
+        .route(
+            "/app/{name}/{*rest}",
+            get(dashboard_handlers::dashboard_handler),
+        )
         .layer(axum::middleware::from_fn_with_state(
             std::sync::Arc::clone(&state),
             middleware::session_gate_layer,
         ));
-
     let proxy_router: Router<std::sync::Arc<state::RouterState>> = Router::new()
         .route(
             "/agent-mcp/mcp/{name}",
@@ -385,6 +491,25 @@ async fn main() -> Result<()> {
         )
         .route(
             "/agent-mcp/api/{name}/{*rest}",
+            axum::routing::any(proxy_routes::api_proxy_handler),
+        )
+        // ADR-0020 root-mount aliases for the proxy surface -- these
+        // routes already do their own bearer/Accept-header admission
+        // (never the operator session gate, see this router's own
+        // structural split, `proxy_router` mounted OUTSIDE
+        // `session_gate_layer` entirely), so their root-mounted twins
+        // live on this same un-gated router, not `admin_router`.
+        .route(
+            "/mcp/{name}",
+            axum::routing::any(proxy_routes::mcp_proxy_handler),
+        )
+        .route(
+            "/api/{name}",
+            axum::routing::any(proxy_routes::api_proxy_handler_no_rest),
+        )
+        // Explicit tail-match root alias #3/3.
+        .route(
+            "/api/{name}/{*rest}",
             axum::routing::any(proxy_routes::api_proxy_handler),
         )
         .layer(axum::extract::DefaultBodyLimit::max(
