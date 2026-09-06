@@ -38,6 +38,7 @@ mod json_sanitize;
 mod lifecycle;
 mod lifecycle_rest;
 mod login;
+mod login_setup_rest;
 mod mcp_handler;
 mod middleware;
 mod mount;
@@ -59,6 +60,7 @@ mod single_tenant;
 mod sso;
 mod sso_config_rest;
 mod state;
+mod templates;
 mod users_groups_rest;
 
 use std::net::SocketAddr;
@@ -455,6 +457,23 @@ async fn main() -> Result<()> {
             "/agent-mcp/app/{name}/{*rest}",
             get(dashboard_handlers::dashboard_handler),
         )
+        // Login / logout / setup-wizard HTML surface (step 4,
+        // `conexus-router-login-setup-templates`). Same UNAUTH_PREFIXES
+        // exemption every other route in `path_policy.rs` already
+        // documents -- `session_gate_layer` PassThroughs these
+        // unconditionally.
+        .route(
+            "/agent-mcp/login",
+            get(login_setup_rest::login_get_handler).post(login_setup_rest::login_post_handler),
+        )
+        .route(
+            "/agent-mcp/logout",
+            get(login_setup_rest::logout_get_handler).post(login_setup_rest::logout_post_handler),
+        )
+        .route(
+            "/agent-mcp/setup",
+            get(login_setup_rest::setup_get_handler).post(login_setup_rest::setup_post_handler),
+        )
         // Dedup rule (confirmed against the real Python
         // `_add_root_aliases` loop): `/agent-mcp` (the bare 301
         // redirect) and `/agent-mcp/` (`index_handler`) both compute
@@ -470,6 +489,19 @@ async fn main() -> Result<()> {
         .route(
             "/app/{name}/",
             get(dashboard_handlers::dashboard_index_handler),
+        )
+        // ADR-0020 root-mount aliases for login/logout/setup.
+        .route(
+            "/login",
+            get(login_setup_rest::login_get_handler).post(login_setup_rest::login_post_handler),
+        )
+        .route(
+            "/logout",
+            get(login_setup_rest::logout_get_handler).post(login_setup_rest::logout_post_handler),
+        )
+        .route(
+            "/setup",
+            get(login_setup_rest::setup_get_handler).post(login_setup_rest::setup_post_handler),
         )
         // Explicit tail-match root alias #1/3 (Python hand-lists
         // these separately since `resource.canonical` strips a

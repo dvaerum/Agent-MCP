@@ -191,6 +191,26 @@ pub struct SessionCookie {
     pub max_age: i64,
 }
 
+impl SessionCookie {
+    /// The real `Set-Cookie` header value -- this struct's own
+    /// promised PR23 serialization (see the doc above). Attribute
+    /// order doesn't matter to a real browser; this is just a stable,
+    /// readable canonical form.
+    pub fn to_header_value(&self) -> String {
+        let mut out = format!(
+            "{}={}; Path={}; Max-Age={}; HttpOnly",
+            self.name, self.value, self.path, self.max_age
+        );
+        if self.secure {
+            out.push_str("; Secure");
+        }
+        match self.same_site {
+            SameSite::Lax => out.push_str("; SameSite=Lax"),
+        }
+        out
+    }
+}
+
 /// Port of `_set_session_cookie`: mints the real cookie with
 /// `Max-Age=`[`COOKIE_MAX_AGE_SECS`]. `path` is the caller's own
 /// `mount::external_prefix(request) + "/"` (ADR-0020: `/` at root,
