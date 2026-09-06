@@ -333,6 +333,38 @@ in {
           kicks in when that field is empty.
         '';
       };
+
+      impl = lib.mkOption {
+        type = lib.types.enum [ "python" "rust" ];
+        default = "python";
+        description = ''
+          Which router implementation is the ACTIVE one -- the one
+          `Install.WantedBy` names, so it's the one that actually gets
+          started by a `home-manager switch`/`systemctl --user start
+          default.target`. The other implementation's unit still
+          exists (both `agent-mcp-router`/`conexus-router` are always
+          defined when their prerequisites are met -- see
+          `conexusRouterPackage`) but carries no `Install.WantedBy`,
+          so it never starts on its own.
+
+          This is the router's rollback-flip mechanism (Phase F,
+          prancy-napping-pie) -- the singleton equivalent of the
+          per-project `backend_impl` registry flag, since the router
+          has no smaller cutover unit to canary (Guiding Principle 2:
+          there is only one router). Flipping this option and running
+          `home-manager switch` is the intended, one-line rollback
+          path in EITHER direction: `"rust" -> "python"` if a
+          `conexus-router` cutover needs reverting, or the reverse to
+          try it. Both units read/write the SAME `router.db` (see
+          `AGENT_MCP_ROUTER_DB` on both), so switching does not
+          migrate or duplicate any state.
+
+          `"rust"` requires `conexusRouterPackage` to be set (enforced
+          by an assertion) -- flipping to Rust without ever building
+          its package would otherwise silently leave NO router
+          running at all after the switch.
+        '';
+      };
     };
 
     dashboard = {
@@ -629,6 +661,22 @@ in {
           create surprising precedence rules and a security footgun.
         '';
       }
+      {
+        # Phase F (prancy-napping-pie): flipping router.impl to "rust"
+        # with no conexusRouterPackage set would leave the profile
+        # with NO active router unit at all after the switch (neither
+        # agent-mcp-router's WantedBy, cleared by the flip, nor
+        # conexus-router's, since that unit doesn't even exist without
+        # the package) -- catch this at evaluation, not as a silent
+        # outage discovered after `home-manager switch`.
+        assertion = cfg.router.impl == "rust" -> cfg.conexusRouterPackage != null;
+        message = ''
+          services.agent-mcp.router.impl = "rust" requires
+          services.agent-mcp.conexusRouterPackage to be set -- without
+          it there is no conexus-router unit for Install.WantedBy to
+          name, and this flip would leave NO router running at all.
+        '';
+      }
     ];
 
     home.packages = [
@@ -889,7 +937,23 @@ in {
           # 2026-06-04 08:57 production stall — see PR <#TBD>.
           TimeoutStopSec = 15;
         } // hardening;
-        Install.WantedBy = [ "default.target" ];
+        # `router.impl` (Phase F, prancy-napping-pie): only the ACTIVE
+        # implementation carries `Install.WantedBy` -- see that
+        # option's own doc for the rollback-flip rationale. Default
+        # ("python") reproduces this unit's behavior from before this
+        # option existed exactly (WantedBy always set) -- see
+        # `test_unset_option_is_exactly_todays_behaviour`-style
+        # coverage for this same "new option changes nothing by
+        # default" contract this module already holds itself to. A
+        # plain Nix `if`, not `lib.mkIf` -- whether `mkIf` resolves
+        # correctly here depends on `Install.WantedBy` being a real
+        # `mkOption`-typed submodule field in the CONSUMER's actual
+        # home-manager, which this repo has no local copy of to check
+        # directly (this module is exported for others to import, not
+        # imported by this flake itself); a plain `if` sidesteps the
+        # question entirely by resolving at eval time regardless of
+        # how the target option is declared.
+        Install.WantedBy = if cfg.router.impl == "python" then [ "default.target" ] else [ ];
       };
 
       # `conexus-router` — the CoNexus Rust router (Phase F packaging
@@ -987,11 +1051,16 @@ in {
           # implementation is live.
           TimeoutStopSec = 15;
         } // hardening;
-        # Not WantedBy any target while this unit is inert-by-default
-        # (see the option doc above) -- an explicit `conexusRouterPackage`
-        # consumer decides when to enable it, matching every other
-        # `cfg.<x> != null`-gated toggle in this module (e.g.
-        # `cfg.sso.oidc`).
+        # `router.impl` (Phase F, prancy-napping-pie): mirrors
+        # `agent-mcp-router`'s own conditional WantedBy above -- only
+        # the ACTIVE implementation gets started. Default ("python")
+        # means this unit carries no WantedBy at all, same as before
+        # `router.impl` existed (the assertion above guarantees
+        # `conexusRouterPackage` is set whenever `impl == "rust"`, so
+        # this can never resolve to "wanted but the unit doesn't
+        # exist"). Plain Nix `if`, not `lib.mkIf` -- see the identical
+        # note on `agent-mcp-router`'s own WantedBy above.
+        Install.WantedBy = if cfg.router.impl == "rust" then [ "default.target" ] else [ ];
       };
     } // lib.listToAttrs (map (a: {
       name = "agent-mcp-daemon-agent@${daemonAgentInstanceName a}";
