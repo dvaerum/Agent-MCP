@@ -8,14 +8,17 @@
 //! [`SessionGateOutcome`] are plain Rust types over already-extracted
 //! inputs; real axum middleware registration is PR 23's job.
 //!
+//! **Proxy-header SSO identity** (`_try_proxy_header_identity`,
+//! `sso.py`) is wired in as of step 10 (`conexus-router-sso-admin-
+//! config`): a caller with no valid session cookie falls through to
+//! [`try_proxy_header_identity`] BEFORE the "no session" rejection,
+//! matching Python's own `resolve_current_user` -> `_try_proxy_header_
+//! identity` -> reject ordering exactly. Full OIDC (`sso.py`'s
+//! authorization-code flow, PR 22) remains separately blocked on the
+//! still-open operator crate-choice question -- this step only wires
+//! the already-ported proxy-header TRUST path, not OIDC.
+//!
 //! Deliberately deferred, documented not silently dropped:
-//! - **Proxy-header SSO identity** (`_try_proxy_header_identity`,
-//!   `sso.py`, PR 22): a caller with no valid session cookie always
-//!   falls through to the same "no session" rejection this module
-//!   returns. Once PR 22 lands, its own caller resolves proxy-header
-//!   identity FIRST and only calls into this gate on a miss --
-//!   matching how PR 9's `mcp_handler.rs` deferred the cookie-
-//!   authenticated MCP proxy path until session machinery existed.
 //! - **A genuinely nonexistent project is NOT rejected here.**
 //!   Ported deliberately, not a gap: when [`resolved_project_from_path`]
 //!   can't resolve the URL segment to any real/aliased project at
@@ -45,7 +48,9 @@ use crate::mcp_handler::{self, HandlerBody, HandlerResponse};
 use crate::orchestrator::resolve as project_resolve;
 use crate::path_policy;
 use crate::project_registry::ProjectRegistry;
+use crate::rate_limit::PeerInfo;
 use crate::single_tenant::bypasses_operator_gate;
+use crate::sso;
 
 /// HTTP methods treated as mutations for the per-project operator/
 /// viewer split -- port of `_MUTATION_METHODS`. GET/HEAD/OPTIONS (and
@@ -80,6 +85,13 @@ pub struct GateRequest<'a> {
     pub accept_header: Option<&'a str>,
     pub cookie_header: Option<&'a str>,
     pub login_url: &'a str,
+    /// Step 10 (`sso-admin-config`): the raw, untrimmed value of
+    /// whichever header `ProxyHeaderSettings.trust_header` names
+    /// (e.g. `X-Agent-MCP-SSO-User`) -- the caller extracts it
+    /// generically since this module doesn't know the configured
+    /// header NAME (that's inside `sso_settings`, resolved once per
+    /// request by the caller, not this pure-decision module).
+    pub proxy_header_value: Option<&'a str>,
 }
 
 /// The gate's decision -- port of `require_operator_session_middleware`'s
@@ -250,20 +262,64 @@ fn resolved_project_from_path(
     }
 }
 
+/// Port of `_try_proxy_header_identity`. Returns `None` (never an
+/// error) on any of: `sso_settings` is `None` (the caller's own SSO
+/// config load failed -- Python's `except Exception: return None`
+/// around `sso.get_sso_config()`), proxy-header mode isn't active,
+/// the request wasn't from a trusted source, the header was missing/
+/// empty, or the router-DB lookup itself failed. This is a best-
+/// effort SECONDARY identity path -- any failure here must fail
+/// closed to "no identity" and let the caller fall through to the
+/// ordinary session-cookie rejection, never propagate and 500 the
+/// whole request the way a real session-cookie DB error would.
+#[allow(clippy::too_many_arguments)]
+fn try_proxy_header_identity(
+    conn: &mut Connection,
+    sso_settings: Option<&sso::SsoSettings>,
+    peer: &PeerInfo,
+    header_value: Option<&str>,
+    own_uid: u32,
+    extra_trusted_uids: &HashSet<u32>,
+    now: &str,
+) -> Option<UserRow> {
+    let settings = sso_settings?;
+    if settings.mode != sso::SsoMode::ProxyHeader {
+        return None;
+    }
+    let proxy = settings.proxy.as_ref()?;
+    sso::extract_proxy_header_user(
+        conn,
+        header_value,
+        peer,
+        proxy,
+        own_uid,
+        extra_trusted_uids,
+        now,
+    )
+    .ok()
+    .flatten()
+}
+
 /// The gate itself -- port of `require_operator_session_middleware`.
 /// Any genuine DB error resolving the session cookie propagates
 /// (this crate's own "distinguish 'not available' from 'available
 /// but broken'" convention); sysadmin/group/project-role resolution
 /// deliberately fail CLOSED to `None`/`false` on error, matching
 /// Python's own defensive `except Exception` around each of those
-/// three calls.
+/// three calls. `conn` is `&mut` (widened from `&Connection` in step
+/// 10) because the proxy-header fallback can JIT-create a new user
+/// row -- a real, mechanical signature change, not additive.
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate_session_gate(
-    conn: &Connection,
+    conn: &mut Connection,
     registry: &ProjectRegistry,
     cfg: &SessionGateConfig,
     now: DateTime<Utc>,
     req: &GateRequest,
+    sso_settings: Option<&sso::SsoSettings>,
+    peer: &PeerInfo,
+    own_uid: u32,
+    extra_trusted_uids: &HashSet<u32>,
 ) -> Result<SessionGateOutcome, IdentityError> {
     // Defensive parity with Python -- mount::canonical_path always
     // yields an `/agent-mcp`-prefixed path in practice, so this never
@@ -292,17 +348,31 @@ pub fn evaluate_session_gate(
     }
 
     let now_str = now.to_rfc3339();
-    let user = login::resolve_current_user(conn, req.cookie_header, &now_str)?;
-    let Some(user) = user else {
-        // Proxy-header SSO identity (`_try_proxy_header_identity`) is
-        // PR 22 territory -- deliberately not attempted here, see
-        // this module's own doc.
-        let response = if wants_html(req.accept_header) {
-            login_redirect_response(req.login_url, req.raw_path_qs)
-        } else {
-            unauthorized_response("session cookie missing or invalid", req.login_url)
-        };
-        return Ok(SessionGateOutcome::Reject(response));
+    let cookie_user = login::resolve_current_user(conn, req.cookie_header, &now_str)?;
+    let user = match cookie_user {
+        Some(user) => user,
+        None => {
+            let proxy_user = try_proxy_header_identity(
+                conn,
+                sso_settings,
+                peer,
+                req.proxy_header_value,
+                own_uid,
+                extra_trusted_uids,
+                &now_str,
+            );
+            match proxy_user {
+                Some(user) => user,
+                None => {
+                    let response = if wants_html(req.accept_header) {
+                        login_redirect_response(req.login_url, req.raw_path_qs)
+                    } else {
+                        unauthorized_response("session cookie missing or invalid", req.login_url)
+                    };
+                    return Ok(SessionGateOutcome::Reject(response));
+                }
+            }
+        }
     };
 
     let groups: Option<HashSet<String>> =
@@ -388,6 +458,7 @@ pub fn evaluate_session_gate(
 mod tests {
     use super::*;
     use crate::identity;
+    use crate::sso::{SsoMode, SsoSettings};
     use conexus_db::schema::init_router_schema;
 
     fn conn() -> Connection {
@@ -438,17 +509,56 @@ mod tests {
             accept_header: None,
             cookie_header: cookie,
             login_url: "/agent-mcp/login",
+            proxy_header_value: None,
         }
+    }
+
+    /// An untrusted peer with no known address -- every pre-existing
+    /// test (all written before step 10's proxy-header fallback)
+    /// exercises the cookie-only path, so `no_trust_peer`/`call_gate`'s
+    /// `sso_settings: None` keep that path exactly as tested.
+    fn no_trust_peer() -> PeerInfo {
+        PeerInfo {
+            tcp_ip: None,
+            uds_uid: None,
+        }
+    }
+
+    /// Thin wrapper over [`evaluate_session_gate`] supplying inert
+    /// defaults for step 10's 4 new parameters, so the ~15
+    /// pre-existing call sites below (all cookie-path tests) don't
+    /// each need to spell out `None`/`no_trust_peer()`/`0`/an empty
+    /// set. Proxy-header-fallback-specific tests call
+    /// `evaluate_session_gate` directly with real values instead.
+    #[allow(clippy::too_many_arguments)]
+    fn call_gate(
+        c: &mut Connection,
+        registry: &ProjectRegistry,
+        cfg: &SessionGateConfig,
+        now: DateTime<Utc>,
+        req: &GateRequest,
+    ) -> Result<SessionGateOutcome, IdentityError> {
+        evaluate_session_gate(
+            c,
+            registry,
+            cfg,
+            now,
+            req,
+            None,
+            &no_trust_peer(),
+            0,
+            &HashSet::new(),
+        )
     }
 
     #[test]
     fn passes_through_an_unauth_allowlisted_path() {
-        let c = conn();
+        let mut c = conn();
         let dir = tempfile::tempdir().unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
         let cfg = SessionGateConfig::default();
         let req = base_req("/agent-mcp/login", None);
-        let outcome = evaluate_session_gate(&c, &registry, &cfg, now_dt(), &req).unwrap();
+        let outcome = call_gate(&mut c, &registry, &cfg, now_dt(), &req).unwrap();
         assert!(matches!(
             outcome,
             SessionGateOutcome::PassThrough {
@@ -459,12 +569,12 @@ mod tests {
 
     #[test]
     fn passes_through_a_delivery_route() {
-        let c = conn();
+        let mut c = conn();
         let dir = tempfile::tempdir().unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
         let cfg = SessionGateConfig::default();
         let req = base_req("/agent-mcp/api/proj-a/delivery/stream", None);
-        let outcome = evaluate_session_gate(&c, &registry, &cfg, now_dt(), &req).unwrap();
+        let outcome = call_gate(&mut c, &registry, &cfg, now_dt(), &req).unwrap();
         assert!(matches!(
             outcome,
             SessionGateOutcome::PassThrough {
@@ -475,7 +585,7 @@ mod tests {
 
     #[test]
     fn single_tenant_mode_bypasses_and_marks_warm_authorized() {
-        let c = conn();
+        let mut c = conn();
         let dir = tempfile::tempdir().unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
         let cfg = SessionGateConfig {
@@ -483,7 +593,7 @@ mod tests {
             ..Default::default()
         };
         let req = base_req("/agent-mcp/api/proj-a/tasks", None);
-        let outcome = evaluate_session_gate(&c, &registry, &cfg, now_dt(), &req).unwrap();
+        let outcome = call_gate(&mut c, &registry, &cfg, now_dt(), &req).unwrap();
         assert!(matches!(
             outcome,
             SessionGateOutcome::PassThrough {
@@ -494,12 +604,12 @@ mod tests {
 
     #[test]
     fn rejects_with_a_401_json_envelope_when_no_session_and_no_html_wanted() {
-        let c = conn();
+        let mut c = conn();
         let dir = tempfile::tempdir().unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
         let cfg = SessionGateConfig::default();
         let req = base_req("/agent-mcp/api/proj-a/tasks", None);
-        let outcome = evaluate_session_gate(&c, &registry, &cfg, now_dt(), &req).unwrap();
+        let outcome = call_gate(&mut c, &registry, &cfg, now_dt(), &req).unwrap();
         let SessionGateOutcome::Reject(resp) = outcome else {
             panic!("expected Reject, got {outcome:?}");
         };
@@ -512,14 +622,14 @@ mod tests {
 
     #[test]
     fn rejects_with_a_303_login_redirect_when_a_browser_wants_html() {
-        let c = conn();
+        let mut c = conn();
         let dir = tempfile::tempdir().unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
         let cfg = SessionGateConfig::default();
         let mut req = base_req("/agent-mcp/app/proj-a/", None);
         req.accept_header = Some("text/html,application/xhtml+xml");
         req.raw_path_qs = "/agent-mcp/app/proj-a/?page=memories";
-        let outcome = evaluate_session_gate(&c, &registry, &cfg, now_dt(), &req).unwrap();
+        let outcome = call_gate(&mut c, &registry, &cfg, now_dt(), &req).unwrap();
         let SessionGateOutcome::Reject(resp) = outcome else {
             panic!("expected Reject, got {outcome:?}");
         };
@@ -544,7 +654,7 @@ mod tests {
         let cfg = SessionGateConfig::default();
         let req = base_req("/agent-mcp/api/proj-a/tasks", Some(&cookie));
 
-        let outcome = evaluate_session_gate(&c, &registry, &cfg, now_dt(), &req).unwrap();
+        let outcome = call_gate(&mut c, &registry, &cfg, now_dt(), &req).unwrap();
         let SessionGateOutcome::Allow(identity) = outcome else {
             panic!("expected Allow, got {outcome:?}");
         };
@@ -567,7 +677,7 @@ mod tests {
         let cfg = SessionGateConfig::default();
         let req = base_req("/agent-mcp/api/router/agents", Some(&cookie));
 
-        let outcome = evaluate_session_gate(&c, &registry, &cfg, now_dt(), &req).unwrap();
+        let outcome = call_gate(&mut c, &registry, &cfg, now_dt(), &req).unwrap();
         let SessionGateOutcome::Allow(identity) = outcome else {
             panic!("expected Allow, got {outcome:?}");
         };
@@ -601,7 +711,7 @@ mod tests {
         let cfg = SessionGateConfig::default();
         let req = base_req("/agent-mcp/api/does-not-exist/tasks", Some(&cookie));
 
-        let outcome = evaluate_session_gate(&c, &registry, &cfg, now_dt(), &req).unwrap();
+        let outcome = call_gate(&mut c, &registry, &cfg, now_dt(), &req).unwrap();
         let SessionGateOutcome::Allow(identity) = outcome else {
             panic!("expected Allow (fall-through), got {outcome:?}");
         };
@@ -629,7 +739,7 @@ mod tests {
         let cfg = SessionGateConfig::default();
         let req = base_req("/agent-mcp/app/proj-a/", Some(&cookie));
 
-        let outcome = evaluate_session_gate(&c, &registry, &cfg, now_dt(), &req).unwrap();
+        let outcome = call_gate(&mut c, &registry, &cfg, now_dt(), &req).unwrap();
         assert!(matches!(outcome, SessionGateOutcome::PublicAppShell));
     }
 
@@ -655,7 +765,7 @@ mod tests {
         let mut req = base_req("/agent-mcp/api/proj-a/tasks", Some(&cookie));
         req.accept_header = Some(mcp_handler::API_MEDIA_TYPE);
 
-        let outcome = evaluate_session_gate(&c, &registry, &cfg, now_dt(), &req).unwrap();
+        let outcome = call_gate(&mut c, &registry, &cfg, now_dt(), &req).unwrap();
         let SessionGateOutcome::Reject(resp) = outcome else {
             panic!("expected Reject, got {outcome:?}");
         };
@@ -683,7 +793,7 @@ mod tests {
         let cfg = SessionGateConfig::default();
         let req = base_req("/agent-mcp/api/proj-a/tasks", Some(&cookie));
 
-        let outcome = evaluate_session_gate(&c, &registry, &cfg, now_dt(), &req).unwrap();
+        let outcome = call_gate(&mut c, &registry, &cfg, now_dt(), &req).unwrap();
         let SessionGateOutcome::Reject(resp) = outcome else {
             panic!("expected Reject, got {outcome:?}");
         };
@@ -716,7 +826,7 @@ mod tests {
         let cfg = SessionGateConfig::default();
 
         let read_req = base_req("/agent-mcp/api/proj-a/tasks", Some(&cookie));
-        let read_outcome = evaluate_session_gate(&c, &registry, &cfg, now_dt(), &read_req).unwrap();
+        let read_outcome = call_gate(&mut c, &registry, &cfg, now_dt(), &read_req).unwrap();
         let SessionGateOutcome::Allow(identity) = read_outcome else {
             panic!("expected Allow for a read, got {read_outcome:?}");
         };
@@ -724,8 +834,7 @@ mod tests {
 
         let mut write_req = base_req("/agent-mcp/api/proj-a/tasks", Some(&cookie));
         write_req.method = "POST";
-        let write_outcome =
-            evaluate_session_gate(&c, &registry, &cfg, now_dt(), &write_req).unwrap();
+        let write_outcome = call_gate(&mut c, &registry, &cfg, now_dt(), &write_req).unwrap();
         let SessionGateOutcome::Reject(resp) = write_outcome else {
             panic!("expected Reject for a viewer mutation, got {write_outcome:?}");
         };
@@ -763,10 +872,196 @@ mod tests {
 
         let mut req = base_req("/agent-mcp/api/proj-a/tasks", Some(&cookie));
         req.method = "POST";
-        let outcome = evaluate_session_gate(&c, &registry, &cfg, now_dt(), &req).unwrap();
+        let outcome = call_gate(&mut c, &registry, &cfg, now_dt(), &req).unwrap();
         let SessionGateOutcome::Allow(identity) = outcome else {
             panic!("expected Allow, got {outcome:?}");
         };
         assert_eq!(identity.project_role, Some(ProjectRole::Operator));
+    }
+
+    // -- step 10: proxy-header identity fallback -------------------------
+
+    fn proxy_settings(trusted_ip: &str) -> sso::ProxyHeaderSettings {
+        sso::ProxyHeaderSettings {
+            trust_header: "X-Agent-MCP-SSO-User".to_string(),
+            trusted_ips: std::collections::HashSet::from([trusted_ip.parse().unwrap()]),
+            default_is_sysadmin: false,
+        }
+    }
+
+    fn trusted_peer(ip: &str) -> PeerInfo {
+        PeerInfo {
+            tcp_ip: Some(ip.parse().unwrap()),
+            uds_uid: None,
+        }
+    }
+
+    /// Seeding an existing sysadmin FIRST (matching every other test in
+    /// this module) means the proxy-header caller below is a SECOND
+    /// user -- sidesteps `extract_proxy_header_user`'s own bootstrap
+    /// gate (already covered directly in `sso.rs`'s own tests) so this
+    /// test exercises the session-gate WIRING, not the bootstrap edge
+    /// case a second time.
+    #[test]
+    fn proxy_header_fallback_admits_when_no_cookie_and_the_header_is_trusted() {
+        let mut c = conn();
+        seed_operator(&mut c, "alice", true);
+        let dir = tempfile::tempdir().unwrap();
+        let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
+        let cfg = SessionGateConfig::default();
+        let settings = SsoSettings {
+            mode: SsoMode::ProxyHeader,
+            oidc: None,
+            proxy: Some(proxy_settings("10.0.0.5")),
+        };
+        let mut req = base_req("/agent-mcp/api/router/overview", None);
+        req.proxy_header_value = Some("bob@corp.example");
+
+        let outcome = evaluate_session_gate(
+            &mut c,
+            &registry,
+            &cfg,
+            now_dt(),
+            &req,
+            Some(&settings),
+            &trusted_peer("10.0.0.5"),
+            0,
+            &HashSet::new(),
+        )
+        .unwrap();
+
+        let SessionGateOutcome::Allow(identity) = outcome else {
+            panic!("expected Allow via the proxy-header fallback, got {outcome:?}");
+        };
+        assert!(identity.user.username.contains("bob"));
+        assert!(!identity.is_sysadmin);
+    }
+
+    #[test]
+    fn proxy_header_fallback_is_skipped_when_sso_mode_is_not_proxy_header() {
+        let mut c = conn();
+        seed_operator(&mut c, "alice", true);
+        let dir = tempfile::tempdir().unwrap();
+        let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
+        let cfg = SessionGateConfig::default();
+        let settings = SsoSettings {
+            mode: SsoMode::Builtin,
+            oidc: None,
+            proxy: Some(proxy_settings("10.0.0.5")),
+        };
+        let mut req = base_req("/agent-mcp/api/router/overview", None);
+        req.proxy_header_value = Some("bob@corp.example");
+
+        let outcome = evaluate_session_gate(
+            &mut c,
+            &registry,
+            &cfg,
+            now_dt(),
+            &req,
+            Some(&settings),
+            &trusted_peer("10.0.0.5"),
+            0,
+            &HashSet::new(),
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, SessionGateOutcome::Reject(_)));
+    }
+
+    #[test]
+    fn proxy_header_fallback_is_skipped_for_an_untrusted_peer() {
+        let mut c = conn();
+        seed_operator(&mut c, "alice", true);
+        let dir = tempfile::tempdir().unwrap();
+        let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
+        let cfg = SessionGateConfig::default();
+        let settings = SsoSettings {
+            mode: SsoMode::ProxyHeader,
+            oidc: None,
+            proxy: Some(proxy_settings("10.0.0.5")),
+        };
+        let mut req = base_req("/agent-mcp/api/router/overview", None);
+        req.proxy_header_value = Some("bob@corp.example");
+
+        // A DIFFERENT source IP than the one `proxy_settings` trusts.
+        let outcome = evaluate_session_gate(
+            &mut c,
+            &registry,
+            &cfg,
+            now_dt(),
+            &req,
+            Some(&settings),
+            &trusted_peer("203.0.113.9"),
+            0,
+            &HashSet::new(),
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, SessionGateOutcome::Reject(_)));
+    }
+
+    #[test]
+    fn proxy_header_fallback_is_skipped_when_the_header_is_absent() {
+        let mut c = conn();
+        seed_operator(&mut c, "alice", true);
+        let dir = tempfile::tempdir().unwrap();
+        let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
+        let cfg = SessionGateConfig::default();
+        let settings = SsoSettings {
+            mode: SsoMode::ProxyHeader,
+            oidc: None,
+            proxy: Some(proxy_settings("10.0.0.5")),
+        };
+        let req = base_req("/agent-mcp/api/router/overview", None); // proxy_header_value: None
+
+        let outcome = evaluate_session_gate(
+            &mut c,
+            &registry,
+            &cfg,
+            now_dt(),
+            &req,
+            Some(&settings),
+            &trusted_peer("10.0.0.5"),
+            0,
+            &HashSet::new(),
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, SessionGateOutcome::Reject(_)));
+    }
+
+    #[test]
+    fn cookie_identity_is_preferred_over_a_trusted_proxy_header_when_both_are_present() {
+        let mut c = conn();
+        let alice = seed_operator(&mut c, "alice", true);
+        let cookie = cookie_for(&c, &alice);
+        let dir = tempfile::tempdir().unwrap();
+        let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
+        let cfg = SessionGateConfig::default();
+        let settings = SsoSettings {
+            mode: SsoMode::ProxyHeader,
+            oidc: None,
+            proxy: Some(proxy_settings("10.0.0.5")),
+        };
+        let mut req = base_req("/agent-mcp/api/router/overview", Some(&cookie));
+        req.proxy_header_value = Some("someone-else@corp.example");
+
+        let outcome = evaluate_session_gate(
+            &mut c,
+            &registry,
+            &cfg,
+            now_dt(),
+            &req,
+            Some(&settings),
+            &trusted_peer("10.0.0.5"),
+            0,
+            &HashSet::new(),
+        )
+        .unwrap();
+
+        let SessionGateOutcome::Allow(identity) = outcome else {
+            panic!("expected Allow via the cookie, got {outcome:?}");
+        };
+        assert_eq!(identity.user.user_id, alice);
     }
 }

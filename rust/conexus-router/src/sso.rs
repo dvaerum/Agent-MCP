@@ -63,6 +63,19 @@ pub enum SsoMode {
     ProxyHeader,
 }
 
+impl SsoMode {
+    /// Port of `SSOMode`'s own `str` values (`mode.value` in Python) --
+    /// `admin_sso_api.py`'s `GET /agent-mcp/api/router/sso/config`
+    /// response reports this verbatim.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SsoMode::Builtin => "builtin",
+            SsoMode::Oidc => "oidc",
+            SsoMode::ProxyHeader => "proxy_header",
+        }
+    }
+}
+
 /// Port of `OIDCSettings`. Config-loading only in this PR -- the
 /// route handlers that CONSUME this (discovery fetch, token exchange)
 /// are PR22.
