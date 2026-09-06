@@ -45,7 +45,7 @@ In your home-manager flake:
     homeConfigurations."alice" = home-manager.lib.homeManagerConfiguration {
       pkgs = import nixpkgs { system = "x86_64-linux"; };
       modules = [
-        agent-mcp.homeManagerModules.default
+        agent-mcp.homeModules.default
         {
           home.username = "alice";
           home.homeDirectory = "/home/alice";
@@ -137,7 +137,7 @@ from a set you choose, leaving the rest of the profile on stable:
 { agent-mcp, pkgs, ... }:
 
 {
-  imports = [ agent-mcp.homeManagerModules.default ];
+  imports = [ agent-mcp.homeModules.default ];
 
   services.agent-mcp.pkgs = import agent-mcp.inputs.nixpkgs {
     inherit (pkgs.stdenv.hostPlatform) system;

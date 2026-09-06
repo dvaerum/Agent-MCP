@@ -225,9 +225,18 @@
       # User-scope module exposing `services.agent-mcp.*` options.
       # See nix/README.md for the worked example.
       #
+      # `homeModules`, not the legacy `homeManagerModules` -- home-manager's
+      # own flake settled on `homeModules` as the class-name-based output
+      # convention (matching `nixosModules`/`darwinModules`; see
+      # nix-community/home-manager#6392 proposing the opposite rename and
+      # #6406 reverting it back to `homeModules`). Renamed 2026-09-06, no
+      # backward-compat alias kept -- this flake's only known consumer
+      # (the operator's own home-manager-config deploy repo) is updated in
+      # the same change.
+      #
       # We wrap the bare module so that its `source` option defaults
       # to `self` — operators who import this flake's
-      # `homeManagerModules.default` don't have to repeat the fork's
+      # `homeModules.default` don't have to repeat the fork's
       # repo path themselves.
       # `config` is needed (not just `{ ... }:`) so `conexusLauncherPackage`
       # below can build against WHATEVER package set the consumer's
@@ -235,7 +244,7 @@
       # (defaults to their own `pkgs`, but is itself overridable) --
       # never this flake's own fixed x86_64-linux `pkgs`, which would
       # silently be wrong for a consumer on a different system.
-      homeManagerModules.default = { config, ... }: {
+      homeModules.default = { config, ... }: {
         imports = [ ./nix/home-manager-module.nix ];
         services.agent-mcp.source = lib.mkDefault self;
         services.agent-mcp.conexusLauncherPackage = lib.mkDefault
@@ -246,7 +255,7 @@
             craneLib = crane.mkLib config.services.agent-mcp.pkgs;
           }).conexusLauncher;
       };
-      homeManagerModules.agent-mcp = self.homeManagerModules.default;
+      homeModules.agent-mcp = self.homeModules.default;
 
       # ── NixOS module (legacy, used by VM tests only) ────────────
       nixosModules.default = ./nix/module.nix;

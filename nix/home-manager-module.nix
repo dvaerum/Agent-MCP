@@ -73,7 +73,7 @@ let
     # rather than half consumer-set, half home-manager's extended lib.
     lib = cfg.pkgs.lib;
     # cfg.source defaults to the fork's repo root via the flake's
-    # `homeManagerModules.default` wrapper. Operators can override
+    # `homeModules.default` wrapper. Operators can override
     # to pin a different source tree (e.g. for local development).
     src = cfg.source;
   };
@@ -186,7 +186,7 @@ in {
       type = lib.types.path;
       description = ''
         Path to the agent-mcp source tree. Defaults to the fork's
-        repo root via the flake's `homeManagerModules.default`
+        repo root via the flake's `homeModules.default`
         wrapper; override to pin a different source tree.
       '';
     };
@@ -200,7 +200,7 @@ in {
         `conexus@<name>.service` user template (Phase D1 step 5,
         prancy-napping-pie). `null` (the default) omits the template
         entirely -- this module has no direct access to the `crane`
-        flake input, so the flake's own `homeManagerModules.default`
+        flake input, so the flake's own `homeModules.default`
         wrapper sets this from its already-built `conexusPkgs`, the
         same "build elsewhere, pass the package in" pattern `source`
         already uses one option up.
@@ -218,7 +218,7 @@ in {
         entirely.
 
         Deliberately NOT set by the flake's own
-        `homeManagerModules.default` wrapper the way
+        `homeModules.default` wrapper the way
         `conexusLauncherPackage` is -- unlike `conexus@<name>`, which
         starts on-demand per-project and only when a project's own
         `backend_impl` registry flag requests it (so building the
@@ -814,7 +814,7 @@ in {
       # exclusive unit templates is safe.
       #
       # `null` by default (see `conexusLauncherPackage`'s option doc)
-      # -- omitted until the flake's `homeManagerModules.default`
+      # -- omitted until the flake's `homeModules.default`
       # wrapper sets it from `conexusPkgs.conexusLauncher`.
       "conexus@" = lib.mkIf (cfg.conexusLauncherPackage != null) {
         Unit = {
