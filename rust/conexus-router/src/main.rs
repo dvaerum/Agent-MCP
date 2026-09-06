@@ -57,6 +57,7 @@ mod security_headers;
 mod session_gate;
 mod single_tenant;
 mod sso;
+mod sso_config_rest;
 mod state;
 mod users_groups_rest;
 
@@ -409,6 +410,14 @@ async fn main() -> Result<()> {
             "/agent-mcp/api/router/projects/{name}/memberships/{membership_id}",
             axum::routing::patch(users_groups_rest::change_project_membership_role_handler)
                 .delete(users_groups_rest::delete_project_membership_handler),
+        )
+        // admin_sso_api.py's single route (step 10) -- registered
+        // before the alias functions in the real `make_app()` too, so
+        // it gets the identical 4-variant treatment as every other
+        // admin API route above.
+        .admin_api_route(
+            "/agent-mcp/api/router/sso/config",
+            get(sso_config_rest::get_sso_config_handler),
         )
         // ── Dashboard-static surface (step 8) + its own ADR-0020
         // root-mount aliases (step 9) ───────────────────────────────

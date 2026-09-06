@@ -52,7 +52,7 @@ use crate::rate_limit::{self, PeerInfo};
 use crate::security_headers;
 use crate::session_gate::{self, GateRequest, SessionGateOutcome};
 use crate::state::RouterState;
-use crate::{identity, login, mount};
+use crate::{identity, login, mount, sso};
 
 /// SO_PEERCRED parameters, inert for this binary -- see module doc.
 const OWN_UID: u32 = 0;
@@ -195,8 +195,8 @@ pub async fn empty_users_redirect_layer(
     next.run(req).await
 }
 
-/// Port of `require_operator_session_middleware`'s cookie-only path
-/// (see module doc for the proxy-header-fallback deferral).
+/// Port of `require_operator_session_middleware`, including the
+/// step-10 proxy-header-identity fallback (see module doc).
 pub async fn session_gate_layer(
     State(state): State<Arc<RouterState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -217,8 +217,23 @@ pub async fn session_gate_layer(
     let forwarded_prefix = header_str(&req, "x-forwarded-prefix").map(str::to_string);
     let login_url = mount::external_path(&path, is_trusted, forwarded_prefix.as_deref(), "/login");
 
+    // Port of `_try_proxy_header_identity`'s own `sso.get_sso_config()`
+    // call -- resolved once per request, matching Python exactly. A
+    // load failure degrades to `None` (fall through to the ordinary
+    // session-cookie path), same as Python's own `except Exception`.
+    let sso_settings = sso::load_sso_config(
+        |key| std::env::var(key).ok(),
+        |secret_path| std::fs::read_to_string(secret_path),
+    )
+    .ok();
+    let proxy_header_value = sso_settings
+        .as_ref()
+        .and_then(|settings| settings.proxy.as_ref())
+        .and_then(|proxy| header_str(&req, &proxy.trust_header))
+        .map(str::to_string);
+
     let outcome = {
-        let conn = state.conn.lock().await;
+        let mut conn = state.conn.lock().await;
         let gate_req = GateRequest {
             path: &path,
             raw_path_qs: &raw_path_qs,
@@ -226,13 +241,18 @@ pub async fn session_gate_layer(
             accept_header: accept_header.as_deref(),
             cookie_header: cookie_header.as_deref(),
             login_url: &login_url,
+            proxy_header_value: proxy_header_value.as_deref(),
         };
         session_gate::evaluate_session_gate(
-            &conn,
+            &mut conn,
             &state.registry,
             &state.session_gate_config,
             Utc::now(),
             &gate_req,
+            sso_settings.as_ref(),
+            &peer,
+            OWN_UID,
+            &extra_trusted_uids(),
         )
     };
 
