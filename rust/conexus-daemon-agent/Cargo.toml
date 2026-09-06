@@ -1,0 +1,38 @@
+[package]
+name = "conexus-daemon-agent"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "CoNexus reference daemon-agent event loop (wait_for_events long-poll client). Port of nix/agent-mcp-daemon-agent-runner.py + agent-mcp-daemon-agent.sh.in -- see /home/dennis/.claude/plans/prancy-napping-pie.md, Phase F daemon-agent-runner scope."
+
+[[bin]]
+name = "conexus-daemon-agent"
+path = "src/main.rs"
+
+[dependencies]
+# A pure MCP wire-protocol client -- deliberately depends on NONE of
+# this workspace's server-side crates (conexus-core/-db/-auth/-tools),
+# matching the Python original's own zero-agent_mcp-import shape: it
+# only ever speaks HTTP/JSON-RPC to whatever backend is live, Python
+# or Rust, and needs no server-side type to do that.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
+clap = { version = "4", features = ["derive"] }
+# Already resolved workspace-wide (conexus-tools' Phase D2 RAG
+# clients); same rustls-tls feature set for consistency, no new TLS
+# stack introduced.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "1"
+
+[dev-dependencies]
+tempfile = "3"
+# Test-only mock backend server, matching `conexus-router::proxy_core`'s
+# own `spawn_backend` precedent (a real HTTP/1 server, not a mock
+# library) -- all four already resolved workspace-wide.
+bytes = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }

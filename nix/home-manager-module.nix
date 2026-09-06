@@ -80,8 +80,17 @@ let
 
   daemonAgentInstanceName = a: "${a.project}--${a.agentId}";
 
+  # `conexusDaemonAgentPackage` (Phase F): the Rust binary resolves
+  # its own token/URL/cursor paths from the `<project>--<agent_id>`
+  # instance argument directly (see rust/conexus-daemon-agent/src/
+  # main.rs), so unlike the Python pair this needs no per-invocation
+  # `cfg.router.port` substitution baked into the wrapper itself --
+  # `--router-port` is passed as a real CLI flag at ExecStart time
+  # instead (see the unit definition below).
   daemonAgentWrapper =
-    pkgs'.agentMcpDaemonAgentWrapper cfg.router.port;
+    if cfg.conexusDaemonAgentPackage != null
+    then cfg.conexusDaemonAgentPackage
+    else pkgs'.agentMcpDaemonAgentWrapper cfg.router.port;
 
   # ── Shared systemd hardening (defense-in-depth) ───────────────────
   # The SAFE sandboxing subset, factored into nix/hardening.nix so the
@@ -204,6 +213,29 @@ in {
         wrapper sets this from its already-built `conexusPkgs`, the
         same "build elsewhere, pass the package in" pattern `source`
         already uses one option up.
+      '';
+    };
+
+    conexusDaemonAgentPackage = lib.mkOption {
+      type = lib.types.nullOr lib.types.package;
+      default = null;
+      description = ''
+        The CoNexus Rust reference daemon-agent binary
+        (`nix/conexus.nix`'s `conexusDaemonAgentWrapper`), for
+        `agent-mcp-daemon-agent@<instance>.service` (Phase F,
+        prancy-napping-pie -- ported for implementation-language
+        consistency, not a functional need: this is a pure MCP
+        wire-protocol client with zero dependency on whether the
+        backend/router it talks to is Python or Rust).
+
+        `null` (the default) falls back to the Python pair
+        (`agentMcpDaemonAgentRunner`/`Wrapper` in `packages.nix`).
+        Unlike `conexusRouterPackage` below, this IS set by the
+        flake's own `homeModules.default` wrapper (same auto-wired
+        pattern as `conexusLauncherPackage`) -- a daemon-agent
+        instance is a per-agent client process with no port to bind
+        and no singleton to race, so building/switching this in
+        carries none of the router's production-outage risk.
       '';
     };
 
@@ -1079,7 +1111,17 @@ in {
         };
         Service = {
           Type = "simple";
-          ExecStart = "${daemonAgentWrapper}/bin/agent-mcp-daemon-agent ${daemonAgentInstanceName a}";
+          # The two implementations take a different CLI shape: the
+          # Rust binary resolves its own token/URL/cursor paths from
+          # the instance argument PLUS an explicit `--router-port`
+          # flag (no per-build @router_port@ substitution needed);
+          # the Python wrapper already has the port baked in via
+          # `agentMcpDaemonAgentWrapper cfg.router.port` above, so it
+          # takes the instance name alone.
+          ExecStart =
+            if cfg.conexusDaemonAgentPackage != null
+            then "${daemonAgentWrapper}/bin/conexus-daemon-agent --router-port ${toString cfg.router.port} ${daemonAgentInstanceName a}"
+            else "${daemonAgentWrapper}/bin/agent-mcp-daemon-agent ${daemonAgentInstanceName a}";
           Restart = "on-failure";
           RestartSec = 10;
         } // hardening;

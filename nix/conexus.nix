@@ -48,6 +48,23 @@
 #                       `agent-mcp-router.service` is Phase F's
 #                       genuine operator-authority cutover decision,
 #                       tracked separately from this packaging work.
+#
+#   conexusDaemonAgent      — the compiled `conexus-daemon-agent`
+#                       binary (rust/conexus-daemon-agent): the
+#                       reference daemon-agent event loop, ported for
+#                       implementation-language consistency (operator
+#                       decision, 2026-09-06) — it's a pure MCP
+#                       wire-protocol client with no functional
+#                       dependency on which backend/router it talks
+#                       to. Replaces the Python pair
+#                       (agentMcpDaemonAgentRunner +
+#                       agentMcpDaemonAgentWrapper in packages.nix)
+#                       as ONE binary — no separate bash wrapper is
+#                       needed since the Rust binary resolves its own
+#                       token/URL/cursor paths directly.
+#   conexusDaemonAgentWrapper — thin writeShellScriptBin invoking
+#                       `conexus-daemon-agent "$@"`, same rationale as
+#                       conexusRouterWrapper above.
 
 let
   # rusqlite's "bundled" feature compiles sqlite3.c itself; crane's
@@ -177,6 +194,25 @@ let
     exec ${conexusRouter}/bin/conexus-router "$@"
   '';
 
+  conexusDaemonAgent = craneLib.buildPackage (commonArgs // {
+    inherit cargoArtifacts;
+    pname = "conexus-daemon-agent";
+    cargoExtraArgs = "-p conexus-daemon-agent";
+    doCheck = false;
+  });
+
+  # ── daemon-agent wrapper ───────────────────────────────────────────
+  # Same rationale as conexusRouterWrapper above: a bare exec, no
+  # per-instance path resolution needed in shell since
+  # `conexus-daemon-agent` resolves its own token/cursor paths
+  # directly from the instance argument (see rust/conexus-daemon-agent/
+  # src/main.rs) — unlike the Python wrapper it replaces, which had to
+  # do that resolution in bash before exec'ing the interpreter.
+  conexusDaemonAgentWrapper = pkgs.writeShellScriptBin "conexus-daemon-agent" ''
+    exec ${conexusDaemonAgent}/bin/conexus-daemon-agent "$@"
+  '';
+
 in {
-  inherit conexusBackend conexusLauncher conexusRouter conexusRouterWrapper;
+  inherit conexusBackend conexusLauncher conexusRouter conexusRouterWrapper
+    conexusDaemonAgent conexusDaemonAgentWrapper;
 }

@@ -413,6 +413,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "conexus-daemon-agent"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "clap",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "conexus-db"
 version = "0.1.0"
 dependencies = [
