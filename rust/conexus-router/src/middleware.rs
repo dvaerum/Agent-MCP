@@ -61,7 +61,13 @@ fn extra_trusted_uids() -> std::collections::HashSet<u32> {
     std::collections::HashSet::new()
 }
 
-fn peer_info(addr: SocketAddr) -> PeerInfo {
+/// `pub(crate)`, not private -- `dashboard_handlers.rs` needs the same
+/// per-connection trust resolution the middleware layers use, to
+/// compute the correct external asset prefix for a dashboard-file
+/// serve (matching Python's own per-request `mount.external_prefix(req)`
+/// calls in `dashboard_handler`/`overview_dashboard_handler`/
+/// `dashboard_assets_handler`).
+pub(crate) fn peer_info(addr: SocketAddr) -> PeerInfo {
     PeerInfo {
         tcp_ip: Some(addr.ip()),
         uds_uid: None,
@@ -75,7 +81,7 @@ pub(crate) fn header_str<'a>(req: &'a Request, name: &str) -> Option<&'a str> {
     req.headers().get(name).and_then(|v| v.to_str().ok())
 }
 
-fn is_request_trusted(state: &RouterState, peer: &PeerInfo) -> bool {
+pub(crate) fn is_request_trusted(state: &RouterState, peer: &PeerInfo) -> bool {
     peer.is_trusted(
         &state.rate_limit_config.trusted_proxies,
         OWN_UID,
