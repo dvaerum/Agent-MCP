@@ -59,6 +59,7 @@ mod session_gate;
 mod single_tenant;
 mod sso;
 mod sso_config_rest;
+mod sso_subject;
 mod state;
 mod templates;
 mod users_groups_rest;
