@@ -130,3 +130,24 @@ serde = { version = "1", features = ["derive"] }
 # hand-rolling a second base64 codec (this crate's own established
 # "well-maintained library over reinventing it" discipline).
 base64 = "0.22"
+# oidc_http_client.rs (Phase E2 PR22 step 5, `conexus-router-oidc-
+# http-client`) -- operator decision 2026-09-06: the full
+# `openidconnect` crate (wraps `oauth2-rs`, same maintainer) over a
+# hand-rolled auth-code flow + a decode-only JWT crate. The flow has
+# several correctness-critical steps (PKCE, state/nonce CSRF, JWKS
+# fetch/cache/rotation, issuer/audience/expiry validation) this
+# project's own "lean on well-maintained libraries for security-
+# relevant logic" norm (Phase B precedent) says not to hand-roll.
+openidconnect = "4"
+# The crate's own BYO-http-client design (no bundled transport as of
+# 4.x) -- `reqwest` is already resolved workspace-wide (conexus-tools'
+# RAG clients, Phase D2), added here as a direct edge with the same
+# rustls-tls feature set for consistency (avoids a second, OpenSSL-
+# linked TLS stack in the same binary).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# oidc_http_client.rs's OBS-R17-SSO origin-pin needs real URL scheme/
+# host/port accessors -- already resolved workspace-wide (a
+# transitive dep of openidconnect/reqwest), added here as a direct
+# edge for the same reason as `base64` above.
+url = "2"
+
