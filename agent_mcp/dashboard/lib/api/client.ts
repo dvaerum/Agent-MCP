@@ -5,7 +5,8 @@
 // memories / messages / system / schedules / settings). This file is
 // the shared core every resource module builds on:
 //   - the `request<T>()` fetch funnel (versioned Accept header, cookie
-//     auth, cold-start 5xx retry, 401→login bounce, timeout),
+//     auth, bounded cold-start 5xx/401 retry, persistent-401→login
+//     bounce, timeout),
 //   - the connection-management setters (`setServer` / `setBaseUrl`),
 //   - the typed `ApiError` / `ShapeError` errors,
 //   - the tiny runtime shape-guard helpers (`isRecord` / `describe`).
@@ -220,8 +221,26 @@ export class ApiClient {
       // replaces — Candidate C, architecture review 2026-06-01).
       //
       // Bounded at 3 attempts (200ms + 400ms = 600ms total backoff
-      // budget plus the original request's own timeout). 4xx and
-      // non-5xx are not retried.
+      // budget plus the original request's own timeout). Non-5xx,
+      // non-401 (see below) are not retried.
+      //
+      // 401 rides the SAME bounded retry (Firefox-MCP finding,
+      // 2026-09-06): the router's `/agent-mcp/api/<project>/*` proxy
+      // route is NOT behind the operator session-gate — it forwards
+      // straight to the per-project backend's own REST gate
+      // (`conexus-backend`'s `rest_gate::require_rest_identity`),
+      // which returns the SAME `{"error":"login_required"}` envelope
+      // whether the operator's session cookie is genuinely gone OR the
+      // router failed to translate a perfectly valid cookie into
+      // whatever header shape the backend's gate expects (a router-side
+      // bug, not a session problem) — the two cases are structurally
+      // indistinguishable at the HTTP layer, so the body/status alone
+      // can't tell them apart. Riding the cold-start retry out on a
+      // transient backend-auth hiccup — instead of yanking the operator
+      // to /login and discarding the current page — costs at most the
+      // same 600ms budget as the 5xx path; a GENUINELY expired session
+      // still 401s on every attempt and still ends in the forced
+      // logout below.
       //
       // Method gate: only safe (read-only) methods are retried. The
       // original implementation retried EVERY method, which silently
@@ -232,8 +251,9 @@ export class ApiClient {
       // tasks (server-generated task_id, no uniqueness collision to
       // catch the dup); sendMessage → double fan-out; terminateAgent
       // → safe (idempotent server-side, but still pointless retry).
-      // 5xx on a mutation must reach the caller's catch handler so the
-      // operator sees the error and decides whether to retry manually.
+      // 5xx/401 on a mutation must reach the caller's catch handler (or,
+      // for 401, the immediate forced-logout below) so a real session
+      // problem on a write is never silently retried or masked.
       const method = (
         typeof fetchOptions.method === 'string' ? fetchOptions.method : 'GET'
       ).toUpperCase()
@@ -244,12 +264,10 @@ export class ApiClient {
           ...fetchOptions,
           signal: controller.signal
         })
-        if (
-          isReadOnly &&
-          response.status >= 500 &&
-          response.status < 600 &&
-          attempt < 2
-        ) {
+        const isRetryableStatus =
+          (response.status >= 500 && response.status < 600) ||
+          response.status === 401
+        if (isReadOnly && isRetryableStatus && attempt < 2) {
           await new Promise(res => setTimeout(res, 200 * 2 ** attempt))
           continue
         }
@@ -265,10 +283,14 @@ export class ApiClient {
 
       if (!r.ok) {
         const errorText = await r.text().catch(() => 'Unknown error')
-        // PR D (prancy-napping-pie): on a 401 from any mutation OR
-        // read, the operator's session cookie has expired (or was
-        // never set). Bounce to /agent-mcp/login and preserve the
-        // current path in ?next= so we land back here post-login.
+        // PR D (prancy-napping-pie): on a 401 from any mutation, or a
+        // 401 that persisted across every read-only retry above (see
+        // the retry loop's comment — a read hitting this line has
+        // already ridden out up to 600ms of transient backend-auth
+        // hiccups), treat it as the operator's session cookie having
+        // expired (or never been set). Bounce to /agent-mcp/login and
+        // preserve the current path in ?next= so we land back here
+        // post-login.
         //
         // Guard the redirect with the standard SSR check (typeof
         // window) so this method stays safe to call from Next.js
