@@ -36,7 +36,7 @@ use crate::sso;
 use crate::state::RouterState;
 use crate::templates::{self, LoginPageContext, SetupPageContext};
 
-fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+pub(crate) fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|v| v.to_str().ok())
 }
 
@@ -64,8 +64,11 @@ fn query_param(raw_query: Option<&str>, name: &str) -> Option<String> {
 /// `is_request_trusted`/`mount::canonical_path` composition
 /// `dashboard_handlers.rs`/`middleware.rs` already establish, needed
 /// here fresh because these routes sit outside the session gate's own
-/// principal resolution (see this module's own doc).
-struct RequestMount {
+/// principal resolution (see this module's own doc). `pub(crate)`:
+/// `oidc_handlers.rs` (Phase E2 PR22 step 7) is a second real
+/// consumer -- both the login/setup and OIDC-flow routes sit outside
+/// the session gate for the identical reason.
+pub(crate) struct RequestMount {
     canonical_path: String,
     is_trusted: bool,
     forwarded_prefix: Option<String>,
@@ -75,7 +78,12 @@ struct RequestMount {
 }
 
 impl RequestMount {
-    fn resolve(state: &RouterState, addr: SocketAddr, raw_path: &str, headers: &HeaderMap) -> Self {
+    pub(crate) fn resolve(
+        state: &RouterState,
+        addr: SocketAddr,
+        raw_path: &str,
+        headers: &HeaderMap,
+    ) -> Self {
         let peer = peer_info(addr);
         RequestMount {
             canonical_path: mount::canonical_path(raw_path),
@@ -87,7 +95,7 @@ impl RequestMount {
         }
     }
 
-    fn external_path(&self, suffix: &str) -> String {
+    pub(crate) fn external_path(&self, suffix: &str) -> String {
         mount::external_path(
             &self.canonical_path,
             self.is_trusted,
@@ -100,7 +108,7 @@ impl RequestMount {
     /// TLS itself (matches `security_headers_layer`'s own established
     /// convention) -- the real transport scheme is always `"http"`; a
     /// trusted proxy's `X-Forwarded-Proto` is what actually flips it.
-    fn external_origin(&self) -> String {
+    pub(crate) fn external_origin(&self) -> String {
         mount::external_origin(
             "http",
             &self.host,
@@ -108,6 +116,18 @@ impl RequestMount {
             self.forwarded_proto.as_deref(),
             self.forwarded_host.as_deref(),
         )
+    }
+
+    /// The trusted-proxy-gated `X-Forwarded-Proto` value --
+    /// `login::cookie_secure_flag`'s own second parameter shape
+    /// (`None` when the header is absent OR the peer isn't trusted,
+    /// matching every existing call site's own `mount_ctx.is_trusted
+    /// .then_some(...).flatten()` composition, promoted here once a
+    /// second module needed the identical expression).
+    pub(crate) fn forwarded_proto_if_trusted(&self) -> Option<&str> {
+        self.is_trusted
+            .then_some(self.forwarded_proto.as_deref())
+            .flatten()
     }
 }
 
@@ -120,7 +140,7 @@ fn html_response(status: StatusCode, body: String) -> Response {
         .into_response()
 }
 
-fn see_other(location: &str) -> Response {
+pub(crate) fn see_other(location: &str) -> Response {
     (StatusCode::SEE_OTHER, [(header::LOCATION, location)]).into_response()
 }
 
@@ -338,7 +358,7 @@ pub async fn login_post_handler(
 /// Port of `_require_secure_cookies`. Reuses `rate_limit::env_truthy`
 /// (already the crate's one canonical truthy-string parser) rather
 /// than hand-rolling a second one.
-fn require_secure_cookies_env() -> bool {
+pub(crate) fn require_secure_cookies_env() -> bool {
     crate::rate_limit::env_truthy(
         std::env::var("AGENT_MCP_REQUIRE_SECURE_COOKIES")
             .ok()

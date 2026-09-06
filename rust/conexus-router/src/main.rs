@@ -44,6 +44,7 @@ mod middleware;
 mod mount;
 mod oidc_flow_state;
 mod oidc_group_mapping;
+mod oidc_handlers;
 mod oidc_http_client;
 mod oidc_reconcile;
 mod orchestrator;
@@ -479,6 +480,17 @@ async fn main() -> Result<()> {
             "/agent-mcp/setup",
             get(login_setup_rest::setup_get_handler).post(login_setup_rest::setup_post_handler),
         )
+        // OIDC authorization-code-flow routes (Phase E2 PR22 step 7,
+        // `conexus-router-oidc-handlers`). Same UNAUTH_PREFIXES
+        // exemption (`/agent-mcp/sso/`) as login/logout/setup above.
+        .route(
+            "/agent-mcp/sso/login",
+            get(oidc_handlers::init_oidc_login_handler),
+        )
+        .route(
+            "/agent-mcp/sso/callback",
+            get(oidc_handlers::handle_oidc_callback),
+        )
         // Dedup rule (confirmed against the real Python
         // `_add_root_aliases` loop): `/agent-mcp` (the bare 301
         // redirect) and `/agent-mcp/` (`index_handler`) both compute
@@ -508,6 +520,9 @@ async fn main() -> Result<()> {
             "/setup",
             get(login_setup_rest::setup_get_handler).post(login_setup_rest::setup_post_handler),
         )
+        // ADR-0020 root-mount aliases for the OIDC flow routes.
+        .route("/sso/login", get(oidc_handlers::init_oidc_login_handler))
+        .route("/sso/callback", get(oidc_handlers::handle_oidc_callback))
         // Explicit tail-match root alias #1/3 (Python hand-lists
         // these separately since `resource.canonical` strips a
         // `{rest:.*}`'s regex, which a programmatic re-add would
