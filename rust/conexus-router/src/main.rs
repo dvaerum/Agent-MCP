@@ -44,6 +44,7 @@ mod middleware;
 mod mount;
 mod oidc_flow_state;
 mod oidc_group_mapping;
+mod oidc_http_client;
 mod oidc_reconcile;
 mod orchestrator;
 mod path_policy;

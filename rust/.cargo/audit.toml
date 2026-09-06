@@ -1,0 +1,37 @@
+# cargo-audit ignore list. Consumed natively by `cargo audit` (reads
+# `.cargo/audit.toml` relative to the workspace root) -- the Rust-
+# ecosystem equivalent of `nix/audit/closure-advisory-allowlist.toml`'s
+# documented-rationale allowlist (per the `aoe-bridge` CI job's own
+# comment: "if an unfixable advisory ever needs one, add it with a
+# documented rationale... not a silent --ignore"). This file uses the
+# audit tool's own native ignore mechanism rather than a bespoke
+# self-retiring checker, since `cargo-audit` has no equivalent staleness-
+# detection hook to build one against -- each entry below is manually
+# re-justified whenever `cargo audit` next flags it (e.g. after a
+# `cargo update` changes the dependency tree), not auto-verified.
+#
+# Each entry below MUST carry a comment explaining why it is safe to
+# ship, mirroring the Python allowlist's `rationale` field.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 (Marvin Attack: potential key recovery through
+    # timing sidechannels in the `rsa` crate's PKCS#1 v1.5
+    # implementation). Pulled in transitively by `openidconnect` (Phase
+    # E2 PR22 step 5, `conexus-router-oidc-http-client`) for its JOSE/
+    # JWS signature-verification stack -- confirmed via `cargo tree -i
+    # rsa`. The advisory's own text is explicit that the leak is in
+    # PRIVATE-key operations (decrypt/sign): "information about the
+    # PRIVATE key is leaked through timing information" -- this
+    # router only ever VERIFIES an IdP's ID-token signature using the
+    # IdP's PUBLIC key from its JWKS; it never holds nor exercises an
+    # RSA private key anywhere in this process. Verification is a
+    # public-key-only operation with no secret timing to leak, so the
+    # Marvin Attack's actual exploit path (a decryption/signing oracle
+    # against a service holding the private key) does not apply here.
+    # "Solution: No fixed upgrade is available!" upstream as of this
+    # writing (2026-09-06) -- re-check `cargo audit` after any future
+    # `cargo update` in case a patched `rsa` release lands, and retire
+    # this entry then rather than carrying it indefinitely.
+    "RUSTSEC-2023-0071",
+]
