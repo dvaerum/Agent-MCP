@@ -22,15 +22,104 @@
 //!    "value": {"kind": "text", "value": "active"}, "now": "..."}
 //! ]}
 //! ```
+//!
+//! A second, unrelated CLI mode (`--dump-router-tables <db_path>`)
+//! closes the Phase F research finding that `router.db` schema
+//! compatibility had only ever been verified SOURCE-vs-SOURCE
+//! (Alembic migrations vs. `schema::init_router_schema`), never by
+//! actually reading a real, populated `router.db` copy through Rust's
+//! own `rusqlite` bindings. Deliberately RAW column dumps (no typed
+//! repository layer) since the point is proving the on-disk schema
+//! parses correctly under Rust at all -- a typed accessor could
+//! silently coerce or skip a column a raw dump wouldn't. Lives here
+//! rather than as a `conexus-router` binary because `conexus-router`
+//! has no library target (ADR-0020's dependency direction runs
+//! conexus-db -> ... -> conexus-router, never the reverse) and this
+//! tool only needs `rusqlite`, which conexus-db already depends on.
 
 use conexus_db::{
     project_context_repository, AgentField, AgentRepository, AgentRow, FieldValue, NewAgent,
     ProjectContextRow,
 };
+use rusqlite::types::ValueRef;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 use std::io::Read;
 use std::process::ExitCode;
+
+/// The router.db tables this dump mode covers -- every table Phase E2
+/// PR3/PR4's `conexus-router::identity`/`conexus_db::
+/// group_membership_repository` ports touch. Ordered by primary key
+/// (or, for `group_membership`/`project_membership`'s composite/no
+/// single PK, by every column) for a deterministic dump.
+const ROUTER_TABLES: &[(&str, &str)] = &[
+    ("users", "user_id"),
+    ("sessions", "session_id"),
+    ("project_membership", "project_name, user_id, group_id"),
+    ("groups", "group_id"),
+    ("group_capability", "group_id, capability"),
+    (
+        "group_membership",
+        "group_id, member_user_id, member_group_id",
+    ),
+];
+
+fn value_ref_to_json(v: ValueRef<'_>) -> JsonValue {
+    match v {
+        ValueRef::Null => JsonValue::Null,
+        ValueRef::Integer(i) => JsonValue::from(i),
+        ValueRef::Real(f) => {
+            serde_json::Number::from_f64(f).map_or(JsonValue::Null, JsonValue::Number)
+        }
+        ValueRef::Text(t) => JsonValue::String(String::from_utf8_lossy(t).into_owned()),
+        ValueRef::Blob(b) => JsonValue::String(format!("<blob {} bytes>", b.len())),
+    }
+}
+
+/// Dumps every row of every table in [`ROUTER_TABLES`] as
+/// `{table_name: [{column: value, ...}, ...]}`, skipping a table that
+/// doesn't exist in this particular `router.db` (an older schema
+/// snapshot, or a test fixture that never ran every migration) rather
+/// than failing the whole dump.
+fn dump_router_tables(conn: &Connection) -> Result<JsonValue, String> {
+    let mut out = serde_json::Map::new();
+    for (table, order_by) in ROUTER_TABLES {
+        let exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(|e| format!("checking table {table}: {e}"))?
+            > 0;
+        if !exists {
+            out.insert(table.to_string(), JsonValue::Array(vec![]));
+            continue;
+        }
+        let sql = format!("SELECT * FROM {table} ORDER BY {order_by}");
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| format!("preparing dump of {table}: {e}"))?;
+        let col_names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+        let rows = stmt
+            .query_map([], |row| {
+                let mut obj = serde_json::Map::new();
+                for (i, name) in col_names.iter().enumerate() {
+                    let v = row.get_ref(i)?;
+                    obj.insert(name.clone(), value_ref_to_json(v));
+                }
+                Ok(JsonValue::Object(obj))
+            })
+            .map_err(|e| format!("querying {table}: {e}"))?;
+        let mut collected = Vec::new();
+        for row in rows {
+            collected.push(row.map_err(|e| format!("reading a row of {table}: {e}"))?);
+        }
+        out.insert(table.to_string(), JsonValue::Array(collected));
+    }
+    Ok(JsonValue::Object(out))
+}
 
 #[derive(Deserialize)]
 struct Request {
@@ -277,8 +366,22 @@ fn run() -> Result<String, String> {
     .map_err(|e| format!("failed to serialize dump: {e}"))
 }
 
+fn run_dump_router_tables(db_path: &str) -> Result<String, String> {
+    let conn = Connection::open(db_path).map_err(|e| format!("failed to open {db_path}: {e}"))?;
+    let dump = dump_router_tables(&conn)?;
+    serde_json::to_string(&dump).map_err(|e| format!("failed to serialize dump: {e}"))
+}
+
 fn main() -> ExitCode {
-    match run() {
+    let args: Vec<String> = std::env::args().collect();
+    let result = match args.get(1).map(String::as_str) {
+        Some("--dump-router-tables") => match args.get(2) {
+            Some(db_path) => run_dump_router_tables(db_path),
+            None => Err("--dump-router-tables requires a <db_path> argument".to_string()),
+        },
+        _ => run(),
+    };
+    match result {
         Ok(json) => {
             println!("{json}");
             ExitCode::SUCCESS
