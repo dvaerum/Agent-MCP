@@ -325,6 +325,19 @@ pub async fn proxy_to_backend(
     let sock = ensure(store, registry, sock_dir, name, "backend", ensure_cfg).await?;
 
     let mut headers = filter_headers(&req.headers);
+    // Python's `_proxy_to_backend` builds the outbound aiohttp request
+    // against `f"http://localhost{backend_path}"`, so aiohttp
+    // implicitly synthesizes `Host: localhost` for the backend leg
+    // even though the CLIENT's real Host was stripped just above.
+    // This hyper-based port builds a bare-path `Request` with no
+    // authority to derive a Host from, so it must be set explicitly
+    // -- omitting it entirely made `conexus-backend`'s rmcp layer
+    // reject every request via its own DNS-rebinding-protection check
+    // (rmcp's `StreamableHttpService` hard-requires `Host` on HTTP/1.1).
+    headers.insert(
+        HeaderName::from_static("host"),
+        HeaderValue::from_static("localhost"),
+    );
     if let Some(alias) = alias_info {
         headers.insert(
             HeaderName::from_static("x-agent-mcp-alias"),
@@ -643,6 +656,71 @@ mod tests {
         assert_eq!(response.status, 200);
         match response.body {
             ProxyResponseBody::Buffered(b) => assert_eq!(b.as_ref(), b"{\"ok\":true}"),
+            ProxyResponseBody::Streaming(_) => panic!("expected a buffered response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_to_backend_sets_host_localhost_for_the_backend_leg() {
+        // Regression test for a real production bug: `filter_headers`
+        // strips the client's real `Host` (matching Python's own
+        // `_proxy_to_backend`), but nothing re-added one for the
+        // backend leg -- Python's aiohttp implicitly synthesizes
+        // `Host: localhost` from its own `f"http://localhost{path}"`
+        // request URL; this hyper-based port built a bare-path
+        // `Request` with no authority, so the backend received NO
+        // Host header at all. `conexus-backend`'s rmcp layer enforces
+        // DNS-rebinding protection and hard-rejects any HTTP/1.1
+        // request missing `Host` -- so every real MCP call through
+        // the deployed router->backend proxy 400'd, caught only by a
+        // real end-to-end MCP call against a live production cutover,
+        // not by any unit test (every prior test/live-verify hit
+        // conexus-backend directly over UDS, bypassing this proxy).
+        let dir = tempfile::tempdir().unwrap();
+        let sock_dir = dir.path().join("sockets");
+        std::fs::create_dir_all(sock_dir.join("proj-a")).unwrap();
+        spawn_backend(sock_dir.join("proj-a").join("backend.sock"), |req| {
+            let host = req
+                .headers()
+                .get("host")
+                .map(|v| v.to_str().unwrap().to_string());
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Full::new(Bytes::from(host.unwrap_or_default())))
+                .unwrap()
+        })
+        .await;
+
+        let registry = registry_with(dir.path(), "proj-a");
+        let store = RuntimeStore::new();
+        let stream_caps = Arc::new(StreamCapRegistry::new(4, 64));
+        let mut headers = HeaderMap::new();
+        // The real client's Host must NOT leak through to the backend
+        // (that would be the client-supplied `Host: evil.example`,
+        // not the synthesized `localhost`).
+        headers.insert("host", HeaderValue::from_static("evil.example"));
+
+        let response = proxy_to_backend(
+            &store,
+            &stream_caps,
+            &registry,
+            &sock_dir,
+            "proj-a",
+            &fast_ensure_cfg(),
+            ProxyRequest {
+                method: Method::POST,
+                path_and_query: "/mcp".to_string(),
+                headers,
+                body: Bytes::from_static(b"{}"),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status, 200);
+        match response.body {
+            ProxyResponseBody::Buffered(b) => assert_eq!(b.as_ref(), b"localhost"),
             ProxyResponseBody::Streaming(_) => panic!("expected a buffered response"),
         }
     }
