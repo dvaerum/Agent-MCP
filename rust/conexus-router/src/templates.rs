@@ -70,12 +70,15 @@ static ENV: LazyLock<Environment<'static>> = LazyLock::new(|| {
 });
 
 /// Port of `login_get_handler`/`login_post_handler`'s `_render("login.html", ...)`
-/// call sites. `sso_provider_name`/`sso_login_url` stay real fields
-/// (not dropped) even though every current caller passes `None`/an
-/// inert URL -- PR22 (OIDC, still blocked on the operator's crate-
-/// choice question) is the only thing standing between this struct
-/// and a real SSO button; the template's own `{% if sso_provider_name %}`
-/// branch is already correct and untouched by that future PR.
+/// call sites. `sso_provider_name` is real for `login_get_handler`'s
+/// success render (`sso::resolve_sso_provider_name`, wired in Phase
+/// E2 PR22 step 2) -- Python's own real asymmetry preserved: the POST
+/// error-rerender paths never resolve it (an omitted kwarg is falsy
+/// in Jinja2's default `Undefined`, matching this struct's own
+/// `None` at those call sites exactly), so it stays `None` there, not
+/// a bug. `sso_login_url` is always a real, mount-aware URL even in
+/// legacy-form mode -- the template's own `{% if sso_provider_name %}`
+/// branch is what actually gates whether the button renders.
 pub struct LoginPageContext<'a> {
     pub error: Option<&'a str>,
     pub username: &'a str,

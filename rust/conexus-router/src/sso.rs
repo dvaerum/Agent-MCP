@@ -254,6 +254,27 @@ pub fn load_sso_config(
     })
 }
 
+/// Port of `login.py::_resolve_sso_provider_name` (Phase E2 PR22 step
+/// 2/8, `conexus-router-sso-login-button`). The OIDC provider's
+/// display name for the login page's SSO button, or `None` ("show the
+/// legacy username/password form"). A `settings: Option<&SsoSettings>`
+/// parameter rather than resolving `load_sso_config` internally --
+/// this crate's own established "explicit input over hidden
+/// dependency" convention (`mount.rs`'s `is_trusted: bool`,
+/// `evaluate_session_gate`'s `sso_settings` parameter); the caller
+/// resolves config once per request exactly like the real Python
+/// `_try_proxy_header_identity`/`sso_config_rest` call sites already
+/// do, and a config-load failure there already degrades to `None`
+/// (Python's own `except Exception: return None` around
+/// `sso.get_sso_config()`) before this function is ever reached.
+pub fn resolve_sso_provider_name(settings: Option<&SsoSettings>) -> Option<String> {
+    let settings = settings?;
+    if settings.mode == SsoMode::Oidc {
+        return settings.oidc.as_ref().map(|o| o.provider_name.clone());
+    }
+    None
+}
+
 /// Port of `is_trusted_proxy_source`. **N3 Tier 1** (load-bearing,
 /// pinned by `test_sso_does_not_inherit_the_rate_limiter_default_
 /// loopback_trust`): `settings.trusted_ips` is the operator-configured
@@ -814,5 +835,70 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(jit_user.username, "alice-2");
+    }
+
+    #[test]
+    fn resolve_sso_provider_name_returns_none_with_no_config_loaded() {
+        assert_eq!(resolve_sso_provider_name(None), None);
+    }
+
+    #[test]
+    fn resolve_sso_provider_name_returns_none_for_builtin_mode() {
+        let settings = SsoSettings {
+            mode: SsoMode::Builtin,
+            oidc: None,
+            proxy: None,
+        };
+        assert_eq!(resolve_sso_provider_name(Some(&settings)), None);
+    }
+
+    #[test]
+    fn resolve_sso_provider_name_returns_none_for_proxy_header_mode() {
+        let settings = SsoSettings {
+            mode: SsoMode::ProxyHeader,
+            oidc: None,
+            proxy: Some(ProxyHeaderSettings {
+                trust_header: "X-Remote-User".to_string(),
+                trusted_ips: HashSet::new(),
+                default_is_sysadmin: false,
+            }),
+        };
+        assert_eq!(resolve_sso_provider_name(Some(&settings)), None);
+    }
+
+    #[test]
+    fn resolve_sso_provider_name_returns_the_configured_name_for_oidc_mode() {
+        let settings = SsoSettings {
+            mode: SsoMode::Oidc,
+            oidc: Some(OidcSettings {
+                issuer: "https://idp.example.test".to_string(),
+                client_id: "client".to_string(),
+                client_secret: "secret".to_string(),
+                provider_name: "Example IdP".to_string(),
+                group_mapping: StdHashMap::new(),
+                redirect_url: None,
+                scopes: vec!["openid".to_string()],
+                default_is_sysadmin: false,
+            }),
+            proxy: None,
+        };
+        assert_eq!(
+            resolve_sso_provider_name(Some(&settings)),
+            Some("Example IdP".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_sso_provider_name_returns_none_when_oidc_mode_has_no_oidc_settings() {
+        // Structurally shouldn't happen (load_sso_config always pairs
+        // SsoMode::Oidc with Some(oidc)), but fail closed rather than
+        // panic if some future caller ever constructs this combination
+        // directly.
+        let settings = SsoSettings {
+            mode: SsoMode::Oidc,
+            oidc: None,
+            proxy: None,
+        };
+        assert_eq!(resolve_sso_provider_name(Some(&settings)), None);
     }
 }
