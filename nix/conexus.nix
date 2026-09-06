@@ -7,7 +7,7 @@
 # genuinely new build toolchain for this repo) stays easy to find and
 # doesn't tangle with the Python derivation list.
 #
-# One top-level derivation so far:
+# Top-level derivations:
 #
 #   conexusBackend   — the compiled `conexus-backend` binary
 #                       (rust/conexus-backend), built via
@@ -15,6 +15,14 @@
 #                       workspace (rusqlite's bundled sqlite3 needs a
 #                       C compiler on PATH, which crane's default
 #                       stdenv already provides).
+#
+#   conexusRouter    — the compiled `conexus-router` binary (Phase F,
+#                       "safe to start now" packaging slice per the
+#                       Phase F research pass, prancy-napping-pie).
+#                       Mirrors conexusBackend's own buildPackage
+#                       shape exactly. NOT yet wired into any
+#                       home-manager option that would make it live in
+#                       production — see conexusRouterWrapper below.
 #
 # Plus the systemd-template launcher the `conexus@<name>.service` unit
 # (Phase D1 step 5) will invoke:
@@ -27,6 +35,19 @@
 #                       same-path process swap (Phase D1 decision #1)
 #                       — exec's `conexus-backend` instead of the
 #                       Python wrapper.
+#
+# And a thin wrapper for the router binary, mirroring
+# nix/packages.nix's `agentMcpRouterWrapper` shape (a one-liner exec,
+# not a per-instance resolver like conexusLauncher above — the router
+# is a singleton reading its own CLI flags/env vars directly, with no
+# `<name>` positional argument to resolve):
+#
+#   conexusRouterWrapper — thin writeShellScriptBin invoking
+#                       `conexus-router "$@"`. Not yet consumed by any
+#                       systemd unit — deploying it to replace
+#                       `agent-mcp-router.service` is Phase F's
+#                       genuine operator-authority cutover decision,
+#                       tracked separately from this packaging work.
 
 let
   # rusqlite's "bundled" feature compiles sqlite3.c itself; crane's
@@ -38,17 +59,25 @@ let
   commonArgs = {
     src = craneLib.cleanCargoSource "${src}/rust";
     strictDeps = true;
-    # conexus-tools/src/prompts.rs reaches out of the rust/ workspace
-    # via `include_str!("../../../agent_mcp/prompts/catalog.json")` (a
-    # deliberate, temporary cross-language coupling per the migration
-    # plan, retired only in Phase F) — cleanCargoSource above scopes
-    # the build to rust/ alone, so that sibling file is missing from
-    # the sandbox unless copied in at the same relative path the
-    # include_str! resolves against (one directory above $sourceRoot,
-    # matching rust/ and agent_mcp/ being siblings in a real checkout).
+    # Two crates reach out of the rust/ workspace via a sandbox-
+    # escaping `include_str!` (a deliberate, temporary cross-language
+    # coupling per the migration plan, retired only in Phase F) --
+    # cleanCargoSource above scopes the build to rust/ alone, so both
+    # sibling paths are missing from the sandbox unless copied in at
+    # the same relative path each include_str! resolves against (one
+    # directory above $sourceRoot, matching rust/ and agent_mcp/ being
+    # siblings in a real checkout):
+    #   - conexus-tools/src/prompts.rs: agent_mcp/prompts/catalog.json
+    #   - conexus-router/src/templates.rs: agent_mcp/router/templates/
+    #     {base,login,setup}.html (Phase E2 PR23 step 4, login-setup --
+    #     found missing here the same way catalog.json was, PR #850,
+    #     while packaging conexus-router for Phase F; conexus-router
+    #     had never been built through this Nix path before).
     postUnpack = ''
       mkdir -p "$sourceRoot/../agent_mcp/prompts"
       cp ${src}/agent_mcp/prompts/catalog.json "$sourceRoot/../agent_mcp/prompts/catalog.json"
+      mkdir -p "$sourceRoot/../agent_mcp/router/templates"
+      cp ${src}/agent_mcp/router/templates/*.html "$sourceRoot/../agent_mcp/router/templates/"
     '';
     # rust/Cargo.toml is a virtual workspace manifest (no [package]
     # section of its own — see the crate list in rust/Cargo.toml), so
@@ -74,6 +103,19 @@ let
     # conexus-core/conexus-vec are libraries with no standalone
     # artifact of their own to install.
     cargoExtraArgs = "-p conexus-backend";
+    doCheck = false;
+  });
+
+  conexusRouter = craneLib.buildPackage (commonArgs // {
+    inherit cargoArtifacts;
+    pname = "conexus-router";
+    # `conexus-router` deliberately depends on conexus-auth/conexus-core
+    # only (ADR-0020, enforced at Cargo.toml level) — scoping the build
+    # here is the same "-p <binary crate>" pattern as conexusBackend
+    # above, sharing the SAME cargoArtifacts (the two binaries pull
+    # from the same workspace dependency graph, so this doesn't force
+    # a second full dependency build).
+    cargoExtraArgs = "-p conexus-router";
     doCheck = false;
   });
 
@@ -122,6 +164,19 @@ let
       --transport sse
   '';
 
+  # ── router wrapper ────────────────────────────────────────────────
+  # Mirrors nix/packages.nix's `agentMcpRouterWrapper` shape: a bare
+  # exec, no PYTHONPATH/interpreter setup needed since this is a
+  # native binary, not a Python entry point. `conexus-router` resolves
+  # every flag/env var itself (see rust/conexus-router/src/main.rs's
+  # own `Cli` struct doc) — this wrapper exists only so the systemd
+  # unit's `ExecStart` names a stable package output rather than
+  # reaching into the Cargo build's own `bin/` layout directly, same
+  # rationale as the Python wrapper it mirrors.
+  conexusRouterWrapper = pkgs.writeShellScriptBin "conexus-router" ''
+    exec ${conexusRouter}/bin/conexus-router "$@"
+  '';
+
 in {
-  inherit conexusBackend conexusLauncher;
+  inherit conexusBackend conexusLauncher conexusRouter conexusRouterWrapper;
 }

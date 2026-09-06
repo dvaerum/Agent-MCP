@@ -207,6 +207,36 @@ in {
       '';
     };
 
+    conexusRouterPackage = lib.mkOption {
+      type = lib.types.nullOr lib.types.package;
+      default = null;
+      description = ''
+        The CoNexus Rust router wrapper (`nix/conexus.nix`'s
+        `conexusRouterWrapper`), for the singleton `conexus-router`
+        user service (Phase F packaging prerequisite,
+        prancy-napping-pie). `null` (the default) omits the service
+        entirely.
+
+        Deliberately NOT set by the flake's own
+        `homeManagerModules.default` wrapper the way
+        `conexusLauncherPackage` is -- unlike `conexus@<name>`, which
+        starts on-demand per-project and only when a project's own
+        `backend_impl` registry flag requests it (so building the
+        launcher changes nothing for a running system), the router is
+        a SINGLETON that binds the same port `agent-mcp-router`
+        already listens on (`AGENT_MCP_ROUTER_PORT`, default 1337).
+        Defaulting this option non-null anywhere would make the
+        `conexus-router` unit's `Install.WantedBy` take effect on the
+        very next `home-manager switch`, racing the still-live Python
+        router for that port -- a real production-outage risk, not a
+        theoretical one. Setting this option is therefore the
+        deliberate act of opting into the router cutover itself; do
+        so only after the operator-authority decision recorded in the
+        migration plan's Phase F section, not as a side effect of
+        picking up a newer agent-mcp flake input.
+      '';
+    };
+
     pkgs = lib.mkOption {
       type = lib.types.pkgs;
       default = consumerPkgs;
@@ -860,6 +890,108 @@ in {
           TimeoutStopSec = 15;
         } // hardening;
         Install.WantedBy = [ "default.target" ];
+      };
+
+      # `conexus-router` — the CoNexus Rust router (Phase F packaging
+      # prerequisite, prancy-napping-pie). Structurally mirrors
+      # `agent-mcp-router` above (same RuntimeDirectory, same
+      # single-tenant seeding, same SSO env-var construction, same
+      # restart budget/hardening) except: (1) most of Python's
+      # env-var-only config surface is a real CLI flag on
+      # `conexus-router` (see its own `Cli` struct doc in
+      # rust/conexus-router/src/main.rs) -- passed as flags here
+      # rather than duplicated as env vars; (2) `AGENT_MCP_README_HTML`/
+      # `AGENT_MCP_INSTALLER_TEMPLATE` are deliberately omitted --
+      # `conexus-router` parses `--readme-html`/`--installer-template`
+      # but doesn't consume them yet (the `client_config`/`installer`
+      # routes they'd feed stay explicitly, permanently deferred per
+      # the migration plan's own PR23-step-6 research finding).
+      #
+      # `null` by default (see `conexusRouterPackage`'s own option doc
+      # for why this is NOT auto-wired the way `conexusLauncherPackage`
+      # is) -- defining this unit changes nothing for any consumer
+      # until they explicitly set `conexusRouterPackage`, which is
+      # itself the router-cutover decision, not a side effect of
+      # taking this option's mere existence.
+      "conexus-router" = lib.mkIf (cfg.conexusRouterPackage != null) {
+        Unit = {
+          Description = "CoNexus router (URL-keyed, idle-stop)";
+          After = [ "ollama.service" ];
+        };
+        Service = {
+          Type = "simple";
+          Environment = [
+            # Same XDG-path rationale as `agent-mcp-router`'s own
+            # `AGENT_MCP_ROUTER_DB` comment above: user-mode units
+            # cannot write to conexus-router's own compiled-in
+            # `/var/lib/agent-mcp/router.db` default.
+            "AGENT_MCP_ROUTER_DB=${config.xdg.dataHome}/agent-mcp/router.db"
+          ]
+          ++ lib.optionals (cfg.sso.oidc != null) [
+            "AGENT_MCP_SSO_OIDC_ISSUER=${cfg.sso.oidc.issuer}"
+            "AGENT_MCP_SSO_OIDC_CLIENT_ID=${cfg.sso.oidc.clientId}"
+            "AGENT_MCP_SSO_OIDC_CLIENT_SECRET_FILE=${
+              toString cfg.sso.oidc.clientSecretFile
+            }"
+            "AGENT_MCP_SSO_OIDC_PROVIDER_NAME=${cfg.sso.oidc.providerName}"
+            "AGENT_MCP_SSO_OIDC_GROUP_MAPPING=${
+              builtins.toJSON cfg.sso.oidc.groupMapping
+            }"
+            "AGENT_MCP_SSO_OIDC_SCOPES=${
+              lib.concatStringsSep " " cfg.sso.oidc.scopes
+            }"
+          ]
+          ++ lib.optionals (
+            cfg.sso.oidc != null && cfg.sso.oidc.redirectUrl != null
+          ) [
+            "AGENT_MCP_SSO_OIDC_REDIRECT_URL=${cfg.sso.oidc.redirectUrl}"
+          ]
+          ++ lib.optionals (cfg.sso.proxyHeader != null) [
+            "AGENT_MCP_SSO_PROXY_HEADER=${cfg.sso.proxyHeader.trustHeader}"
+            "AGENT_MCP_SSO_PROXY_TRUSTED_IPS=${
+              lib.concatStringsSep "," cfg.sso.proxyHeader.trustedIps
+            }"
+            "AGENT_MCP_SSO_PROXY_DEFAULT_SYSADMIN=${
+              if cfg.sso.proxyHeader.defaultIsSysadmin then "true" else "false"
+            }"
+          ];
+          RuntimeDirectory = "agent-mcp";
+          RuntimeDirectoryMode = "0700";
+          ExecStartPre = lib.mkIf (!cfg.multiTenant) [
+            "${singleProjectSeedScript}"
+          ];
+          ExecStart =
+            let
+              commonFlags =
+                "--port ${toString cfg.router.port} "
+                + "--projects-file %h/.config/agent-mcp/projects.local.json "
+                + "--sock-dir %t/agent-mcp "
+                + "--dashboard-dir ${cfg.dashboard.package}/share/agent-mcp-dashboard "
+                + "--external-url ${lib.escapeShellArg cfg.router.externalUrl} "
+                + "--idle-sec ${toString cfg.router.idleSec}";
+            in
+            if cfg.multiTenant then
+              "${cfg.conexusRouterPackage}/bin/conexus-router " + commonFlags
+            else
+              "${cfg.conexusRouterPackage}/bin/conexus-router " + commonFlags + " "
+              + "--single-tenant ${lib.escapeShellArg cfg.singleProject.name} "
+              + "--single-workspace ${lib.escapeShellArg cfg.singleProject.workspace}";
+          Restart = "on-failure";
+          RestartSec = 10;
+          # Same defense-in-depth ceiling as `agent-mcp-router` above,
+          # even though `conexus-backend`'s own proxy-drain behavior
+          # hasn't hit an equivalent 90s-stall incident (none of this
+          # migration's own shutdown-path tests have needed a longer
+          # window) -- kept at the identical value so a router restart
+          # behaves identically to an operator regardless of which
+          # implementation is live.
+          TimeoutStopSec = 15;
+        } // hardening;
+        # Not WantedBy any target while this unit is inert-by-default
+        # (see the option doc above) -- an explicit `conexusRouterPackage`
+        # consumer decides when to enable it, matching every other
+        # `cfg.<x> != null`-gated toggle in this module (e.g.
+        # `cfg.sso.oidc`).
       };
     } // lib.listToAttrs (map (a: {
       name = "agent-mcp-daemon-agent@${daemonAgentInstanceName a}";
