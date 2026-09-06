@@ -174,11 +174,23 @@
         agent-mcp-router-wrapper = productionPkgs.agentMcpRouterWrapper;
         default = productionPkgs.agentMcpPy;
 
-        # CoNexus Rust backend (Phase D1). Not yet wired into any
-        # home-manager option or systemd unit — see nix/conexus.nix
-        # and the migration plan's Phase D1 steps 5-6.
+        # CoNexus Rust backend (Phase D1) — wired into the
+        # `conexus@<name>.service` template via
+        # `conexusLauncherPackage` (both live projects run it in
+        # production, Phase D1 step 6). See nix/conexus.nix.
         conexus-backend = conexusPkgs.conexusBackend;
         conexus-launcher = conexusPkgs.conexusLauncher;
+
+        # CoNexus Rust router (Phase F packaging prerequisite). Built
+        # and check-gated here, but NOT yet wired into any
+        # home-manager option or systemd unit — deploying it to
+        # replace `agent-mcp-router.service` is Phase F's own
+        # operator-authority cutover decision (a router restart is
+        # global/singleton, unlike the per-project backend's
+        # canary-per-project shape), tracked separately in
+        # prancy-napping-pie.md.
+        conexus-router = conexusPkgs.conexusRouter;
+        conexus-router-wrapper = conexusPkgs.conexusRouterWrapper;
 
         vm = vmMulti;
         vm-multi = vmMulti;
@@ -260,6 +272,9 @@
         # clippy/test/audit for the crate sources directly; this check
         # additionally proves the flake's own crane wiring builds.
         conexus-backend = conexusPkgs.conexusBackend;
+        # CoNexus Rust router (Phase F packaging prerequisite) — same
+        # cheap build-only rationale as conexus-backend above.
+        conexus-router = conexusPkgs.conexusRouter;
         vm-multi-tenant = import ./nix/tests/multi-tenant.nix {
           inherit pkgs lib self;
         };
