@@ -32,6 +32,7 @@ use crate::identity;
 use crate::login::{self, LoginAttemptOutcome, SetupError, SetupGetOutcome, SetupPostOutcome};
 use crate::middleware::{is_request_trusted, peer_info};
 use crate::mount;
+use crate::sso;
 use crate::state::RouterState;
 use crate::templates::{self, LoginPageContext, SetupPageContext};
 
@@ -202,15 +203,22 @@ pub async fn login_get_handler(
     let next_display = next_param.unwrap_or_default();
     let login_action = mount_ctx.external_path("/login");
     let sso_login_url = mount_ctx.external_path("/sso/login");
-    // SSO provider resolution (`_resolve_sso_provider_name`) is PR22
-    // territory (OIDC, still blocked on the operator's crate-choice
-    // question) -- always the legacy username/password form until
-    // then, matching `login.rs`'s own documented deferral.
+    // Port of `_resolve_sso_provider_name`: a config-load failure
+    // degrades to `None` (legacy form) exactly like Python's own
+    // `except Exception: return None` -- the login page must still
+    // render so the operator can read the real error from the
+    // journal/logs and fix the config, not 500 on every visit.
+    let sso_settings = sso::load_sso_config(
+        |key| std::env::var(key).ok(),
+        |path| std::fs::read_to_string(path),
+    )
+    .ok();
+    let sso_provider_name = sso::resolve_sso_provider_name(sso_settings.as_ref());
     let html = templates::render_login(&LoginPageContext {
         error: None,
         username: "",
         next: &next_display,
-        sso_provider_name: None,
+        sso_provider_name: sso_provider_name.as_deref(),
         login_action: &login_action,
         sso_login_url: &sso_login_url,
     });
