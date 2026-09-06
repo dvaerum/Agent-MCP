@@ -273,6 +273,26 @@ pub fn stamp_sso_subject_if_absent(
     Ok(())
 }
 
+/// Port of `upgrade_sso_subject` -- R19-F1's self-heal, re-stamping a
+/// row matched via the pre-R18-F1 UNTAGGED reconciliation key to the
+/// current tagged format. The `WHERE sso_subject = old_subject` guard
+/// (exact match, not `IS NULL`, unlike [`stamp_sso_subject_if_absent`])
+/// means this only ever advances the SAME row that was just matched by
+/// that exact legacy string -- it can't clobber a row that has
+/// concurrently already moved on to a different subject.
+pub fn upgrade_sso_subject(
+    conn: &Connection,
+    user_id: &str,
+    old_subject: &str,
+    new_subject: &str,
+) -> Result<(), IdentityError> {
+    conn.execute(
+        "UPDATE users SET sso_subject = ?1 WHERE user_id = ?2 AND sso_subject = ?3",
+        (new_subject, user_id, old_subject),
+    )?;
+    Ok(())
+}
+
 /// Port of `touch_last_login`.
 pub fn touch_last_login(conn: &Connection, user_id: &str, now: &str) -> Result<(), IdentityError> {
     conn.execute(
@@ -1110,6 +1130,78 @@ mod tests {
                 .sso_subject
                 .as_deref(),
             Some("proxy:alice")
+        );
+    }
+
+    #[test]
+    fn upgrade_sso_subject_advances_a_row_matched_by_the_exact_old_key() {
+        let mut c = conn();
+        let uid = create_user(
+            &mut c,
+            "alice",
+            "correct horse battery staple",
+            None,
+            false,
+            true,
+            &[],
+            NOW,
+        )
+        .unwrap();
+        stamp_sso_subject_if_absent(&c, &uid, "oidc:https://idp.example.test:alice-1").unwrap();
+
+        upgrade_sso_subject(
+            &c,
+            &uid,
+            "oidc:https://idp.example.test:alice-1",
+            "oidc:https://idp.example.test:str:alice-1",
+        )
+        .unwrap();
+
+        assert_eq!(
+            get_user_by_id(&c, &uid)
+                .unwrap()
+                .unwrap()
+                .sso_subject
+                .as_deref(),
+            Some("oidc:https://idp.example.test:str:alice-1")
+        );
+    }
+
+    #[test]
+    fn upgrade_sso_subject_is_a_noop_when_the_row_has_already_moved_on() {
+        // The exact-old-value WHERE guard means a row that concurrently
+        // already advanced to a DIFFERENT subject must not be clobbered
+        // by a stale caller still holding the old legacy key.
+        let mut c = conn();
+        let uid = create_user(
+            &mut c,
+            "alice",
+            "correct horse battery staple",
+            None,
+            false,
+            true,
+            &[],
+            NOW,
+        )
+        .unwrap();
+        stamp_sso_subject_if_absent(&c, &uid, "oidc:https://idp.example.test:already-moved-on")
+            .unwrap();
+
+        upgrade_sso_subject(
+            &c,
+            &uid,
+            "oidc:https://idp.example.test:alice-1",
+            "oidc:https://idp.example.test:str:alice-1",
+        )
+        .unwrap();
+
+        assert_eq!(
+            get_user_by_id(&c, &uid)
+                .unwrap()
+                .unwrap()
+                .sso_subject
+                .as_deref(),
+            Some("oidc:https://idp.example.test:already-moved-on")
         );
     }
 
