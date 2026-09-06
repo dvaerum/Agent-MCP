@@ -145,11 +145,15 @@ fn internal_error() -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
 }
 
-/// Reads the `users` table's empty/non-empty state, mapping a genuine
-/// DB error to a 500 -- every handler below needs this at least once.
-async fn users_table_is_empty(state: &RouterState) -> Result<bool, Response> {
+/// Reads the `users` table's empty/non-empty state. `Err(())` means a
+/// genuine DB error -- every handler below maps it to a 500 itself
+/// via `internal_error()`, rather than this fn returning a full
+/// `Response` as its error variant (clippy::result_large_err: a
+/// `hyper::Response<axum::body::Body>` is >128 bytes and this error
+/// carries no information beyond "something went wrong").
+async fn users_table_is_empty(state: &RouterState) -> Result<bool, ()> {
     let conn = state.conn.lock().await;
-    identity::users_table_is_empty(&conn).map_err(|_| internal_error())
+    identity::users_table_is_empty(&conn).map_err(|_| ())
 }
 
 /// Port of `identity.create_user`'s internal `_list_registered_projects()`
@@ -385,7 +389,7 @@ pub async fn logout_get_handler() -> Response {
 pub async fn setup_get_handler(State(state): State<Arc<RouterState>>) -> Response {
     let empty = match users_table_is_empty(&state).await {
         Ok(e) => e,
-        Err(resp) => return resp,
+        Err(()) => return internal_error(),
     };
     match login::setup_get_outcome(empty) {
         SetupGetOutcome::RedirectToLogin => see_other("/agent-mcp/login"),
@@ -445,7 +449,7 @@ pub async fn setup_post_handler(
 
     let empty = match users_table_is_empty(&state).await {
         Ok(e) => e,
-        Err(resp) => return resp,
+        Err(()) => return internal_error(),
     };
     if !empty {
         // A POST after the wizard's already completed -- most likely a
