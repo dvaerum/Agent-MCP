@@ -108,3 +108,18 @@ futures-util = "0.3"
 # hand-rolling a second escaper (this crate's own established
 # "well-maintained library over reinventing it" discipline).
 percent-encoding = "2"
+# templates.rs (step 4, `conexus-router-login-setup-templates`) --
+# operator decision 2026-09-06: Jinja2-syntax-compatible over askama
+# (a different, Rust-native macro syntax that would mean REWRITING
+# the existing `agent_mcp/router/templates/*.html` files rather than
+# PORTING them) or hand-written `format!` HTML (autoescaping stays
+# structural instead of relying on every future editor remembering to
+# escape a new field). Same author as Jinja2 itself (Armin Ronacher).
+# Default features only -- no filesystem loader needed (templates are
+# `include_str!`'d at compile time), no `speedups`/`stacker`.
+minijinja = "2"
+# login_setup_rest.rs's `Form<LoginFormBody>`/`Form<SetupFormBody>`
+# extractors need `Deserialize` -- already resolved workspace-wide
+# (a transitive dep of axum/serde_json), added here as a direct edge
+# for the `derive` feature.
+serde = { version = "1", features = ["derive"] }
