@@ -224,10 +224,9 @@ impl SsoSubject {
             Value::Number(n) => {
                 if let Some(i) = n.as_i64() {
                     SsoSubjectValue::Int(i)
-                } else if let Some(f) = n.as_f64() {
-                    SsoSubjectValue::Float(f)
                 } else {
-                    return None;
+                    let f = n.as_f64()?;
+                    SsoSubjectValue::Float(f)
                 }
             }
             _ => return None,
