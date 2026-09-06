@@ -34,9 +34,13 @@ vi.mock("@/components/ui/toast", () => ({
   toastSuccess: vi.fn(),
 }))
 
-const CAP_A = "agents.view"
-const CAP_B = "agents.register"
-const CAP_C = "tasks.view"
+// system.* only — the picker (fixed 2026-09-06) no longer renders
+// resource-tier capabilities like the old agents.view/agents.register/
+// tasks.view fixtures once used here, since those are rejected
+// server-side for group grants (see group-capabilities-system-only.test.tsx).
+const CAP_A = "system.view"
+const CAP_B = "system.config.write"
+const CAP_C = "system.users.manage"
 
 function wrapper({ children }: { children: React.ReactNode }) {
   return (
