@@ -216,4 +216,81 @@ mod tests {
             .unwrap();
         assert_eq!(csp_header.value, "default-src 'none'");
     }
+
+    /// R7-F2: aiohttp's protocol-parser error path leaked the raw
+    /// `Server: Python/x.y aiohttp/z` banner for a request malformed
+    /// enough to trip the parser BEFORE `web.Application`'s own
+    /// middleware chain ever saw it -- there was nowhere left to patch
+    /// except the framework's own `SERVER_SOFTWARE` module constant (see
+    /// this module's own doc). This module's doc claims that vulnerability
+    /// class doesn't exist on hyper/axum (neither emits a version-
+    /// disclosing `Server` header by default in the first place); this
+    /// test proves that claim empirically against a REAL bound listener
+    /// (a well-formed `aiohttp_client`/reqwest-style client can't
+    /// construct a genuinely malformed request -- same reasoning as the
+    /// Python test, hence the raw socket) rather than leaving it as an
+    /// unverified doc comment, and pins it against a future hyper/axum
+    /// version silently changing that default.
+    mod raw_socket_r7_f2 {
+        use axum::routing::get;
+        use axum::Router;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn handler() -> &'static str {
+            "ok"
+        }
+
+        #[tokio::test]
+        async fn malformed_content_length_does_not_leak_a_version_disclosing_server_banner() {
+            // Deliberately a BARE router -- no `security_headers_layer`
+            // (or any middleware) wired in. A malformed `Content-Length`
+            // trips hyper's own HTTP/1 parser inside `axum::serve` before
+            // the request is ever dispatched to the `Router`, so a
+            // passing assertion here can only be explained by hyper's own
+            // default behavior, not by this crate's per-response header
+            // stamping (already covered by `middleware.rs`'s own
+            // full-stack tests).
+            let app: Router = Router::new().route("/", get(handler));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let _ = axum::serve(listener, app.into_make_service()).await;
+            });
+
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let raw_request = b"GET / HTTP/1.1\r\n\
+                Host: localhost\r\n\
+                Content-Length: abc\r\n\
+                Connection: close\r\n\
+                \r\n";
+            stream.write_all(raw_request).await.unwrap();
+            let mut buf = Vec::new();
+            // Bounded: a genuine regression that hangs the connection
+            // must fail the test, not stall the whole suite.
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                stream.read_to_end(&mut buf),
+            )
+            .await;
+            server.abort();
+
+            let response = String::from_utf8_lossy(&buf);
+            let head = response.split("\r\n\r\n").next().unwrap_or("");
+            let status_line = head.lines().next().unwrap_or("");
+            assert!(
+                status_line.contains("400"),
+                "expected a 400 for the malformed Content-Length, got: {status_line:?} \
+                 (full head: {head:?})"
+            );
+            let server_header = head
+                .lines()
+                .find(|l| l.to_ascii_lowercase().starts_with("server:"))
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            assert!(
+                !server_header.contains("hyper") && !server_header.contains("axum"),
+                "leaked a version-disclosing Server header: {server_header:?}"
+            );
+        }
+    }
 }

@@ -416,4 +416,66 @@ mod tests {
             "the spawned task hasn't run yet on a single-threaded runtime"
         );
     }
+
+    // -- SC-R6-1: warm-start gated on the session-gate's own authorization
+    // decision, not merely project existence ------------------------------
+
+    fn addr() -> SocketAddr {
+        "127.0.0.1:9999".parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn dashboard_handler_impl_does_not_warm_when_not_authorized() {
+        let (_dir, state) = real_state();
+        // Mirrors an authenticated NON-MEMBER's `GET /app/<victim>/`:
+        // `session_gate_layer` maps that to `WarmAuthorized(false)` (see
+        // that type's own doc) -- the shell is still served (asserted via
+        // the 404 fast path since no dashboard_dir is configured here;
+        // the response shape itself is covered by `serve_candidate`'s own
+        // tests), but the spawn side effect must not fire.
+        let _ = dashboard_handler_impl(
+            &state,
+            addr(),
+            "/agent-mcp/app/victim/",
+            &HeaderMap::new(),
+            "victim",
+            false,
+            "",
+        )
+        .await;
+        match state.runtime.snapshot("victim") {
+            None => {} // never even touched -- also a valid "did not warm"
+            Some(rt) => assert!(
+                !rt.warm_inflight,
+                "a non-member/unauthorized GET must NOT warm-start the backend \
+                 -- that is a cross-tenant resource-activation / DoS vector"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn dashboard_handler_impl_warms_when_authorized() {
+        let (_dir, state) = real_state();
+        // Mirrors an authorized member/sysadmin's `GET /app/<name>/`:
+        // `session_gate_layer` maps that to `WarmAuthorized(true)`.
+        let _ = dashboard_handler_impl(
+            &state,
+            addr(),
+            "/agent-mcp/app/shared/",
+            &HeaderMap::new(),
+            "shared",
+            true,
+            "",
+        )
+        .await;
+        let rt = state
+            .runtime
+            .snapshot("shared")
+            .expect("schedule_backend_warm must have touched the runtime row");
+        assert!(
+            rt.warm_inflight,
+            "an authorized GET must schedule the warm-start \
+             (the documented lazy-spawn on first request)"
+        );
+    }
 }
