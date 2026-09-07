@@ -165,4 +165,16 @@ url = "2"
 # spec example, not a secret, and the same fixture `openidconnect`'s
 # own test suite uses for its public-key half.
 jsonwebtoken = "9"
+# login_setup_rest.rs's own HTTP-level tests (test_sec_router_login_
+# setup_group_3, PR 3/13 of the test_sec_* router port) drive a real
+# axum::Router end to end via `ServiceExt::oneshot` -- proving the
+# FULL handler (extraction, same-origin check, credential check,
+# status/cookie) rather than only the pure decision-function half
+# `login.rs`'s own unit tests already cover. Already resolved
+# workspace-wide at this exact version (a transitive dep of axum
+# itself), added here as a direct dev-only edge for the `util`
+# feature (`ServiceExt`) rather than adding a heavier
+# request-building crate (`axum-test`, not otherwise needed anywhere
+# in this workspace).
+tower = { version = "0.5", default-features = false, features = ["util"] }
 
