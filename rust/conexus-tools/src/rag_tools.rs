@@ -468,6 +468,7 @@ async fn query_rag_system(
         .chat(
             &[("system", SYSTEM_PROMPT_GENERAL), ("user", &user_message)],
             0.4,
+            None,
         )
         .await
         .map_err(|e| {

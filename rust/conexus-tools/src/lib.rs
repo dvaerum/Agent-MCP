@@ -17,6 +17,7 @@ pub mod context_window;
 pub mod embedding_client;
 pub mod file_management_tools;
 pub mod file_metadata_tools;
+pub mod message_suggestions;
 pub mod project_context_tools;
 pub mod project_settings_tools;
 pub mod prompts;

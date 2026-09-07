@@ -93,6 +93,101 @@ mod message_retention {
     }
 }
 
+/// Port of `agent_mcp/features/subject_backfill.py`. A root message
+/// sent without an explicit subject stores `subject = NULL`; this
+/// sweep titles the backlog LATER (batched, so the local model is
+/// loaded once per sweep and amortised) rather than blocking the
+/// synchronous send path on a model call.
+mod subject_backfill {
+    use super::*;
+    use conexus_tools::message_suggestions;
+
+    pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(120);
+    const DEFAULT_BATCH_LIMIT: i64 = 25;
+
+    fn batch_limit(get_env: &impl Fn(&str) -> Option<String>) -> i64 {
+        get_env("MCP_SUBJECT_BACKFILL_BATCH_LIMIT")
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(DEFAULT_BATCH_LIMIT)
+    }
+
+    /// Titles up to `batch_limit` NULL-subject root messages via the
+    /// configured local model. Returns the number titled this sweep;
+    /// `0` when the model is unconfigured or there's nothing to do.
+    ///
+    /// The DB fetch/write run under `shared.conn`'s lock; the
+    /// `suggest_subject` HTTP call to the local model runs OUTSIDE it
+    /// (released between fetch and write) -- a slow/unavailable model
+    /// must never stall every other tool call/agent's DB access.
+    pub async fn backfill_null_subjects(
+        shared: &Arc<SharedState>,
+        get_env: impl Fn(&str) -> Option<String> + Clone,
+        batch_limit: i64,
+    ) -> rusqlite::Result<i64> {
+        if !message_suggestions::subject_model_configured(&get_env) {
+            return Ok(0);
+        }
+
+        let roots = {
+            let conn = shared.conn.lock().await;
+            conexus_db::message_repository::fetch_null_subject_roots(&conn, batch_limit)?
+        };
+        if roots.is_empty() {
+            return Ok(0);
+        }
+
+        let mut titled = 0i64;
+        for root in &roots {
+            let Some(subject) =
+                message_suggestions::suggest_subject(get_env.clone(), &root.message_content).await
+            else {
+                // Model unavailable / empty completion -- leave NULL,
+                // retry next sweep. Don't burn the rest of the batch
+                // on a dead model.
+                continue;
+            };
+            let ok = {
+                let conn = shared.conn.lock().await;
+                conexus_db::message_repository::set_message_subject(
+                    &conn,
+                    &root.message_id,
+                    &subject,
+                )?
+            };
+            if ok {
+                titled += 1;
+                // Release any held skinny message event: the message
+                // now has a real title, so wake the recipient's
+                // parked wait_for_events promptly instead of on the
+                // next poll.
+                shared.waiter_registry.notify(&root.recipient_id);
+            }
+        }
+        Ok(titled)
+    }
+
+    pub async fn run_periodically(
+        shared: Arc<SharedState>,
+        get_env: impl Fn(&str) -> Option<String> + Clone + Send + 'static,
+        interval: Duration,
+    ) {
+        loop {
+            let limit = batch_limit(&get_env);
+            match backfill_null_subjects(&shared, get_env.clone(), limit).await {
+                Ok(0) => {}
+                Ok(titled) => {
+                    eprintln!("conexus-backend: subject backfill titled {titled} message(s)");
+                }
+                Err(e) => {
+                    eprintln!("conexus-backend: subject backfill cycle failed: {e}");
+                }
+            }
+            tokio::time::sleep(interval).await;
+        }
+    }
+}
+
 /// Spawns every approved background maintenance loop. Called once from
 /// `main()` after `SharedState` is constructed; each loop gets its own
 /// detached task (never joined -- see this module's own doc on why no
@@ -101,6 +196,11 @@ pub fn spawn_all(shared: &Arc<SharedState>) {
     tokio::spawn(message_retention::run_periodically(
         shared.clone(),
         message_retention::DEFAULT_INTERVAL,
+    ));
+    tokio::spawn(subject_backfill::run_periodically(
+        shared.clone(),
+        |key: &str| std::env::var(key).ok(),
+        subject_backfill::DEFAULT_INTERVAL,
     ));
 }
 
@@ -207,5 +307,179 @@ mod tests {
         // Must not panic.
         let deleted = prune_old_messages(&conn, now).unwrap();
         assert_eq!(deleted, 1);
+    }
+}
+
+#[cfg(test)]
+mod subject_backfill_tests {
+    use super::subject_backfill::backfill_null_subjects;
+    use crate::server::SharedState;
+    use conexus_db::message_repository::{self, NewMessage};
+    use conexus_db::schema::init_schema;
+    use conexus_wakeloop::file_map::FileMap;
+    use conexus_wakeloop::waiter_registry::WaiterRegistry;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn test_shared() -> Arc<SharedState> {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        Arc::new(SharedState {
+            conn: tokio::sync::Mutex::new(conn),
+            forwarding_hmac_key: None,
+            waiter_registry: WaiterRegistry::new(),
+            file_map: FileMap::new(),
+            project_dir: std::env::temp_dir(),
+            operator_events: crate::operator_events::OperatorEventsHub::new(),
+            delivery_transport: crate::delivery_transport::DeliveryTransportHub::new(),
+        })
+    }
+
+    fn seed_root(conn: &rusqlite::Connection, id: &str, recipient_id: &str, content: &str) {
+        message_repository::send(
+            conn,
+            NewMessage {
+                message_id: id,
+                sender_id: "alice",
+                recipient_id,
+                message_content: content,
+                message_type: "direct",
+                priority: "normal",
+                timestamp: "2026-01-01T00:00:00Z",
+                delivered: true,
+                read: false,
+                subject: None,
+                parent_message_id: None,
+            },
+        )
+        .unwrap();
+    }
+
+    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + Clone {
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |key| map.get(key).cloned()
+    }
+
+    #[tokio::test]
+    async fn model_unconfigured_is_a_no_op() {
+        let shared = test_shared();
+        {
+            let conn = shared.conn.lock().await;
+            seed_root(&conn, "m1", "admin", "hello there");
+        }
+        let titled = backfill_null_subjects(&shared, env(&[]), 25).await.unwrap();
+        assert_eq!(titled, 0);
+    }
+
+    #[tokio::test]
+    async fn nothing_to_backfill_is_a_no_op() {
+        let shared = test_shared();
+        let titled = backfill_null_subjects(
+            &shared,
+            env(&[("AGENT_MCP_SUBJECT_MODEL", "qwen2.5:3b-instruct")]),
+            25,
+        )
+        .await
+        .unwrap();
+        assert_eq!(titled, 0);
+    }
+
+    #[tokio::test]
+    async fn a_dead_model_leaves_every_root_null_and_titles_nothing() {
+        // The model is "configured" but points at an unreachable
+        // endpoint -- every suggest_subject call must degrade to None
+        // rather than propagate an error, matching Python's own
+        // per-row `continue` on a dead model.
+        let shared = test_shared();
+        {
+            let conn = shared.conn.lock().await;
+            seed_root(&conn, "m1", "admin", "hello there");
+        }
+        let titled = backfill_null_subjects(
+            &shared,
+            env(&[
+                ("AGENT_MCP_SUBJECT_MODEL", "qwen2.5:3b-instruct"),
+                ("AGENT_MCP_LLM_BASE_URL", "http://127.0.0.1:1/v1"),
+                ("AGENT_MCP_MODEL_CONTEXT_WINDOW", "4096"),
+            ]),
+            25,
+        )
+        .await
+        .unwrap();
+        assert_eq!(titled, 0);
+        let conn = shared.conn.lock().await;
+        assert!(message_repository::get_by_id(&conn, "m1")
+            .unwrap()
+            .unwrap()
+            .subject
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn titles_a_real_null_subject_root_and_wakes_the_recipient() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 8192];
+            let _ = socket.read(&mut buf).await;
+            let body = r#"{"choices":[{"message":{"content":"Deploy failed on staging"}}]}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = socket.write_all(resp.as_bytes()).await;
+            let _ = socket.shutdown().await;
+        });
+
+        let shared = test_shared();
+        {
+            let conn = shared.conn.lock().await;
+            conexus_db::agent_repository::AgentRepository::create(
+                &conn,
+                conexus_db::agent_repository::NewAgent {
+                    token: "tok-bob",
+                    agent_id: "bob",
+                    created_at: "2026-01-01T00:00:00Z",
+                    status: "created",
+                    current_task: None,
+                    working_directory: "/tmp",
+                    color: None,
+                    agent_role: "worker",
+                },
+            )
+            .unwrap();
+            seed_root(&conn, "m1", "bob", "the deploy to staging just failed");
+        }
+        // A parked waiter for "bob" -- proves the post-title wake
+        // actually reaches the recipient's registry entry, not just
+        // that notify() was called without an observable effect.
+        let (_tx, mut rx) = shared.waiter_registry.register("bob");
+
+        let base_url = format!("http://{addr}/v1");
+        let titled = backfill_null_subjects(
+            &shared,
+            env(&[
+                ("AGENT_MCP_SUBJECT_MODEL", "qwen2.5:3b-instruct"),
+                ("AGENT_MCP_LLM_BASE_URL", &base_url),
+                ("AGENT_MCP_MODEL_CONTEXT_WINDOW", "4096"),
+            ]),
+            25,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(titled, 1);
+        let conn = shared.conn.lock().await;
+        let row = message_repository::get_by_id(&conn, "m1").unwrap().unwrap();
+        assert_eq!(row.subject.as_deref(), Some("Deploy failed on staging"));
+        assert!(rx.try_recv().is_ok(), "recipient's waiter was not woken");
+        handle.await.unwrap();
     }
 }
