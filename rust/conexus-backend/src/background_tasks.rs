@@ -188,6 +188,160 @@ mod subject_backfill {
     }
 }
 
+/// Port of `agent_mcp/features/claude_session_monitor.py`. Watches
+/// `.agent/registry.json` (the git-agentmcp hook's own multi-agent
+/// coordination file) for Claude Code process activity and mirrors it
+/// into the `claude_code_sessions` table.
+mod claude_session_monitor {
+    use super::*;
+    use serde_json::{Map, Value};
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::time::SystemTime;
+
+    pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(5);
+
+    fn registry_path(project_dir: &Path) -> PathBuf {
+        project_dir.join(".agent").join("registry.json")
+    }
+
+    /// Per-loop mutable state -- Python's module-level singleton
+    /// (`known_sessions`/`last_modified`) owned by the spawned task
+    /// itself instead of a shared global, matching this crate's own
+    /// "no process-wide mutable statics outside `SharedState`"
+    /// convention.
+    #[derive(Default)]
+    pub struct MonitorState {
+        last_modified: Option<SystemTime>,
+        // pub(crate), not private: this crate's own sibling test
+        // module (`claude_session_monitor_tests`) asserts against it
+        // directly to prove the mtime-gate/diff logic, not just the
+        // DB side effects.
+        pub(crate) known_sessions: HashMap<String, Value>,
+    }
+
+    fn str_field<'a>(data: &'a Value, key: &str) -> Option<&'a str> {
+        data.get(key).and_then(Value::as_str)
+    }
+
+    fn int_field(data: &Value, key: &str) -> i64 {
+        data.get(key).and_then(Value::as_i64).unwrap_or(0)
+    }
+
+    /// One sweep: re-reads the registry ONLY if its mtime advanced
+    /// since the last sweep, diffs against `state.known_sessions`, and
+    /// syncs the DB (new -> `register_new_session` + a durable
+    /// `claude_session_detected` audit row; still-present -> `
+    /// update_activity`; dropped-out -> `mark_inactive`). A missing or
+    /// unreadable/malformed registry file is a silent no-op, matching
+    /// Python's own "normal for new projects" tolerance.
+    pub async fn check_registry_changes(shared: &Arc<SharedState>, state: &mut MonitorState) {
+        let path = registry_path(&shared.project_dir);
+        let Ok(mtime) = std::fs::metadata(&path).and_then(|m| m.modified()) else {
+            return;
+        };
+        if let Some(last) = state.last_modified {
+            if mtime <= last {
+                return;
+            }
+        }
+        state.last_modified = Some(mtime);
+
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let registry: Value = match serde_json::from_str(&contents) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!(
+                    "conexus-backend: invalid JSON in registry file {}: {e}",
+                    path.display()
+                );
+                return;
+            }
+        };
+        let sessions: Map<String, Value> = registry
+            .get("sessions")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let stale: Vec<String> = state
+            .known_sessions
+            .keys()
+            .filter(|id| !sessions.contains_key(*id))
+            .cloned()
+            .collect();
+
+        {
+            let conn = shared.conn.lock().await;
+            for (id, data) in &sessions {
+                let last_activity = str_field(data, "last_activity").unwrap_or(&now).to_string();
+                let metadata = data.to_string();
+                if state.known_sessions.contains_key(id) {
+                    if let Err(e) = conexus_db::claude_code_session_repository::update_activity(
+                        &conn,
+                        id,
+                        &last_activity,
+                        &metadata,
+                    ) {
+                        eprintln!("conexus-backend: error updating claude session {id}: {e}");
+                    }
+                } else {
+                    let new_session = conexus_db::claude_code_session_repository::NewSession {
+                        session_id: id,
+                        pid: int_field(data, "pid"),
+                        parent_pid: int_field(data, "parent_pid"),
+                        working_directory: str_field(data, "working_directory"),
+                        metadata: &metadata,
+                    };
+                    if let Err(e) = conexus_db::claude_code_session_repository::register_new_session(
+                        &conn,
+                        &new_session,
+                        &last_activity,
+                        &now,
+                    ) {
+                        eprintln!("conexus-backend: error registering claude session {id}: {e}");
+                        continue;
+                    }
+                    let details = serde_json::json!({
+                        "session_id": id,
+                        "pid": int_field(data, "pid"),
+                        "parent_pid": int_field(data, "parent_pid"),
+                        "working_directory": str_field(data, "working_directory"),
+                    });
+                    let _ = conexus_db::agent_action_repository::log_agent_action(
+                        &conn,
+                        "system",
+                        "claude_session_detected",
+                        None,
+                        Some(&details),
+                        &now,
+                    );
+                }
+            }
+            for id in &stale {
+                if let Err(e) =
+                    conexus_db::claude_code_session_repository::mark_inactive(&conn, id, &now)
+                {
+                    eprintln!("conexus-backend: error marking claude session {id} inactive: {e}");
+                }
+            }
+        }
+
+        state.known_sessions = sessions.into_iter().collect();
+    }
+
+    pub async fn run_periodically(shared: Arc<SharedState>, interval: Duration) {
+        let mut state = MonitorState::default();
+        loop {
+            check_registry_changes(&shared, &mut state).await;
+            tokio::time::sleep(interval).await;
+        }
+    }
+}
+
 /// Spawns every approved background maintenance loop. Called once from
 /// `main()` after `SharedState` is constructed; each loop gets its own
 /// detached task (never joined -- see this module's own doc on why no
@@ -201,6 +355,10 @@ pub fn spawn_all(shared: &Arc<SharedState>) {
         shared.clone(),
         |key: &str| std::env::var(key).ok(),
         subject_backfill::DEFAULT_INTERVAL,
+    ));
+    tokio::spawn(claude_session_monitor::run_periodically(
+        shared.clone(),
+        claude_session_monitor::DEFAULT_INTERVAL,
     ));
 }
 
@@ -481,5 +639,186 @@ mod subject_backfill_tests {
         assert_eq!(row.subject.as_deref(), Some("Deploy failed on staging"));
         assert!(rx.try_recv().is_ok(), "recipient's waiter was not woken");
         handle.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod claude_session_monitor_tests {
+    use super::claude_session_monitor::{check_registry_changes, MonitorState};
+    use crate::server::SharedState;
+    use conexus_db::schema::init_schema;
+    use conexus_wakeloop::file_map::FileMap;
+    use conexus_wakeloop::waiter_registry::WaiterRegistry;
+    use std::sync::Arc;
+
+    fn test_shared(project_dir: std::path::PathBuf) -> Arc<SharedState> {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        Arc::new(SharedState {
+            conn: tokio::sync::Mutex::new(conn),
+            forwarding_hmac_key: None,
+            waiter_registry: WaiterRegistry::new(),
+            file_map: FileMap::new(),
+            project_dir,
+            operator_events: crate::operator_events::OperatorEventsHub::new(),
+            delivery_transport: crate::delivery_transport::DeliveryTransportHub::new(),
+        })
+    }
+
+    fn scratch_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "conexus-claude-session-monitor-test-{name}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(dir.join(".agent")).unwrap();
+        dir
+    }
+
+    fn write_registry(project_dir: &std::path::Path, json: &str) {
+        std::fs::write(project_dir.join(".agent").join("registry.json"), json).unwrap();
+    }
+
+    #[tokio::test]
+    async fn no_registry_file_is_a_silent_no_op() {
+        let dir = scratch_dir("missing");
+        let shared = test_shared(dir.clone());
+        let mut state = MonitorState::default();
+        check_registry_changes(&shared, &mut state).await;
+        let conn = shared.conn.lock().await;
+        assert!(
+            conexus_db::claude_code_session_repository::list_active(&conn)
+                .unwrap()
+                .is_empty()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn malformed_json_is_a_silent_no_op() {
+        let dir = scratch_dir("malformed");
+        write_registry(&dir, "not json");
+        let shared = test_shared(dir.clone());
+        let mut state = MonitorState::default();
+        check_registry_changes(&shared, &mut state).await;
+        let conn = shared.conn.lock().await;
+        assert!(
+            conexus_db::claude_code_session_repository::list_active(&conn)
+                .unwrap()
+                .is_empty()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_new_session_is_registered_and_audited() {
+        let dir = scratch_dir("new");
+        write_registry(
+            &dir,
+            r#"{"sessions": {"s1": {"pid": 111, "parent_pid": 222, "working_directory": "/repo"}}}"#,
+        );
+        let shared = test_shared(dir.clone());
+        let mut state = MonitorState::default();
+        check_registry_changes(&shared, &mut state).await;
+
+        assert!(state.known_sessions.contains_key("s1"));
+        let conn = shared.conn.lock().await;
+        let row = conexus_db::claude_code_session_repository::get_by_id(&conn, "s1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.pid, 111);
+        assert_eq!(row.parent_pid, 222);
+        assert_eq!(row.working_directory.as_deref(), Some("/repo"));
+        assert_eq!(row.status.as_deref(), Some("detected"));
+
+        let actions: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT action_type FROM agent_actions WHERE agent_id = 'system'")
+                .unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(actions, vec!["claude_session_detected"]);
+        drop(conn);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_mtime_skips_the_second_read_entirely() {
+        let dir = scratch_dir("unchanged");
+        write_registry(&dir, r#"{"sessions": {"s1": {"pid": 1, "parent_pid": 2}}}"#);
+        let shared = test_shared(dir.clone());
+        let mut state = MonitorState::default();
+        check_registry_changes(&shared, &mut state).await;
+        assert_eq!(state.known_sessions.len(), 1);
+
+        // Second sweep with the SAME mtime -- must be a no-op even
+        // though the file (if re-read) would still parse fine; this
+        // proves the mtime gate itself is doing the skipping, not
+        // some other short-circuit.
+        check_registry_changes(&shared, &mut state).await;
+        assert_eq!(state.known_sessions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_session_still_present_is_updated_not_re_registered() {
+        let dir = scratch_dir("update");
+        write_registry(
+            &dir,
+            r#"{"sessions": {"s1": {"pid": 1, "parent_pid": 2, "last_activity": "2026-01-01T00:00:00Z"}}}"#,
+        );
+        let shared = test_shared(dir.clone());
+        let mut state = MonitorState::default();
+        check_registry_changes(&shared, &mut state).await;
+
+        // Force a new mtime by re-writing with updated content.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        write_registry(
+            &dir,
+            r#"{"sessions": {"s1": {"pid": 1, "parent_pid": 2, "last_activity": "2026-01-02T00:00:00Z"}}}"#,
+        );
+        check_registry_changes(&shared, &mut state).await;
+
+        let conn = shared.conn.lock().await;
+        let row = conexus_db::claude_code_session_repository::get_by_id(&conn, "s1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.last_activity, "2026-01-02T00:00:00Z");
+        assert_eq!(row.status.as_deref(), Some("active"));
+        // Only ONE detection audit row -- the second sweep updated,
+        // it did not re-register/re-audit.
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM agent_actions WHERE action_type = 'claude_session_detected'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        drop(conn);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_session_dropped_from_the_registry_is_marked_inactive() {
+        let dir = scratch_dir("drop");
+        write_registry(&dir, r#"{"sessions": {"s1": {"pid": 1, "parent_pid": 2}}}"#);
+        let shared = test_shared(dir.clone());
+        let mut state = MonitorState::default();
+        check_registry_changes(&shared, &mut state).await;
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        write_registry(&dir, r#"{"sessions": {}}"#);
+        check_registry_changes(&shared, &mut state).await;
+
+        assert!(!state.known_sessions.contains_key("s1"));
+        let conn = shared.conn.lock().await;
+        let row = conexus_db::claude_code_session_repository::get_by_id(&conn, "s1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status.as_deref(), Some("inactive"));
+        drop(conn);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
