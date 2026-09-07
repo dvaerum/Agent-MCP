@@ -137,6 +137,24 @@ pub fn resolve_principal(
         });
     };
 
+    // R16-DiD-1: `get_by_token` returns a row for ANY status
+    // (terminated/tombstone included, for audit/attribution elsewhere)
+    // -- a real, found gap: this admission seam had NO liveness check
+    // at all, unlike Python's real `_bearer_is_active` gate on the
+    // identical `/mcp` path. Termination flips only `status`, never
+    // the token itself, so a terminated/tombstoned agent's original
+    // bearer stayed a fully valid `/mcp` credential indefinitely.
+    // Reuses the same canonical `AgentRepository::is_live` predicate
+    // `rest_principal.rs`'s sibling fix uses.
+    let live = AgentRepository::is_live(conn, &row.agent_id).map_err(|_| PrincipalRejected {
+        reason: "Unauthorized: failed to resolve agent".to_string(),
+    })?;
+    if !live {
+        return Err(PrincipalRejected {
+            reason: "Unauthorized: valid token required".to_string(),
+        });
+    }
+
     let agent_role = normalize_agent_role(&row.agent_role);
     let caps = conexus_auth::resolve_capabilities(
         None,
@@ -187,10 +205,20 @@ mod tests {
     }
 
     fn seed_agent(conn: &Connection, token: &str, agent_id: &str, role: &str) {
+        seed_agent_with_status(conn, token, agent_id, role, "active");
+    }
+
+    fn seed_agent_with_status(
+        conn: &Connection,
+        token: &str,
+        agent_id: &str,
+        role: &str,
+        status: &str,
+    ) {
         conn.execute(
             "INSERT INTO agents (token, agent_id, created_at, status, working_directory, agent_role) \
-             VALUES (?1, ?2, '2026-01-01T00:00:00Z', 'active', '/tmp', ?3)",
-            (token, agent_id, role),
+             VALUES (?1, ?2, '2026-01-01T00:00:00Z', ?4, '/tmp', ?3)",
+            (token, agent_id, role, status),
         )
         .unwrap();
     }
@@ -210,6 +238,40 @@ mod tests {
         assert_eq!(principal.kind, PrincipalKind::AgentBearer);
         assert_eq!(principal.agent_id.as_deref(), Some("agent-1"));
         assert_eq!(principal.agent_role, Some(AgentRole::Worker));
+    }
+
+    /// R16-DiD-1 sibling gap (found by class-sweeping the same
+    /// finding across every bearer-auth call site, after fixing
+    /// `rest_principal.rs`'s identical gap): `get_by_token` returns a
+    /// row for ANY status, and `resolve_principal`'s bearer branch had
+    /// NO liveness check at all -- not even the weak
+    /// `status != "terminated"` variant. Python's real gate
+    /// (`_bearer_is_active`, `main_app.py`) explicitly rejects a
+    /// terminated/tombstoned agent's bearer on the identical `/mcp`
+    /// admission seam; this port had never carried an equivalent over.
+    /// A terminated agent's original token (never invalidated by
+    /// termination -- only its `status` flips) stayed a fully valid
+    /// `/mcp` credential indefinitely.
+    #[test]
+    fn a_terminated_agents_bearer_is_rejected() {
+        let conn = test_conn();
+        seed_agent_with_status(&conn, "tok123", "agent-1", "worker", "terminated");
+        let result = resolve_principal(&conn, Some("Bearer tok123"), None, None, 1000);
+        assert!(
+            result.is_err(),
+            "a terminated agent's bearer must not resolve a principal at all"
+        );
+    }
+
+    #[test]
+    fn a_tombstoned_agents_bearer_is_rejected() {
+        let conn = test_conn();
+        seed_agent_with_status(&conn, "tok123", "agent-1", "manager", "tombstone");
+        let result = resolve_principal(&conn, Some("Bearer tok123"), None, None, 1000);
+        assert!(
+            result.is_err(),
+            "a tombstoned agent's bearer must not resolve a principal at all"
+        );
     }
 
     #[test]

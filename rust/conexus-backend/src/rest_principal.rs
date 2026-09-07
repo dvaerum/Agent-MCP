@@ -159,6 +159,26 @@ pub fn resolve_rest_principal(
         });
     }
 
+    // R16-DiD-1: `get_by_token` returns a row for ANY status
+    // (terminated/tombstone included -- deliberately, for audit/
+    // attribution elsewhere), so liveness is NOT implied by a
+    // successful lookup and must be checked here explicitly -- a real,
+    // found gap: this call site previously checked `agent_role` alone.
+    // Reuses `AgentRepository::is_live`'s canonical `NOT_TERMINAL_SQL`
+    // predicate (the same one `list_active`/`current_task` reconcile
+    // use) rather than a second, driftable `status != "terminated"`
+    // check -- the exact weak-variant class this finding's own Python
+    // source names as the historical bug.
+    let live = AgentRepository::is_live(conn, &row.agent_id).map_err(|_| PrincipalRejected {
+        reason: "Unauthorized: failed to resolve agent".to_string(),
+    })?;
+    if !live {
+        return Err(PrincipalRejected {
+            reason: "Unauthorized: signed forwarding header or operator-tier bearer required."
+                .to_string(),
+        });
+    }
+
     Ok(RestPrincipal::OperatorBearer {
         bearer_token: token.to_string(),
     })
@@ -228,10 +248,20 @@ mod tests {
     }
 
     fn seed_agent(conn: &Connection, token: &str, agent_id: &str, role: &str) {
+        seed_agent_with_status(conn, token, agent_id, role, "active");
+    }
+
+    fn seed_agent_with_status(
+        conn: &Connection,
+        token: &str,
+        agent_id: &str,
+        role: &str,
+        status: &str,
+    ) {
         conn.execute(
             "INSERT INTO agents (token, agent_id, created_at, status, working_directory, agent_role) \
-             VALUES (?1, ?2, '2026-01-01T00:00:00Z', 'active', '/tmp', ?3)",
-            (token, agent_id, role),
+             VALUES (?1, ?2, '2026-01-01T00:00:00Z', ?4, '/tmp', ?3)",
+            (token, agent_id, role, status),
         )
         .unwrap();
     }
@@ -264,6 +294,41 @@ mod tests {
             RestPrincipal::OperatorBearer {
                 bearer_token: "tok123".to_string()
             }
+        );
+    }
+
+    /// R16-DiD-1: `get_by_token` returns a row for ANY status
+    /// (terminated/tombstone included -- for audit/attribution, same
+    /// as Python's `AgentRepository.get_by_token`), so the operator-
+    /// tier bearer gate must check LIVENESS itself, not just role. A
+    /// real, found gap: this call site checked `agent_role` alone with
+    /// no status check at all -- a terminated manager's OLD bearer
+    /// token (never invalidated by termination, only its `status`
+    /// flips) stayed admitted as an operator-tier REST bearer
+    /// indefinitely.
+    #[test]
+    fn a_terminated_manager_bearer_is_rejected() {
+        let conn = test_conn();
+        seed_agent_with_status(&conn, "tok123", "manager", "manager", "terminated");
+        let result = resolve_rest_principal(&conn, Some("Bearer tok123"), None, None, 1000);
+        assert!(
+            result.is_err(),
+            "a terminated manager's bearer must not be admitted as operator-tier"
+        );
+    }
+
+    #[test]
+    fn a_tombstoned_manager_bearer_is_rejected() {
+        let conn = test_conn();
+        // Constructed directly with a non-NULL operator role (the
+        // predicate itself is what must reject this -- not merely the
+        // NULL agent_role a real tombstone row happens to carry today,
+        // matching test_sec_r16_bearer_liveness.py's own rationale).
+        seed_agent_with_status(&conn, "tok123", "manager", "manager", "tombstone");
+        let result = resolve_rest_principal(&conn, Some("Bearer tok123"), None, None, 1000);
+        assert!(
+            result.is_err(),
+            "a tombstoned manager's bearer must not be admitted as operator-tier"
         );
     }
 
