@@ -19,6 +19,7 @@
 //! that has no `conexus@<name>.service` caller to replicate for yet).
 
 mod auth_gate;
+mod background_tasks;
 mod boot;
 mod delivery_gate;
 mod delivery_transport;
@@ -110,6 +111,8 @@ async fn main() -> Result<()> {
         operator_events: operator_events::OperatorEventsHub::new(),
         delivery_transport: delivery_transport::DeliveryTransportHub::new(),
     });
+
+    background_tasks::spawn_all(&shared);
 
     let shared_for_factory = shared.clone();
     let mcp_service: StreamableHttpService<ConexusServer, LocalSessionManager> =
