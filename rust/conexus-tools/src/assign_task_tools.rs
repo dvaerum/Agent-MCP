@@ -1751,6 +1751,39 @@ mod tests {
         assert!(matches!(result, ToolResult::NotFound { .. }));
     }
 
+    /// AZ-R19-1 regression (ported from
+    /// `tests/test_sec_r19_mode0_parent_ownership.py::
+    /// test_admin_can_attach_child_under_any_parent`): the
+    /// worker-parent-ownership gate is skipped entirely for a
+    /// privileged caller (`worker_created_by` is only `Some` on the
+    /// `WorkerFileUnassigned` authorization branch) -- an admin can
+    /// file a Mode-0 task under ANY existing parent, not just tasks it
+    /// owns.
+    #[tokio::test]
+    async fn mode0_admin_can_file_under_any_existing_parent() {
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "bob_parent", "pending", Some("bob"), "bob", None);
+        }
+        let result = call_assign(
+            serde_json::json!({
+                "task_title": "operator-filed subtask",
+                "task_description": "coordination breakdown",
+                "parent_task_id": "bob_parent"
+            }),
+            &admin("alice"),
+            &conn,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        let guard = conn.lock().await;
+        let parent = task_repository::get_by_id(&guard, "bob_parent")
+            .unwrap()
+            .unwrap();
+        assert_eq!(parent.child_tasks.unwrap_or_default().len(), 1);
+    }
+
     #[tokio::test]
     async fn mode0_worker_cannot_file_a_root_task() {
         let conn = test_conn();
@@ -1779,6 +1812,53 @@ mod tests {
         assert_eq!(rows[0].status, "unassigned");
     }
 
+    /// R5-F5 (ported from `tests/test_sec_r5_f5_bulk_task_single_root.py::
+    /// test_mode0_two_parentless_tasks_same_batch_is_clean_conflict`):
+    /// two parentless tasks in the SAME Mode-0 batch, with no existing
+    /// root, must be a clean `Conflict` -- never fall through to the
+    /// generic `Failed`/DB-IntegrityError path -- and neither task may
+    /// be persisted (all-or-nothing).
+    #[tokio::test]
+    async fn mode0_two_parentless_tasks_in_one_batch_is_a_clean_conflict() {
+        let conn = test_conn();
+        let result = call_assign(
+            serde_json::json!({
+                "tasks": [
+                    {"title": "t1", "description": "d1"},
+                    {"title": "t2", "description": "d2"}
+                ]
+            }),
+            &admin("alice"),
+            &conn,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Conflict { .. }));
+        let guard = conn.lock().await;
+        assert!(task_repository::list_all(&guard, None).unwrap().is_empty());
+    }
+
+    /// R5-F5 (ported from `tests/test_sec_r5_f5_bulk_task_single_root.py::
+    /// test_mode0_one_parentless_task_when_root_exists_is_clean_conflict`):
+    /// a single parentless task in a Mode-0 batch, while a root ALREADY
+    /// exists in the DB, must also be a clean `Conflict`.
+    #[tokio::test]
+    async fn mode0_one_parentless_task_in_batch_when_root_exists_is_a_clean_conflict() {
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "root", "pending", None, "alice", None);
+        }
+        let result = call_assign(
+            serde_json::json!({"tasks": [{"title": "t1", "description": "d1"}]}),
+            &admin("alice"),
+            &conn,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Conflict { .. }));
+        let guard = conn.lock().await;
+        assert_eq!(task_repository::list_all(&guard, None).unwrap().len(), 1);
+    }
+
     // -- AssignTaskTool: Mode 3 (existing) ---------------------------------
 
     #[tokio::test]
@@ -1803,6 +1883,19 @@ mod tests {
         let guard = conn.lock().await;
         let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
         assert_eq!(row.assigned_to.as_deref(), Some("bob"));
+        // OBS-R17-AZ (ported from `tests/test_sec_r17_request_assist_
+        // oracle.py::test_mode3_self_claim_audit_actor_is_worker`): the
+        // audit record must attribute the self-claim to the REAL
+        // requesting worker, not a hardcoded "admin" literal.
+        let audit_actor: String = guard
+            .query_row(
+                "SELECT agent_id FROM agent_actions WHERE action_type = 'assigned_task' \
+                 ORDER BY timestamp DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(audit_actor, "bob");
     }
 
     #[tokio::test]
@@ -1886,6 +1979,109 @@ mod tests {
         assert_eq!(rx.try_recv(), Ok(WakeSignal::Wake));
     }
 
+    /// BL-R18-1 (ported from `tests/test_sec_r18_self_claim_oracle_
+    /// terminal.py::test_worker_cannot_self_claim_terminal_task`): a
+    /// worker must not be able to self-claim a TERMINAL but unassigned
+    /// task (re-executing finished work). It collapses to the same
+    /// phantom `NotFound` as a nonexistent task, and the task stays
+    /// terminal + unassigned.
+    #[tokio::test]
+    async fn mode3_worker_cannot_self_claim_a_terminal_task() {
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_agent(&guard, "bob");
+        }
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "root", "pending", None, "alice", None);
+            seed_task(&guard, "t1", "completed", None, "alice", Some("root"));
+        }
+        let result = call_assign(
+            serde_json::json!({"task_ids": ["t1"]}),
+            &worker("bob"),
+            &conn,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::NotFound { .. }));
+        let guard = conn.lock().await;
+        let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+        assert_eq!(row.assigned_to, None);
+        assert_eq!(row.status, "completed");
+    }
+
+    /// AZ-R18-1 regression (ported from
+    /// `tests/test_sec_r18_self_claim_oracle_terminal.py::
+    /// test_admin_gets_informative_conflict_for_foreign_task`): an
+    /// admin (`tasks.assign`) assigning an already-assigned task to a
+    /// DIFFERENT agent still gets the real informative `Conflict`
+    /// naming the current owner -- the phantom-`NotFound` collapse is
+    /// ONLY for the non-admin self-claim oracle.
+    #[tokio::test]
+    async fn mode3_admin_gets_informative_conflict_for_an_already_assigned_task() {
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_agent(&guard, "bob");
+            seed_agent(&guard, "carol");
+        }
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "root", "pending", None, "alice", None);
+            seed_task(&guard, "t1", "pending", Some("bob"), "alice", Some("root"));
+        }
+        let result = call_assign(
+            serde_json::json!({"agent_token": "tok-carol", "task_ids": ["t1"]}),
+            &admin("alice"),
+            &conn,
+        )
+        .await;
+        match result {
+            ToolResult::Conflict { reason } => {
+                assert!(
+                    reason.contains("bob"),
+                    "expected owner named, got {reason:?}"
+                );
+            }
+            other => panic!("expected an informative Conflict, got {other:?}"),
+        }
+    }
+
+    /// BL-R18-1 admin regression (ported from
+    /// `tests/test_sec_r18_self_claim_oracle_terminal.py::
+    /// test_admin_blocked_from_assigning_terminal_task_informatively`):
+    /// terminal is a sink on the assign axis for admins too, but with
+    /// an INFORMATIVE error, never the phantom `NotFound`.
+    #[tokio::test]
+    async fn mode3_admin_blocked_from_assigning_a_terminal_task_informatively() {
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_agent(&guard, "eve");
+        }
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "root", "pending", None, "alice", None);
+            seed_task(&guard, "t1", "completed", None, "alice", Some("root"));
+        }
+        let result = call_assign(
+            serde_json::json!({"agent_token": "tok-eve", "task_ids": ["t1"]}),
+            &admin("alice"),
+            &conn,
+        )
+        .await;
+        match result {
+            ToolResult::Conflict { reason } => {
+                assert!(reason.to_lowercase().contains("terminal"), "{reason}");
+            }
+            other => panic!("expected an informative terminal Conflict, got {other:?}"),
+        }
+        let guard = conn.lock().await;
+        let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+        assert_eq!(row.assigned_to, None);
+        assert_eq!(row.status, "completed");
+    }
+
     // -- AssignTaskTool: Mode 1 (single create+assign) ---------------------
 
     #[tokio::test]
@@ -1927,6 +2123,55 @@ mod tests {
         )
         .await;
         assert!(matches!(result, ToolResult::NotFound { .. }));
+    }
+
+    /// SEC-R2 (ported from `tests/test_sec_r2_task_toctou.py`'s
+    /// terminated-but-warm-in-memory scenario): the in-transaction
+    /// `agent_assignable` gate (line ~1055) must reject a target agent
+    /// whose DB row is `terminated`, end-to-end -- no task row gets
+    /// created or assigned. Python needed a second explicit gate here
+    /// because a terminated-but-still-"warm" agent could skip its
+    /// not-in-memory-only inline status check; this port has no such
+    /// in-memory presence cache to go stale, so a single DB-backed
+    /// `is_live` check (exercised here through the full tool call)
+    /// covers both the "cold" and "warm" cases identically.
+    #[tokio::test]
+    async fn mode1_rejects_a_terminated_target_agent() {
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            AgentRepository::create(
+                &guard,
+                NewAgent {
+                    token: "tok-bob",
+                    agent_id: "bob",
+                    created_at: NOW,
+                    status: "terminated",
+                    current_task: None,
+                    working_directory: "/tmp",
+                    color: None,
+                    agent_role: "worker",
+                },
+            )
+            .unwrap();
+        }
+        let result = call_assign(
+            serde_json::json!({
+                "agent_token": "tok-bob",
+                "task_title": "task for a terminated agent",
+                "task_description": "desc"
+            }),
+            &admin("alice"),
+            &conn,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::NotFound { .. }));
+        let guard = conn.lock().await;
+        let rows = task_repository::list_all(&guard, None).unwrap();
+        assert!(
+            rows.is_empty(),
+            "no task should have been persisted for a terminated target agent"
+        );
     }
 
     #[tokio::test]
@@ -2036,6 +2281,60 @@ mod tests {
         assert!(msg.contains("Tasks Created: 2"));
     }
 
+    /// R5-F5 (ported from `tests/test_sec_r5_f5_bulk_task_single_root.py::
+    /// test_mode2_two_parentless_tasks_same_batch_is_clean_conflict`):
+    /// same guard, Mode-2 (create-and-assign) call site -- two
+    /// parentless tasks in one batch, no existing root, must be a clean
+    /// `Conflict`, and no task may be created/assigned to the target
+    /// agent (all-or-nothing).
+    #[tokio::test]
+    async fn mode2_two_parentless_tasks_in_one_batch_is_a_clean_conflict() {
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_agent(&guard, "bob");
+        }
+        let result = call_assign(
+            serde_json::json!({
+                "agent_token": "tok-bob",
+                "tasks": [
+                    {"title": "t1", "description": "d1"},
+                    {"title": "t2", "description": "d2"}
+                ]
+            }),
+            &admin("alice"),
+            &conn,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Conflict { .. }));
+        let guard = conn.lock().await;
+        assert!(task_repository::list_all(&guard, None).unwrap().is_empty());
+    }
+
+    /// R5-F5 (ported from `tests/test_sec_r5_f5_bulk_task_single_root.py::
+    /// test_mode2_one_parentless_task_when_root_exists_is_clean_conflict`).
+    #[tokio::test]
+    async fn mode2_one_parentless_task_in_batch_when_root_exists_is_a_clean_conflict() {
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_agent(&guard, "bob");
+            seed_task(&guard, "root", "pending", None, "alice", None);
+        }
+        let result = call_assign(
+            serde_json::json!({
+                "agent_token": "tok-bob",
+                "tasks": [{"title": "t1", "description": "d1"}]
+            }),
+            &admin("alice"),
+            &conn,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Conflict { .. }));
+        let guard = conn.lock().await;
+        assert_eq!(task_repository::list_all(&guard, None).unwrap().len(), 1);
+    }
+
     // -- agent_id alias -----------------------------------------------------
 
     #[tokio::test]
@@ -2103,6 +2402,23 @@ mod create_self_task_tests {
             can_wake_loop: true,
             source_token: Some(format!("tok-{agent_id}")),
             capabilities: Capabilities::from_iter([Capability::TasksCreate]),
+        }
+    }
+
+    fn manager(agent_id: &str) -> Principal {
+        Principal {
+            kind: PrincipalKind::AgentBearer,
+            user_id: None,
+            agent_id: Some(agent_id.to_string()),
+            project_name: None,
+            project_role: None,
+            agent_role: None,
+            can_wake_loop: true,
+            source_token: Some(format!("tok-{agent_id}")),
+            capabilities: Capabilities::from_iter([
+                Capability::TasksCreate,
+                Capability::TasksAssign,
+            ]),
         }
     }
 
@@ -2237,6 +2553,93 @@ mod create_self_task_tests {
         )
         .await;
         assert!(matches!(result, ToolResult::NotFound { .. }));
+    }
+
+    /// R4-F5 (ported from `tests/test_sec_r4_f5_self_task_depends_on_
+    /// ownership.py::test_worker_self_task_nonexistent_dep_rejected`):
+    /// a NONEXISTENT dependency id renders through the exact same
+    /// `ToolResult::NotFound` branch as a foreign-owned one (`get_by_id`
+    /// returns `None` either way) -- no existence oracle is possible by
+    /// construction, but pin the nonexistent-id path explicitly too.
+    #[tokio::test]
+    async fn a_worker_cannot_depend_on_a_nonexistent_task() {
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "root", Some("bob"), "bob", None);
+        }
+        let result = call(
+            serde_json::json!({
+                "task_title": "x",
+                "task_description": "desc",
+                "parent_task_id": "root",
+                "depends_on_tasks": ["task_deadbeefdeadbeef"]
+            }),
+            &worker("bob"),
+            &conn,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::NotFound { .. }));
+    }
+
+    /// R4-F5 regression (ported from `tests/test_sec_r4_f5_self_task_
+    /// depends_on_ownership.py::test_worker_self_task_can_depend_on_own_
+    /// task`): a worker CAN still depend on a task it owns -- the
+    /// ownership gate must not over-restrict past cross-agent edges.
+    #[tokio::test]
+    async fn a_worker_can_depend_on_its_own_task() {
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "root", Some("bob"), "bob", None);
+            seed_task(&guard, "own_dep", Some("bob"), "bob", Some("root"));
+        }
+        let result = call(
+            serde_json::json!({
+                "task_title": "x",
+                "task_description": "desc",
+                "parent_task_id": "root",
+                "depends_on_tasks": ["own_dep"]
+            }),
+            &worker("bob"),
+            &conn,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        let guard = conn.lock().await;
+        let created = task_repository::list_all(&guard, None)
+            .unwrap()
+            .into_iter()
+            .find(|t| !["root", "own_dep"].contains(&t.task_id.as_str()))
+            .unwrap();
+        assert_eq!(created.depends_on_tasks, Some(vec!["own_dep".to_string()]));
+    }
+
+    /// R4-F5 regression (ported from `tests/test_sec_r4_f5_self_task_
+    /// depends_on_ownership.py::test_admin_self_task_can_depend_on_any_
+    /// task`): a privileged (`tasks.assign`) caller keeps the ability to
+    /// set a cross-owner dependency -- the ownership gate is scoped to
+    /// non-privileged callers only.
+    #[tokio::test]
+    async fn a_privileged_caller_can_depend_on_a_cross_owner_task() {
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "root", Some("alice"), "alice", None);
+            seed_task(&guard, "bob_dep", Some("bob"), "bob", Some("root"));
+        }
+        let result = call(
+            serde_json::json!({
+                "task_title": "coordination task",
+                "task_description": "desc",
+                "parent_task_id": "root",
+                "depends_on_tasks": ["bob_dep"]
+            }),
+            &manager("alice"),
+            &conn,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
     }
 
     #[tokio::test]
