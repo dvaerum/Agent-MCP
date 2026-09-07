@@ -685,6 +685,135 @@ mod tests {
     }
 
     #[test]
+    fn precheck_accepts_grace_days_at_the_upper_bound_3650() {
+        // test_sec_r2_grace_days_bounds.py's `test_grace_days_upper_
+        // bound_ok`: 3650 is a legitimate max grace, not off-by-one
+        // rejected.
+        let mut c = conn();
+        let dir = tempfile::tempdir().unwrap();
+        let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
+        registry
+            .register("old-name", "/ws/old-name", "python", now_dt())
+            .unwrap();
+        let uid = seed_operator_member(&mut c, "bob", "old-name", "operator");
+        let store = RuntimeStore::default();
+
+        let outcome = rename_precheck(
+            &c,
+            &registry,
+            &store,
+            false,
+            Some(&uid),
+            "old-name",
+            Some(&serde_json::json!("new-name")),
+            Some(&serde_json::json!(3650)),
+            now_dt(),
+        )
+        .unwrap();
+        let RenamePrecheck::Proceed(ok) = outcome else {
+            panic!("expected Proceed, got {outcome:?}");
+        };
+        assert_eq!(ok.grace_days, 3650);
+    }
+
+    #[test]
+    fn precheck_rejects_a_negative_grace_days() {
+        // test_sec_r2_grace_days_bounds.py's `test_grace_days_negative_
+        // returns_400`.
+        let mut c = conn();
+        let dir = tempfile::tempdir().unwrap();
+        let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
+        registry
+            .register("old-name", "/ws/old-name", "python", now_dt())
+            .unwrap();
+        let uid = seed_operator_member(&mut c, "bob", "old-name", "operator");
+        let store = RuntimeStore::default();
+
+        let outcome = rename_precheck(
+            &c,
+            &registry,
+            &store,
+            false,
+            Some(&uid),
+            "old-name",
+            Some(&serde_json::json!("new-name")),
+            Some(&serde_json::json!(-1)),
+            now_dt(),
+        )
+        .unwrap();
+        let RenamePrecheck::Rejected(resp) = outcome else {
+            panic!("expected Rejected");
+        };
+        assert_eq!(resp.status, 400);
+    }
+
+    #[test]
+    fn precheck_rejects_the_literal_sec_round_2_repro_value_of_10_pow_18() {
+        // test_sec_r2_grace_days_bounds.py's exact repro: `10 ** 18`
+        // fits in an i64 (unlike PF-R18-1's `1e400`/infinity sibling
+        // above), so this exercises the plain `0..=3650` range guard
+        // rather than the non-finite-float guard -- both must 400.
+        let mut c = conn();
+        let dir = tempfile::tempdir().unwrap();
+        let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
+        registry
+            .register("old-name", "/ws/old-name", "python", now_dt())
+            .unwrap();
+        let uid = seed_operator_member(&mut c, "bob", "old-name", "operator");
+        let store = RuntimeStore::default();
+
+        let huge: i64 = 1_000_000_000_000_000_000;
+        let outcome = rename_precheck(
+            &c,
+            &registry,
+            &store,
+            false,
+            Some(&uid),
+            "old-name",
+            Some(&serde_json::json!("new-name")),
+            Some(&serde_json::json!(huge)),
+            now_dt(),
+        )
+        .unwrap();
+        let RenamePrecheck::Rejected(resp) = outcome else {
+            panic!("expected Rejected");
+        };
+        assert_eq!(resp.status, 400);
+    }
+
+    #[test]
+    fn precheck_rejects_a_non_string_new_name() {
+        // test_sec_r8_type_confusion.py's rename half (PF-R8-1): a
+        // structured JSON value for `name` must 400 via `reject_non_
+        // str_name`, never reach `.strip()`/`.trim()`.
+        let mut c = conn();
+        let dir = tempfile::tempdir().unwrap();
+        let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
+        registry
+            .register("old-name", "/ws/old-name", "python", now_dt())
+            .unwrap();
+        let uid = seed_operator_member(&mut c, "bob", "old-name", "operator");
+        let store = RuntimeStore::default();
+
+        let outcome = rename_precheck(
+            &c,
+            &registry,
+            &store,
+            false,
+            Some(&uid),
+            "old-name",
+            Some(&serde_json::json!({"nested": "obj"})),
+            None,
+            now_dt(),
+        )
+        .unwrap();
+        let RenamePrecheck::Rejected(resp) = outcome else {
+            panic!("expected Rejected");
+        };
+        assert_eq!(resp.status, 400);
+    }
+
+    #[test]
     fn precheck_rejects_identical_old_and_new_names() {
         let mut c = conn();
         let dir = tempfile::tempdir().unwrap();
@@ -744,6 +873,91 @@ mod tests {
             resp.status, 404,
             "a hidden collision must look like unknown, not a confirmed 409"
         );
+    }
+
+    #[test]
+    fn precheck_closes_the_oracle_on_a_hidden_alias_collision() {
+        // The alias half of `precheck_closes_the_oracle_on_a_hidden_name_
+        // collision` above (test_sec_r1f1_create_rename_name_oracle.py's
+        // `test_rename_delegate_without_membership_alias_collision_gets_
+        // uniform_404`): a hidden project's ALIAS must gate identically
+        // to a hidden project's real name.
+        let mut c = conn();
+        let dir = tempfile::tempdir().unwrap();
+        let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
+        registry
+            .register("old-name", "/ws/old-name", "python", now_dt())
+            .unwrap();
+        registry
+            .register("hidden", "/ws/hidden", "python", now_dt())
+            .unwrap();
+        registry
+            .add_alias("hidden", "alias-of-hidden", None, Some(30), now_dt())
+            .unwrap();
+        // bob is a member of old-name (can rename it) but NOT of "hidden".
+        let uid = seed_operator_member(&mut c, "bob", "old-name", "operator");
+        let store = RuntimeStore::default();
+
+        let outcome = rename_precheck(
+            &c,
+            &registry,
+            &store,
+            false,
+            Some(&uid),
+            "old-name",
+            Some(&serde_json::json!("alias-of-hidden")),
+            None,
+            now_dt(),
+        )
+        .unwrap();
+        let RenamePrecheck::Rejected(resp) = outcome else {
+            panic!("expected Rejected");
+        };
+        assert_eq!(
+            resp.status, 404,
+            "a hidden alias collision must look like unknown, not a confirmed 409"
+        );
+        let HandlerBody::Json(body) = resp.body else {
+            panic!("expected JSON body");
+        };
+        assert_eq!(body["error"], "not_found");
+    }
+
+    #[test]
+    fn precheck_denies_a_viewer_tier_member_as_forbidden() {
+        // test_sec_r9f2_lifecycle_role_rank.py's rename half: a mere
+        // `viewer`-tier member (even holding the deployment-wide
+        // capability elsewhere) must not reach a destructive rename --
+        // 403 forbidden, distinct from the 404 a genuine non-member sees.
+        let mut c = conn();
+        let dir = tempfile::tempdir().unwrap();
+        let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
+        registry
+            .register("old-name", "/ws/old-name", "python", now_dt())
+            .unwrap();
+        let uid = seed_operator_member(&mut c, "bob", "old-name", "viewer");
+        let store = RuntimeStore::default();
+
+        let outcome = rename_precheck(
+            &c,
+            &registry,
+            &store,
+            false,
+            Some(&uid),
+            "old-name",
+            Some(&serde_json::json!("new-name")),
+            None,
+            now_dt(),
+        )
+        .unwrap();
+        let RenamePrecheck::Rejected(resp) = outcome else {
+            panic!("expected Rejected");
+        };
+        assert_eq!(resp.status, 403);
+        let HandlerBody::Json(body) = resp.body else {
+            panic!("expected JSON body");
+        };
+        assert_eq!(body["error"], "forbidden");
     }
 
     #[test]
@@ -1004,5 +1218,142 @@ mod tests {
             registry.get("old-name").unwrap().is_some(),
             "old-name must still be registered"
         );
+    }
+
+    // -- map_rename_registry_error (R2-F1: the inside-lock exception-
+    // handler backstop, confirmed live-race-reachable in Python since
+    // `_ensure_lock` keys on old_name -- two renames with DIFFERENT
+    // old-names racing the SAME new-name never serialise against each
+    // other) -----------------------------------------------------------
+
+    #[test]
+    fn rename_backstop_project_name_taken_hidden_owner_gets_uniform_not_found() {
+        // test_sec_r2f1_rename_toctou_backstop.py's `test_rename_
+        // delegate_loses_project_name_taken_race_gets_uniform_404`: the
+        // delegate has ZERO membership on the project that won the race
+        // for `new_name` -- must see the SAME uniform 404 a genuinely
+        // free name would, not the raw `name_taken` 409.
+        let mut c = conn();
+        let dir = tempfile::tempdir().unwrap();
+        let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
+        registry
+            .register("shared-target", "/ws/shared-target", "python", now_dt())
+            .unwrap();
+        // bob has no membership on "shared-target" at all.
+        let bob = identity::create_user(
+            &mut c,
+            "bob",
+            "correct horse battery staple",
+            None,
+            false,
+            true,
+            &[],
+            NOW_STR,
+        )
+        .unwrap();
+
+        let resp = map_rename_registry_error(
+            &c,
+            &registry,
+            false,
+            Some(&bob),
+            "own-visible-project",
+            "shared-target",
+            RegistryError::ProjectNameTaken(
+                "project 'shared-target' is already registered".to_string(),
+            ),
+            now_dt(),
+        )
+        .unwrap();
+        assert_eq!(resp.status, 404);
+        let HandlerBody::Json(body) = resp.body else {
+            panic!("expected JSON body");
+        };
+        assert_eq!(body["error"], "not_found");
+        let text = serde_json::to_string(&body).unwrap().to_lowercase();
+        assert!(!text.contains("taken"));
+        assert!(!text.contains("already"));
+    }
+
+    #[test]
+    fn rename_backstop_alias_collision_hidden_owner_gets_uniform_not_found() {
+        // test_sec_r2f1_rename_toctou_backstop.py's `test_rename_
+        // delegate_loses_alias_collision_race_gets_uniform_404`: the
+        // winner is a concurrent `add_alias` on a HIDDEN project rather
+        // than a create -- the delegate has no membership on the alias
+        // OWNER either.
+        let mut c = conn();
+        let dir = tempfile::tempdir().unwrap();
+        let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
+        registry
+            .register("hidden", "/ws/hidden", "python", now_dt())
+            .unwrap();
+        registry
+            .add_alias("hidden", "collision-target", None, Some(30), now_dt())
+            .unwrap();
+        let bob = identity::create_user(
+            &mut c,
+            "bob",
+            "correct horse battery staple",
+            None,
+            false,
+            true,
+            &[],
+            NOW_STR,
+        )
+        .unwrap();
+
+        let resp = map_rename_registry_error(
+            &c,
+            &registry,
+            false,
+            Some(&bob),
+            "own-visible-project",
+            "collision-target",
+            RegistryError::AliasCollision("name 'collision-target' is an active alias".to_string()),
+            now_dt(),
+        )
+        .unwrap();
+        assert_eq!(resp.status, 404);
+        let HandlerBody::Json(body) = resp.body else {
+            panic!("expected JSON body");
+        };
+        assert_eq!(body["error"], "not_found");
+        let text = serde_json::to_string(&body).unwrap().to_lowercase();
+        assert!(!text.contains("alias"));
+    }
+
+    #[test]
+    fn rename_backstop_alias_collision_visible_owner_gets_the_real_409() {
+        // Happy path: the SAME race, but the loser can see the alias
+        // owner (here, a real membership on it) -- must still get the
+        // real, informative 409, matching PF-R37-1's original behaviour.
+        let mut c = conn();
+        let dir = tempfile::tempdir().unwrap();
+        let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
+        registry
+            .register("visible", "/ws/visible", "python", now_dt())
+            .unwrap();
+        registry
+            .add_alias("visible", "alias-target", None, Some(30), now_dt())
+            .unwrap();
+        let uid = seed_operator_member(&mut c, "bob", "visible", "operator");
+
+        let resp = map_rename_registry_error(
+            &c,
+            &registry,
+            false,
+            Some(&uid),
+            "own-visible-project",
+            "alias-target",
+            RegistryError::AliasCollision("name 'alias-target' is an active alias".to_string()),
+            now_dt(),
+        )
+        .unwrap();
+        assert_eq!(resp.status, 409);
+        let HandlerBody::Json(body) = resp.body else {
+            panic!("expected JSON body");
+        };
+        assert_eq!(body["error"], "alias_collision");
     }
 }

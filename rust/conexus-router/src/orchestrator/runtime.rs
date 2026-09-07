@@ -214,6 +214,24 @@ impl RuntimeStore {
             .clone()
     }
 
+    /// Drop the ensure lock for exactly `(name, role)` -- port of
+    /// `admin_api.py`'s own `ensure_locks.pop((name, "backend"), None)`
+    /// calls in `delete_project_handler`/`rename_project_handler`
+    /// (SC-R8-1), run by the CALLER only after the surrounding
+    /// `revalidated_lock` guard has already been dropped (released).
+    /// `forget`'s own `!keep_lock` branch (used by
+    /// `finish_delete_project`/`finish_rename_project`, both called
+    /// WHILE the lock is still held) intentionally can't do this --
+    /// popping a DashMap entry while a guard derived from it is still
+    /// outstanding would desync the entry from the lock instance any
+    /// other waiter is holding a reference to. Idempotent (a
+    /// second/duplicate call, or one for a key that was never
+    /// created, is a silent no-op).
+    pub fn drop_ensure_lock(&self, name: &str, role: &str) {
+        self.ensure_locks
+            .remove(&(name.to_string(), role.to_string()));
+    }
+
     /// The single clear-on-lifecycle-end path -- port of `forget()`.
     /// Clears `last_active`/`active_conns`/`unit_start_times`/
     /// `ensure_failures`/`restart_streaks`/`warm_inflight`
@@ -378,6 +396,67 @@ mod tests {
         let c = store.ensure_lock("proj-a", "other-role");
         assert!(!Arc::ptr_eq(&a, &b));
         assert!(!Arc::ptr_eq(&a, &c));
+    }
+
+    // -- drop_ensure_lock (SC-R8-1: delete/rename must pop their OWN
+    // lock entry once the surrounding lock is released, or create+
+    // delete/rename of N distinct names leaks N lock objects forever)
+
+    #[test]
+    fn drop_ensure_lock_removes_exactly_the_named_key() {
+        let store = RuntimeStore::new();
+        store.ensure_lock("proj-a", "backend");
+        store.ensure_lock("proj-a", "backend"); // idempotent get-or-create
+
+        store.drop_ensure_lock("proj-a", "backend");
+
+        assert!(
+            store.ensure_locks.is_empty(),
+            "the lock entry must be gone after drop_ensure_lock"
+        );
+    }
+
+    #[test]
+    fn drop_ensure_lock_leaves_a_different_project_or_role_untouched() {
+        let store = RuntimeStore::new();
+        store.ensure_lock("proj-a", "backend");
+        store.ensure_lock("proj-b", "backend");
+        store.ensure_lock("proj-a", "other-role");
+
+        store.drop_ensure_lock("proj-a", "backend");
+
+        assert_eq!(store.ensure_locks.len(), 2);
+        assert!(store
+            .ensure_locks
+            .contains_key(&("proj-b".to_string(), "backend".to_string())));
+        assert!(store
+            .ensure_locks
+            .contains_key(&("proj-a".to_string(), "other-role".to_string())));
+    }
+
+    #[test]
+    fn drop_ensure_lock_of_an_unseen_key_is_a_silent_noop() {
+        let store = RuntimeStore::new();
+        // Must not panic.
+        store.drop_ensure_lock("nope", "backend");
+        assert!(store.ensure_locks.is_empty());
+    }
+
+    #[test]
+    fn drop_ensure_lock_does_not_affect_a_guard_someone_already_holds() {
+        // A caller that cloned the Arc<AsyncMutex<()>> BEFORE the drop
+        // (i.e. is already inside its own critical section) must be
+        // completely unaffected by another caller popping the DashMap
+        // entry out from under it -- the Arc keeps the mutex alive.
+        let store = RuntimeStore::new();
+        let lock = store.ensure_lock("proj-a", "backend");
+        let guard = lock.try_lock().expect("uncontended");
+
+        store.drop_ensure_lock("proj-a", "backend");
+
+        // The guard (and the mutex it locks) is still perfectly valid.
+        drop(guard);
+        assert!(store.ensure_locks.is_empty());
     }
 
     #[test]

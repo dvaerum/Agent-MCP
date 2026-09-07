@@ -428,12 +428,16 @@ pub fn decide_create_project(
 
     match registry.register(&name, &workspace.to_string_lossy(), "python", now) {
         Ok(_) => {}
-        Err(RegistryError::ProjectNameTaken(msg)) | Err(RegistryError::AliasCollision(msg)) => {
-            return Ok(CreateProjectOutcome::Rejected(lifecycle::error_envelope(
-                LifecycleError::AlreadyRegistered,
-                &msg,
-                None,
-            )));
+        Err(e @ (RegistryError::ProjectNameTaken(_) | RegistryError::AliasCollision(_))) => {
+            return Ok(CreateProjectOutcome::Rejected(map_create_registry_error(
+                conn,
+                registry,
+                is_sysadmin,
+                caller_user_id,
+                &name,
+                e,
+                now,
+            )?));
         }
         Err(e) => return Err(e.into()),
     }
@@ -450,6 +454,94 @@ pub fn decide_create_project(
             &workspace.to_string_lossy(),
             default_workspace_parent,
         ),
+    })
+}
+
+/// R2-F1 finding #3 (class-sweep of R1-F1, defense-in-depth): maps
+/// `registry.register()`'s own atomic-write guard raising
+/// `ProjectNameTaken`/`AliasCollision` to the R1-F1-gated response --
+/// the same escape hatch [`decide_create_project`]'s OUTSIDE
+/// `validate_name`/`resolve_alias` checks already apply, re-run here
+/// because a concurrent create/rename could in principle claim `name`
+/// in the window between those checks and this call. NOT race-
+/// reachable today (no `await` sits between them in this crate, same
+/// as Python's own synchronous handler body), but fixed anyway so a
+/// future change that introduces a yield point there can't silently
+/// reopen the oracle. Mirrors `project_rename.rs`'s
+/// `map_rename_registry_error`, which already threads this same
+/// escape hatch through its own `ProjectNameTaken`/`AliasCollision`
+/// backstop branches -- extracted to its own function (rather than
+/// left inline in `decide_create_project`) so this exact mapping is
+/// unit-testable without needing a genuine two-writer race.
+fn map_create_registry_error(
+    conn: &Connection,
+    registry: &ProjectRegistry,
+    is_sysadmin: bool,
+    caller_user_id: Option<&str>,
+    name: &str,
+    e: RegistryError,
+    now: DateTime<Utc>,
+) -> Result<HandlerResponse, GateError> {
+    Ok(match e {
+        RegistryError::ProjectNameTaken(msg) => match deny_cross_tenant_project_read(
+            conn,
+            registry,
+            is_sysadmin,
+            caller_user_id,
+            name,
+            None,
+        )? {
+            CrossTenantOutcome::Admit => {
+                lifecycle::error_envelope(LifecycleError::AlreadyRegistered, &msg, None)
+            }
+            _ => lifecycle::error_envelope(
+                LifecycleError::NotFound,
+                &format!("unknown project: {name:?}"),
+                None,
+            ),
+        },
+        RegistryError::AliasCollision(_msg) => {
+            // Re-resolve the alias fresh (rather than reusing the
+            // outside check's now-stale result) -- the whole point of
+            // this backstop is that the collision may have landed
+            // AFTER that check ran.
+            let alias_owner = registry.resolve_alias(name, now)?;
+            match alias_owner {
+                Some(owner) => match deny_cross_tenant_project_read(
+                    conn,
+                    registry,
+                    is_sysadmin,
+                    caller_user_id,
+                    &owner,
+                    None,
+                )? {
+                    CrossTenantOutcome::Admit => lifecycle::error_envelope(
+                        LifecycleError::AliasCollision,
+                        &format!("name {name:?} is a live alias of another project"),
+                        None,
+                    ),
+                    _ => lifecycle::error_envelope(
+                        LifecycleError::NotFound,
+                        &format!("unknown project: {name:?}"),
+                        None,
+                    ),
+                },
+                // The alias no longer resolves (a benign race between
+                // this re-check and the registry's own state) -- fall
+                // back to the plain, visible-shape message.
+                None => lifecycle::error_envelope(
+                    LifecycleError::AliasCollision,
+                    &format!("name {name:?} is a live alias of another project"),
+                    None,
+                ),
+            }
+        }
+        // Unreachable: this fn's only two call sites (`decide_create_
+        // project`'s `Err(e @ (ProjectNameTaken | AliasCollision))`
+        // match guard) never pass any other variant -- kept exhaustive
+        // rather than `unreachable!()` so a future change to that
+        // guard fails a compile check here, not a runtime panic.
+        other => return Err(other.into()),
     })
 }
 
@@ -1035,6 +1127,223 @@ mod tests {
         let CreateProjectOutcome::Rejected(resp) = outcome else {
             panic!("expected Rejected");
         };
+        assert_eq!(resp.status, 409);
+        let HandlerBody::Json(body) = resp.body else {
+            panic!("expected JSON body");
+        };
+        assert_eq!(body["error"], "alias_collision");
+    }
+
+    #[test]
+    fn a_non_member_colliding_with_a_hidden_alias_owner_sees_uniform_not_found() {
+        // The alias half of `a_non_member_colliding_with_a_hidden_project_
+        // sees_uniform_not_found` above (test_sec_r1f1_create_rename_name_
+        // oracle.py's `test_create_delegate_without_membership_alias_
+        // collision_gets_uniform_404`): a hidden project's ALIAS must gate
+        // identically to a hidden project's real name.
+        let mut c = conn();
+        seed_user(&mut c, "alice"); // sysadmin, but irrelevant -- caller below is bob
+        let bob = crate::identity::create_user(
+            &mut c,
+            "bob",
+            "correct horse battery staple",
+            None,
+            false,
+            true,
+            &[],
+            NOW_STR,
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let registry = registry_with(dir.path(), "hidden"); // bob has no membership on it
+        registry
+            .add_alias("hidden", "old-name", None, Some(30), now_dt())
+            .unwrap();
+
+        let outcome = decide_create_project(
+            &c,
+            &registry,
+            dir.path(),
+            false,
+            Some(&bob),
+            Some(&serde_json::json!("old-name")),
+            now_dt(),
+        )
+        .unwrap();
+        let CreateProjectOutcome::Rejected(resp) = outcome else {
+            panic!("expected Rejected");
+        };
+        assert_eq!(resp.status, 404);
+        let HandlerBody::Json(body) = resp.body else {
+            panic!("expected JSON body");
+        };
+        assert_eq!(body["error"], "not_found");
+        assert!(!json_str(&body).contains("alias"));
+    }
+
+    fn json_str(v: &serde_json::Value) -> String {
+        serde_json::to_string(v).unwrap().to_lowercase()
+    }
+
+    // -- map_create_registry_error (R2-F1 finding #3: the register()
+    // backstop, unreachable via a real race in this synchronous
+    // handler today but fixed as defense-in-depth) -------------------
+
+    #[test]
+    fn create_backstop_project_name_taken_hidden_owner_gets_uniform_not_found() {
+        let mut c = conn();
+        seed_user(&mut c, "alice"); // sysadmin, irrelevant -- caller is bob
+        let bob = crate::identity::create_user(
+            &mut c,
+            "bob",
+            "correct horse battery staple",
+            None,
+            false,
+            true,
+            &[],
+            NOW_STR,
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let registry = registry_with(dir.path(), "hidden"); // bob has no membership on it
+
+        let resp = map_create_registry_error(
+            &c,
+            &registry,
+            false,
+            Some(&bob),
+            "hidden",
+            RegistryError::ProjectNameTaken("project 'hidden' is already registered".to_string()),
+            now_dt(),
+        )
+        .unwrap();
+        assert_eq!(resp.status, 404);
+        let HandlerBody::Json(body) = resp.body else {
+            panic!("expected JSON body");
+        };
+        assert_eq!(body["error"], "not_found");
+        assert!(!json_str(&body).contains("already"));
+    }
+
+    #[test]
+    fn create_backstop_project_name_taken_visible_owner_gets_the_real_409() {
+        let mut c = conn();
+        let uid = seed_user(&mut c, "alice");
+        c.execute(
+            "INSERT INTO project_membership (project_name, user_id, role) VALUES ('proj-a', ?1, 'operator')",
+            [&uid],
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let registry = registry_with(dir.path(), "proj-a");
+
+        let resp = map_create_registry_error(
+            &c,
+            &registry,
+            false,
+            Some(&uid),
+            "proj-a",
+            RegistryError::ProjectNameTaken("project 'proj-a' is already registered".to_string()),
+            now_dt(),
+        )
+        .unwrap();
+        assert_eq!(resp.status, 409);
+        let HandlerBody::Json(body) = resp.body else {
+            panic!("expected JSON body");
+        };
+        assert_eq!(body["error"], "already_registered");
+    }
+
+    #[test]
+    fn create_backstop_alias_collision_hidden_owner_gets_uniform_not_found() {
+        let mut c = conn();
+        seed_user(&mut c, "alice"); // sysadmin, irrelevant -- caller is bob
+        let bob = crate::identity::create_user(
+            &mut c,
+            "bob",
+            "correct horse battery staple",
+            None,
+            false,
+            true,
+            &[],
+            NOW_STR,
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let registry = registry_with(dir.path(), "hidden"); // bob has no membership on it
+        registry
+            .add_alias("hidden", "old-name", None, Some(30), now_dt())
+            .unwrap();
+
+        let resp = map_create_registry_error(
+            &c,
+            &registry,
+            false,
+            Some(&bob),
+            "old-name",
+            RegistryError::AliasCollision("name 'old-name' is already an active alias".to_string()),
+            now_dt(),
+        )
+        .unwrap();
+        assert_eq!(resp.status, 404);
+        let HandlerBody::Json(body) = resp.body else {
+            panic!("expected JSON body");
+        };
+        assert_eq!(body["error"], "not_found");
+        assert!(!json_str(&body).contains("alias"));
+    }
+
+    #[test]
+    fn create_backstop_alias_collision_visible_owner_gets_the_real_409() {
+        let mut c = conn();
+        let uid = seed_user(&mut c, "alice");
+        c.execute(
+            "INSERT INTO project_membership (project_name, user_id, role) VALUES ('proj-a', ?1, 'operator')",
+            [&uid],
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let registry = registry_with(dir.path(), "proj-a");
+        registry
+            .add_alias("proj-a", "old-name", None, Some(30), now_dt())
+            .unwrap();
+
+        let resp = map_create_registry_error(
+            &c,
+            &registry,
+            false,
+            Some(&uid),
+            "old-name",
+            RegistryError::AliasCollision("name 'old-name' is already an active alias".to_string()),
+            now_dt(),
+        )
+        .unwrap();
+        assert_eq!(resp.status, 409);
+        let HandlerBody::Json(body) = resp.body else {
+            panic!("expected JSON body");
+        };
+        assert_eq!(body["error"], "alias_collision");
+    }
+
+    #[test]
+    fn create_backstop_alias_collision_falls_back_to_the_plain_message_if_the_alias_vanished() {
+        // A benign race between this re-check and the registry's own
+        // state: the alias no longer resolves at all -- must not panic
+        // or error, just fall back to the plain (visible-shape) message.
+        let c = conn();
+        let dir = tempfile::tempdir().unwrap();
+        let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
+
+        let resp = map_create_registry_error(
+            &c,
+            &registry,
+            false,
+            None,
+            "never-was-an-alias",
+            RegistryError::AliasCollision("name is already an active alias".to_string()),
+            now_dt(),
+        )
+        .unwrap();
         assert_eq!(resp.status, 409);
         let HandlerBody::Json(body) = resp.body else {
             panic!("expected JSON body");

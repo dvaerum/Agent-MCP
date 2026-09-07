@@ -445,4 +445,105 @@ mod tests {
         let resp = revalidate_result.unwrap_err();
         assert_eq!(resp.status, 403);
     }
+
+    /// R8-F3 parity check (test_sec_r8f3_project_membership_toctou.py):
+    /// R8-F3's whole finding, in Python, was that R7-F1's revalidation
+    /// fix re-checked ONLY the capability half after a yield point,
+    /// never the MEMBERSHIP half -- because Python composed two
+    /// SEPARATE re-check calls and only fixed one of them. This crate's
+    /// `revalidate()` never had that seam to begin with: `spec.project.
+    /// is_some()` always routes through `revalidate_capability_and_
+    /// membership`, a SINGLE call that re-derives capability AND
+    /// membership-rank together, so there is no "capability-only"
+    /// re-check to have missed the membership half in the first place.
+    /// This test proves that structural claim under the SAME genuine-
+    /// concurrency shape as the capability sibling above -- a real
+    /// second task revokes the caller's PROJECT MEMBERSHIP (capability
+    /// left fully intact, via a real group grant) while `revalidate_
+    /// after`'s paused awaitable is still in flight.
+    #[tokio::test]
+    async fn revalidate_after_catches_a_membership_revocation_that_lands_during_a_real_concurrent_await(
+    ) {
+        let mut c = conn();
+        // A non-sysadmin operator whose ONLY source of `system.projects.
+        // manage` is a group grant (capability stays untouched by the
+        // race below) plus a real `operator`-tier membership row on
+        // "proj-a" (what the race revokes).
+        seed_sysadmin(&mut c, "root"); // sentinel first user (bootstrap sysadmin), irrelevant otherwise
+        let bob = crate::identity::create_user(
+            &mut c,
+            "bob",
+            "correct horse battery staple",
+            None,
+            false,
+            false,
+            &[],
+            NOW,
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO groups (group_id, name, is_sysadmin, created_at) VALUES ('g1', 'g1', 0, ?1)",
+            [NOW],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO group_capability (group_id, capability) VALUES ('g1', 'system.projects.manage')",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO group_membership (group_id, member_user_id, added_at) VALUES ('g1', ?1, ?2)",
+            [&bob, NOW],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO project_membership (project_name, user_id, role) VALUES ('proj-a', ?1, 'operator')",
+            [&bob],
+        )
+        .unwrap();
+
+        let db = std::sync::Arc::new(AsyncMutex::new(c));
+        let spec = RevalidationSpec {
+            stale_user_id: &bob,
+            cookie_header: None,
+            now: NOW,
+            cap: Capability::SystemProjectsManage,
+            project: Some(RevalidationProject {
+                project_name: "proj-a",
+                min_role: Some("operator"),
+            }),
+        };
+
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let entered_in_awaitable = entered.clone();
+        let release_in_awaitable = release.clone();
+        let awaitable = async move {
+            entered_in_awaitable.notify_one();
+            release_in_awaitable.notified().await;
+        };
+
+        let db_for_revoker = db.clone();
+        let bob_for_revoker = bob.clone();
+        let revoker = tokio::spawn(async move {
+            entered.notified().await;
+            {
+                let conn = db_for_revoker.lock().await;
+                // Membership-ONLY strip -- the group capability grant
+                // above is left completely untouched.
+                conn.execute(
+                    "DELETE FROM project_membership WHERE project_name = 'proj-a' AND user_id = ?1",
+                    [&bob_for_revoker],
+                )
+                .unwrap();
+            }
+            release.notify_one();
+        });
+
+        let (_unit, revalidate_result) = revalidate_after(awaitable, &db, &spec).await;
+        revoker.await.unwrap();
+
+        let resp = revalidate_result.unwrap_err();
+        assert_eq!(resp.status, 403);
+    }
 }
