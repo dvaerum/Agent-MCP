@@ -1,0 +1,29 @@
+[package]
+name = "conexus-cli"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "CoNexus operator CLI: `backup` and `router create-operator` (Phase F). See /home/dennis/.claude/plans/prancy-napping-pie.md."
+
+[[bin]]
+name = "conexus-cli"
+path = "src/main.rs"
+
+[dependencies]
+# `identity`/`project_registry` reused via conexus-router's small
+# lib target (see rust/conexus-router/src/lib.rs's own doc) --
+# deliberately NOT a duplicate re-implementation of argon2 hashing
+# or the registry's slug/lock/atomic-write logic.
+conexus-router = { path = "../conexus-router" }
+conexus-db = { path = "../conexus-db" }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Interactive password prompt (hidden input, matching Python's
+# `click.prompt(hide_input=True)`/getpass) -- no existing workspace
+# precedent, same "genuinely new, no fork to resolve" shape as this
+# migration's other small single-purpose crate picks (fd-lock,
+# dashmap, ...). `--password-stdin` (scripted path) needs no crate.
+rpassword = "7"

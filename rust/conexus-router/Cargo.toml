@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 description = "CoNexus always-on URL-keyed router binary (Phase E2). See /home/dennis/.claude/plans/prancy-napping-pie.md."
 
+[lib]
+name = "conexus_router"
+path = "src/lib.rs"
+
 [[bin]]
 name = "conexus-router"
 path = "src/main.rs"
