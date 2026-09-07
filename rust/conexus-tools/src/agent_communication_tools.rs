@@ -2319,6 +2319,212 @@ mod tests {
         assert!(!row.read, "mark_as_read=false must not flip the row");
     }
 
+    /// SEC round-2, finding 1 (`test_sec_r2_messaging.py::
+    /// TestMarkReadScope`): mark-read must be scoped to the rows the
+    /// caller's own filtered/paged fetch actually returned, never the
+    /// whole inbox -- a filtered-out control message must not be
+    /// silently marked seen. Already correct by construction here
+    /// (`received_ids` is derived from `messages`, the SAME rows
+    /// `list_recent_for_agent`'s filters/limit already narrowed) --
+    /// this pins the invariant with a real regression test rather
+    /// than leaving it to the implementation's own good behavior.
+    #[tokio::test]
+    async fn get_agent_messages_type_filter_does_not_mark_other_types_read() {
+        use conexus_auth::Tool;
+        let conn = test_conn();
+        seed_agent(&conn, "alice").await;
+        seed_agent(&conn, "bob").await;
+        {
+            let guard = conn.lock().await;
+            conexus_db::message_repository::send(
+                &guard,
+                conexus_db::message_repository::NewMessage {
+                    message_id: "text-1",
+                    sender_id: "alice",
+                    recipient_id: "bob",
+                    message_content: "hi",
+                    message_type: "text",
+                    priority: "normal",
+                    timestamp: "2026-01-01T00:00:00Z",
+                    delivered: false,
+                    read: false,
+                    subject: None,
+                    parent_message_id: None,
+                },
+            )
+            .unwrap();
+            conexus_db::message_repository::send(
+                &guard,
+                conexus_db::message_repository::NewMessage {
+                    message_id: "ctrl-1",
+                    sender_id: "alice",
+                    recipient_id: "bob",
+                    message_content: "STOP",
+                    message_type: "stop_command",
+                    priority: "normal",
+                    timestamp: "2026-01-01T00:00:00Z",
+                    delivered: false,
+                    read: false,
+                    subject: None,
+                    parent_message_id: None,
+                },
+            )
+            .unwrap();
+        }
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let principal = agent_bearer_with_messages_view("bob");
+
+        let result = GetAgentMessagesTool::call(
+            Some(&principal),
+            &json!({"message_type": "text"}),
+            &conn,
+            NOW,
+            &ctx,
+        )
+        .await;
+        let ToolResult::Ok { data, .. } = result else {
+            panic!("expected Ok");
+        };
+        assert_eq!(data.unwrap()["count"], 1);
+
+        let guard = conn.lock().await;
+        let text_row = conexus_db::message_repository::get_by_id(&guard, "text-1")
+            .unwrap()
+            .unwrap();
+        let ctrl_row = conexus_db::message_repository::get_by_id(&guard, "ctrl-1")
+            .unwrap()
+            .unwrap();
+        assert!(text_row.read, "the fetched 'text' row must be marked read");
+        assert!(
+            !ctrl_row.read,
+            "a control message filtered OUT of the fetch must stay unread"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_agent_messages_limit_does_not_mark_beyond_the_page_read() {
+        use conexus_auth::Tool;
+        let conn = test_conn();
+        seed_agent(&conn, "alice").await;
+        seed_agent(&conn, "bob").await;
+        {
+            let guard = conn.lock().await;
+            for (id, ts) in [
+                ("m0", "2026-01-01T00:00:02Z"),
+                ("m1", "2026-01-01T00:00:01Z"),
+                ("m2", "2026-01-01T00:00:00Z"),
+            ] {
+                conexus_db::message_repository::send(
+                    &guard,
+                    conexus_db::message_repository::NewMessage {
+                        message_id: id,
+                        sender_id: "alice",
+                        recipient_id: "bob",
+                        message_content: id,
+                        message_type: "text",
+                        priority: "normal",
+                        timestamp: ts,
+                        delivered: false,
+                        read: false,
+                        subject: None,
+                        parent_message_id: None,
+                    },
+                )
+                .unwrap();
+            }
+        }
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let principal = agent_bearer_with_messages_view("bob");
+
+        let result =
+            GetAgentMessagesTool::call(Some(&principal), &json!({"limit": 1}), &conn, NOW, &ctx)
+                .await;
+        let ToolResult::Ok { data, .. } = result else {
+            panic!("expected Ok");
+        };
+        assert_eq!(data.unwrap()["count"], 1);
+
+        let guard = conn.lock().await;
+        let mut read_count = 0;
+        for id in ["m0", "m1", "m2"] {
+            let row = conexus_db::message_repository::get_by_id(&guard, id)
+                .unwrap()
+                .unwrap();
+            if row.read {
+                read_count += 1;
+            }
+        }
+        assert_eq!(
+            read_count, 1,
+            "only the single returned row (the newest) may be marked read"
+        );
+        let newest = conexus_db::message_repository::get_by_id(&guard, "m0")
+            .unwrap()
+            .unwrap();
+        assert!(newest.read, "the newest row (the actual page) must be read");
+    }
+
+    #[tokio::test]
+    async fn get_agent_messages_never_marks_a_sent_message_read() {
+        use conexus_auth::Tool;
+        let conn = test_conn();
+        seed_agent(&conn, "alice").await;
+        seed_agent(&conn, "bob").await;
+        {
+            let guard = conn.lock().await;
+            conexus_db::message_repository::send(
+                &guard,
+                conexus_db::message_repository::NewMessage {
+                    message_id: "sent-1",
+                    sender_id: "alice",
+                    recipient_id: "bob",
+                    message_content: "outbound",
+                    message_type: "text",
+                    priority: "normal",
+                    timestamp: "2026-01-01T00:00:00Z",
+                    delivered: false,
+                    read: false,
+                    subject: None,
+                    parent_message_id: None,
+                },
+            )
+            .unwrap();
+        }
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        // alice fetches her OWN sent messages -- the read flag belongs
+        // to bob's (the recipient's) inbox view and must never be
+        // flipped by the sender's own fetch.
+        let principal = agent_bearer_with_messages_view("alice");
+
+        let result = GetAgentMessagesTool::call(
+            Some(&principal),
+            &json!({"include_sent": true, "include_received": true}),
+            &conn,
+            NOW,
+            &ctx,
+        )
+        .await;
+        let ToolResult::Ok { data, .. } = result else {
+            panic!("expected Ok");
+        };
+        assert_eq!(data.unwrap()["count"], 1);
+
+        let guard = conn.lock().await;
+        let row = conexus_db::message_repository::get_by_id(&guard, "sent-1")
+            .unwrap()
+            .unwrap();
+        assert!(
+            !row.read,
+            "a sent message must never be marked read on the sender's own fetch"
+        );
+    }
+
     #[tokio::test]
     async fn get_agent_messages_denies_a_worker_with_no_messages_view_capability() {
         let conn = test_conn();
@@ -2497,6 +2703,64 @@ mod tests {
         .await;
         assert!(
             matches!(result, ToolResult::NotFound { resource, identifier, .. } if resource == "agent" && identifier == "ghost")
+        );
+    }
+
+    /// PF-R32-1 (`test_sec_r32_parent_message_validation.py`): a
+    /// well-formed but NONEXISTENT `parent_message_id` must be an
+    /// error, with NEITHER a message row nor an orphan `send_message`
+    /// audit row persisted -- already correct by construction here
+    /// (`message_repository::send` validates parent existence BEFORE
+    /// any INSERT, returning `Err(ParentMessageNotFound)`, which this
+    /// tool maps to `ToolResult::NotFound` before ever reaching the
+    /// audit-log write). This pins the invariant with a real
+    /// regression test.
+    #[tokio::test]
+    async fn send_agent_message_nonexistent_parent_is_not_found_and_stores_nothing() {
+        use conexus_auth::Tool;
+        let conn = test_conn();
+        seed_agent(&conn, "alice").await;
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let mut admin = agent_bearer("admin");
+        admin.capabilities = Capabilities::from_iter([]);
+
+        let result = SendAgentMessageTool::call(
+            Some(&admin),
+            &json!({
+                "recipient_id": "alice",
+                "message": "orphan-parent body",
+                "parent_message_id": "msg_does_not_exist",
+            }),
+            &conn,
+            NOW,
+            &ctx,
+        )
+        .await;
+        assert!(
+            matches!(result, ToolResult::NotFound { resource, identifier, .. } if resource == "parent message" && identifier == "msg_does_not_exist")
+        );
+
+        let guard = conn.lock().await;
+        let msg_count: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM agent_messages WHERE message_content = 'orphan-parent body'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(msg_count, 0, "message with a nonexistent parent was stored");
+        let audit_count: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM agent_actions WHERE action_type = 'send_message'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            audit_count, 0,
+            "a failed send left an orphan audit row behind"
         );
     }
 
