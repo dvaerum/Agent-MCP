@@ -224,6 +224,10 @@ async fn main() -> Result<()> {
             "/messages/participants",
             post(rest_handlers::list_participants),
         )
+        .route(
+            "/messages/suggest-subject",
+            post(rest_handlers::suggest_subject),
+        )
         .route("/messages", post(rest_handlers::create_message))
         .route(
             "/messages/{message_id}/thread",
