@@ -3739,3 +3739,36 @@ pub async fn delivery_status(
         .set_status(&identity.agent_id, status);
     Json(json!({"ok": true, "agent_id": identity.agent_id, "status": status})).into_response()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `test_sec_r10_message_silent_drop.py`'s Finding F1 (a dict/list
+    /// `subject`/`parent_message_id` reached a SQLite bind that
+    /// `send()` swallowed into a false-200 silent drop) is
+    /// structurally impossible here: `create_message` runs EVERY one
+    /// of `recipient_id`/`message_content`/`subject`/
+    /// `parent_message_id`/`sender_id` through this SAME `require_str`
+    /// gate before any repository call, and `message_repository::send`
+    /// itself only ever accepts `&str` fields -- there is no `Value`
+    /// path from an untyped JSON body to a SQL bind at all. This pins
+    /// the gate's own decision rather than leaving it to the
+    /// implementation's good behavior.
+    #[test]
+    fn require_str_rejects_a_non_string_value() {
+        assert!(require_str(Some(&json!({"a": 1})), "subject").is_some());
+        assert!(require_str(Some(&json!(["a"])), "parent_message_id").is_some());
+    }
+
+    #[test]
+    fn require_str_allows_null_and_absent() {
+        assert!(require_str(None, "subject").is_none());
+        assert!(require_str(Some(&Value::Null), "subject").is_none());
+    }
+
+    #[test]
+    fn require_str_allows_a_real_string() {
+        assert!(require_str(Some(&json!("a real subject")), "subject").is_none());
+    }
+}
