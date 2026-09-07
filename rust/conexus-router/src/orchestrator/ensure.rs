@@ -616,6 +616,15 @@ exit 0
         cfg.boot_grace = Duration::from_secs(30); // well within grace for the whole test
         cfg.socket_poll_attempts = 2;
 
+        // No `unit_start_times` entry seeded -- this is the "we never
+        // saw this unit start" case (a router restart lost the map, or
+        // systemd's own `Restart=on-failure` fired without going
+        // through us).
+        assert!(store
+            .snapshot("proj-a")
+            .and_then(|rt| rt.unit_start_times.get("backend").copied())
+            .is_none());
+
         let err = ensure(&store, &registry, &sock_dir, "proj-a", "backend", &cfg)
             .await
             .unwrap_err();
@@ -628,6 +637,32 @@ exit 0
         assert!(
             calls.lines().all(|l| !l.contains("start") && !l.contains("restart")),
             "within the boot-grace window, systemctl must be touched ONLY for is-active, never start/restart -- got: {calls:?}"
+        );
+
+        // ADOPTED as starting "now" -- a subsequent call must measure
+        // the grace window from THIS first observation, not treat the
+        // unit as having no start record forever.
+        assert!(
+            store
+                .snapshot("proj-a")
+                .and_then(|rt| rt.unit_start_times.get("backend").copied())
+                .is_some(),
+            "an active-but-socketless unit with no prior record must be adopted -- a start \
+             time must be recorded so later calls measure grace from this observation"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_config_default_boot_grace_covers_cold_boot_and_socket_wait_budget() {
+        // The default boot-grace budget must exceed both the cold-boot
+        // time (~44s) and the production socket-wait (~20s) so a
+        // single caller's own socket-wait never trips the grace into a
+        // restart (SC-R7-1's whole point -- see this module's doc).
+        let cfg = EnsureConfig::from_env(|_| None);
+        assert!(
+            cfg.boot_grace >= Duration::from_secs_f64(44.0),
+            "default AGENT_MCP_BOOT_GRACE_SEC must cover the ~44s cold boot, got {:?}",
+            cfg.boot_grace
         );
     }
 

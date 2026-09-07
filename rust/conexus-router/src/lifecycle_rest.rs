@@ -373,16 +373,30 @@ pub async fn stop_project_handler(
         if let Err(resp) = revalidate_result {
             return resp.into_response();
         }
-        match stop_result {
-            Ok(r) if r.success() => {}
-            Ok(_) | Err(_) => {
-                return internal_error("failed to stop project backend").into_response();
-            }
+        if let Some(resp) = stop_result_to_failure_response(&stop_result) {
+            return resp;
         }
     }
 
     project_teardown::finish_stop_project(&state.runtime, &name);
     lifecycle::success_envelope(serde_json::json!({"stopped": name}), 200).into_response()
+}
+
+/// SD-R15-1: map a completed `systemctl stop` outcome to the client-
+/// facing early return. `None` means "the stop succeeded, keep
+/// going"; `Some(response)` is the 500 to return immediately. The
+/// message is always this fixed literal -- NEVER built from
+/// `stop_result`'s stderr/error detail (mirroring `_ensure`'s own
+/// SC-R8-2 sibling in `orchestrator::ensure`) -- extracted into its
+/// own pure function so that property has a real regression test
+/// without needing a full `RouterState`/axum request round-trip.
+fn stop_result_to_failure_response(
+    stop_result: &Result<crate::orchestrator::primitives::SystemctlResult, HandlerResponse>,
+) -> Option<Response> {
+    match stop_result {
+        Ok(r) if r.success() => None,
+        Ok(_) | Err(_) => Some(internal_error("failed to stop project backend").into_response()),
+    }
 }
 
 /// `systemctl is-active <unit>` for `name`'s backend, folding a
@@ -674,5 +688,78 @@ pub async fn remove_alias_handler(
         Ok(project_reads::RemoveAliasOutcome::Removed(resp)) => resp.into_response(),
         Ok(project_reads::RemoveAliasOutcome::Rejected(resp)) => resp.into_response(),
         Err(e) => HandlerResponse::from(e).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::orchestrator::primitives::SystemctlResult;
+
+    // -- SD-R15-1: systemctl stderr must not reach the client body ----
+
+    #[tokio::test]
+    async fn stop_result_to_failure_response_never_reflects_systemctl_stderr() {
+        let secret = "/nix/store/SECRET-unit-path/agent-mcp-leaky-backend.service";
+        let stop_result: Result<SystemctlResult, HandlerResponse> = Ok(SystemctlResult {
+            returncode: 1,
+            stdout: String::new(),
+            stderr: format!("Failed at step EXEC spawning {secret}: No such file"),
+        });
+
+        let resp = stop_result_to_failure_response(&stop_result)
+            .expect("a failed systemctl stop must produce a failure response");
+        assert_eq!(resp.status(), 500);
+
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains(secret),
+            "systemctl stderr leaked into body: {text:?}"
+        );
+        assert!(
+            !text.contains("Failed at step EXEC"),
+            "systemctl exec-step detail leaked into body: {text:?}"
+        );
+        assert!(
+            !text.contains("leaky"),
+            "unit/project name leaked into body: {text:?}"
+        );
+    }
+
+    #[test]
+    fn stop_result_to_failure_response_is_none_on_a_clean_stop() {
+        let stop_result: Result<SystemctlResult, HandlerResponse> = Ok(SystemctlResult {
+            returncode: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        });
+        assert!(stop_result_to_failure_response(&stop_result).is_none());
+    }
+
+    #[tokio::test]
+    async fn stop_result_to_failure_response_handles_a_resolution_error_generically_too() {
+        // The `Err` arm (unit-name resolution failure) must be just as
+        // generic as the `Ok(non-zero)` arm -- same fixed message,
+        // regardless of whatever detail the resolution error itself
+        // carries.
+        let stop_result: Result<SystemctlResult, HandlerResponse> = Err(internal_error(
+            "could not resolve unit for \"leaky\": UnsupportedRole",
+        ));
+        let resp = stop_result_to_failure_response(&stop_result)
+            .expect("a resolution error must produce a failure response");
+        assert_eq!(resp.status(), 500);
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains("UnsupportedRole") && !text.contains("leaky"),
+            "resolution-error detail leaked into body: {text:?}"
+        );
     }
 }
