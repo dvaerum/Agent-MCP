@@ -374,4 +374,75 @@ mod tests {
         assert!(!is_active_result);
         assert!(revalidate_result.is_ok());
     }
+
+    /// R14-F2 (test_sec_r14f2_revalidated_lock_yield_gap.py): a held
+    /// lock only blocks OTHER coroutines racing for the SAME lock --
+    /// it does nothing to stop an unrelated capability revocation from
+    /// committing to the DB while this task is suspended mid-await
+    /// INSIDE the "protected" block. This is the genuine-concurrency
+    /// version of the property `revalidate_after_runs_the_real_
+    /// awaitable_then_revalidates` above already proves sequentially
+    /// (await first, revalidate second): here a SEPARATE tokio task
+    /// really does race the revocation against the paused awaitable --
+    /// `revalidate_after`'s post-await DB read must observe it. This
+    /// is the exact primitive `lifecycle_rest.rs`'s
+    /// `delete_project_handler`/`stop_project_handler`/
+    /// `rename_project_handler` all three fuse their own in-lock
+    /// `systemctl stop`/`is-active` await around -- one shared,
+    /// already-tested-here mechanism, so exercising it directly (with
+    /// a real paced future standing in for the real systemctl await)
+    /// covers all three call sites without needing a full axum/HTTP
+    /// round trip through each handler.
+    #[tokio::test]
+    async fn revalidate_after_catches_a_revocation_that_lands_during_a_real_concurrent_await() {
+        let mut c = conn();
+        let uid = seed_sysadmin(&mut c, "alice");
+        let db = std::sync::Arc::new(AsyncMutex::new(c));
+        let spec = RevalidationSpec {
+            stale_user_id: &uid,
+            cookie_header: None,
+            now: NOW,
+            cap: Capability::SystemProjectsManage,
+            project: None,
+        };
+
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+
+        // Stands in for the real in-lock `systemctl stop`/`is-active`
+        // await -- signals it has genuinely started, then blocks on a
+        // real async notification (not a poll loop) until released.
+        let entered_in_awaitable = entered.clone();
+        let release_in_awaitable = release.clone();
+        let awaitable = async move {
+            entered_in_awaitable.notify_one();
+            release_in_awaitable.notified().await;
+        };
+
+        // A REAL second task -- not a pre-mutation before the call --
+        // races the revocation against the paused awaitable above:
+        // waits for entry, revokes alice's sysadmin bit (her only
+        // source of `SystemProjectsManage` here) via a genuine
+        // concurrent DB write, then releases the pause.
+        let db_for_revoker = db.clone();
+        let uid_for_revoker = uid.clone();
+        let revoker = tokio::spawn(async move {
+            entered.notified().await;
+            {
+                let conn = db_for_revoker.lock().await;
+                conn.execute(
+                    "UPDATE users SET is_sysadmin = 0 WHERE user_id = ?1",
+                    [&uid_for_revoker],
+                )
+                .unwrap();
+            }
+            release.notify_one();
+        });
+
+        let (_unit, revalidate_result) = revalidate_after(awaitable, &db, &spec).await;
+        revoker.await.unwrap();
+
+        let resp = revalidate_result.unwrap_err();
+        assert_eq!(resp.status, 403);
+    }
 }

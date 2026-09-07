@@ -821,3 +821,555 @@ pub async fn delete_project_membership_handler(
         DeleteProjectMembershipOutcome::Rejected(resp) => resp.into_response(),
     }
 }
+
+/// Port of test_sec_r6f2_stale_principal_toctou.py /
+/// test_sec_r9f4_session_validity_toctou.py, one layer down: those
+/// Python tests race a REAL slow-drip body read against a concurrent
+/// revocation/logout, because aiohttp's `req.read()` is a genuine
+/// mid-handler await Python code controls. Axum's `Bytes` extractor
+/// already resolves the body BEFORE any of these handler functions
+/// runs at all (see `perm_gates.rs`'s own module doc for why that
+/// yield point moved outside this crate's code) -- so pacing it from
+/// inside a test here can't reach the real race window either.
+///
+/// What's still fully real and testable at this layer: every handler
+/// below is called with a `GateIdentity` built from live DB state
+/// BEFORE a capability/session is revoked (the exact snapshot
+/// `require_operator_session_middleware` caches once at entry, before
+/// ANY yield point) -- proving the entry-time gate
+/// (`require_*_capability`) would still ADMIT on that stale identity,
+/// while `perm_gates::read_body_and_revalidate`'s later, FRESH re-read
+/// of the SAME live DB correctly denies. That is the entire property
+/// R6-F2/R9-F4 pin: a destructive write must never complete off an
+/// entry-time snapshot that's gone stale by the time the handler's
+/// own revalidation runs -- independent of what mechanism separates
+/// the two reads in time.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity;
+    use crate::login;
+    use crate::orchestrator::ensure::EnsureConfig;
+    use crate::project_registry::ProjectRegistry;
+    use crate::rate_limit::RateLimitConfig;
+    use crate::state::RouterStateConfig;
+    use conexus_auth::capabilities::{resolve_capabilities, ResolveCapabilitiesInput};
+    use conexus_core::principal::PrincipalKind;
+    use conexus_db::schema::init_router_schema;
+    use conexus_db::{group_capability_repository, group_membership_repository};
+    use rusqlite::OptionalExtension;
+
+    const NOW: &str = "2026-01-01T00:00:00.000+00:00";
+
+    fn real_state() -> (tempfile::TempDir, Arc<RouterState>) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_router_schema(&conn).unwrap();
+        let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
+        let state = Arc::new(RouterState::new(
+            conn,
+            registry,
+            RateLimitConfig::resolve(|_| None),
+            EnsureConfig::from_env(|_| None),
+            RouterStateConfig {
+                sock_dir: dir.path().join("sockets"),
+                dashboard_dir: None,
+                external_url: None,
+                idle_sec: 14400,
+                asset_prefix: None,
+                single_tenant_name: None,
+                single_tenant_workspace: None,
+                max_streams_per_agent: 4,
+                max_streams_global: 64,
+                default_workspace_parent: dir.path().join("projects"),
+                token_dir: None,
+            },
+        ));
+        (dir, state)
+    }
+
+    /// A LIVE-derived `GateIdentity` -- exactly the resolution
+    /// `evaluate_session_gate` performs once at entry, built here
+    /// on-demand so a test can snapshot it BEFORE mutating the DB and
+    /// still call a handler with that now-stale `Extension`.
+    fn identity_for(conn: &Connection, user_id: &str) -> GateIdentity {
+        let user = identity::get_user_by_id(conn, user_id).unwrap().unwrap();
+        let groups = group_membership_repository::resolve_user_groups(conn, user_id).ok();
+        let is_sysadmin =
+            group_membership_repository::resolve_user_is_sysadmin(conn, user_id, groups.as_ref())
+                .unwrap_or(false);
+        let capabilities = resolve_capabilities(
+            Some(conn),
+            ResolveCapabilitiesInput {
+                sysadmin: is_sysadmin,
+                kind: PrincipalKind::OperatorSession,
+                agent_role: None,
+                user_id: Some(user_id),
+                project_role: None,
+                groups: groups.as_ref(),
+            },
+        )
+        .unwrap();
+        let principal = Principal {
+            kind: PrincipalKind::OperatorSession,
+            user_id: Some(user_id.to_string()),
+            agent_id: None,
+            project_name: None,
+            project_role: None,
+            agent_role: None,
+            can_wake_loop: false,
+            source_token: None,
+            capabilities,
+        };
+        GateIdentity {
+            user,
+            is_sysadmin,
+            project: None,
+            project_role: None,
+            principal,
+        }
+    }
+
+    /// Seeds a genuinely NON-sysadmin user carrying `caps` via a fresh
+    /// delegated group -- mirrors every Python pentest fixture's
+    /// "dev/alice carries a capability via GROUP grant, not raw
+    /// sysadmin" shape (R6-F2/R9-F4's whole attack surface is a
+    /// caller who is NOT sysadmin, so revoking their one delegated
+    /// capability -- or their session -- is the entire privilege).
+    /// Returns `(user_id, group_id, identity-built-before-any-revocation)`.
+    async fn seed_delegate(
+        state: &RouterState,
+        username: &str,
+        caps: &[&str],
+    ) -> (String, String, GateIdentity) {
+        let mut conn = state.conn.lock().await;
+        let is_empty: i64 = conn
+            .query_row("SELECT COUNT(*) AS n FROM users", [], |r| r.get(0))
+            .unwrap();
+        if is_empty == 0 {
+            identity::create_user(
+                &mut conn,
+                "__test_first_sysadmin",
+                "ignoredsentinelpassword",
+                None,
+                false,
+                true,
+                &[],
+                NOW,
+            )
+            .unwrap();
+        }
+        let uid = identity::create_user(
+            &mut conn,
+            username,
+            "correct horse battery staple",
+            None,
+            false,
+            true,
+            &[],
+            NOW,
+        )
+        .unwrap();
+        let group =
+            group_membership_repository::create_group(&conn, &format!("g-{username}"), false, NOW)
+                .unwrap();
+        group_capability_repository::replace(&conn, &group.group_id, caps.iter().copied()).unwrap();
+        group_membership_repository::add_group_member(
+            &conn,
+            &group.group_id,
+            Some(&uid),
+            None,
+            NOW,
+        )
+        .unwrap();
+        let identity = identity_for(&conn, &uid);
+        (uid, group.group_id, identity)
+    }
+
+    async fn revoke_capability(state: &RouterState, group_id: &str) {
+        let conn = state.conn.lock().await;
+        group_capability_repository::replace(&conn, group_id, std::iter::empty()).unwrap();
+    }
+
+    fn json_body(v: serde_json::Value) -> Bytes {
+        Bytes::from(serde_json::to_vec(&v).unwrap())
+    }
+
+    fn resp_status(resp: &Response) -> u16 {
+        resp.status().as_u16()
+    }
+
+    // -- R6-F2: capability revoked between entry gate and revalidation --
+
+    #[tokio::test]
+    async fn create_user_handler_denies_off_a_capability_revoked_before_the_call() {
+        let (_dir, state) = real_state();
+        let (_dev_id, group_id, identity) =
+            seed_delegate(&state, "dev", &[Capability::SystemUsersManage.as_str()]).await;
+        revoke_capability(&state, &group_id).await;
+
+        let body = json_body(serde_json::json!({
+            "username": "raced-in-user",
+            "password": "somepasswordvalue",
+        }));
+        let resp = create_user_handler(
+            State(state.clone()),
+            Extension(identity),
+            HeaderMap::new(),
+            body,
+        )
+        .await;
+        assert_eq!(resp_status(&resp), 403);
+
+        let conn = state.conn.lock().await;
+        assert!(
+            identity::get_user_by_username(&conn, "raced-in-user")
+                .unwrap()
+                .is_none(),
+            "user must NOT have been created off the stale, pre-revocation grant"
+        );
+    }
+
+    /// The LIVE-EXPLOITED repro shape (test A): a caller whose OWN
+    /// sysadmin-granting privilege is revoked mid-flight must not be
+    /// able to mint a NEW sysadmin off the stale snapshot --
+    /// `fresh_is_sysadmin(&principal)` (this file's own documented
+    /// TOCTOU fix) must see the post-revocation state, not
+    /// `identity.is_sysadmin`.
+    #[tokio::test]
+    async fn edit_user_handler_denies_a_sysadmin_grant_off_a_capability_revoked_before_the_call() {
+        let (_dir, state) = real_state();
+        let (dev_id, group_id, identity) =
+            seed_delegate(&state, "dev", &[Capability::SystemUsersManage.as_str()]).await;
+        let (victim_id, _victim_group, _victim_identity) =
+            seed_delegate(&state, "victim", &[]).await;
+        revoke_capability(&state, &group_id).await;
+        let _ = dev_id;
+
+        let body = json_body(serde_json::json!({"is_sysadmin": true}));
+        let resp = edit_user_handler(
+            State(state.clone()),
+            Extension(identity),
+            Path(victim_id.clone()),
+            HeaderMap::new(),
+            body,
+        )
+        .await;
+        assert_eq!(resp_status(&resp), 403);
+
+        let conn = state.conn.lock().await;
+        let victim = identity::get_user_by_id(&conn, &victim_id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !victim.is_sysadmin,
+            "victim must NOT have been promoted off dev's stale, pre-revocation grant"
+        );
+    }
+
+    /// R9-F4: a session invalidated (logged out) between entry-gate
+    /// resolution and this handler's own revalidation must be denied
+    /// too -- re-deriving capability/group membership fresh isn't
+    /// enough on its own if the underlying SESSION is already dead.
+    #[tokio::test]
+    async fn edit_user_handler_denies_a_session_logged_out_before_the_call() {
+        let (_dir, state) = real_state();
+        let (dev_id, _group_id, identity) =
+            seed_delegate(&state, "dev", &[Capability::SystemUsersManage.as_str()]).await;
+        let (victim_id, _victim_group, _victim_identity) =
+            seed_delegate(&state, "victim", &[]).await;
+
+        let sid = {
+            let conn = state.conn.lock().await;
+            identity::create_session(&conn, &dev_id, NOW, "2026-02-01T00:00:00.000+00:00").unwrap()
+        };
+        let cookie = format!("{}={}", login::SESSION_COOKIE_NAME, sid);
+        let mut headers = HeaderMap::new();
+        headers.insert("cookie", cookie.parse().unwrap());
+
+        // Simulate the concurrent logout landing before this paused
+        // request resumes -- the session row is genuinely gone by the
+        // time the handler's own revalidation reads it.
+        {
+            let conn = state.conn.lock().await;
+            identity::delete_session(&conn, &sid).unwrap();
+        }
+
+        let body = json_body(serde_json::json!({"email": "raced-in@example.test"}));
+        let resp = edit_user_handler(
+            State(state.clone()),
+            Extension(identity),
+            Path(victim_id.clone()),
+            headers,
+            body,
+        )
+        .await;
+        assert_eq!(resp_status(&resp), 403);
+
+        let conn = state.conn.lock().await;
+        let victim = identity::get_user_by_id(&conn, &victim_id)
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            victim.email.as_deref(),
+            Some("raced-in@example.test"),
+            "edit must NOT have landed using an already-logged-out session"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_group_handler_denies_a_sysadmin_flagged_group_off_a_capability_revoked_before_the_call(
+    ) {
+        let (_dir, state) = real_state();
+        let (_dev_id, group_id, identity) =
+            seed_delegate(&state, "dev", &[Capability::SystemGroupsManage.as_str()]).await;
+        revoke_capability(&state, &group_id).await;
+
+        let body = json_body(serde_json::json!({
+            "name": "raced-sysadmin-group",
+            "is_sysadmin": true,
+        }));
+        let resp = create_group_handler(
+            State(state.clone()),
+            Extension(identity),
+            HeaderMap::new(),
+            body,
+        )
+        .await;
+        assert_eq!(resp_status(&resp), 403);
+
+        let conn = state.conn.lock().await;
+        let row: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM groups WHERE name = ?1",
+                ["raced-sysadmin-group"],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert!(
+            row.is_none(),
+            "sysadmin-flagged group must NOT have been created off the stale grant"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_group_handler_denies_off_a_capability_revoked_before_the_call() {
+        let (_dir, state) = real_state();
+        let (_dev_id, group_id, identity) =
+            seed_delegate(&state, "dev", &[Capability::SystemGroupsManage.as_str()]).await;
+        let target_group_id = {
+            let conn = state.conn.lock().await;
+            group_membership_repository::create_group(&conn, "target-group", false, NOW)
+                .unwrap()
+                .group_id
+        };
+        revoke_capability(&state, &group_id).await;
+
+        let body = json_body(serde_json::json!({"name": "renamed-target-group"}));
+        let resp = edit_group_handler(
+            State(state.clone()),
+            Extension(identity),
+            Path(target_group_id.clone()),
+            HeaderMap::new(),
+            body,
+        )
+        .await;
+        assert_eq!(resp_status(&resp), 403);
+
+        let conn = state.conn.lock().await;
+        let row: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM groups WHERE group_id = ?1 AND name = 'target-group'",
+                [&target_group_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert!(row.is_some(), "group must NOT have been renamed");
+    }
+
+    #[tokio::test]
+    async fn add_group_member_handler_denies_off_a_capability_revoked_before_the_call() {
+        let (_dir, state) = real_state();
+        let (_dev_id, group_id, identity) =
+            seed_delegate(&state, "dev", &[Capability::SystemGroupsManage.as_str()]).await;
+        let (newbie_id, _newbie_group, _newbie_identity) =
+            seed_delegate(&state, "newbie", &[]).await;
+        let target_group_id = {
+            let conn = state.conn.lock().await;
+            group_membership_repository::create_group(&conn, "target-group-2", false, NOW)
+                .unwrap()
+                .group_id
+        };
+        revoke_capability(&state, &group_id).await;
+
+        let body = json_body(serde_json::json!({"user_id": newbie_id}));
+        let resp = add_group_member_handler(
+            State(state.clone()),
+            Extension(identity),
+            Path(target_group_id.clone()),
+            HeaderMap::new(),
+            body,
+        )
+        .await;
+        assert_eq!(resp_status(&resp), 403);
+
+        let conn = state.conn.lock().await;
+        let members = group_membership_repository::resolve_user_groups(&conn, &newbie_id).unwrap();
+        assert!(
+            !members.contains(&target_group_id),
+            "newbie must NOT have been added to the group off the stale grant"
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_group_capabilities_handler_denies_off_a_capability_revoked_before_the_call() {
+        let (_dir, state) = real_state();
+        let (_dev_id, group_id, identity) = seed_delegate(
+            &state,
+            "dev",
+            &[Capability::SystemGroupsCapabilitiesManage.as_str()],
+        )
+        .await;
+        let target_group_id = {
+            let conn = state.conn.lock().await;
+            group_membership_repository::create_group(&conn, "target-group-3", false, NOW)
+                .unwrap()
+                .group_id
+        };
+        revoke_capability(&state, &group_id).await;
+
+        let body = json_body(serde_json::json!({
+            "capabilities": [Capability::SystemUsersManage.as_str()],
+        }));
+        let resp = replace_group_capabilities_handler(
+            State(state.clone()),
+            Extension(identity),
+            Path(target_group_id.clone()),
+            HeaderMap::new(),
+            body,
+        )
+        .await;
+        assert_eq!(resp_status(&resp), 403);
+
+        let conn = state.conn.lock().await;
+        let caps = group_capability_repository::fetch(&conn, &target_group_id).unwrap();
+        assert!(
+            caps.is_empty(),
+            "target group's capabilities must NOT have been replaced off the stale grant"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_project_membership_handler_denies_off_a_capability_revoked_before_the_call() {
+        let (_dir, state) = real_state();
+        let (dev_id, group_id, identity) =
+            seed_delegate(&state, "dev", &[Capability::SystemProjectsManage.as_str()]).await;
+        let (newbie_id, _newbie_group, _newbie_identity) =
+            seed_delegate(&state, "newbie", &[]).await;
+        state
+            .registry
+            .register("proj-a", "/ws/proj-a", "python", chrono::Utc::now())
+            .unwrap();
+        {
+            let conn = state.conn.lock().await;
+            identity::grant_project_membership(&conn, "proj-a", Some(&dev_id), None, "operator")
+                .unwrap();
+        }
+        revoke_capability(&state, &group_id).await;
+
+        let body = json_body(serde_json::json!({"user_id": newbie_id, "role": "viewer"}));
+        let resp = add_project_membership_handler(
+            State(state.clone()),
+            Extension(identity),
+            Path("proj-a".to_string()),
+            HeaderMap::new(),
+            body,
+        )
+        .await;
+        assert_eq!(resp_status(&resp), 403);
+
+        let conn = state.conn.lock().await;
+        let role = group_membership_repository::resolve_user_project_role(
+            &conn, &newbie_id, "proj-a", None,
+        )
+        .unwrap();
+        assert!(
+            role.is_none(),
+            "newbie must NOT have been granted project membership off the stale grant"
+        );
+    }
+
+    #[tokio::test]
+    async fn change_project_membership_role_handler_denies_off_a_capability_revoked_before_the_call(
+    ) {
+        let (_dir, state) = real_state();
+        let (dev_id, group_id, identity) =
+            seed_delegate(&state, "dev", &[Capability::SystemProjectsManage.as_str()]).await;
+        let (target_id, _target_group, _target_identity) =
+            seed_delegate(&state, "target", &[]).await;
+        state
+            .registry
+            .register("proj-b", "/ws/proj-b", "python", chrono::Utc::now())
+            .unwrap();
+        {
+            let conn = state.conn.lock().await;
+            identity::grant_project_membership(&conn, "proj-b", Some(&dev_id), None, "operator")
+                .unwrap();
+            identity::grant_project_membership(&conn, "proj-b", Some(&target_id), None, "viewer")
+                .unwrap();
+        }
+        revoke_capability(&state, &group_id).await;
+
+        let body = json_body(serde_json::json!({"role": "operator"}));
+        let resp = change_project_membership_role_handler(
+            State(state.clone()),
+            Extension(identity),
+            Path(("proj-b".to_string(), format!("u:{target_id}"))),
+            HeaderMap::new(),
+            body,
+        )
+        .await;
+        assert_eq!(resp_status(&resp), 403);
+
+        let conn = state.conn.lock().await;
+        let role = group_membership_repository::resolve_user_project_role(
+            &conn, &target_id, "proj-b", None,
+        )
+        .unwrap();
+        assert_eq!(
+            role.as_deref(),
+            Some("viewer"),
+            "target's role must NOT have been changed off the stale grant"
+        );
+    }
+
+    // -- happy-path regression: a non-racing delegate still succeeds --
+
+    #[tokio::test]
+    async fn non_racing_edit_user_still_succeeds() {
+        let (_dir, state) = real_state();
+        let (_dev_id, _group_id, identity) =
+            seed_delegate(&state, "dev", &[Capability::SystemUsersManage.as_str()]).await;
+        let (victim_id, _victim_group, _victim_identity) =
+            seed_delegate(&state, "victim", &[]).await;
+
+        let body = json_body(serde_json::json!({"email": "still-valid@example.test"}));
+        let resp = edit_user_handler(
+            State(state.clone()),
+            Extension(identity),
+            Path(victim_id.clone()),
+            HeaderMap::new(),
+            body,
+        )
+        .await;
+        assert_eq!(resp_status(&resp), 200, "{:?}", resp.into_body());
+
+        let conn = state.conn.lock().await;
+        let victim = identity::get_user_by_id(&conn, &victim_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(victim.email.as_deref(), Some("still-valid@example.test"));
+    }
+}
