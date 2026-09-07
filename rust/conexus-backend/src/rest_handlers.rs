@@ -2037,15 +2037,72 @@ pub async fn list_participants(
     }
 }
 
+/// `POST /api/messages/suggest-subject` -- the dashboard's manual
+/// "Suggest" button, matching `suggest_subject_api_route`. Genuinely
+/// unauthenticated in Python's own default (gated only by
+/// `require_operator_session`, same as every other route in this
+/// router mount) -- mounted here on the SAME gated sub-router as its
+/// siblings.
+///
+/// Graceful-degrade contract preserved exactly: empty/whitespace-only
+/// content, or no model configured, or a failed model call all
+/// collapse to `200 {"subject": null}` -- never a 5xx, since the
+/// dashboard treats this as a hint, not a hard requirement. Simpler
+/// than Python here: `conexus_tools::message_suggestions::
+/// suggest_subject` already collapses every failure mode to `None`
+/// internally (its own established contract from the
+/// `subject_backfill` background-loop port), so this handler needs no
+/// try/catch of its own.
+pub async fn suggest_subject(body: Bytes) -> Response {
+    let data = match decode_untrusted_body(&body) {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
+    };
+
+    let content_val = data.get("content");
+    if let Some(resp) = require_str(content_val, "content") {
+        return resp;
+    }
+    let content = content_val.and_then(Value::as_str).unwrap_or("").trim();
+    if content.is_empty() {
+        return Json(json!({"subject": Value::Null})).into_response();
+    }
+
+    let get_env = |k: &str| std::env::var(k).ok();
+    if !conexus_tools::message_suggestions::subject_model_configured(&get_env) {
+        return Json(json!({"subject": Value::Null})).into_response();
+    }
+
+    let subject = conexus_tools::message_suggestions::suggest_subject(get_env, content).await;
+    Json(json!({"subject": subject})).into_response()
+}
+
 /// `POST /api/messages` -- admin composes a message, matching
 /// `create_message_api_route`. Covers broadcast fan-out
 /// (`recipient_id: "*"`), the `sender_id` operator-impersonation
 /// override (validated via the same `recipient_exists` check a real
 /// recipient gets), OBS6's shared `check_send_message_permission`
 /// gate run once before either branch, and the post-commit recipient
-/// wake for the single-recipient path only -- Python's broadcast
-/// branch fires no wake at all, preserved as-is (verified by reading
-/// the real handler, not assumed symmetric).
+/// wake for BOTH the single-recipient AND broadcast paths.
+///
+/// **Correction (`test_sec_r8_messages.py`, BL-R8-1)**: an earlier
+/// port of this handler claimed Python's broadcast branch "fires no
+/// wake at all" -- that claim was wrong, found by re-reading
+/// `create_message_api_route`'s own source directly rather than
+/// trusting the prior note: Python's real `bulk_send` fires an
+/// EventBus `message.created` publish per distinct recipient (the
+/// handler's own comment says so explicitly), routed through the SAME
+/// `LongPollSignalAdapter` that wakes a parked `wait_for_events`
+/// waiter. The single-recipient branch already fired this correctly
+/// (see its own `BL-R8-1` comment below); the broadcast branch was
+/// the one this migration's port missed -- fixed to notify every
+/// recipient post-commit here too.
 pub async fn create_message(
     State(shared): State<Arc<SharedState>>,
     Extension(resolved): Extension<ResolvedRestPrincipal>,
@@ -2251,14 +2308,28 @@ pub async fn create_message(
         })();
         drop(guard);
         return match outcome {
-            Ok(sent_count) => Json(json!({
-                "success": true,
-                "broadcast": true,
-                "sent_count": sent_count,
-                "message_ids": message_ids,
-                "message": format!("Broadcast sent to {sent_count} agents"),
-            }))
-            .into_response(),
+            Ok(sent_count) => {
+                // BL-R8-1 sibling fix: the single-recipient branch
+                // already fires this post-commit; this branch was the
+                // one this migration's own port missed -- Python's
+                // real `bulk_send` fires an EventBus
+                // `message.created` publish per distinct recipient
+                // (confirmed by reading `create_message_api_route`'s
+                // own comment directly, not assumed symmetric with
+                // the single-recipient case), so a broadcast recipient
+                // parked in `wait_for_events` was never woken here.
+                for recipient in &recipients {
+                    shared.waiter_registry.notify(recipient);
+                }
+                Json(json!({
+                    "success": true,
+                    "broadcast": true,
+                    "sent_count": sent_count,
+                    "message_ids": message_ids,
+                    "message": format!("Broadcast sent to {sent_count} agents"),
+                }))
+                .into_response()
+            }
             Err(()) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": "Failed to send message"})),
