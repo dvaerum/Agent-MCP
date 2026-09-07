@@ -620,3 +620,341 @@ mod tests {
         );
     }
 }
+
+/// End-to-end tests over a real `axum::Router` (via `ServiceExt::
+/// oneshot`, no real socket needed) -- proves the FULL
+/// `login_post_handler`/`setup_post_handler` stack (real `Form`
+/// extraction, `enforce_same_origin`, credential checking, status +
+/// cookie), not just the pure decision-function halves `login.rs`'s
+/// own unit tests already cover. Three test_sec_* pentest-regression
+/// ports land here:
+///
+/// - SEC-R10-F2 (`test_sec_r10_form_field_typeconf.py`): a form field
+///   submitted as a multipart FILE part. Python's `request.post()`
+///   returns a `FileField` for it, which reaches `.strip()`/argon2
+///   uncaught -> 500. Rust's `axum::extract::Form<T>` only ever
+///   accepts `Content-Type: application/x-www-form-urlencoded`
+///   (checked BEFORE the body is even read) -- a `multipart/form-data`
+///   submission is rejected as `FormRejection::InvalidFormContentType`
+///   at the extractor layer, landing in the SAME `Ok(Form(body)) =
+///   form else { ... }` branch both handlers already use for every
+///   other malformed-body case. The vulnerability class (a non-`str`
+///   value reaching `.strip()`/argon2) is architecturally impossible
+///   here: `LoginFormBody`/`SetupFormBody`'s fields are typed `String`,
+///   so there is no `FileField`-shaped value `serde` could ever hand
+///   the handler even if multipart parsing were attempted.
+/// - AC-R17-1 (`test_sec_r17_sso_login_enum_oracle.py`): already
+///   exhaustively covered at the pure-`attempt_login` level by
+///   `login.rs`'s own `attempt_login_rejects_an_sso_only_user_with_
+///   no_password_hash`/`attempt_login_runs_the_identical_argon2_work_
+///   on_every_rejection_path` (and structurally guaranteed beyond
+///   that: `password_hash: Option<String>` makes a `None`-hash panic
+///   impossible by construction -- there is no `.as_deref()` call that
+///   could hand argon2 a null pointer the way Python's
+///   `verify_password(None, pw)` did). This is a top-up closing the
+///   ONE gap those unit tests don't reach: the real HTTP layer, proving
+///   `login_post_handler` itself returns 401 (never 500) for a
+///   passwordless SSO-provisioned user.
+/// - PF-R21-1 (`test_sec_r21_unicode_decode_body.py`), form tier only
+///   (sites 3/4 -- the JSON tier, sites 1/2, already routes through
+///   `json_sanitize::decode_untrusted_body`'s own exhaustively-tested
+///   `std::str::from_utf8` guard, confirmed by reading every JSON-body-
+///   accepting handler in this crate: `lifecycle_rest.rs`/
+///   `users_groups_rest.rs` all fuse through `perm_gates::
+///   read_body_and_revalidate` -> `decode_untrusted_body`, so no
+///   second guard is needed there). For the FORM tier: `axum::extract
+///   ::Form`'s underlying `serde_urlencoded`/`form_urlencoded` decode
+///   is LOSSY per the WHATWG spec (invalid UTF-8 bytes become
+///   U+FFFD), never an `Err` -- a materially SAFER failure mode than
+///   Python's strict-decode-or-raise, and never a stack-overflow risk
+///   either (form bodies are flat key=value pairs, not recursively
+///   nested like JSON). These tests pin the observable contract (never
+///   500) end to end regardless of which of the two safe mechanisms
+///   (lossy decode -> empty/garbled field -> ordinary invalid-
+///   credentials 401, or a genuine `FormRejection`) actually fires.
+#[cfg(test)]
+mod http_tests {
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use axum::routing::get;
+    use axum::Router;
+    use tower::ServiceExt;
+
+    use super::*;
+    use crate::identity;
+    use crate::login::SESSION_COOKIE_NAME;
+    use crate::orchestrator::ensure::EnsureConfig;
+    use crate::project_registry::ProjectRegistry;
+    use crate::rate_limit::RateLimitConfig;
+    use crate::state::RouterStateConfig;
+
+    const NOW: &str = "2026-01-01T00:00:00.000+00:00";
+
+    fn test_state_config() -> RouterStateConfig {
+        RouterStateConfig {
+            sock_dir: std::path::PathBuf::from("/tmp/agent-mcp-sockets"),
+            dashboard_dir: None,
+            external_url: None,
+            idle_sec: 14400,
+            asset_prefix: None,
+            single_tenant_name: None,
+            single_tenant_workspace: None,
+            max_streams_per_agent: 4,
+            max_streams_global: 64,
+            default_workspace_parent: std::path::PathBuf::from("/tmp/agent-mcp-projects"),
+            token_dir: None,
+        }
+    }
+
+    /// A real login/setup axum sub-router over a freshly built
+    /// in-memory `RouterState` -- no session gate / rate-limit /
+    /// empty-users-redirect middleware layered on (irrelevant to the
+    /// 3 findings above: `/agent-mcp/login`+`/agent-mcp/setup` are
+    /// `path_policy::UNAUTH_PREFIXES`-exempt from all three in the
+    /// real app anyway). `_dir` must outlive the router (the project
+    /// registry's backing file lives under it).
+    fn test_app() -> (tempfile::TempDir, Arc<RouterState>, Router) {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conexus_db::schema::init_router_schema(&conn).unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
+        let state = Arc::new(RouterState::new(
+            conn,
+            registry,
+            RateLimitConfig::resolve_from_process_env(),
+            EnsureConfig::from_env(|_| None),
+            test_state_config(),
+        ));
+        let router = Router::new()
+            .route(
+                "/agent-mcp/login",
+                get(login_get_handler).post(login_post_handler),
+            )
+            .route(
+                "/agent-mcp/setup",
+                get(setup_get_handler).post(setup_post_handler),
+            )
+            .with_state(Arc::clone(&state));
+        (dir, state, router)
+    }
+
+    fn peer_addr() -> SocketAddr {
+        "127.0.0.1:9999".parse().unwrap()
+    }
+
+    async fn post(
+        router: &Router,
+        path: &str,
+        content_type: &str,
+        body: Vec<u8>,
+    ) -> (StatusCode, HeaderMap) {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header(header::CONTENT_TYPE, content_type)
+            .body(Body::from(body))
+            .unwrap();
+        // `ConnectInfo` is normally populated by
+        // `into_make_service_with_connect_info` off a real accepted
+        // connection; `oneshot` drives the `Router` directly with no
+        // listener, so it's supplied by hand the same way a real
+        // socket's peer address would be.
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(peer_addr()));
+        let resp = router.clone().oneshot(req).await.unwrap();
+        (resp.status(), resp.headers().clone())
+    }
+
+    /// A real multipart/form-data body with one field forced into a
+    /// FILE part (`filename=` present) -- the exact aiohttp
+    /// `FormData.add_field(..., filename=...)` shape
+    /// `test_sec_r10_form_field_typeconf.py` sends.
+    fn multipart_body(boundary: &str, username_is_file: bool, password_is_file: bool) -> Vec<u8> {
+        fn part(boundary: &str, name: &str, value: &str, as_file: bool) -> String {
+            if as_file {
+                format!(
+                    "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"; \
+                     filename=\"evil.txt\"\r\nContent-Type: application/octet-stream\r\n\r\n\
+                     {value}\r\n"
+                )
+            } else {
+                format!(
+                    "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n\
+                     {value}\r\n"
+                )
+            }
+        }
+        let mut body = String::new();
+        body.push_str(&part(boundary, "username", "alice", username_is_file));
+        body.push_str(&part(boundary, "password", "hunter2", password_is_file));
+        body.push_str(&format!("--{boundary}--\r\n"));
+        body.into_bytes()
+    }
+
+    // -- SEC-R10-F2: multipart file-part fields must never 500 --------
+
+    #[tokio::test]
+    async fn login_post_rejects_a_multipart_body_with_401_not_500() {
+        let (_dir, _state, router) = test_app();
+        let body = multipart_body("XBOUNDARY", true, true);
+        let (status, _headers) = post(
+            &router,
+            "/agent-mcp/login",
+            "multipart/form-data; boundary=XBOUNDARY",
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn login_post_password_only_as_a_file_part_is_401_not_500() {
+        let (_dir, state, router) = test_app();
+        {
+            let mut conn = state.conn.lock().await;
+            identity::create_user(
+                &mut conn,
+                "bob",
+                "hunter2pw123",
+                None,
+                false,
+                true,
+                &[],
+                NOW,
+            )
+            .unwrap();
+        }
+        let body = multipart_body("XBOUNDARY", false, true);
+        let (status, _headers) = post(
+            &router,
+            "/agent-mcp/login",
+            "multipart/form-data; boundary=XBOUNDARY",
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn setup_post_rejects_a_multipart_body_with_400_not_500() {
+        let (_dir, _state, router) = test_app();
+        let body = multipart_body("XBOUNDARY", true, false);
+        let (status, _headers) = post(
+            &router,
+            "/agent-mcp/setup",
+            "multipart/form-data; boundary=XBOUNDARY",
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    // -- Regression: genuine urlencoded text fields keep working --------
+
+    #[tokio::test]
+    async fn login_post_urlencoded_credentials_still_authenticate() {
+        let (_dir, state, router) = test_app();
+        {
+            let mut conn = state.conn.lock().await;
+            identity::create_user(
+                &mut conn,
+                "carol",
+                "hunter2pw123",
+                None,
+                false,
+                true,
+                &[],
+                NOW,
+            )
+            .unwrap();
+        }
+        let (status, headers) = post(
+            &router,
+            "/agent-mcp/login",
+            "application/x-www-form-urlencoded",
+            b"username=carol&password=hunter2pw123".to_vec(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        let set_cookie = headers
+            .get(header::SET_COOKIE)
+            .expect("correct login must set a cookie")
+            .to_str()
+            .unwrap();
+        assert!(set_cookie.contains(SESSION_COOKIE_NAME));
+    }
+
+    #[tokio::test]
+    async fn setup_post_urlencoded_fields_still_create_the_first_operator() {
+        let (_dir, state, router) = test_app();
+        let (status, headers) = post(
+            &router,
+            "/agent-mcp/setup",
+            "application/x-www-form-urlencoded",
+            b"username=first_op&password=secret-pw-1234&password_confirm=secret-pw-1234".to_vec(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert!(headers.get(header::SET_COOKIE).is_some());
+        let conn = state.conn.lock().await;
+        assert!(identity::get_user_by_username(&conn, "first_op")
+            .unwrap()
+            .is_some());
+    }
+
+    // -- AC-R17-1 top-up: SSO/passwordless user must not 500 over HTTP --
+
+    #[tokio::test]
+    async fn login_post_sso_passwordless_user_is_401_not_500() {
+        let (_dir, state, router) = test_app();
+        {
+            let mut conn = state.conn.lock().await;
+            identity::create_sso_user(&mut conn, "sso-victim", "sub-1", None, false, false, NOW)
+                .unwrap();
+        }
+        let (status, headers) = post(
+            &router,
+            "/agent-mcp/login",
+            "application/x-www-form-urlencoded",
+            b"username=sso-victim&password=anything".to_vec(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(
+            headers.get(header::SET_COOKIE).is_none(),
+            "an SSO/passwordless account must never mint a session"
+        );
+    }
+
+    // -- PF-R21-1 (form tier): invalid-UTF8 body must never 500 ---------
+
+    #[tokio::test]
+    async fn login_post_invalid_utf8_body_is_401_not_500() {
+        let (_dir, _state, router) = test_app();
+        let (status, headers) = post(
+            &router,
+            "/agent-mcp/login",
+            "application/x-www-form-urlencoded",
+            b"{\"k\":\"\xff\xfe\xfd\"}".to_vec(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(headers.get(header::SET_COOKIE).is_none());
+    }
+
+    #[tokio::test]
+    async fn setup_post_invalid_utf8_body_is_4xx_not_500() {
+        let (_dir, _state, router) = test_app();
+        let (status, _headers) = post(
+            &router,
+            "/agent-mcp/setup",
+            "application/x-www-form-urlencoded",
+            b"{\"k\":\"\xff\xfe\xfd\"}".to_vec(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+}
