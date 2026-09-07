@@ -887,6 +887,103 @@ mod tests {
         assert_eq!(ids, std::collections::BTreeSet::from(["t1", "t2"]));
     }
 
+    /// R16-F2 (ported from `tests/test_sec_r16_task_input_and_pool.py::
+    /// test_engine_worker_pool_excludes_terminal_but_keeps_own`): the
+    /// `include_unassigned` self-claim pool drops a TERMINAL unassigned
+    /// row (nobody can claim dead-end work) but keeps the caller's OWN
+    /// terminal task visible (it's their history, not the claimable
+    /// pool) -- and still excludes a foreign agent's non-terminal task.
+    #[test]
+    fn query_agent_id_with_include_unassigned_excludes_terminal_pool_but_keeps_own_terminal() {
+        let conn = test_conn();
+        create(
+            &conn,
+            new_task(
+                "root",
+                "root",
+                "pending",
+                Some("alice"),
+                None,
+                "bob",
+                "medium",
+                "2026-01-01T00:00:00Z",
+            ),
+        )
+        .unwrap();
+        create(
+            &conn,
+            new_task(
+                "pool_open",
+                "pool open",
+                "pending",
+                None,
+                Some("root"),
+                "bob",
+                "medium",
+                "2026-01-01T00:00:00Z",
+            ),
+        )
+        .unwrap();
+        create(
+            &conn,
+            new_task(
+                "pool_done",
+                "pool done",
+                "completed",
+                None,
+                Some("root"),
+                "bob",
+                "medium",
+                "2026-01-01T00:00:00Z",
+            ),
+        )
+        .unwrap();
+        create(
+            &conn,
+            new_task(
+                "mine_done",
+                "mine done",
+                "completed",
+                Some("alice"),
+                Some("root"),
+                "bob",
+                "medium",
+                "2026-01-01T00:00:00Z",
+            ),
+        )
+        .unwrap();
+        create(
+            &conn,
+            new_task(
+                "foreign",
+                "foreign",
+                "pending",
+                Some("carol"),
+                Some("root"),
+                "bob",
+                "medium",
+                "2026-01-01T00:00:00Z",
+            ),
+        )
+        .unwrap();
+
+        let engine = TaskQueryEngine::new();
+        let filters = TaskFilterSpec {
+            agent_id: Some("alice".to_string()),
+            include_unassigned: true,
+            ..Default::default()
+        };
+        let result = engine
+            .query(&conn, &filters, &TaskSortSpec::default(), 0, None)
+            .unwrap();
+        let ids: std::collections::BTreeSet<_> =
+            result.tasks.iter().map(|t| t.task_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            std::collections::BTreeSet::from(["root", "pool_open", "mine_done"])
+        );
+    }
+
     #[test]
     fn query_unassigned_filter_excludes_terminal_tasks() {
         let conn = test_conn();

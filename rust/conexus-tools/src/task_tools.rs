@@ -2830,6 +2830,33 @@ mod tests {
         assert!(!agent_assignable(&conn, "nobody"));
     }
 
+    /// SEC-R2 (ported from `tests/test_sec_r2_task_toctou.py`'s
+    /// terminated-but-warm-in-memory scenario): `agent_assignable`
+    /// always hits `AgentRepository::is_live`'s live SQL query -- there
+    /// is no in-memory presence cache in this port for a terminated
+    /// agent's status to go stale behind, unlike the Python gate this
+    /// mirrors (which had a not-in-memory-only DB fallback a "warm"
+    /// terminated agent could skip).
+    #[test]
+    fn agent_assignable_false_for_a_terminated_agent() {
+        let conn = test_conn();
+        conexus_db::agent_repository::AgentRepository::create(
+            &conn,
+            conexus_db::agent_repository::NewAgent {
+                token: "tok",
+                agent_id: "bob",
+                created_at: "2026-01-01T00:00:00Z",
+                status: "terminated",
+                current_task: None,
+                working_directory: "/tmp",
+                color: None,
+                agent_role: "worker",
+            },
+        )
+        .unwrap();
+        assert!(!agent_assignable(&conn, "bob"));
+    }
+
     // -- single_root_conflict -----------------------------------------------
 
     #[test]
@@ -2844,6 +2871,46 @@ mod tests {
         task_repository::create(&conn, new_task("task_1", "root", None, None)).unwrap();
         let result = single_root_conflict(&conn);
         assert!(matches!(result, Some(ToolResult::Conflict { .. })));
+    }
+
+    // -- normalize_parent -----------------------------------------------------
+    //
+    // R16-F1 (ported from `tests/test_sec_r16_task_input_and_pool.py`):
+    // an empty or whitespace-only `parent_task`/`parent_task_id` must
+    // collapse to `None` at the earliest point so it can never reach
+    // the self-FK INSERT as a literal `""` (which would either violate
+    // the FK or -- worse -- silently create a `parent_task = ''` row).
+    // A single shared function used by every create path (`create_task`,
+    // `assign_task` Modes 0/1, `create_self_task`) means this can't
+    // drift per-surface the way the Python sweep had to fix four call
+    // sites individually.
+
+    #[test]
+    fn normalize_parent_collapses_an_empty_string_to_none() {
+        assert_eq!(normalize_parent(Some(&Value::String(String::new()))), None);
+    }
+
+    #[test]
+    fn normalize_parent_collapses_whitespace_only_to_none() {
+        assert_eq!(
+            normalize_parent(Some(&Value::String("   \t\n".to_string()))),
+            None
+        );
+    }
+
+    #[test]
+    fn normalize_parent_trims_and_keeps_a_real_id() {
+        assert_eq!(
+            normalize_parent(Some(&Value::String("  task_abc123  ".to_string()))),
+            Some("task_abc123".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_parent_is_none_for_a_missing_or_non_string_value() {
+        assert_eq!(normalize_parent(None), None);
+        assert_eq!(normalize_parent(Some(&Value::Null)), None);
+        assert_eq!(normalize_parent(Some(&serde_json::json!(42))), None);
     }
 
     // -- collect_task_descendants --------------------------------------------
@@ -4373,6 +4440,45 @@ mod create_task_tests {
         assert!(matches!(result, ToolResult::PermissionDenied { .. }));
     }
 
+    /// SECURITY (pentest R1-F5, ported from
+    /// `tests/test_sec_r1_f5_create_task_worker_authz.py`): pins the two
+    /// concrete escalations the `TasksAssign` gate above closes for a
+    /// worker bearer -- minting a ROOT task, and assigning it to a
+    /// DIFFERENT agent -- plus that the denial names `create_self_task`
+    /// so a worker is pointed at the path it should have used.
+    #[tokio::test]
+    async fn create_task_denies_worker_root_and_cross_agent_assignment_escalation() {
+        let conn = test_conn();
+        seed_agent(&conn, "victim").await;
+        let registry = WaiterRegistry::new();
+        let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
+        let result = CreateTaskTool::call(
+            Some(&worker("bob")),
+            &serde_json::json!({
+                "task_title": "worker-forged root task assigned to victim",
+                "assigned_to": "victim"
+            }),
+            &conn,
+            NOW,
+            &ctx,
+        )
+        .await;
+        match result {
+            ToolResult::PermissionDenied { reason } => {
+                assert!(
+                    reason.contains("create_self_task"),
+                    "denial should point workers at create_self_task, got {reason:?}"
+                );
+            }
+            other => panic!("expected PermissionDenied, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn create_task_requires_a_non_blank_title() {
         let conn = test_conn();
@@ -5211,6 +5317,92 @@ mod update_task_tests {
         assert!(matches!(result, ToolResult::Conflict { .. }));
     }
 
+    /// R16-F2 ordering-gap fix (ported from
+    /// `tests/test_sec_r16_task_input_and_pool.py::
+    /// test_update_complete_and_unassign_no_fanout`): a COMBINED
+    /// `{status: "completed", assigned_to: null}` on a currently
+    /// NON-terminal task must land (completing + unassigning in one
+    /// call is legitimate) but must NOT fire the broadcast
+    /// unassigned-pool fanout -- the resulting task is terminal, so
+    /// nobody should be told it just became claimable. Distinguished
+    /// from the ordinary prior-assignee wake by using a BYSTANDER
+    /// agent the broadcast fanout (not the targeted wake) would reach.
+    #[tokio::test]
+    async fn completing_and_unassigning_in_one_call_does_not_fire_the_broadcast_fanout() {
+        let conn = test_conn();
+        seed_agent(&conn, "bob").await;
+        seed_agent(&conn, "bystander").await;
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "t1", "pending", Some("bob"));
+        }
+        let registry = WaiterRegistry::new();
+        let (_tx_bystander, mut rx_bystander) = registry.register("bystander");
+        let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
+        let result = UpdateTaskTool::call(
+            Some(&admin("alice")),
+            &serde_json::json!({"task_id": "t1", "status": "completed", "assigned_to": ""}),
+            &conn,
+            NOW,
+            &ctx,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        let guard = conn.lock().await;
+        let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+        assert_eq!(row.status, "completed");
+        assert_eq!(row.assigned_to, None);
+        drop(guard);
+        assert!(
+            rx_bystander.try_recv().is_err(),
+            "a bystander must not be woken by a spurious unassigned-pool fanout"
+        );
+    }
+
+    /// R16-F2 control (ported from
+    /// `tests/test_sec_r16_task_input_and_pool.py::
+    /// test_update_plain_unassign_still_fans_out`): a PLAIN unassign of
+    /// a NON-terminal task (no status change) must still fire the
+    /// broadcast unassigned-pool fanout -- the fix must not silence a
+    /// legitimate claimable transition.
+    #[tokio::test]
+    async fn plain_unassign_of_a_nonterminal_task_still_fires_the_broadcast_fanout() {
+        let conn = test_conn();
+        seed_agent(&conn, "bob").await;
+        seed_agent(&conn, "bystander").await;
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "t1", "pending", Some("bob"));
+        }
+        let registry = WaiterRegistry::new();
+        let (_tx_bystander, mut rx_bystander) = registry.register("bystander");
+        let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
+        let result = UpdateTaskTool::call(
+            Some(&admin("alice")),
+            &serde_json::json!({"task_id": "t1", "assigned_to": ""}),
+            &conn,
+            NOW,
+            &ctx,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        assert_eq!(
+            rx_bystander.try_recv(),
+            Ok(WakeSignal::Wake),
+            "a plain unassign of a claimable task must fan out to every active agent"
+        );
+    }
+
     #[tokio::test]
     async fn a_call_with_nothing_to_change_is_a_no_op() {
         let conn = test_conn();
@@ -5259,6 +5451,80 @@ mod update_task_tests {
         assert!(matches!(result, ToolResult::Ok { .. }));
         assert_eq!(rx_bob.try_recv(), Ok(WakeSignal::Wake));
         assert_eq!(rx_carol.try_recv(), Ok(WakeSignal::Wake));
+    }
+
+    /// BL-R7-1 (ported from `tests/test_sec_r7_taskedit_notify.py::
+    /// test_edit_assign_publishes_task_updated_and_wakes_new_assignee`):
+    /// assigning a previously-UNASSIGNED task via `update_task` (the
+    /// same impl the dashboard's `POST /api/update-task-dashboard`
+    /// route is a thin adapter over) must wake the new assignee's
+    /// waiter -- there is no prior assignee to also wake.
+    #[tokio::test]
+    async fn assigning_a_previously_unassigned_task_wakes_the_new_assignee() {
+        let conn = test_conn();
+        seed_agent(&conn, "carol").await;
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "t1", "pending", None);
+        }
+        let registry = WaiterRegistry::new();
+        let (_tx_carol, mut rx_carol) = registry.register("carol");
+        let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
+        let result = UpdateTaskTool::call(
+            Some(&admin("alice")),
+            &serde_json::json!({"task_id": "t1", "assigned_to": "carol"}),
+            &conn,
+            NOW,
+            &ctx,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        assert_eq!(rx_carol.try_recv(), Ok(WakeSignal::Wake));
+    }
+
+    /// BL-R7-1 (ported from `tests/test_sec_r7_taskedit_notify.py::
+    /// test_unassign_wakes_prior_assignee`): clearing a task's
+    /// assignment via `update_task` must wake the PRIOR assignee (the
+    /// task just left their queue).
+    #[tokio::test]
+    async fn clearing_an_assignment_wakes_the_prior_assignee() {
+        let conn = test_conn();
+        seed_agent(&conn, "bob").await;
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "t1", "pending", Some("bob"));
+            AgentRepository::reconcile_current_task_on_reassign(
+                &guard,
+                "t1",
+                None,
+                Some("bob"),
+                NOW,
+            )
+            .unwrap();
+        }
+        let registry = WaiterRegistry::new();
+        let (_tx_bob, mut rx_bob) = registry.register("bob");
+        let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
+        let result = UpdateTaskTool::call(
+            Some(&admin("alice")),
+            &serde_json::json!({"task_id": "t1", "assigned_to": "unassigned"}),
+            &conn,
+            NOW,
+            &ctx,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        assert_eq!(rx_bob.try_recv(), Ok(WakeSignal::Wake));
     }
 }
 
@@ -5475,6 +5741,61 @@ mod delete_task_tests {
         assert_eq!(agent.current_task, None);
     }
 
+    /// Round-3 finding BL-3 (ported from
+    /// `tests/test_sec_r3_force_delete_currenttask.py::
+    /// test_force_delete_clears_descendant_current_task`): when a
+    /// CASCADED DESCENDANT -- not the delete target itself -- is an
+    /// agent's `current_task`, the force-cascade must still NULL that
+    /// pointer (the whole delete set, not just the top-level task id,
+    /// must be passed to `clear_current_task_for_many`) or the
+    /// subtree DELETE trips `agents.current_task`'s FK.
+    #[tokio::test]
+    async fn force_delete_clears_a_cascaded_descendants_current_task_pointer() {
+        let conn = test_conn();
+        seed_agent(&conn, "bob").await;
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "parent", "pending", None, None, None);
+            seed_task(
+                &guard,
+                "child",
+                "pending",
+                Some("bob"),
+                Some("parent"),
+                None,
+            );
+            AgentRepository::reconcile_current_task_on_reassign(
+                &guard,
+                "child",
+                None,
+                Some("bob"),
+                NOW,
+            )
+            .unwrap();
+        }
+        let result = call(
+            serde_json::json!({"task_id": "parent", "force_delete": true}),
+            &conn,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        let guard = conn.lock().await;
+        assert!(task_repository::get_by_id(&guard, "parent")
+            .unwrap()
+            .is_none());
+        assert!(
+            task_repository::get_by_id(&guard, "child")
+                .unwrap()
+                .is_none(),
+            "the in-use descendant must be cascade-deleted, not orphaned"
+        );
+        let agent = AgentRepository::get_by_id(&guard, "bob").unwrap().unwrap();
+        assert_eq!(
+            agent.current_task, None,
+            "descendant assignee's current_task must be NULLed too"
+        );
+    }
+
     #[tokio::test]
     async fn force_delete_removes_the_parents_child_tasks_mirror_entry() {
         let conn = test_conn();
@@ -5580,6 +5901,58 @@ mod delete_task_tests {
         assert_eq!(dependent.status, "in_progress");
     }
 
+    /// BL-R19-1 (ported from
+    /// `tests/test_sec_r19_force_delete_dep_reconcile.py::
+    /// test_force_delete_reconciles_descendant_dependency`): the
+    /// dangling-dependency prune + auto-advance must cover the WHOLE
+    /// delete set, not just the direct target -- an OUTSIDE task
+    /// depending on a CASCADE-DELETED DESCENDANT (not the root being
+    /// force-deleted directly) must have that reference pruned and
+    /// advance out of pending too, or it stalls forever (deletion,
+    /// unlike completion, never fires the ordinary auto-advance).
+    #[tokio::test]
+    async fn force_delete_reconciles_a_dependency_on_a_cascaded_descendant() {
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "root1", "pending", None, None, None);
+            seed_task(&guard, "a", "pending", None, Some("root1"), None);
+            seed_task(&guard, "b", "pending", None, Some("a"), None);
+            // "outside" is a SIBLING of "a" under the shared root,
+            // depending on "b" -- a cascade-deleted DESCENDANT of "a",
+            // not "a" itself.
+            seed_task(
+                &guard,
+                "outside",
+                "pending",
+                None,
+                Some("root1"),
+                Some(&["b".to_string()]),
+            );
+        }
+        let result = call(
+            serde_json::json!({"task_id": "a", "force_delete": true}),
+            &conn,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        let guard = conn.lock().await;
+        assert!(task_repository::get_by_id(&guard, "a").unwrap().is_none());
+        assert!(task_repository::get_by_id(&guard, "b").unwrap().is_none());
+        let outside = task_repository::get_by_id(&guard, "outside")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            outside.depends_on_tasks,
+            Some(vec![]),
+            "outside's dependency on the cascade-deleted descendant b must be pruned"
+        );
+        assert_eq!(
+            outside.status, "in_progress",
+            "outside must auto-advance once its only blocking dep is gone"
+        );
+    }
+
     #[tokio::test]
     async fn writes_a_durable_audit_row() {
         let conn = test_conn();
@@ -5656,6 +6029,23 @@ mod request_assistance_tests {
             can_wake_loop: true,
             source_token: None,
             capabilities: Capabilities::from_iter([Capability::CoordinationAssist]),
+        }
+    }
+
+    fn admin(agent_id: &str) -> Principal {
+        Principal {
+            kind: PrincipalKind::AgentBearer,
+            user_id: None,
+            agent_id: Some(agent_id.to_string()),
+            project_name: None,
+            project_role: None,
+            agent_role: None,
+            can_wake_loop: true,
+            source_token: None,
+            capabilities: Capabilities::from_iter([
+                Capability::CoordinationAssist,
+                Capability::TasksAssign,
+            ]),
         }
     }
 
@@ -5798,6 +6188,28 @@ mod request_assistance_tests {
             .unwrap();
         assert_eq!(count, 1);
     }
+
+    /// AZ-R17-1 regression (ported from
+    /// `tests/test_sec_r17_request_assist_oracle.py::
+    /// test_admin_can_request_assistance_for_any_existing_task`): an
+    /// admin/manager (`tasks.assign`) can still request assistance on
+    /// ANY existing task, not just their own -- the phantom-NotFound
+    /// ownership gate only constrains non-privileged callers.
+    #[tokio::test]
+    async fn admin_can_request_assistance_on_a_foreign_task() {
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "t1", Some("bob"), "alice");
+        }
+        let result = call(
+            serde_json::json!({"task_id": "t1", "description": "admin escalating"}),
+            &admin("alice"),
+            &conn,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+    }
 }
 
 #[cfg(test)]
@@ -5932,9 +6344,59 @@ mod bulk_task_operations_tests {
         .await;
         let msg = message_of(&result);
         assert!(msg.contains("status updated to 'in_progress'"));
+    }
+
+    /// SD-R12-1 (ported from
+    /// `tests/test_sec_r12_bulk_ops_error_hygiene.py`): a per-op
+    /// repository write failure must never surface the raw DB error on
+    /// the wire -- only a static, non-revealing line. Forces a genuine
+    /// SQLite write failure (`PRAGMA query_only = ON`, so
+    /// `task_repository::update_fields`'s `UPDATE` actually errors)
+    /// rather than mocking, to prove the `Err(_e) => ... "Database
+    /// error in bulk operations"` branch this port already takes
+    /// (confirmed by inspection: no call site in this function
+    /// interpolates the underlying `rusqlite::Error` into a response
+    /// string) really is what a live failure produces end-to-end.
+    ///
+    /// Note: unlike Python's per-op catch-and-continue (which is what
+    /// let `str(e)` leak into an `Ok` results line in the first
+    /// place), this port aborts the whole bulk call with a single
+    /// generic `Failed` on a genuine repository error -- there is no
+    /// per-op try/except to leak through, a stronger shape than the
+    /// literal Python fix.
+    #[tokio::test]
+    async fn update_status_op_db_failure_does_not_leak_the_raw_error() {
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "t1", "pending", Some("bob"), "alice");
+            guard.execute_batch("PRAGMA query_only = ON;").unwrap();
+        }
+        let result = call(
+            serde_json::json!({"operations": [{"type": "update_status", "task_id": "t1", "status": "in_progress"}]}),
+            &worker("bob"),
+            &conn,
+        )
+        .await;
+        let msg = match &result {
+            ToolResult::Failed { message } => message.clone(),
+            other => panic!("expected Failed on a genuine DB write error, got {other:?}"),
+        };
+        assert!(
+            !msg.to_lowercase().contains("readonly")
+                && !msg.to_lowercase().contains("read-only")
+                && !msg.to_lowercase().contains("sqlite"),
+            "raw DB error text leaked onto the wire: {msg:?}"
+        );
+        assert!(
+            msg.to_lowercase().contains("database error"),
+            "expected a static internal-error line, got {msg:?}"
+        );
+        // The write never landed -- the transaction rolled back on the
+        // genuine SQLite error, so the task's status is untouched.
         let guard = conn.lock().await;
         let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
-        assert_eq!(row.status, "in_progress");
+        assert_eq!(row.status, "pending");
     }
 
     #[tokio::test]
@@ -5952,6 +6414,78 @@ mod bulk_task_operations_tests {
         .await;
         let msg = message_of(&result);
         assert!(msg.contains("Task 't1' not found"));
+    }
+
+    /// AZ-R16-1 (ported from `tests/test_sec_r16_bulk_ops_guards.py::
+    /// test_worker_bulk_update_status_denied_when_policy_off`): with
+    /// `config_allow_worker_update_own_status` disabled, a worker's
+    /// bulk `update_status` on its OWN task must be denied (per-op
+    /// error) -- parity with the single-task path's
+    /// `@requires_policy` gate.
+    #[tokio::test]
+    async fn update_status_op_denied_for_a_worker_when_policy_is_off() {
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "t1", "pending", Some("bob"), "alice");
+            project_settings_repository::upsert(
+                &guard,
+                "config_allow_worker_update_own_status",
+                "false",
+                None,
+                false,
+                "test",
+                NOW,
+            )
+            .unwrap();
+        }
+        let result = call(
+            serde_json::json!({"operations": [{"type": "update_status", "task_id": "t1", "status": "in_progress"}]}),
+            &worker("bob"),
+            &conn,
+        )
+        .await;
+        let msg = message_of(&result);
+        assert!(
+            msg.contains("config_allow_worker_update_own_status"),
+            "{msg}"
+        );
+        assert!(!msg.contains("status updated to 'in_progress'"), "{msg}");
+        let guard = conn.lock().await;
+        let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+        assert_eq!(row.status, "pending");
+    }
+
+    /// AZ-R16-1 (ported from `tests/test_sec_r16_bulk_ops_guards.py::
+    /// test_admin_bulk_update_status_works_with_policy_off`): the
+    /// policy toggle only gates non-admin workers -- an admin/manager
+    /// (`tasks.assign`) retains bulk status updates even with the
+    /// toggle OFF.
+    #[tokio::test]
+    async fn update_status_op_still_works_for_admin_when_policy_is_off() {
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "t1", "pending", Some("admin"), "alice");
+            project_settings_repository::upsert(
+                &guard,
+                "config_allow_worker_update_own_status",
+                "false",
+                None,
+                false,
+                "test",
+                NOW,
+            )
+            .unwrap();
+        }
+        let result = call(
+            serde_json::json!({"operations": [{"type": "update_status", "task_id": "t1", "status": "in_progress"}]}),
+            &admin("alice"),
+            &conn,
+        )
+        .await;
+        let msg = message_of(&result);
+        assert!(msg.contains("status updated to 'in_progress'"), "{msg}");
     }
 
     #[tokio::test]
@@ -6006,6 +6540,113 @@ mod bulk_task_operations_tests {
         assert_eq!(row.notes.unwrap()[0].content, "progress");
     }
 
+    /// R12-F4 (ported from
+    /// `tests/test_sec_r12_bulk_priority_note_terminal_sink.py::
+    /// test_bulk_update_priority_on_terminal_task_denied`): a bulk
+    /// `update_priority` op on a task whose status is already terminal
+    /// must be denied as a per-op error (batch continues), not silently
+    /// applied.
+    #[tokio::test]
+    async fn update_priority_on_a_terminal_task_is_a_per_op_error() {
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "t1", "completed", Some("bob"), "alice");
+        }
+        let result = call(
+            serde_json::json!({"operations": [{"type": "update_priority", "task_id": "t1", "priority": "high"}]}),
+            &admin("alice"),
+            &conn,
+        )
+        .await;
+        let msg = message_of(&result);
+        assert!(msg.to_lowercase().contains("terminal"), "{msg}");
+        assert!(!msg.contains("priority updated to 'high'"), "{msg}");
+        let guard = conn.lock().await;
+        let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+        assert_eq!(
+            row.priority, "medium",
+            "the seeded priority must be unchanged"
+        );
+    }
+
+    /// R12-F4 (ported from
+    /// `tests/test_sec_r12_bulk_priority_note_terminal_sink.py::
+    /// test_bulk_add_note_on_terminal_task_denied`): a bulk `add_note`
+    /// op on a terminal task must be denied as a per-op error, not
+    /// silently applied.
+    #[tokio::test]
+    async fn add_note_on_a_terminal_task_is_a_per_op_error() {
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "t1", "cancelled", Some("bob"), "alice");
+        }
+        let result = call(
+            serde_json::json!({"operations": [{"type": "add_note", "task_id": "t1", "content": "should not land"}]}),
+            &admin("alice"),
+            &conn,
+        )
+        .await;
+        let msg = message_of(&result);
+        assert!(msg.to_lowercase().contains("terminal"), "{msg}");
+        assert!(!msg.contains("Note added"), "{msg}");
+        let guard = conn.lock().await;
+        let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+        assert!(row.notes.unwrap_or_default().is_empty());
+    }
+
+    /// R12-F4 (ported from
+    /// `tests/test_sec_r12_bulk_priority_note_terminal_sink.py::
+    /// test_bulk_batch_not_aborted_by_terminal_priority_or_note`): a
+    /// denied terminal-sink op must not abort the rest of the batch --
+    /// a later legitimate op in the same call still lands.
+    #[tokio::test]
+    async fn a_denied_terminal_op_does_not_abort_the_rest_of_the_batch() {
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "terminal", "completed", Some("bob"), "alice");
+            task_repository::create(
+                &guard,
+                NewTask {
+                    task_id: Some("live"),
+                    title: "live",
+                    description: None,
+                    assigned_to: Some("bob"),
+                    created_by: "alice",
+                    status: "in_progress",
+                    priority: "medium",
+                    parent_task: Some("terminal"),
+                    child_tasks: None,
+                    depends_on_tasks: None,
+                    notes: None,
+                    now: NOW,
+                },
+            )
+            .unwrap();
+        }
+        let result = call(
+            serde_json::json!({"operations": [
+                {"type": "update_priority", "task_id": "terminal", "priority": "high"},
+                {"type": "add_note", "task_id": "live", "content": "still processed"}
+            ]}),
+            &admin("alice"),
+            &conn,
+        )
+        .await;
+        let msg = message_of(&result);
+        assert!(msg.to_lowercase().contains("terminal"), "{msg}");
+        assert!(msg.contains("Note added"), "{msg}");
+        let guard = conn.lock().await;
+        let terminal_row = task_repository::get_by_id(&guard, "terminal")
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminal_row.priority, "medium");
+        let live_row = task_repository::get_by_id(&guard, "live").unwrap().unwrap();
+        assert_eq!(live_row.notes.unwrap()[0].content, "still processed");
+    }
+
     #[tokio::test]
     async fn worker_cannot_reassign() {
         let conn = test_conn();
@@ -6046,6 +6687,86 @@ mod bulk_task_operations_tests {
             .unwrap()
             .unwrap();
         assert_eq!(agent.current_task.as_deref(), Some("t1"));
+    }
+
+    /// BL-R25-1 (ported from
+    /// `tests/test_sec_r25_bulk_reassign_terminal_sink.py::
+    /// test_admin_bulk_reassign_terminal_task_denied`): the bulk
+    /// `reassign` op must deny reassigning a TERMINAL task onto a live
+    /// agent -- the target-agent-liveness check alone (`_agent_
+    /// assignable`) isn't enough, the TASK's own status is a sink too
+    /// (mirrors the terminal guard `update_priority`/`add_note` already
+    /// enforce, R12-F4).
+    #[tokio::test]
+    async fn reassign_op_on_a_terminal_task_is_denied() {
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_agent(&guard, "bob");
+            seed_task(&guard, "t1", "completed", Some("alice"), "alice");
+        }
+        let result = call(
+            serde_json::json!({"operations": [{"type": "reassign", "task_id": "t1", "assigned_to": "bob"}]}),
+            &admin("alice"),
+            &conn,
+        )
+        .await;
+        let msg = message_of(&result);
+        assert!(msg.to_lowercase().contains("terminal"), "{msg}");
+        assert!(!msg.contains("reassigned to 'bob'"), "{msg}");
+        let guard = conn.lock().await;
+        let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+        assert_eq!(row.assigned_to.as_deref(), Some("alice"));
+        assert_eq!(row.status, "completed");
+    }
+
+    /// BL-R25-1 (ported from
+    /// `tests/test_sec_r25_bulk_reassign_terminal_sink.py::
+    /// test_bulk_batch_not_aborted_by_terminal_reassign`): a denied
+    /// terminal reassign must not abort the rest of the batch.
+    #[tokio::test]
+    async fn a_denied_terminal_reassign_does_not_abort_the_rest_of_the_batch() {
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_agent(&guard, "bob");
+            seed_task(&guard, "terminal", "completed", Some("alice"), "alice");
+            task_repository::create(
+                &guard,
+                NewTask {
+                    task_id: Some("live"),
+                    title: "live",
+                    description: None,
+                    assigned_to: Some("alice"),
+                    created_by: "alice",
+                    status: "in_progress",
+                    priority: "medium",
+                    parent_task: Some("terminal"),
+                    child_tasks: None,
+                    depends_on_tasks: None,
+                    notes: None,
+                    now: NOW,
+                },
+            )
+            .unwrap();
+        }
+        let result = call(
+            serde_json::json!({"operations": [
+                {"type": "reassign", "task_id": "terminal", "assigned_to": "bob"},
+                {"type": "add_note", "task_id": "live", "content": "still processed"}
+            ]}),
+            &admin("alice"),
+            &conn,
+        )
+        .await;
+        let msg = message_of(&result);
+        assert!(msg.to_lowercase().contains("terminal"), "{msg}");
+        assert!(msg.contains("Note added"), "{msg}");
+        let guard = conn.lock().await;
+        let terminal_row = task_repository::get_by_id(&guard, "terminal")
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminal_row.assigned_to.as_deref(), Some("alice"));
     }
 
     #[tokio::test]
