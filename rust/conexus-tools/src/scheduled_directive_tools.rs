@@ -1027,6 +1027,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn overflowing_interval_seconds_is_a_clean_invalid_never_a_panic() {
+        // Port of test_sec_r16_schedule_overflow.py's R16-F3 --
+        // re-derived, not ported at face value. Python's bug was
+        // `int(<client value>)` raising `OverflowError` (uncaught) on
+        // `float('inf')`, then a huge-but-finite int overflowing
+        // `timedelta(seconds=...)`. Neither mechanism exists here.
+        //
+        // The `1e400`/infinity half of Python's repro has NO Rust
+        // analog at all, confirmed empirically, not assumed:
+        // `serde_json::from_str("1e400")` returns a hard parse Err
+        // ("number out of range") -- unlike Python's `json.loads`,
+        // which happily parses an oversized literal into
+        // `float('inf')`. A real client request containing that
+        // literal fails to deserialize as JSON before it ever reaches
+        // this tool -- there is no `serde_json::Value` to construct
+        // in-process that represents it, so that half of the Python
+        // scenario is structurally unconstructable here, not merely
+        // guarded against.
+        //
+        // The remaining, genuinely reachable half -- a huge but
+        // FINITE value -- is what this test proves: `validate_interval`'s
+        // own pre-existing `MAX_INTERVAL_SECONDS` bound (10 years)
+        // rejects it long before it could reach `Duration::seconds()`
+        // -- verified directly (a throwaway probe, not assumed):
+        // chrono's own internal bound panics around 1e15s, five
+        // orders of magnitude above this bound.
+        let conn = setup().await;
+        {
+            let c = conn.lock().await;
+            seed_agent(&c, "alice", "worker");
+        }
+        let alice = worker("alice");
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        for interval in [
+            serde_json::json!(86_400_000_000_000_000_i64), // finite, exceeds the 10-year bound
+            // A 23-digit literal doesn't even fit serde_json's own
+            // Number representation as an i64 -- as_i64() -> None.
+            serde_json::from_str::<serde_json::Value>("99999999999999999999999").unwrap(),
+        ] {
+            let result = CreateScheduledDirectiveTool::call(
+                Some(&alice),
+                &serde_json::json!({"prompt": "x", "interval_seconds": interval}),
+                &conn,
+                NOW,
+                &c,
+            )
+            .await;
+            assert!(
+                matches!(result, ToolResult::Invalid { field: Some(ref f), .. } if f == "interval_seconds"),
+                "interval {interval:?} should be a clean Invalid, got {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn overflowing_count_is_a_clean_invalid_never_a_panic() {
+        // Port of test_sec_r16_schedule_overflow.py's R16-F4 -- same
+        // re-derivation rationale as the interval_seconds sibling
+        // above (including the confirmed-unconstructable `1e400`
+        // half); `validate_count`'s own pre-existing `MAX_COUNT`
+        // bound plus `as_i64()`'s checked conversion close the
+        // genuinely reachable half of the same bug class.
+        let conn = setup().await;
+        {
+            let c = conn.lock().await;
+            seed_agent(&c, "alice", "worker");
+        }
+        let alice = worker("alice");
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let count = serde_json::from_str::<serde_json::Value>("99999999999999999999999").unwrap();
+        let result = CreateScheduledDirectiveTool::call(
+            Some(&alice),
+            &serde_json::json!({"prompt": "x", "interval_seconds": 120, "count": count}),
+            &conn,
+            NOW,
+            &c,
+        )
+        .await;
+        assert!(
+            matches!(result, ToolResult::Invalid { field: Some(ref f), .. } if f == "count"),
+            "count should be a clean Invalid, got {result:?}"
+        );
+        // MAX_COUNT itself is also enforced -- a valid, finite,
+        // in-range integer that's simply too large.
+        let result2 = CreateScheduledDirectiveTool::call(
+            Some(&alice),
+            &serde_json::json!({"prompt": "x", "interval_seconds": 120, "count": MAX_COUNT + 1}),
+            &conn,
+            NOW,
+            &c,
+        )
+        .await;
+        assert!(matches!(
+            result2,
+            ToolResult::Invalid { field: Some(ref f), .. } if f == "count"
+        ));
+    }
+
+    #[tokio::test]
     async fn a_worker_cannot_schedule_for_another_worker() {
         let conn = setup().await;
         {
@@ -1358,6 +1461,156 @@ mod tests {
         )
         .await;
         assert!(matches!(result, ToolResult::Invalid { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_garbage_until_string_is_a_clean_invalid_not_a_panic() {
+        // Port of test_sec_r17_scheduled_directive.py's
+        // test_create_garbage_until_clean_invalid (R17-F1) -- a
+        // malformed `until` must reach the caller as a clean
+        // Invalid, never a 500/panic.
+        let conn = setup().await;
+        {
+            let c = conn.lock().await;
+            seed_agent(&c, "alice", "worker");
+        }
+        let alice = worker("alice");
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = CreateScheduledDirectiveTool::call(
+            Some(&alice),
+            &serde_json::json!({"prompt": "x", "interval_seconds": 300, "until": "not-a-date"}),
+            &conn,
+            NOW,
+            &c,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            ToolResult::Invalid { field: Some(f), .. } if f == "until"
+        ));
+    }
+
+    #[tokio::test]
+    async fn tz_aware_until_spellings_of_the_same_instant_store_coherently() {
+        // Port of test_sec_r17_scheduled_directive.py's
+        // test_create_tz_aware_until_normalized_not_500 (R17-F1) --
+        // re-derived, not ported at face value: Python's fix
+        // normalizes `until` to its own naive-local convention so a
+        // LEXICAL compare against `next_due_at` stays coherent. This
+        // crate's design closes the whole bug CLASS instead --
+        // `format_utc` is the ONE function both `until_at` and
+        // `next_due_at` are written through (`to_rfc3339_opts` with a
+        // fixed `Z` suffix + microsecond precision), so every stored
+        // timestamp is already in the same canonical form regardless
+        // of the caller's input spelling. Proven here by feeding 3
+        // different spellings of the IDENTICAL instant and asserting
+        // they all produce the same stored `until_at`, and that it
+        // still lexically compares correctly against `next_due_at`.
+        let conn = setup().await;
+        {
+            let c = conn.lock().await;
+            seed_agent(&c, "alice", "worker");
+        }
+        let alice = worker("alice");
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+
+        let mut stored: Vec<String> = Vec::new();
+        for until in [
+            "2035-01-01T00:00:00Z",
+            "2035-01-01T05:00:00+05:00",
+            "2035-01-01T00:00:00+00:00",
+        ] {
+            let result = CreateScheduledDirectiveTool::call(
+                Some(&alice),
+                &serde_json::json!({"prompt": "x", "interval_seconds": 60, "until": until}),
+                &conn,
+                NOW,
+                &c,
+            )
+            .await;
+            let ToolResult::Ok { data, .. } = result else {
+                panic!("expected Ok for {until:?}, got {result:?}");
+            };
+            let d = data.unwrap();
+            let until_at = d["directive"]["until_at"].as_str().unwrap().to_string();
+            let next_due_at = d["directive"]["next_due_at"].as_str().unwrap().to_string();
+            assert!(
+                next_due_at.as_str() < until_at.as_str(),
+                "next_due_at {next_due_at} must sort before until_at {until_at}"
+            );
+            stored.push(until_at);
+        }
+        assert!(
+            stored.iter().all(|s| s == &stored[0]),
+            "3 spellings of the same instant must normalize to the identical stored string: {stored:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_owner_delete_and_a_missing_directive_delete_are_indistinguishable() {
+        // Port of test_sec_r17_scheduled_directive.py's
+        // test_nonowner_worker_delete_gets_notfound_not_unauthorized
+        // (R17-F2) -- the update-side sibling of this scenario is
+        // already covered by
+        // `a_non_owner_update_and_a_missing_directive_update_are_
+        // indistinguishable`, but nothing pinned the delete side,
+        // even though `authorize_existing_or_notfound` is the SAME
+        // shared helper both tools call. Also proves the phantom
+        // NotFound did not actually delete the real row.
+        let conn = setup().await;
+        {
+            let c = conn.lock().await;
+            seed_agent(&c, "bob", "worker");
+            seed_agent(&c, "alice", "worker");
+        }
+        let bob = worker("bob");
+        let alice = worker("alice");
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let created = CreateScheduledDirectiveTool::call(
+            Some(&bob),
+            &serde_json::json!({"prompt": "a", "interval_seconds": 60}),
+            &conn,
+            NOW,
+            &c,
+        )
+        .await;
+        let ToolResult::Ok { data, .. } = created else {
+            panic!("expected Ok, got {created:?}");
+        };
+        let directive_id = data.unwrap()["directive"]["directive_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let foreign = DeleteScheduledDirectiveTool::call(
+            Some(&alice),
+            &serde_json::json!({"directive_id": directive_id}),
+            &conn,
+            NOW,
+            &c,
+        )
+        .await;
+        let missing = DeleteScheduledDirectiveTool::call(
+            Some(&alice),
+            &serde_json::json!({"directive_id": "sd_doesnotexist"}),
+            &conn,
+            NOW,
+            &c,
+        )
+        .await;
+        assert!(matches!(foreign, ToolResult::NotFound { .. }));
+        assert!(!matches!(foreign, ToolResult::PermissionDenied { .. }));
+        assert!(matches!(missing, ToolResult::NotFound { .. }));
+        // Bob's directive must still be there -- the phantom NotFound
+        // did not actually delete it.
+        let guard = conn.lock().await;
+        assert!(repo::get(&guard, &directive_id).unwrap().is_some());
     }
 
     #[tokio::test]
