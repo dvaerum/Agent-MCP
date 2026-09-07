@@ -743,6 +743,87 @@ mod tests {
         assert!(matches!(outcome, SessionGateOutcome::PublicAppShell));
     }
 
+    /// R3 xtenant-oracle (test_sec_r3_xtenant_oracle.py): the `/app/`
+    /// surface's other half. A NONEXISTENT project on `/app/` must
+    /// resolve the same way `/api/`'s own nonexistent-project case
+    /// already does (`falls_through_for_a_genuinely_nonexistent_
+    /// project` above) -- `Allow` with `project: None` -- so it reaches
+    /// the SAME downstream SPA-shell serving
+    /// (`dashboard_handlers::dashboard_index_handler`) an existing
+    /// project's non-member sees via `PublicAppShell` just above.
+    /// Confirmed byte-identical at the response layer too:
+    /// `dashboard_index_handler` only reads the `WarmAuthorized` bool
+    /// this gate stashes (`false` for `PublicAppShell`, `true` for a
+    /// project-scoped `Allow` -- but a `project: None` `Allow` never
+    /// takes that branch; see `evaluate_session_gate`'s own `Allow`
+    /// construction) and unconditionally serves the same static
+    /// `index.html`, never the `name` path segment itself -- so this
+    /// gate-level equivalence is the whole story, not just half of it.
+    #[test]
+    fn falls_through_for_a_genuinely_nonexistent_project_on_app_path() {
+        let mut c = conn();
+        let dir = tempfile::tempdir().unwrap();
+        seed_operator(&mut c, "alice", true); // first user, sysadmin
+        let bob = identity::create_user(
+            &mut c,
+            "bob",
+            "correct horse battery staple",
+            None,
+            false,
+            true,
+            &[],
+            NOW,
+        )
+        .unwrap();
+        let cookie = cookie_for(&c, &bob);
+        let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
+        let cfg = SessionGateConfig::default();
+        let req = base_req("/agent-mcp/app/ghost-tenant-proj/", Some(&cookie));
+
+        let outcome = call_gate(&mut c, &registry, &cfg, now_dt(), &req).unwrap();
+        let SessionGateOutcome::Allow(identity) = outcome else {
+            panic!("expected Allow (fall-through), got {outcome:?}");
+        };
+        assert!(identity.project.is_none());
+    }
+
+    /// R3 xtenant-oracle, the unauthenticated path (test D in the
+    /// Python file): the cookie-missing/invalid 401 fires BEFORE any
+    /// project lookup at all (`evaluate_session_gate`'s own
+    /// `cookie_user` branch, above every `resolved_project_from_path`
+    /// call) -- so it's uniform for an existing and a nonexistent
+    /// project by construction, not by coincidence. Pinned directly:
+    /// `unauthorized_response` takes no project-derived argument, so
+    /// both calls below must produce a byte-identical body.
+    #[test]
+    fn unauthenticated_caller_gets_the_uniform_401_for_existing_and_nonexistent_projects_alike() {
+        let mut c = conn();
+        let dir = tempfile::tempdir().unwrap();
+        let registry = registry_with(dir.path(), "existing-tenant-proj", now_dt());
+        let cfg = SessionGateConfig::default();
+
+        let existing_req = base_req("/agent-mcp/api/existing-tenant-proj/agents", None);
+        let existing_outcome = call_gate(&mut c, &registry, &cfg, now_dt(), &existing_req).unwrap();
+        let SessionGateOutcome::Reject(existing_resp) = existing_outcome else {
+            panic!("expected Reject, got {existing_outcome:?}");
+        };
+
+        let ghost_req = base_req("/agent-mcp/api/ghost-tenant-proj/agents", None);
+        let ghost_outcome = call_gate(&mut c, &registry, &cfg, now_dt(), &ghost_req).unwrap();
+        let SessionGateOutcome::Reject(ghost_resp) = ghost_outcome else {
+            panic!("expected Reject, got {ghost_outcome:?}");
+        };
+
+        assert_eq!(existing_resp.status, 401);
+        assert_eq!(existing_resp.status, ghost_resp.status);
+        let (HandlerBody::Json(existing_body), HandlerBody::Json(ghost_body)) =
+            (&existing_resp.body, &ghost_resp.body)
+        else {
+            panic!("expected JSON bodies");
+        };
+        assert_eq!(existing_body, ghost_body, "unauth 401 must be uniform");
+    }
+
     #[test]
     fn non_member_on_api_path_gets_the_unknown_project_response() {
         let mut c = conn();
