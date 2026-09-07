@@ -1995,6 +1995,73 @@ mod tests {
         hold_ladder::clear();
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn agent_terminated_mid_flight_stops_the_open_slow_path_wait() {
+        // R29 class-sweep sibling (port of
+        // test_sec_r29_terminate_sse_revoke.py::
+        // test_wait_for_events_stops_when_agent_terminated_midflight):
+        // an agent terminated WHILE already parked in the slow path's
+        // open long-poll must have that poll stop on its next
+        // `FLAG_RECHECK_INTERVAL_SECONDS` liveness tick, not keep
+        // waiting/delivering for the rest of its requested window.
+        //
+        // `RevalidatingStream` (conexus_wakeloop::stream_gates) is the
+        // shared mechanism this relies on -- already unit-tested
+        // generically there (`idle_expiry_revokes_when_no_longer_live`,
+        // and SEC-B-F2's post-dequeue sibling
+        // `a_dequeued_item_is_discarded_and_revoked_when_no_longer_live`)
+        // and at the entry-gate level here
+        // (`flag_gate_off_returns_stop_listening_and_unregisters`), but
+        // neither exercises revocation occurring strictly AFTER a
+        // waiter is already parked in `wait_for_events_slow_path`'s
+        // loop -- the actual "already-open long-poll" shape the R29
+        // test file pins. This is that missing mid-flight case.
+        let conn = test_conn();
+        seed_agent(&conn, "kate").await;
+        let registry = WaiterRegistry::new();
+        let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        // Long enough that only the liveness re-check tick -- not the
+        // overall hold deadline -- can end the call inside this window.
+        let setup = enter_slow_path(&conn, &ctx, "kate", &json!({"timeout_seconds": 300})).await;
+
+        // Terminate AFTER the waiter is already parked, mirroring an
+        // already-open long-poll being revoked mid-flight (not a
+        // pre-existing terminated agent that should never have entered
+        // the slow path at all -- that's the entry-gate test above).
+        {
+            let guard = conn.lock().await;
+            AgentRepository::update_field(
+                &guard,
+                "kate",
+                AgentField::Status,
+                FieldValue::Text("terminated".to_string()),
+                &now_iso(),
+            )
+            .unwrap();
+        }
+
+        let result = wait_for_events_slow_path(setup, &conn, &ctx).await;
+        let ToolResult::Ok { data, .. } = result else {
+            panic!("expected Ok");
+        };
+        let events = data.unwrap();
+        let events = events["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["type"], "stop_listening");
+        assert!(
+            events[0]["payload"]["reason"]
+                .as_str()
+                .unwrap()
+                .to_lowercase()
+                .contains("terminat"),
+            "the stop reason must attribute the stop to termination, got {events:?}"
+        );
+        // Mid-flight revocation must unregister the waiter, same as
+        // every other slow-path exit.
+        assert_eq!(registry.waiter_count("kate"), 0);
+    }
+
     // -- is_identified_agent --------------------------------------------
 
     #[test]

@@ -1495,6 +1495,135 @@ mod tests {
     }
 
     #[test]
+    fn assemble_event_feed_clamps_the_merged_cursor_to_the_message_truncation_boundary() {
+        // BL-R21-1, end-to-end through `assemble_event_feed` (port of
+        // test_sec_r21_event_feed_clamp_propagation.py::
+        // test_newer_task_event_does_not_skip_truncated_messages).
+        //
+        // `collect_events_with_cap`'s own internal clamp (see
+        // `collect_events_with_cap_caps_at_the_message_query_cap` above)
+        // and `cap_events_to_boundary` in isolation (see the
+        // `no_boundary_returns_events_unchanged` group above) were both
+        // already covered, but neither exercised the full merge
+        // pipeline with a real UNBOUNDED sibling stream
+        // (`unassigned_task_appeared`) layered on top of a truncated
+        // message backlog. A newer such event must not drag the merged
+        // cursor past the message truncation boundary, or messages
+        // beyond the cap would be skipped forever on the next poll.
+        let conn = test_conn();
+        seed_agent(&conn, "alice");
+        let total = MESSAGE_EVENT_QUERY_CAP + 100;
+        for i in 0..total {
+            send_message(
+                &conn,
+                &format!("m{i}"),
+                "alice",
+                &format!(
+                    "2026-01-01T{:02}:{:02}:{:02}Z",
+                    i / 3600,
+                    (i / 60) % 60,
+                    i % 60
+                ),
+                "text",
+            );
+        }
+        // A task transitioning to unassigned strictly AFTER every
+        // message -- in production this is exactly the scenario BL-R21-1
+        // fixed: a newer, unbounded event dragging a naive global max()
+        // cursor past undelivered messages.
+        task_repository::create(
+            &conn,
+            NewTask {
+                task_id: Some("task_newer"),
+                title: "newer than the truncated backlog",
+                description: None,
+                assigned_to: None,
+                created_by: "bob",
+                status: "pending",
+                priority: "medium",
+                parent_task: None,
+                child_tasks: None,
+                depends_on_tasks: None,
+                notes: None,
+                now: "2026-01-02T00:00:00Z",
+            },
+        )
+        .unwrap();
+
+        // ---- Poll 1: truncated at the cap; the task event held back.
+        let poll1 = assemble_event_feed(
+            &conn,
+            "alice",
+            None,
+            "2026-01-03T00:00:00Z",
+            Vec::new(),
+            false,
+            no_env,
+        )
+        .unwrap();
+        let msg_events1 = poll1
+            .events
+            .iter()
+            .filter(|e| e["type"] == "message")
+            .count();
+        assert_eq!(msg_events1 as i64, MESSAGE_EVENT_QUERY_CAP);
+        assert!(
+            !poll1
+                .events
+                .iter()
+                .any(|e| e["type"] == "unassigned_task_appeared"),
+            "the newer task event must be clamped OUT of the truncated first batch \
+             so it can't drag the cursor forward, got {:?}",
+            poll1.events
+        );
+        let cap_boundary = format!(
+            "2026-01-01T{:02}:{:02}:{:02}Z",
+            (MESSAGE_EVENT_QUERY_CAP - 1) / 3600,
+            ((MESSAGE_EVENT_QUERY_CAP - 1) / 60) % 60,
+            (MESSAGE_EVENT_QUERY_CAP - 1) % 60
+        );
+        assert_eq!(
+            poll1.next_cursor, cap_boundary,
+            "the persisted cursor must be CAPPED to the 500th message's timestamp, \
+             not the newer task event"
+        );
+
+        // ---- Poll 2: from the capped cursor, the remaining messages AND
+        // the previously-held-back task event now surface -- nothing
+        // skipped, nothing duplicated.
+        let poll2 = assemble_event_feed(
+            &conn,
+            "alice",
+            Some(poll1.next_cursor.as_str()),
+            "2026-01-03T00:00:00Z",
+            Vec::new(),
+            false,
+            no_env,
+        )
+        .unwrap();
+        let msg_events2 = poll2
+            .events
+            .iter()
+            .filter(|e| e["type"] == "message")
+            .count();
+        assert_eq!(msg_events2 as i64, total - MESSAGE_EVENT_QUERY_CAP);
+        assert!(
+            poll2
+                .events
+                .iter()
+                .any(|e| e["type"] == "unassigned_task_appeared" && e["ref_id"] == "task_newer"),
+            "the deferred unassigned-task event must surface once the message \
+             backlog drops below the cap, got {:?}",
+            poll2.events
+        );
+        assert_eq!(
+            poll2.next_cursor, "2026-01-02T00:00:00Z",
+            "with no more truncation the cursor advances to the true global max \
+             (the task event)"
+        );
+    }
+
+    #[test]
     fn assemble_event_feed_empty_result_preserves_the_cursor() {
         let conn = test_conn();
         seed_agent(&conn, "alice");
