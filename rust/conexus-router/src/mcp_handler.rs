@@ -6,14 +6,29 @@
 //! extractors/responses -- these two handler functions are the first
 //! REAL callers of `proxy_core`/`orchestrator`/`project_registry`.
 //!
-//! **Scope, matching PR 8's own decision**: the BEARER-authenticated
-//! path only. Every branch that needs a cookie-authenticated operator
-//! session (`_forwarding_header_from_cookie`, the REST-side operator-
-//! session gate) is out of scope until that identity plumbing is
-//! ported. A caller with no bearer at all gets the SAME uniform 401
-//! Python's own no-credential branch returns -- there is no cookie
-//! fallback to attempt yet, matching Python's OWN behavior for a
-//! caller carrying neither credential.
+//! **Scope**: [`backend_mcp_handler`] stays BEARER-authenticated only,
+//! matching PR 8's own decision -- a caller with no bearer at all gets
+//! the SAME uniform 401 Python's own no-credential branch returns,
+//! with no cookie fallback attempted (that path's own dependencies
+//! would need the SAME re-derivation-per-body-read discipline Python's
+//! `inject_header_resolver` closure exists for; `/mcp`'s body is a
+//! genuine live upstream hold for `GET /mcp`, unlike `/api`'s, so this
+//! crate's simpler "resolve once, pass a signed value" shape from
+//! [`backend_api_handler`] below doesn't carry over cleanly -- left
+//! for a later PR rather than forced in here).
+//!
+//! [`backend_api_handler`] DOES apply a cookie-authenticated operator
+//! session when no bearer is present -- it takes the already-resolved
+//! `(operator_id, role)` as its `cookie_role` parameter rather than
+//! resolving it itself (see that function's own doc for why: it stays
+//! DB-free, its caller -- `proxy_routes.rs` -- resolves the cookie via
+//! `crate::cookie_forwarding` under a short-lived DB lock first). This
+//! closes the gap that left every cookie-authenticated dashboard
+//! request (`all-data`/`events`) 401ing once a project's backend is
+//! the Rust `conexus-backend` (which, unlike the old Python backend,
+//! has no raw-cookie admission door of its own; see
+//! `conexus-backend::rest_principal`'s own module doc for why that
+//! door was deliberately dropped).
 //!
 //! **SEC FINDING 1 (constant-time pre-auth 401 floor) is preserved
 //! bit-for-bit**: an UNKNOWN project (resolved in-process, fast) and a
@@ -37,7 +52,10 @@ use chrono::Utc;
 use hyper::{HeaderMap, Method};
 use regex::Regex;
 
-use crate::orchestrator::ensure::{EnsureConfig, EnsureError};
+use conexus_auth::forwarding_header::{self, ForwardedRole};
+
+use crate::orchestrator::ensure::{self, EnsureConfig, EnsureError};
+use crate::orchestrator::primitives::ensure_forwarding_hmac_key;
 use crate::orchestrator::resolve::{self, ResolveError};
 use crate::orchestrator::runtime::{EnsureFailureReason, RuntimeStore};
 use crate::path_policy;
@@ -299,6 +317,32 @@ fn ensure_error_status(e: &EnsureError) -> (u16, String, Option<Duration>) {
     }
 }
 
+/// Map an [`EnsureError`] straight to a [`HandlerResponse`] -- shared
+/// by [`proxy_error_response`]'s `ProxyError::Ensure` arm and
+/// [`backend_api_handler`]'s own pre-proxy `ensure()` call (the
+/// cookie-forwarding bridge's F015 v5 step), so the SAME real failure
+/// produces the byte-identical response regardless of which of those
+/// two call sites happens to hit it first.
+fn ensure_error_response(e: &EnsureError) -> HandlerResponse {
+    let (status, message, retry_after) = ensure_error_status(e);
+    // Port of `too_many_requests_response`'s own ceil-to-whole-seconds
+    // convention (rate_limit.rs) -- an HTTP `Retry-After` is defined in
+    // whole seconds, and rounding UP means a caller never retries a
+    // hair too early.
+    let headers = match retry_after {
+        Some(d) => vec![(
+            "Retry-After".to_string(),
+            (d.as_secs_f64().ceil().max(1.0) as u64).to_string(),
+        )],
+        None => vec![],
+    };
+    HandlerResponse {
+        status,
+        headers,
+        body: HandlerBody::Text(message),
+    }
+}
+
 /// Map any [`ProxyError`] to a genuine [`HandlerResponse`] -- the
 /// SHARED, un-floored mapping every proxy failure gets by default;
 /// [`backend_mcp_handler`] additionally floors two SPECIFIC cases
@@ -308,26 +352,7 @@ fn ensure_error_status(e: &EnsureError) -> (u16, String, Option<Duration>) {
 /// mapping unfloored, exactly as an uncaught Python exception would.
 fn proxy_error_response(e: ProxyError) -> HandlerResponse {
     match e {
-        ProxyError::Ensure(inner) => {
-            let (status, message, retry_after) = ensure_error_status(&inner);
-            // Port of `too_many_requests_response`'s own
-            // ceil-to-whole-seconds convention (rate_limit.rs) -- an
-            // HTTP `Retry-After` is defined in whole seconds, and
-            // rounding UP means a caller never retries a hair too
-            // early.
-            let headers = match retry_after {
-                Some(d) => vec![(
-                    "Retry-After".to_string(),
-                    (d.as_secs_f64().ceil().max(1.0) as u64).to_string(),
-                )],
-                None => vec![],
-            };
-            HandlerResponse {
-                status,
-                headers,
-                body: HandlerBody::Text(message),
-            }
-        }
+        ProxyError::Ensure(inner) => ensure_error_response(&inner),
         ProxyError::BackendUnavailable(_) => HandlerResponse {
             status: 502,
             headers: vec![("Retry-After".to_string(), "2".to_string())],
@@ -476,6 +501,7 @@ pub async fn backend_mcp_handler(
         ensure_cfg,
         proxy_req,
         alias_info.as_ref(),
+        None,
     )
     .await
     {
@@ -495,11 +521,31 @@ pub async fn backend_mcp_handler(
 }
 
 /// `/agent-mcp/__api/<name>/{rest}` -> backend `/api/{rest}`. Port of
-/// `backend_api_handler` -- see the module doc for the cookie-path
-/// scope this deliberately omits (this handler never had any
-/// bearer-vs-cookie branching in Python either; it forwards whatever
-/// credential state the caller already carries and lets the backend's
-/// own auth surface decide).
+/// `backend_api_handler`, PLUS the cookie-authenticated forwarding
+/// bridge Python's OWN `backend_api_handler` never had either (see
+/// this module's own doc and `crate::cookie_forwarding`'s doc for why
+/// that's a deliberate improvement over Python's parity target, not a
+/// divergence bug): when the caller has no bearer, a session cookie
+/// resolving to a real project-member operator gets a freshly-signed
+/// forwarding header minted and attached, closing the gap that left
+/// every cookie-authenticated dashboard request 401ing against the
+/// Rust `conexus-backend`. A bearer-authenticated (or fully
+/// unauthenticated) request's behavior is UNCHANGED.
+///
+/// `cookie_role` is the caller's ALREADY-RESOLVED `(operator_id, role)`
+/// pair (`crate::cookie_forwarding::resolve_cookie_project_role`,
+/// called by the axum wrapper -- `proxy_routes.rs` -- under a SHORT
+/// `RouterState.conn` lock, dropped before this function ever runs).
+/// This function stays DB-free by design (matching every other
+/// framework-agnostic handler in this module): a `rusqlite::Connection`
+/// borrowed for this whole async call would tie `RouterState.conn`'s
+/// single shared lock to the full `ensure()`/UDS-proxy round-trip below
+/// (`lifecycle_rest.rs::delete_project_handler`'s own scoped-`{}`-block
+/// precedent is exactly the pattern this signature avoids needing).
+/// Still enforced HERE, not just trusted from the caller: `cookie_role`
+/// is only ever applied when [`extract_bearer`] finds nothing on THIS
+/// call, so a future caller that (incorrectly) supplies both a bearer
+/// and a resolved `cookie_role` can never have the cookie identity win.
 #[allow(clippy::too_many_arguments)]
 pub async fn backend_api_handler(
     store: &RuntimeStore,
@@ -508,6 +554,7 @@ pub async fn backend_api_handler(
     sock_dir: &std::path::Path,
     ensure_cfg: &EnsureConfig,
     cfg: &McpHandlerConfig,
+    cookie_role: Option<(String, ForwardedRole)>,
     now: chrono::DateTime<Utc>,
     rest: &str,
     req: HandlerRequest,
@@ -553,6 +600,64 @@ pub async fn backend_api_handler(
     };
     let alias_info = alias.map(|(name, expires_at)| AliasInfo { name, expires_at });
 
+    // Cookie-forwarding bridge: only applied when the caller carries NO
+    // bearer at all -- a bearer, even an invalid one, is a stronger
+    // credential this crate never downgrades away from (re-checked
+    // HERE, not just trusted from `cookie_role`'s caller -- see this
+    // function's own doc).
+    let mut forwarding_header_value: Option<String> = None;
+    if let (None, Some((operator_id, role))) = (extract_bearer(&req.headers), cookie_role) {
+        // F015 v5 parity: ensure the backend is actually spawned BEFORE
+        // reading its HMAC key off disk -- the key is written by the
+        // systemd unit's own `ExecStartPre`, which only runs once
+        // `ensure()` triggers a `systemctl start`. A cold backend with
+        // no prior bearer traffic would otherwise 401 every
+        // cookie-authenticated dashboard request in a tight loop (see
+        // `agent_mcp/router/app.py::_forwarding_header_from_cookie`'s
+        // own F015 v5 note).
+        match ensure::ensure(store, registry, sock_dir, &real_name, "backend", ensure_cfg).await {
+            Ok(_) => {
+                if let Ok(Some(key)) = ensure_forwarding_hmac_key(store, sock_dir, &real_name) {
+                    // A FRESH clock read here, not the `now` this function
+                    // received at entry: `ensure()` above can legitimately
+                    // run for many real seconds on a cold start (up to the
+                    // full `boot_grace` window) -- signing against the
+                    // stale entry-time `now` could hand the backend a
+                    // header whose `DEFAULT_TTL_SEC` had ALREADY elapsed
+                    // before it ever left this process. Matches Python's
+                    // own `_fh.sign(...)` call, which reads `time.time()`
+                    // internally at this exact point (AFTER its own
+                    // `await _ensure(...)`), and this crate's established
+                    // "a genuinely time-spanning function reads the clock
+                    // at multiple points" precedent (see
+                    // `orchestrator::ensure`'s own module doc).
+                    let now_unix = Utc::now().timestamp().max(0) as u64;
+                    forwarding_header_value = Some(forwarding_header::sign(
+                        &operator_id,
+                        role,
+                        &key,
+                        now_unix,
+                        forwarding_header::DEFAULT_TTL_SEC,
+                    ));
+                }
+                // else: the HMAC key still isn't on disk even after
+                // ensure() -- a deployment-side bug (the unit's
+                // ExecStartPre didn't run/write it), not this
+                // resolver's to mask. Fall through with no forwarding
+                // header; the backend's own `rest_gate` produces the
+                // correct 401.
+            }
+            Err(e) => {
+                // A real spawn failure (bad unit, timeout, or the
+                // repeated-failure `GaveUp` case) -- the SAME failure
+                // `proxy_to_backend` would hit a few lines down if this
+                // fell through silently. Surface it now with the
+                // identical mapping, rather than a misleading 401.
+                return ensure_error_response(&e);
+            }
+        }
+    }
+
     let proxy_req = ProxyRequest {
         method: req.method,
         path_and_query: path_and_query(&format!("/api/{rest}"), req.query.as_deref()),
@@ -569,6 +674,7 @@ pub async fn backend_api_handler(
         ensure_cfg,
         proxy_req,
         alias_info.as_ref(),
+        forwarding_header_value.as_deref(),
     )
     .await
     {
@@ -974,6 +1080,7 @@ mod tests {
             &sock_dir,
             &fast_ensure_cfg(),
             &fast_cfg(),
+            None,
             test_now(),
             "agents",
             req,
@@ -1010,6 +1117,7 @@ mod tests {
             &sock_dir,
             &fast_ensure_cfg(),
             &fast_cfg(),
+            None,
             test_now(),
             "events",
             req,
@@ -1043,6 +1151,7 @@ mod tests {
             &sock_dir,
             &fast_ensure_cfg(),
             &fast_cfg(),
+            None,
             test_now(),
             "agents",
             req,
@@ -1094,6 +1203,7 @@ mod tests {
             &sock_dir,
             &fast_ensure_cfg(),
             &fast_cfg(),
+            None,
             test_now(),
             "agents",
             req,
@@ -1106,5 +1216,252 @@ mod tests {
             }
             other => panic!("expected a buffered proxied body, got {other:?}"),
         }
+    }
+
+    // ── Cookie-forwarding bridge (the fix this module's own doc
+    // describes). `backend_api_handler` takes an already-resolved
+    // `cookie_role` -- these tests exercise ITS handling of that input
+    // directly; `crate::cookie_forwarding`'s own tests cover the DB
+    // resolution that produces it. ─────────────────────────────────
+
+    async fn spawn_echo_forwarding_header_backend(sock_path: std::path::PathBuf) {
+        spawn_backend(sock_path, |req| {
+            let header = req
+                .headers()
+                .get("x-agent-mcp-forwarded-operator")
+                .map(|v| v.to_str().unwrap().to_string())
+                .unwrap_or_default();
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Full::new(Bytes::from(header)))
+                .unwrap()
+        })
+        .await;
+    }
+
+    fn cookie_bridge_req(no_bearer: bool) -> HandlerRequest {
+        let mut req = base_req("proj-a", "/agent-mcp/__api/proj-a/all-data");
+        req.method = Method::GET;
+        req.headers.insert(
+            hyper::header::ACCEPT,
+            HeaderValue::from_static(API_MEDIA_TYPE),
+        );
+        if no_bearer {
+            req.headers.remove(AUTHORIZATION);
+        }
+        req
+    }
+
+    #[tokio::test]
+    async fn backend_api_handler_mints_a_valid_forwarding_header_when_cookie_role_is_resolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_dir = dir.path().join("sockets");
+        std::fs::create_dir_all(sock_dir.join("proj-a")).unwrap();
+        let key = b"a-real-32-byte-test-hmac-key!!!!".to_vec();
+        std::fs::write(sock_dir.join("proj-a").join("forwarding_hmac"), &key).unwrap();
+        spawn_echo_forwarding_header_backend(sock_dir.join("proj-a").join("backend.sock")).await;
+
+        let registry = registry_with(dir.path(), "proj-a", "python");
+        let store = RuntimeStore::new();
+        let stream_caps = Arc::new(StreamCapRegistry::new(4, 64));
+
+        let resp = backend_api_handler(
+            &store,
+            &stream_caps,
+            &registry,
+            &sock_dir,
+            &fast_ensure_cfg(),
+            &fast_cfg(),
+            Some(("op1".to_string(), ForwardedRole::Operator)),
+            test_now(),
+            "all-data",
+            cookie_bridge_req(true),
+        )
+        .await;
+        assert_eq!(resp.status, 200);
+        let HandlerBody::Proxied(ProxyResponseBody::Buffered(body)) = resp.body else {
+            panic!("expected a buffered proxied body");
+        };
+        let header_value = String::from_utf8_lossy(&body).to_string();
+        assert!(
+            !header_value.is_empty(),
+            "a resolved cookie_role must mint a forwarding header"
+        );
+        // `sign()` is now called against a FRESH `Utc::now()` read
+        // inside `backend_api_handler` itself (see its own comment),
+        // not the fixed `test_now()` this test's OTHER params use --
+        // verify against the real wall clock too.
+        let now_unix = Utc::now().timestamp() as u64;
+        let verified = forwarding_header::verify(
+            &header_value,
+            &key,
+            now_unix,
+            forwarding_header::DEFAULT_REPLAY_WINDOW_SEC,
+        );
+        assert_eq!(
+            verified,
+            Some(("op1".to_string(), ForwardedRole::Operator)),
+            "the minted header must verify with the SAME scheme conexus-backend's \
+             rest_principal uses, and carry the resolved operator/role"
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_api_handler_mints_a_viewer_role_header_not_operator() {
+        // SEC-1 parity: a viewer-tier `cookie_role` must never be
+        // upgraded to operator.
+        let dir = tempfile::tempdir().unwrap();
+        let sock_dir = dir.path().join("sockets");
+        std::fs::create_dir_all(sock_dir.join("proj-a")).unwrap();
+        let key = b"a-real-32-byte-test-hmac-key!!!!".to_vec();
+        std::fs::write(sock_dir.join("proj-a").join("forwarding_hmac"), &key).unwrap();
+        spawn_echo_forwarding_header_backend(sock_dir.join("proj-a").join("backend.sock")).await;
+
+        let registry = registry_with(dir.path(), "proj-a", "python");
+        let store = RuntimeStore::new();
+        let stream_caps = Arc::new(StreamCapRegistry::new(4, 64));
+
+        let resp = backend_api_handler(
+            &store,
+            &stream_caps,
+            &registry,
+            &sock_dir,
+            &fast_ensure_cfg(),
+            &fast_cfg(),
+            Some(("op2".to_string(), ForwardedRole::Viewer)),
+            test_now(),
+            "all-data",
+            cookie_bridge_req(true),
+        )
+        .await;
+        let HandlerBody::Proxied(ProxyResponseBody::Buffered(body)) = resp.body else {
+            panic!("expected a buffered proxied body");
+        };
+        let header_value = String::from_utf8_lossy(&body).to_string();
+        // `sign()` is now called against a FRESH `Utc::now()` read
+        // inside `backend_api_handler` itself (see its own comment),
+        // not the fixed `test_now()` this test's OTHER params use --
+        // verify against the real wall clock too.
+        let now_unix = Utc::now().timestamp() as u64;
+        let verified = forwarding_header::verify(
+            &header_value,
+            &key,
+            now_unix,
+            forwarding_header::DEFAULT_REPLAY_WINDOW_SEC,
+        );
+        assert_eq!(verified, Some(("op2".to_string(), ForwardedRole::Viewer)));
+    }
+
+    #[tokio::test]
+    async fn backend_api_handler_mints_no_header_when_cookie_role_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_dir = dir.path().join("sockets");
+        std::fs::create_dir_all(sock_dir.join("proj-a")).unwrap();
+        spawn_echo_forwarding_header_backend(sock_dir.join("proj-a").join("backend.sock")).await;
+
+        let registry = registry_with(dir.path(), "proj-a", "python");
+        let store = RuntimeStore::new();
+        let stream_caps = Arc::new(StreamCapRegistry::new(4, 64));
+
+        let resp = backend_api_handler(
+            &store,
+            &stream_caps,
+            &registry,
+            &sock_dir,
+            &fast_ensure_cfg(),
+            &fast_cfg(),
+            None, // no cookie, no session, or not a project member
+            test_now(),
+            "all-data",
+            cookie_bridge_req(true),
+        )
+        .await;
+        assert_eq!(resp.status, 200);
+        let HandlerBody::Proxied(ProxyResponseBody::Buffered(body)) = resp.body else {
+            panic!("expected a buffered proxied body");
+        };
+        assert_eq!(
+            body.as_ref(),
+            b"",
+            "no resolved cookie_role must never mint a forwarding header"
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_api_handler_ignores_a_resolved_cookie_role_when_a_bearer_is_present() {
+        // A bearer is a stronger credential this crate never downgrades
+        // away from -- even a resolved `cookie_role` must be ignored
+        // once a bearer is present (task requirement: bearer-
+        // authenticated behavior is unaffected by this change). This
+        // is `backend_api_handler`'s own defense-in-depth re-check, not
+        // just caller discipline -- see its doc.
+        let dir = tempfile::tempdir().unwrap();
+        let sock_dir = dir.path().join("sockets");
+        std::fs::create_dir_all(sock_dir.join("proj-a")).unwrap();
+        spawn_echo_forwarding_header_backend(sock_dir.join("proj-a").join("backend.sock")).await;
+
+        let registry = registry_with(dir.path(), "proj-a", "python");
+        let store = RuntimeStore::new();
+        let stream_caps = Arc::new(StreamCapRegistry::new(4, 64));
+
+        // bearer_headers() is already set by base_req (no_bearer=false).
+        let req = cookie_bridge_req(false);
+
+        let resp = backend_api_handler(
+            &store,
+            &stream_caps,
+            &registry,
+            &sock_dir,
+            &fast_ensure_cfg(),
+            &fast_cfg(),
+            Some(("op1".to_string(), ForwardedRole::Operator)),
+            test_now(),
+            "all-data",
+            req,
+        )
+        .await;
+        assert_eq!(resp.status, 200);
+        let HandlerBody::Proxied(ProxyResponseBody::Buffered(body)) = resp.body else {
+            panic!("expected a buffered proxied body");
+        };
+        assert_eq!(
+            body.as_ref(),
+            b"",
+            "a bearer-carrying request must never mint a cookie-derived forwarding header"
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_api_handler_surfaces_a_real_ensure_failure_for_a_cookie_authenticated_caller()
+    {
+        // No backend spawned at all -- `ensure()`'s own socket-poll
+        // timeout must surface as the SAME real error status
+        // `proxy_to_backend` would produce a few lines down, not a
+        // misleading 401 (matches `proxy_core.rs`'s own
+        // `proxy_to_backend_reports_backend_unavailable_for_a_missing_socket`
+        // precedent for the equivalent bearer-path failure).
+        let dir = tempfile::tempdir().unwrap();
+        let sock_dir = dir.path().join("sockets");
+        let registry = registry_with(dir.path(), "proj-a", "python");
+        let store = RuntimeStore::new();
+        let stream_caps = Arc::new(StreamCapRegistry::new(4, 64));
+
+        let resp = backend_api_handler(
+            &store,
+            &stream_caps,
+            &registry,
+            &sock_dir,
+            &fast_ensure_cfg(),
+            &fast_cfg(),
+            Some(("op1".to_string(), ForwardedRole::Operator)),
+            test_now(),
+            "all-data",
+            cookie_bridge_req(true),
+        )
+        .await;
+        assert_eq!(
+            resp.status, 504,
+            "a real ensure() failure must surface as its own real status, not a misleading 401"
+        );
     }
 }

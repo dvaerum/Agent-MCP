@@ -13,13 +13,16 @@
 //! `path_policy::UNAUTH_PREFIXES` -- the session gate already passes
 //! it through unconditionally; `/agent-mcp/api/` is REDIRECT-exempt
 //! but not unauth-exempt in Python's real path-policy tables, since a
-//! cookie-authenticated dashboard browser call also flows through
-//! this same route -- that cookie-forwarding composition is still
-//! PR9's own documented, deliberate scope gap ("the bearer-
-//! authenticated path only"), not something this step re-opens).
-//! Still wrapped by security-headers/rate-limit/empty-users-redirect
-//! (the empty-users-redirect is a documented no-op here either way --
-//! both prefixes are in `path_policy::REDIRECT_EXEMPT_PREFIXES`).
+//! cookie-authenticated dashboard browser call also flows through this
+//! same route). [`api_proxy_handler`]/[`api_proxy_handler_no_rest`]
+//! resolve that cookie-forwarding bridge (`crate::cookie_forwarding`)
+//! themselves, in a SHORT `state.conn.lock().await` scope dropped
+//! before `backend_api_handler` ever runs -- see
+//! [`resolve_cookie_role_for_proxy`]'s own doc for why that split
+//! exists. Still wrapped by security-headers/rate-limit/empty-users-
+//! redirect (the empty-users-redirect is a documented no-op here
+//! either way -- both prefixes are in
+//! `path_policy::REDIRECT_EXEMPT_PREFIXES`).
 
 use std::sync::Arc;
 
@@ -27,8 +30,13 @@ use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, Method, Uri};
 use axum::response::{IntoResponse, Response};
+use chrono::{DateTime, Utc};
 
+use conexus_auth::forwarding_header::ForwardedRole;
+
+use crate::cookie_forwarding;
 use crate::mcp_handler::{self, HandlerRequest};
+use crate::orchestrator::resolve;
 use crate::state::RouterState;
 
 fn handler_request(
@@ -73,6 +81,47 @@ pub async fn mcp_proxy_handler(
     .into_response()
 }
 
+/// Resolve `req`'s cookie-authenticated project role, if any, for
+/// [`api_proxy_handler`]/[`api_proxy_handler_no_rest`] to pass into
+/// `backend_api_handler`'s `cookie_role` parameter.
+///
+/// **Why this lives here, not inside `backend_api_handler` itself**:
+/// `RouterState.conn` is ONE shared `tokio::sync::Mutex` behind the
+/// WHOLE router (every project's dashboard/admin traffic) -- borrowing
+/// it for `backend_api_handler`'s entire async call would tie that
+/// single lock to the full `ensure()`/UDS-proxy round-trip beneath it
+/// (a cold-start `ensure()` can legitimately take several real
+/// seconds). Every other `state.conn.lock().await` call site in this
+/// crate scopes the guard tightly and drops it before any such
+/// subsequent long-running async work (`lifecycle_rest.rs::
+/// delete_project_handler`'s own `{}`-scoped-lock-then-proceed
+/// precedent) -- this function is that same scope, factored out so
+/// both proxy routes share it.
+///
+/// Returns `None` immediately, with NO lock taken at all, when a
+/// bearer is already present (a stronger credential this crate never
+/// downgrades away from) or when the URL segment doesn't resolve to a
+/// real/aliased project (the real 404 is `backend_api_handler`'s own
+/// job, via its own `resolve::resolve` call moments later).
+async fn resolve_cookie_role_for_proxy(
+    state: &RouterState,
+    req: &HandlerRequest,
+    now: DateTime<Utc>,
+) -> Option<(String, ForwardedRole)> {
+    if mcp_handler::extract_bearer(&req.headers).is_some() {
+        return None;
+    }
+    let cookie_header = req
+        .headers
+        .get(axum::http::header::COOKIE)
+        .and_then(|v| v.to_str().ok())?;
+    let (real_name, _alias) = resolve::resolve(&state.registry, &req.project_name, now).ok()?;
+    let conn = state.conn.lock().await;
+    cookie_forwarding::resolve_cookie_project_role(&conn, Some(cookie_header), &real_name, now)
+        .ok()
+        .flatten()
+}
+
 /// `/agent-mcp/api/{name}/{*rest}` -- the common case, a real
 /// sub-path under the project's API.
 pub async fn api_proxy_handler(
@@ -84,6 +133,8 @@ pub async fn api_proxy_handler(
     body: Bytes,
 ) -> Response {
     let req = handler_request(method, &uri, name, headers, body);
+    let now = chrono::Utc::now();
+    let cookie_role = resolve_cookie_role_for_proxy(&state, &req, now).await;
     mcp_handler::backend_api_handler(
         &state.runtime,
         &state.stream_caps,
@@ -91,7 +142,8 @@ pub async fn api_proxy_handler(
         &state.sock_dir,
         &state.ensure_config,
         &state.mcp_handler_config,
-        chrono::Utc::now(),
+        cookie_role,
+        now,
         &rest,
         req,
     )
@@ -112,6 +164,8 @@ pub async fn api_proxy_handler_no_rest(
     body: Bytes,
 ) -> Response {
     let req = handler_request(method, &uri, name, headers, body);
+    let now = chrono::Utc::now();
+    let cookie_role = resolve_cookie_role_for_proxy(&state, &req, now).await;
     mcp_handler::backend_api_handler(
         &state.runtime,
         &state.stream_caps,
@@ -119,7 +173,8 @@ pub async fn api_proxy_handler_no_rest(
         &state.sock_dir,
         &state.ensure_config,
         &state.mcp_handler_config,
-        chrono::Utc::now(),
+        cookie_role,
+        now,
         "",
         req,
     )
