@@ -89,6 +89,9 @@ pkgs.testers.nixosTest {
         ];
         RuntimeDirectory = "agent-mcp/%i";
         RuntimeDirectoryMode = "0700";
+        # See agent-mcp-router's own RuntimeDirectoryPreserve comment
+        # below -- same bare-parent-vs-%i-child sharing, same fix.
+        RuntimeDirectoryPreserve = "yes";
         # R8-F2 class-sweep: same forwarding-HMAC fix as single-tenant.nix
         # — see its comment. Idempotent stale-socket cleanup (bind() can't
         # bind over an existing sock file) kept as the second step.
@@ -147,8 +150,19 @@ pkgs.testers.nixosTest {
         Type = "simple";
         User = "testuser";
         Group = "testuser";
+        # RuntimeDirectoryPreserve=yes (live incident 2026-09-07, see
+        # nix/home-manager-module.nix's agent-mcp-router unit for the
+        # full writeup): this bare, single-component RuntimeDirectory
+        # is a strict parent of agent-mcp@'s own "agent-mcp/%i" above --
+        # per systemd.exec(5), that makes it THIS unit's own innermost
+        # subdirectory, so without `=yes` every stop of this router
+        # (crash-loop, redeploy) recursively deletes the whole
+        # /run/agent-mcp tree, including any live per-project backend's
+        # own subdirectory and socket -- exactly the multi-tenant
+        # scenario this test exists to exercise.
         RuntimeDirectory = "agent-mcp";
         RuntimeDirectoryMode = "0700";
+        RuntimeDirectoryPreserve = "yes";
         ExecStartPre = "${pkgs.coreutils}/bin/mkdir -p /home/testuser/.config/agent-mcp /home/testuser/projects";
         ExecStart = "${packagedPkgs.agentMcpRouterWrapper}/bin/agent-mcp-router";
         Restart = "on-failure";

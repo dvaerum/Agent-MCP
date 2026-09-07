@@ -754,6 +754,15 @@ in {
           # (= $XDG_RUNTIME_DIR/agent-mcp/<name>/) — tmpfs, 0700.
           RuntimeDirectory = "agent-mcp/%i";
           RuntimeDirectoryMode = "0700";
+          # Matches nix/module.nix's system-mode template (which has
+          # carried this since PR #214-era hardening) — home-manager's
+          # copy never got it, which is exactly what let a SIBLING
+          # unit's own RuntimeDirectory teardown (see agent-mcp-router/
+          # conexus-router's own RuntimeDirectoryPreserve comment below)
+          # go unnoticed for this long: without `=yes` here too, THIS
+          # unit's own stop/restart would ALSO be free to tear down its
+          # leaf on every cycle rather than just on uninstall.
+          RuntimeDirectoryPreserve = "yes";
           Environment = [
             # Backend MUST point at the same router.db as the router
             # unit below. agent_mcp.app.deps._resolve_session_user lazily
@@ -856,6 +865,10 @@ in {
           Type = "simple";
           RuntimeDirectory = "agent-mcp/%i";
           RuntimeDirectoryMode = "0700";
+          # See `agent-mcp@`'s own RuntimeDirectoryPreserve comment
+          # above — same rationale, same fix, ported from
+          # nix/module.nix's already-correct system-mode template.
+          RuntimeDirectoryPreserve = "yes";
           ExecStartPre = [
             "${pkgs.runtimeShell} -c 'test -f \"$RUNTIME_DIRECTORY/forwarding_hmac\" || { ${pkgs.coreutils}/bin/head -c 32 /dev/urandom > \"$RUNTIME_DIRECTORY/forwarding_hmac\" && ${pkgs.coreutils}/bin/chmod 600 \"$RUNTIME_DIRECTORY/forwarding_hmac\"; }'"
             "${pkgs.coreutils}/bin/rm -f %t/agent-mcp/%i/backend.sock"
@@ -937,8 +950,30 @@ in {
           # project subdirs the template creates inherit a private
           # parent. (The template's own RuntimeDirectory creates each
           # %t/agent-mcp/<name>/; this just ensures the parent exists.)
+          #
+          # RuntimeDirectoryPreserve=yes is NOT optional here (live
+          # incident, 2026-09-07): `RuntimeDirectory=agent-mcp` is a
+          # BARE, single-component value -- per systemd.exec(5)'s
+          # RuntimeDirectory= section, that bare path IS this unit's
+          # "innermost subdirectory", so on every stop (a crash-loop
+          # restart, a redeploy, `router.impl` A/B flip while BOTH
+          # router units briefly coexist) systemd rm's the ENTIRE
+          # %t/agent-mcp/ tree by default -- including every live
+          # per-project conexus@%i/agent-mcp@%i subdirectory and UDS
+          # socket unrelated units still own and are actively listening
+          # on. Confirmed live: a stray enabled-but-port-losing
+          # `agent-mcp-router` crash-looping every ~10s (address already
+          # in use against a running `conexus-router`) wiped
+          # %t/agent-mcp/ on each cycle, so `ss` kept showing per-project
+          # sockets LISTEN (the kernel remembers the bind) while every
+          # new connect() to the now-unlinked path failed --
+          # indistinguishable from "backend not ready" at every layer
+          # above this. `=yes` makes this unit's OWN stop leave the tree
+          # alone, matching nix/module.nix's system-mode template (which
+          # already carries the equivalent guard on ITS units).
           RuntimeDirectory = "agent-mcp";
           RuntimeDirectoryMode = "0700";
+          RuntimeDirectoryPreserve = "yes";
           # Single-tenant: seed projects.local.json with the one
           # declared project before the router starts. Multi-tenant
           # this is a no-op (no ExecStartPre is set).
@@ -1051,8 +1086,15 @@ in {
               if cfg.sso.proxyHeader.defaultIsSysadmin then "true" else "false"
             }"
           ];
+          # See `agent-mcp-router`'s own RuntimeDirectoryPreserve
+          # comment above -- identical bare-parent footgun, identical
+          # fix. This unit is the one that was actually live-affected
+          # (2026-09-07): `conexus-router` itself restarting (e.g. this
+          # very cutover's home-manager switch) wiped the shared tree
+          # just as effectively as `agent-mcp-router`'s crash-loop did.
           RuntimeDirectory = "agent-mcp";
           RuntimeDirectoryMode = "0700";
+          RuntimeDirectoryPreserve = "yes";
           ExecStartPre = lib.mkIf (!cfg.multiTenant) [
             "${singleProjectSeedScript}"
           ];

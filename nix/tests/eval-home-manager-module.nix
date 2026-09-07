@@ -73,6 +73,14 @@ let
             externalUrl = "https://example.invalid";
             defaultWorkspaceParent = "/home/test/.local/share/agent-mcp/projects";
           };
+          # Stub packages (never built -- this harness is eval-only) to
+          # bring the `conexus-router`/`conexus@` units into existence
+          # for RuntimeDirectoryPreserve coverage below; any `nullOr
+          # package`-typed value satisfies the option, `pkgs.hello`
+          # just needs a real `/bin/<name>` for ExecStart string
+          # interpolation to resolve at eval time.
+          conexusRouterPackage = pkgs.hello;
+          conexusLauncherPackage = pkgs.hello;
         } // lib.optionalAttrs (modulePkgs != null) { pkgs = modulePkgs; };
       }
     ];
@@ -91,6 +99,25 @@ in {
   routerExecStart = units."agent-mcp-router".Service.ExecStart;
   backendExecStart = units."agent-mcp@".Service.ExecStart;
   routerEnvironment = units."agent-mcp-router".Service.Environment;
+
+  # RuntimeDirectoryPreserve regression guard (live incident,
+  # 2026-09-07): `agent-mcp-router`/`conexus-router` declare a BARE
+  # `RuntimeDirectory = "agent-mcp"`, a strict parent of the per-project
+  # templates' `agent-mcp/%i`. Per systemd.exec(5), that bare value IS
+  # the router unit's own "innermost subdirectory", so without
+  # `RuntimeDirectoryPreserve = "yes"` EVERY stop of EITHER router unit
+  # (a crash-loop, a redeploy, an A/B `router.impl` flip) recursively
+  # removes the WHOLE `%t/agent-mcp/` tree -- including every live
+  # per-project backend's own subdirectory and UDS socket, unrelated
+  # units still own and are actively listening on. See each unit's own
+  # inline comment in ../home-manager-module.nix for the full incident
+  # writeup this test pins against a regression of.
+  runtimeDirectoryPreserve = {
+    agent-mcp-router = units."agent-mcp-router".Service.RuntimeDirectoryPreserve or null;
+    conexus-router = units."conexus-router".Service.RuntimeDirectoryPreserve or null;
+    "agent-mcp@" = units."agent-mcp@".Service.RuntimeDirectoryPreserve or null;
+    "conexus@" = units."conexus@".Service.RuntimeDirectoryPreserve or null;
+  };
 
   # Store paths installed into the profile.
   homePackages = map (p: p.outPath) cfg.home.packages;
