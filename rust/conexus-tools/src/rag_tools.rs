@@ -99,10 +99,13 @@ fn config_allow_worker_view_foreign_tasks(conn: &Connection) -> bool {
 /// Why [`query_rag_system`] failed to produce an answer. Both variants
 /// render to the IDENTICAL generic `Failed` message at the tool
 /// boundary (SD-R9-1: never leak provider detail to a worker) --
-/// kept as a real enum, not a bare error unit, only so a future
-/// logging pass (this workspace has no logging/tracing crate yet --
-/// see `project_settings_tools`'s own note) has something to log
-/// distinctly. No live behavioral difference between variants today.
+/// kept as a real enum, not a bare error unit, so the two call sites
+/// that construct it can each log a distinctly-worded `eprintln!`
+/// before discarding the real error (this workspace still has no
+/// logging/tracing crate -- see `project_settings_tools`'s own note --
+/// so this matches the plain-`eprintln!` convention already used
+/// elsewhere, e.g. `conexus-backend::server.rs`'s `log_failed_tool_
+/// result`). No live behavioral difference between variants today.
 #[derive(Debug)]
 enum RagQueryError {
     CompletionNotConfigured,
@@ -447,15 +450,41 @@ async fn query_rag_system(
     );
 
     // --- 5. Chat completion ---
-    let client = completion_client::resolve_from_process_env()
-        .map_err(|_| RagQueryError::CompletionNotConfigured)?;
+    let client = completion_client::resolve_from_process_env().map_err(|e| {
+        // SD-R9-1: the caller-facing message stays the identical
+        // generic string either way (see RagQueryError's own doc) --
+        // but unlike the earlier draft of this port, the real detail
+        // is no longer discarded before it could ever reach a log.
+        // Matches Python's own `logger.error(..., exc_info=True)`
+        // half of this fix, which the original `map_err(|_| ...)`
+        // here silently dropped.
+        eprintln!(
+            "{}",
+            rag_completion_error_log_line("completion client unavailable", &e)
+        );
+        RagQueryError::CompletionNotConfigured
+    })?;
     client
         .chat(
             &[("system", SYSTEM_PROMPT_GENERAL), ("user", &user_message)],
             0.4,
         )
         .await
-        .map_err(|_| RagQueryError::CompletionUnavailable)
+        .map_err(|e| {
+            eprintln!(
+                "{}",
+                rag_completion_error_log_line("chat completion failed", &e)
+            );
+            RagQueryError::CompletionUnavailable
+        })
+}
+
+/// Pure half of the two `eprintln!` sites above -- isolated so the
+/// log-line format is unit-testable without capturing real stderr,
+/// matching `conexus-backend::server.rs`'s own `failed_tool_result_
+/// log_line` precedent.
+fn rag_completion_error_log_line(context: &str, err: &impl std::fmt::Display) -> String {
+    format!("conexus-tools: ask_project_rag {context}: {err}")
 }
 
 // --- ask_project_rag tool -------------------------------------------
@@ -550,6 +579,26 @@ mod tests {
             source_token: None,
             capabilities: caps,
         }
+    }
+
+    #[test]
+    fn rag_completion_error_log_line_carries_the_real_detail() {
+        // Port of test_sec_r9_rag_error_prose.py's server-side-logging
+        // assertion (SD-R9-1) -- the caller-facing message is already
+        // proven generic elsewhere (RagQueryError always renders to
+        // the identical static string); this proves the detail this
+        // port previously discarded (`map_err(|_| ...)`) is now
+        // actually captured for a server-side log line.
+        struct FakeError(&'static str);
+        impl std::fmt::Display for FakeError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}", self.0)
+            }
+        }
+        let leak = "no such column: rag_chunks.secret";
+        let line = rag_completion_error_log_line("chat completion failed", &FakeError(leak));
+        assert!(line.contains(leak));
+        assert!(line.contains("ask_project_rag"));
     }
 
     fn operator_session() -> Principal {
