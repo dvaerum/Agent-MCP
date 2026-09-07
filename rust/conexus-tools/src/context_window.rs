@@ -31,6 +31,16 @@ const PROMPT_OVERHEAD_TOKENS: u64 = 512;
 const MAX_TOKENS_PER_WORD: u64 = 2;
 const MIN_BUDGET: u64 = 256;
 
+/// Subject helper: a one-line subject only needs the OPENING of a
+/// message, so its input cap is CEILING-capped (never grows past this
+/// even on a huge window) yet still auto-shrinks below the ceiling on
+/// a smaller window.
+const SUBJECT_CHARS_CEILING: u64 = 4000;
+const SUBJECT_RESERVE_TOKENS: u64 = 128;
+/// Conservative chars/token: a SMALL value keeps the char cap safe
+/// (fewer chars per token budget) even for dense/code/CJK input.
+const CHARS_PER_TOKEN: u64 = 2;
+
 const PROPS_TIMEOUT_SECS: u64 = 3;
 
 fn env_nonempty(get_env: &impl Fn(&str) -> Option<String>, key: &str) -> Option<String> {
@@ -141,6 +151,22 @@ pub async fn resolve_max_context_tokens(
     (context_tokens / MAX_TOKENS_PER_WORD).max(MIN_BUDGET)
 }
 
+/// Max characters of message body fed to the subject-suggestion
+/// helper -- small enough to never overflow the window, ceiling-capped
+/// because a subject only needs the opening. Falls back to the
+/// ceiling (Ollama/undiscoverable-window behaviour) when the window
+/// can't be determined.
+pub async fn resolve_subject_input_chars(
+    get_env: impl Fn(&str) -> Option<String>,
+    base_url: Option<&str>,
+) -> u64 {
+    let Some(window) = resolve_context_window(get_env, base_url).await else {
+        return SUBJECT_CHARS_CEILING;
+    };
+    let safe_tokens = window.saturating_sub(SUBJECT_RESERVE_TOKENS).max(1);
+    SUBJECT_CHARS_CEILING.min(safe_tokens * CHARS_PER_TOKEN)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,5 +274,40 @@ mod tests {
         // Nothing bound on this port -- connection refused.
         let window = resolve_context_window(env(&[]), Some("http://127.0.0.1:1")).await;
         assert_eq!(window, None);
+    }
+
+    // ── resolve_subject_input_chars ──
+
+    #[tokio::test]
+    async fn undiscoverable_window_falls_back_to_the_ceiling() {
+        let chars = resolve_subject_input_chars(env(&[]), None).await;
+        assert_eq!(chars, SUBJECT_CHARS_CEILING);
+    }
+
+    #[tokio::test]
+    async fn a_small_window_shrinks_below_the_ceiling() {
+        // (2048 - 128) * 2 = 3840, below the 4000 ceiling.
+        let chars =
+            resolve_subject_input_chars(env(&[("AGENT_MCP_MODEL_CONTEXT_WINDOW", "2048")]), None)
+                .await;
+        assert_eq!(chars, 3840);
+    }
+
+    #[tokio::test]
+    async fn a_huge_window_stays_capped_at_the_ceiling() {
+        let chars = resolve_subject_input_chars(
+            env(&[("AGENT_MCP_MODEL_CONTEXT_WINDOW", "1000000")]),
+            None,
+        )
+        .await;
+        assert_eq!(chars, SUBJECT_CHARS_CEILING);
+    }
+
+    #[tokio::test]
+    async fn a_degenerate_window_never_yields_a_zero_or_negative_cap() {
+        let chars =
+            resolve_subject_input_chars(env(&[("AGENT_MCP_MODEL_CONTEXT_WINDOW", "1")]), None)
+                .await;
+        assert_eq!(chars, 2); // max(1, 1-128 saturating) * 2 = 1 * 2
     }
 }

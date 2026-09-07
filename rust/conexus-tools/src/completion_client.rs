@@ -148,24 +148,33 @@ impl CompletionClient {
     /// Send a chat-completion request, return the assistant text (or
     /// `""` if the provider's `content` field was null, matching
     /// Python's `content or ""`).
+    ///
+    /// `max_tokens`, when given, caps the completion length -- needed
+    /// by callers with a small, fixed output budget (e.g. a one-line
+    /// subject suggestion); `None` leaves the provider's own default.
     pub async fn chat(
         &self,
         messages: &[(&str, &str)],
         temperature: f64,
+        max_tokens: Option<u32>,
     ) -> Result<String, ChatError> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let messages_json: Vec<Value> = messages
             .iter()
             .map(|(role, content)| json!({"role": role, "content": content}))
             .collect();
+        let mut body = json!({
+            "model": self.model,
+            "messages": messages_json,
+            "temperature": temperature,
+        });
+        if let Some(max_tokens) = max_tokens {
+            body["max_tokens"] = json!(max_tokens);
+        }
         let resp = HTTP_CLIENT
             .post(&url)
             .bearer_auth(&self.api_key)
-            .json(&json!({
-                "model": self.model,
-                "messages": messages_json,
-                "temperature": temperature,
-            }))
+            .json(&body)
             .send()
             .await
             .map_err(|e| ChatError(e.to_string()))?;
@@ -318,7 +327,7 @@ mod tests {
             api_key: "test".to_string(),
             model: "test-model".to_string(),
         };
-        let answer = client.chat(&[("user", "hi")], 0.4).await.unwrap();
+        let answer = client.chat(&[("user", "hi")], 0.4, None).await.unwrap();
         assert_eq!(answer, "the answer");
         handle.await.unwrap();
     }
@@ -332,7 +341,7 @@ mod tests {
             api_key: "test".to_string(),
             model: "test-model".to_string(),
         };
-        let answer = client.chat(&[("user", "hi")], 0.4).await.unwrap();
+        let answer = client.chat(&[("user", "hi")], 0.4, None).await.unwrap();
         assert_eq!(answer, "");
         handle.await.unwrap();
     }
@@ -345,7 +354,7 @@ mod tests {
             api_key: "test".to_string(),
             model: "test-model".to_string(),
         };
-        let err = client.chat(&[("user", "hi")], 0.4).await.unwrap_err();
+        let err = client.chat(&[("user", "hi")], 0.4, None).await.unwrap_err();
         assert!(err.to_string().contains("500"));
         handle.await.unwrap();
     }
