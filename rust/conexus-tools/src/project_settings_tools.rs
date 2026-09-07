@@ -5,8 +5,11 @@
 //! capability, touch exactly one already-ported repository
 //! (`project_settings_repository`, Phase B), and their one piece of
 //! cross-module coupling — the post-write wake — is handled via
-//! `crate::wake_notify` rather than silently dropped; see that
-//! module's doc for why delivery is deferred but classification isn't).
+//! `crate::wake_notify::deliver` (real delivery, not just
+//! classification; see BL-R14-1 in the `update`/`delete` tools below
+//! — a real, found gap where this file's own call sites used bare
+//! `wakes_for()` while `project_context_tools.rs`'s writes already
+//! delivered for real).
 //!
 //! Deliberately NOT ported, with an explicit reason each (never a
 //! silent drop):
@@ -34,8 +37,6 @@ use regex::Regex;
 use rusqlite::Connection;
 use serde_json::Value;
 use tokio::sync::Mutex as AsyncMutex;
-
-use crate::wake_notify::wakes_for;
 
 static CONFIG_KEY_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^config_").unwrap());
 
@@ -206,7 +207,7 @@ impl conexus_auth::Tool for UpdateProjectSettingsTool {
         arguments: &'a Value,
         conn: &'a AsyncMutex<Connection>,
         now: &'a str,
-        _ctx: &'a conexus_auth::ToolCallContext<'a>,
+        ctx: &'a conexus_auth::ToolCallContext<'a>,
     ) -> conexus_auth::BoxFuture<'a, ToolResult> {
         Box::pin(async move {
             let conn = conn.lock().await;
@@ -309,12 +310,23 @@ impl conexus_auth::Tool for UpdateProjectSettingsTool {
                 };
             }
 
-            // BL-R14-1 parity: classify which post-write wake(s) this key
-            // requires. Actual delivery deferred -- see crate::wake_notify.
-            let wakes: Vec<&str> = wakes_for(context_key)
-                .into_iter()
-                .map(|w| w.as_str())
-                .collect();
+            // BL-R14-1 parity: classify AND deliver whichever wake(s)
+            // this key requires. Real delivery, not just
+            // classification -- a real, found gap fixed here: this
+            // call site used bare `wakes_for()` (classification only)
+            // while `project_context_tools.rs`'s writes already call
+            // `deliver()` for real (PR #832), so a REST or MCP write of
+            // `config_auto_event_loop_global` through THIS tool never
+            // actually woke an in-flight `wait_for_events` waiter --
+            // both surfaces converge on this one function either way,
+            // so the parity half of BL-R14-1 (REST vs MCP divergence)
+            // was never at risk here, but the DELIVERY half was
+            // missing for both transports identically.
+            let wakes: Vec<&str> =
+                crate::wake_notify::deliver(&conn, ctx.waiter_registry, context_key)
+                    .into_iter()
+                    .map(|w| w.as_str())
+                    .collect();
 
             ToolResult::Ok {
                 data: Some(serde_json::json!({
@@ -363,7 +375,7 @@ impl conexus_auth::Tool for DeleteProjectSettingsTool {
         arguments: &'a Value,
         conn: &'a AsyncMutex<Connection>,
         now: &'a str,
-        _ctx: &'a conexus_auth::ToolCallContext<'a>,
+        ctx: &'a conexus_auth::ToolCallContext<'a>,
     ) -> conexus_auth::BoxFuture<'a, ToolResult> {
         Box::pin(async move {
             let conn = conn.lock().await;
@@ -419,10 +431,13 @@ impl conexus_auth::Tool for DeleteProjectSettingsTool {
                 };
             }
 
-            let wakes: Vec<&str> = wakes_for(context_key)
-                .into_iter()
-                .map(|w| w.as_str())
-                .collect();
+            // BL-R14-1: real delivery, not just classification -- same
+            // fix as the update tool above.
+            let wakes: Vec<&str> =
+                crate::wake_notify::deliver(&conn, ctx.waiter_registry, context_key)
+                    .into_iter()
+                    .map(|w| w.as_str())
+                    .collect();
 
             ToolResult::Ok {
                 data: Some(serde_json::json!({
@@ -693,6 +708,116 @@ mod tests {
         assert_eq!(
             data.unwrap()["wakes"],
             serde_json::json!(["tools_list_changed"])
+        );
+    }
+
+    /// BL-R14-1: a real, found gap -- this call site used bare
+    /// `wakes_for()` (classification only) while `project_context_
+    /// tools.rs`'s writes already deliver for real (PR #832). Proves
+    /// the fix with a REAL parked waiter, not just the response's
+    /// `data["wakes"]` label array: writing `config_auto_event_loop_
+    /// global` through `update_project_settings` must actually wake a
+    /// live agent's in-flight `wait_for_events`, on both the create
+    /// path this test drives here.
+    #[tokio::test]
+    async fn update_of_the_loop_toggle_actually_wakes_a_live_agents_waiter() {
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            conexus_db::agent_repository::AgentRepository::create(
+                &guard,
+                conexus_db::agent_repository::NewAgent {
+                    token: "tok-bob",
+                    agent_id: "bob",
+                    created_at: NOW,
+                    status: "created",
+                    current_task: None,
+                    working_directory: "/tmp",
+                    color: None,
+                    agent_role: "worker",
+                },
+            )
+            .unwrap();
+        }
+        let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
+        let (_tx, mut rx) = registry.register("bob");
+        let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
+
+        let result = UpdateProjectSettingsTool::call(
+            Some(&operator_principal()),
+            &serde_json::json!({"context_key": "config_auto_event_loop_global", "context_value": false}),
+            &conn,
+            NOW,
+            &ctx,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        assert_eq!(
+            rx.try_recv(),
+            Ok(conexus_wakeloop::waiter_registry::WakeSignal::Wake),
+            "bob's parked waiter was not actually woken -- classification-only, not delivered"
+        );
+    }
+
+    /// Same fix, delete path (a delete of the loop toggle reverts it
+    /// to default, which is exactly as wake-worthy as an update).
+    #[tokio::test]
+    async fn delete_of_the_loop_toggle_actually_wakes_a_live_agents_waiter() {
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            settings_repo::upsert(
+                &guard,
+                "config_auto_event_loop_global",
+                "false",
+                None,
+                false,
+                "test",
+                NOW,
+            )
+            .unwrap();
+            conexus_db::agent_repository::AgentRepository::create(
+                &guard,
+                conexus_db::agent_repository::NewAgent {
+                    token: "tok-bob",
+                    agent_id: "bob",
+                    created_at: NOW,
+                    status: "created",
+                    current_task: None,
+                    working_directory: "/tmp",
+                    color: None,
+                    agent_role: "worker",
+                },
+            )
+            .unwrap();
+        }
+        let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
+        let (_tx, mut rx) = registry.register("bob");
+        let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
+
+        let result = DeleteProjectSettingsTool::call(
+            Some(&operator_principal()),
+            &serde_json::json!({"context_key": "config_auto_event_loop_global"}),
+            &conn,
+            NOW,
+            &ctx,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        assert_eq!(
+            rx.try_recv(),
+            Ok(conexus_wakeloop::waiter_registry::WakeSignal::Wake),
+            "bob's parked waiter was not actually woken on delete either"
         );
     }
 
