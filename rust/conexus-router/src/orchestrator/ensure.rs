@@ -38,10 +38,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::orchestrator::primitives::{
-    ensure_forwarding_hmac_key, is_real_socket, run_systemctl, sock_path, unit_name, SystemctlMode,
+    ensure_forwarding_hmac_key, run_systemctl, sock_path, socket_ready, unit_name, SystemctlMode,
     UnitNameError,
 };
-use crate::orchestrator::runtime::{EnsureFailureReason, RuntimeStore};
+use crate::orchestrator::runtime::{EnsureFailureReason, RestartStreak, RuntimeStore};
 use crate::project_registry::{ProjectRegistry, RegistryError};
 
 /// Port of Python's raised-exception surface at this seam
@@ -63,6 +63,22 @@ pub enum EnsureError {
     /// A FRESH failure just occurred (systemctl shell-out failed, or
     /// the socket never appeared within the poll budget).
     Failed(EnsureFailureReason),
+    /// SC-R7-1 livelock fix: `EnsureConfig::max_restart_attempts`
+    /// consecutive forced restarts within the current unbroken
+    /// failure streak all failed to produce a connectable socket.
+    /// Refuses to issue another `systemctl restart` until
+    /// `retry_after` elapses (see [`EnsureConfig::giveup_cooldown`])
+    /// -- this is the fix for the self-resetting
+    /// restart-every-request livelock this variant exists to end (see
+    /// this module's doc comment and the `RestartStreak` doc). A
+    /// backend that becomes healthy through ANY other means (an
+    /// operator's manual restart, systemd's own `Restart=` policy) is
+    /// still picked up immediately by the normal fast path above,
+    /// which clears this state on success -- giving up only stops the
+    /// ROUTER from continuing to force restarts on its own.
+    GaveUp {
+        retry_after: Duration,
+    },
     Registry(RegistryError),
     UnitName(UnitNameError),
     Io(std::io::Error),
@@ -92,6 +108,11 @@ impl std::fmt::Display for EnsureError {
             EnsureError::UnknownProject => write!(f, "unknown project"),
             EnsureError::Cooldown(reason) => write!(f, "{}", reason.message()),
             EnsureError::Failed(reason) => write!(f, "{}", reason.message()),
+            EnsureError::GaveUp { retry_after } => write!(
+                f,
+                "backend repeatedly failed to become ready; giving up for {:.0}s",
+                retry_after.as_secs_f64()
+            ),
             EnsureError::Registry(e) => write!(f, "{e}"),
             EnsureError::UnitName(e) => write!(f, "{e}"),
             EnsureError::Io(e) => write!(f, "{e}"),
@@ -122,6 +143,16 @@ pub struct EnsureConfig {
     /// `asyncio.sleep(0.1)` interval, itself not env-overridable --
     /// only the attempt COUNT is).
     pub socket_poll_attempts: u32,
+    /// SC-R7-1 livelock fix: how many consecutive forced restarts an
+    /// unbroken failure streak is allowed before `ensure()` gives up
+    /// (see [`EnsureError::GaveUp`] / `RestartStreak`) rather than
+    /// restarting forever.
+    pub max_restart_attempts: u32,
+    /// SC-R7-1 livelock fix: once a streak has given up, how long
+    /// `ensure()` refuses to touch systemctl again before allowing
+    /// exactly one fresh attempt (self-healing without an operator,
+    /// but at a bounded rate far below "every incoming request").
+    pub giveup_cooldown: Duration,
 }
 
 impl EnsureConfig {
@@ -148,6 +179,13 @@ impl EnsureConfig {
             socket_poll_attempts: get_env("AGENT_MCP_ENSURE_SOCKET_ATTEMPTS")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(200),
+            max_restart_attempts: get_env("AGENT_MCP_ENSURE_MAX_RESTART_ATTEMPTS")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(5),
+            giveup_cooldown: Duration::from_secs_f64(f64_env(
+                "AGENT_MCP_ENSURE_GIVEUP_COOLDOWN_SEC",
+                600.0,
+            )),
         }
     }
 }
@@ -186,7 +224,7 @@ pub async fn ensure(
     )
     .await
     .success();
-    let needs_start = !unit_active || !is_real_socket(&sock);
+    let needs_start = !unit_active || !socket_ready(&sock).await;
 
     if needs_start {
         // P005 cascade-fix: a cached failure still within its cooldown
@@ -238,6 +276,59 @@ pub async fn ensure(
             if started_at.elapsed() < cfg.boot_grace {
                 None // still booting -- keep waiting, don't touch systemctl
             } else {
+                // SC-R7-1 livelock fix: grace has expired on THIS
+                // incarnation, but a forced restart re-stamps
+                // `unit_start_times` to "now" a few lines down -- on
+                // its own that would let an unbroken run of restarts
+                // NEVER accumulate enough elapsed time to give up,
+                // since every restart resets the very clock meant to
+                // measure "how long has this actually been failing".
+                // `restart_streaks` tracks that separately, from its
+                // FIRST restart, so it can't be reset by the restarts
+                // it's counting (see `RestartStreak`'s doc).
+                let streak = store
+                    .snapshot(name)
+                    .and_then(|rt| rt.restart_streaks.get(role).copied());
+                let exhausted = streak.is_some_and(|s| s.attempts >= cfg.max_restart_attempts);
+                if exhausted {
+                    let s = streak.expect("exhausted implies a streak is present");
+                    let remaining = cfg.giveup_cooldown.saturating_sub(s.started_at.elapsed());
+                    if !remaining.is_zero() {
+                        // Still within the give-up cooldown: refuse to
+                        // touch systemctl again, no matter how many
+                        // requests land -- this is what actually stops
+                        // the livelock, as opposed to the pre-existing
+                        // P005 cooldown, which is far shorter than
+                        // `boot_grace` and so never once prevented a
+                        // new restart cycle from starting.
+                        return Err(EnsureError::GaveUp {
+                            retry_after: remaining,
+                        });
+                    }
+                    // The give-up cooldown elapsed: allow exactly ONE
+                    // more fresh attempt (self-healing without an
+                    // operator) by starting a brand new streak.
+                    store.with_runtime_mut(name, |rt| {
+                        rt.restart_streaks.insert(
+                            role.to_string(),
+                            RestartStreak {
+                                started_at: Instant::now(),
+                                attempts: 1,
+                            },
+                        );
+                    });
+                } else {
+                    store.with_runtime_mut(name, |rt| {
+                        let entry =
+                            rt.restart_streaks
+                                .entry(role.to_string())
+                                .or_insert(RestartStreak {
+                                    started_at: Instant::now(),
+                                    attempts: 0,
+                                });
+                        entry.attempts += 1;
+                    });
+                }
                 Some("restart")
             }
         };
@@ -298,7 +389,7 @@ pub async fn ensure(
 
         let mut ready = false;
         for _ in 0..cfg.socket_poll_attempts {
-            if is_real_socket(&sock) {
+            if socket_ready(&sock).await {
                 ready = true;
                 break;
             }
@@ -323,10 +414,15 @@ pub async fn ensure(
         }
     }
 
-    // Success -- evict any stale failure entry so the next caller
-    // doesn't see a phantom cooldown for a now-healthy backend.
+    // Success -- evict any stale failure/restart-streak entry so the
+    // next caller doesn't see a phantom cooldown, or an inherited
+    // give-up state, for a now-healthy backend. A backend that
+    // recovers through ANY means (not just our own restart -- an
+    // operator's manual restart, systemd's own `Restart=` policy)
+    // ends its streak here, exactly like it clears `ensure_failures`.
     store.with_runtime_mut(name, |rt| {
         rt.ensure_failures.remove(role);
+        rt.restart_streaks.remove(role);
         rt.last_active.insert(role.to_string(), SystemTime::now());
     });
     Ok(sock)
@@ -354,6 +450,8 @@ mod tests {
             ensure_failure_cooldown: Duration::from_millis(200),
             boot_grace: Duration::from_millis(150),
             socket_poll_attempts: 5,
+            max_restart_attempts: 5,
+            giveup_cooldown: Duration::from_secs(600),
         }
     }
 
@@ -688,5 +786,230 @@ exit 0
         // -- the real proof the lock doesn't deadlock or corrupt state
         // is that both complete successfully with a consistent view.
         let _ = log;
+    }
+
+    // -- SC-R7-1 livelock fix ------------------------------------------
+
+    #[tokio::test]
+    async fn ensure_treats_a_stale_socket_file_as_not_ready_and_restarts_past_grace() {
+        // A socket FILE exists at the expected path (it would pass a
+        // bare `fs::metadata(..).file_type().is_socket()` check) but
+        // nothing is listening on it -- `UnixListener::bind` then
+        // `drop` leaves exactly this: std's `Drop` closes the fd
+        // without unlinking the path. Before this fix, `ensure()`'s
+        // readiness check was exactly that bare file-type check, so
+        // it would treat this as "already ready" and return `Ok`
+        // WITHOUT ever consulting the boot-grace/restart decision --
+        // silently handing a caller a socket path nothing will ever
+        // accept a connection on. A real connect probe must see
+        // through the stale file and drive the SAME SC-R7-1
+        // restart-past-grace path a genuinely-missing socket would.
+        let dir = tempfile::tempdir().unwrap();
+        let sock_dir = dir.path().join("sockets");
+        let registry = registry_with(dir.path(), "proj-a", "python");
+        let store = RuntimeStore::new();
+        let (program, log) = write_fake_systemctl(dir.path(), 0, 1); // active; restart fails
+        std::fs::create_dir_all(sock_dir.join("proj-a")).unwrap();
+        let sock_path = sock_dir.join("proj-a").join("backend.sock");
+        {
+            let listener = UnixListener::bind(&sock_path).unwrap();
+            drop(listener);
+        }
+        use std::os::unix::fs::FileTypeExt;
+        assert!(
+            std::fs::metadata(&sock_path)
+                .unwrap()
+                .file_type()
+                .is_socket(),
+            "sanity: the stale file must still look like a socket to a bare file-type check"
+        );
+
+        store.with_runtime_mut("proj-a", |rt| {
+            rt.unit_start_times.insert(
+                "backend".to_string(),
+                Instant::now() - Duration::from_secs(1),
+            );
+        });
+        let mut cfg = fast_cfg(&program);
+        cfg.boot_grace = Duration::from_millis(1); // expired relative to the seeded start time
+
+        let err = ensure(&store, &registry, &sock_dir, "proj-a", "backend", &cfg)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                EnsureError::Failed(EnsureFailureReason::SystemctlFailed)
+            ),
+            "a stale socket file must not short-circuit to Ok -- got {err:?}"
+        );
+
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            calls.contains("restart"),
+            "a stale socket FILE with nothing listening must be treated as not-ready and \
+             trigger the SC-R7-1 restart decision, proving readiness is a real connect \
+             probe, not bare file-existence -- got: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_in_flight_restart_is_never_duplicated_by_a_back_to_back_request() {
+        // Two requests land back-to-back while a forced restart is
+        // due. The per-(name, role) ensure lock serializes them for
+        // the ENTIRE duration of `ensure()` (including the socket
+        // poll), so the second caller must observe the first caller's
+        // completed attempt (via the restart-streak/P005 state) rather
+        // than racing its own independent `systemctl restart`. A
+        // regression guard for the new restart-streak bookkeeping:
+        // it must not introduce a way for two holders to each think
+        // they're the one that gets to restart.
+        let dir = tempfile::tempdir().unwrap();
+        let sock_dir = dir.path().join("sockets");
+        let registry = std::sync::Arc::new(registry_with(dir.path(), "proj-a", "python"));
+        let store = std::sync::Arc::new(RuntimeStore::new());
+        let (program, log) = write_fake_systemctl(dir.path(), 0, 1); // active, socketless; restart fails
+
+        store.with_runtime_mut("proj-a", |rt| {
+            rt.unit_start_times.insert(
+                "backend".to_string(),
+                Instant::now() - Duration::from_secs(1),
+            );
+        });
+        let mut cfg = fast_cfg(&program);
+        cfg.boot_grace = Duration::from_millis(1); // expired
+        let cfg = std::sync::Arc::new(cfg);
+        let sock_dir = std::sync::Arc::new(sock_dir);
+
+        let (r1, r2) = tokio::join!(
+            ensure(&store, &registry, &sock_dir, "proj-a", "backend", &cfg),
+            ensure(&store, &registry, &sock_dir, "proj-a", "backend", &cfg)
+        );
+        r1.unwrap_err();
+        r2.unwrap_err();
+
+        let restarts = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .filter(|l| l.contains("restart"))
+            .count();
+        assert_eq!(
+            restarts, 1,
+            "two back-to-back requests during a due restart must trigger exactly ONE \
+             systemctl restart, not one each"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_gives_up_after_max_restart_attempts_and_stops_hammering_systemctl() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_dir = dir.path().join("sockets");
+        let registry = registry_with(dir.path(), "proj-a", "python");
+        let store = RuntimeStore::new();
+        // active; restart "succeeds" (rc=0) but never actually creates
+        // a real socket -- exactly the confirmed-live symptom (systemd
+        // reports the restart as clean, `NRestarts=0`/
+        // `ExecMainStatus=0`, yet the backend never becomes reachable).
+        let (program, log) = write_fake_systemctl(dir.path(), 0, 0);
+
+        let mut cfg = fast_cfg(&program);
+        cfg.boot_grace = Duration::from_millis(1);
+        cfg.max_restart_attempts = 3;
+        cfg.giveup_cooldown = Duration::from_secs(600); // must not silently retry mid-test
+
+        // Seed a streak already AT the attempt cap, started long
+        // enough ago that boot-grace is trivially expired but the
+        // give-up cooldown has NOT -- simulates "already restarted
+        // max_restart_attempts times in an unbroken streak and every
+        // one of them failed to produce a real socket".
+        store.with_runtime_mut("proj-a", |rt| {
+            rt.unit_start_times.insert(
+                "backend".to_string(),
+                Instant::now() - Duration::from_secs(10),
+            );
+            rt.restart_streaks.insert(
+                "backend".to_string(),
+                RestartStreak {
+                    started_at: Instant::now() - Duration::from_secs(10),
+                    attempts: 3,
+                },
+            );
+        });
+
+        let err = ensure(&store, &registry, &sock_dir, "proj-a", "backend", &cfg)
+            .await
+            .unwrap_err();
+        let retry_after = match err {
+            EnsureError::GaveUp { retry_after } => retry_after,
+            other => panic!("attempts exhausted must return a terminal GaveUp error, not restart again -- got {other:?}"),
+        };
+        assert!(retry_after > Duration::ZERO && retry_after <= cfg.giveup_cooldown);
+
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            !calls.lines().any(|l| l.contains("restart")),
+            "give-up must not issue another systemctl restart -- got: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_allows_one_fresh_attempt_after_the_giveup_cooldown_elapses() {
+        // Self-healing check: once the (much longer) give-up cooldown
+        // itself has elapsed, `ensure()` must allow exactly one more
+        // real restart attempt rather than refusing forever.
+        let dir = tempfile::tempdir().unwrap();
+        let sock_dir = dir.path().join("sockets");
+        let registry = registry_with(dir.path(), "proj-a", "python");
+        let store = RuntimeStore::new();
+        let (program, log) = write_fake_systemctl(dir.path(), 0, 1); // active; restart fails
+
+        let mut cfg = fast_cfg(&program);
+        cfg.boot_grace = Duration::from_millis(1);
+        cfg.max_restart_attempts = 3;
+        cfg.giveup_cooldown = Duration::from_millis(1); // already elapsed by the time we check
+
+        store.with_runtime_mut("proj-a", |rt| {
+            rt.unit_start_times.insert(
+                "backend".to_string(),
+                Instant::now() - Duration::from_secs(10),
+            );
+            rt.restart_streaks.insert(
+                "backend".to_string(),
+                RestartStreak {
+                    started_at: Instant::now() - Duration::from_secs(10),
+                    attempts: 3,
+                },
+            );
+        });
+
+        let err = ensure(&store, &registry, &sock_dir, "proj-a", "backend", &cfg)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                EnsureError::Failed(EnsureFailureReason::SystemctlFailed)
+            ),
+            "once the give-up cooldown elapses, a fresh attempt must actually be tried \
+             (and observe the fake systemctl's real failure), not immediately GaveUp again \
+             -- got {err:?}"
+        );
+
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            calls.lines().any(|l| l.contains("restart")),
+            "the give-up cooldown elapsing must allow exactly one fresh systemctl restart \
+             -- got: {calls:?}"
+        );
+
+        let streak = store
+            .snapshot("proj-a")
+            .and_then(|rt| rt.restart_streaks.get("backend").copied())
+            .expect("a fresh streak must be recorded for the new attempt");
+        assert_eq!(
+            streak.attempts, 1,
+            "the fresh attempt must start a NEW streak (attempts reset to 1), not keep \
+             accumulating on top of the exhausted one"
+        );
     }
 }

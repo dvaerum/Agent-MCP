@@ -267,25 +267,35 @@ pub(crate) fn api_version_required_response() -> HandlerResponse {
     }
 }
 
-/// Map an [`EnsureError`] to `(status, message)` -- port of the
-/// status/reason pairs `_ensure`'s own raised `web.HTTP*` exceptions
-/// carry (see `orchestrator::ensure`'s own doc for the underlying
-/// cases).
-fn ensure_error_status(e: &EnsureError) -> (u16, String) {
+/// Map an [`EnsureError`] to `(status, message, retry_after)` -- port
+/// of the status/reason pairs `_ensure`'s own raised `web.HTTP*`
+/// exceptions carry (see `orchestrator::ensure`'s own doc for the
+/// underlying cases). `retry_after` is `Some` only for
+/// [`EnsureError::GaveUp`] (SC-R7-1 livelock fix): a caller hitting
+/// the give-up state gets a concrete, real wait hint instead of
+/// hammering the router again immediately.
+fn ensure_error_status(e: &EnsureError) -> (u16, String, Option<Duration>) {
     match e {
-        EnsureError::UnknownProject => (404, "unknown project".to_string()),
-        EnsureError::Cooldown(reason) => (504, reason.message().to_string()),
+        EnsureError::UnknownProject => (404, "unknown project".to_string(), None),
+        EnsureError::Cooldown(reason) => (504, reason.message().to_string(), None),
         EnsureError::Failed(EnsureFailureReason::SystemctlFailed) => (
             500,
             EnsureFailureReason::SystemctlFailed.message().to_string(),
+            None,
         ),
         EnsureError::Failed(EnsureFailureReason::SocketTimeout) => (
             504,
             EnsureFailureReason::SocketTimeout.message().to_string(),
+            None,
         ),
-        EnsureError::Registry(reg) => (500, reg.to_string()),
-        EnsureError::UnitName(u) => (500, u.to_string()),
-        EnsureError::Io(io) => (500, io.to_string()),
+        EnsureError::GaveUp { retry_after } => (
+            503,
+            "backend repeatedly failed to become ready; try again shortly".to_string(),
+            Some(*retry_after),
+        ),
+        EnsureError::Registry(reg) => (500, reg.to_string(), None),
+        EnsureError::UnitName(u) => (500, u.to_string(), None),
+        EnsureError::Io(io) => (500, io.to_string(), None),
     }
 }
 
@@ -299,10 +309,22 @@ fn ensure_error_status(e: &EnsureError) -> (u16, String) {
 fn proxy_error_response(e: ProxyError) -> HandlerResponse {
     match e {
         ProxyError::Ensure(inner) => {
-            let (status, message) = ensure_error_status(&inner);
+            let (status, message, retry_after) = ensure_error_status(&inner);
+            // Port of `too_many_requests_response`'s own
+            // ceil-to-whole-seconds convention (rate_limit.rs) -- an
+            // HTTP `Retry-After` is defined in whole seconds, and
+            // rounding UP means a caller never retries a hair too
+            // early.
+            let headers = match retry_after {
+                Some(d) => vec![(
+                    "Retry-After".to_string(),
+                    (d.as_secs_f64().ceil().max(1.0) as u64).to_string(),
+                )],
+                None => vec![],
+            };
             HandlerResponse {
                 status,
-                headers: vec![],
+                headers,
                 body: HandlerBody::Text(message),
             }
         }
@@ -592,7 +614,26 @@ mod tests {
             ensure_failure_cooldown: Duration::from_millis(200),
             boot_grace: Duration::from_millis(150),
             socket_poll_attempts: 5,
+            max_restart_attempts: 5,
+            giveup_cooldown: Duration::from_secs(600),
         }
+    }
+
+    #[test]
+    fn proxy_error_response_maps_ensure_gave_up_to_a_503_with_a_real_retry_after() {
+        // SC-R7-1 livelock fix: a caller hitting the give-up state
+        // must see a distinct, actionable status -- not another 504
+        // indistinguishable from an ordinary socket-poll timeout --
+        // with a real `Retry-After` computed from the remaining
+        // give-up cooldown, ceiled up to whole seconds.
+        let response = proxy_error_response(ProxyError::Ensure(EnsureError::GaveUp {
+            retry_after: Duration::from_millis(2500),
+        }));
+        assert_eq!(response.status, 503);
+        assert_eq!(
+            response.headers,
+            vec![("Retry-After".to_string(), "3".to_string())]
+        );
     }
 
     fn fast_cfg() -> McpHandlerConfig {

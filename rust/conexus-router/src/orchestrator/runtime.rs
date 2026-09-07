@@ -74,6 +74,27 @@ impl EnsureFailureReason {
     }
 }
 
+/// SC-R7-1 livelock fix: how long, and how many times, `ensure()` has
+/// been forcing a restart on an active-but-not-yet-ready unit without
+/// it ever becoming ready -- tracked SEPARATELY from
+/// `ProjectRuntime::unit_start_times` on purpose. `unit_start_times`
+/// legitimately resets to "now" on every real restart (that
+/// incarnation genuinely does get a fresh boot-grace window) -- but
+/// that means it can never be used to answer "how long has THIS
+/// backend been failing overall", because every restart resets it.
+/// `started_at` here is written ONCE, on the first forced restart of
+/// an unbroken streak, and never touched again until the streak ends
+/// (either a real success, or `attempts` hits
+/// `EnsureConfig::max_restart_attempts` and the give-up cooldown
+/// starts counting down from it) -- so a streak of restarts that keeps
+/// resetting `unit_start_times` still accumulates real elapsed time
+/// here and can eventually give up instead of looping forever.
+#[derive(Debug, Clone, Copy)]
+pub struct RestartStreak {
+    pub started_at: Instant,
+    pub attempts: u32,
+}
+
 /// One project's runtime bookkeeping -- mirrors Python's
 /// `ProjectRuntime` dataclass minus `ensure_locks` (see module doc for
 /// why that field lives in [`RuntimeStore`] instead). Every field here
@@ -92,6 +113,11 @@ pub struct ProjectRuntime {
     /// the same process lifetime.
     pub unit_start_times: HashMap<String, Instant>,
     pub ensure_failures: HashMap<String, (Instant, EnsureFailureReason)>,
+    /// SC-R7-1 livelock fix (see [`RestartStreak`]) -- present only
+    /// while a role has at least one forced restart outstanding in an
+    /// unbroken streak; removed as soon as the role reaches a real
+    /// ready socket.
+    pub restart_streaks: HashMap<String, RestartStreak>,
     pub forwarding_hmac_key: Option<Vec<u8>>,
     pub warm_inflight: bool,
 }
@@ -105,6 +131,7 @@ impl ProjectRuntime {
             && self.active_conns == 0
             && self.unit_start_times.is_empty()
             && self.ensure_failures.is_empty()
+            && self.restart_streaks.is_empty()
             && self.forwarding_hmac_key.is_none()
             && !self.warm_inflight
     }
@@ -189,17 +216,18 @@ impl RuntimeStore {
 
     /// The single clear-on-lifecycle-end path -- port of `forget()`.
     /// Clears `last_active`/`active_conns`/`unit_start_times`/
-    /// `ensure_failures`/`warm_inflight` unconditionally; clears
-    /// `forwarding_hmac_key` unless `keep_hmac` (F015 v4: the on-disk
-    /// key file survives a stop/restart, so the in-memory cache can
-    /// too); clears every ensure lock for `name` (any role) unless
-    /// `keep_lock`.
+    /// `ensure_failures`/`restart_streaks`/`warm_inflight`
+    /// unconditionally; clears `forwarding_hmac_key` unless
+    /// `keep_hmac` (F015 v4: the on-disk key file survives a
+    /// stop/restart, so the in-memory cache can too); clears every
+    /// ensure lock for `name` (any role) unless `keep_lock`.
     pub fn forget(&self, name: &str, keep_hmac: bool, keep_lock: bool) {
         self.with_runtime_mut(name, |rt| {
             rt.last_active.clear();
             rt.active_conns = 0;
             rt.unit_start_times.clear();
             rt.ensure_failures.clear();
+            rt.restart_streaks.clear();
             rt.warm_inflight = false;
             if !keep_hmac {
                 rt.forwarding_hmac_key = None;
@@ -223,6 +251,13 @@ mod tests {
             rt.ensure_failures.insert(
                 "backend".into(),
                 (Instant::now(), EnsureFailureReason::SystemctlFailed),
+            );
+            rt.restart_streaks.insert(
+                "backend".into(),
+                RestartStreak {
+                    started_at: Instant::now(),
+                    attempts: 1,
+                },
             );
             rt.forwarding_hmac_key = Some(vec![1, 2, 3]);
             rt.warm_inflight = true;
@@ -261,6 +296,7 @@ mod tests {
         assert_eq!(rt.active_conns, 0);
         assert!(rt.unit_start_times.is_empty());
         assert!(rt.ensure_failures.is_empty());
+        assert!(rt.restart_streaks.is_empty());
         assert!(!rt.warm_inflight);
         assert!(
             store.ensure_locks.is_empty(),

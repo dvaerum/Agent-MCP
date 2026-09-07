@@ -241,16 +241,26 @@ pub async fn is_active(mode: SystemctlMode, unit: &str, timeout: Duration) -> bo
         .success()
 }
 
-/// `true` iff `path` exists AND is genuinely a Unix domain socket --
-/// port of Python's `sock.exists() and sock.is_socket()` (`ensure()`'s
-/// readiness check, PR 6c). Follows symlinks (`std::fs::metadata`,
-/// not `symlink_metadata`), matching `Path.exists()`/`Path.is_socket()`
-/// which both stat through a symlink by default.
-pub fn is_real_socket(path: &Path) -> bool {
-    use std::os::unix::fs::FileTypeExt;
-    std::fs::metadata(path)
-        .map(|m| m.file_type().is_socket())
-        .unwrap_or(false)
+/// `true` iff `path` is a Unix domain socket that ACTUALLY ACCEPTS a
+/// connection right now -- SC-R7-1 hardening, replaces a bare
+/// `sock.exists() and sock.is_socket()` file-type check (Python's own
+/// original readiness check, and this crate's own prior
+/// `is_real_socket`). A socket FILE existing is necessary but not
+/// sufficient for "ready to serve a request": a backend that created
+/// the file (e.g. an early `bind()`) but hasn't reached
+/// `listen()`/`accept()` yet, or that crashed leaving a stale file
+/// behind (`std::os::unix::net::UnixListener`'s `Drop` closes the fd
+/// without unlinking the path), both pass the file-type check while
+/// failing a real connect. Connects then immediately drops the
+/// stream -- a lightweight liveness probe, not a real request.
+///
+/// Returns `false` for EVERY connect failure alike (path missing,
+/// connection refused, permission denied, ...) -- distinguishing
+/// "still booting, keep waiting" from "never coming up, give up" is
+/// `ensure()`'s restart/backoff state machine's job (see
+/// `orchestrator::ensure`'s module doc), not this probe's.
+pub async fn socket_ready(path: &Path) -> bool {
+    tokio::net::UnixStream::connect(path).await.is_ok()
 }
 
 #[cfg(test)]
@@ -466,6 +476,45 @@ mod tests {
             "124 mirrors coreutils timeout's exit code"
         );
         assert!(result.stderr.contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn socket_ready_is_false_when_no_file_exists_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backend.sock");
+        assert!(!socket_ready(&path).await);
+    }
+
+    #[tokio::test]
+    async fn socket_ready_is_false_for_a_stale_socket_file_nothing_listens_on() {
+        // SC-R7-1: a `UnixListener` bound then dropped leaves the
+        // special file on disk (std's `Drop` closes the fd, it never
+        // unlinks) -- exactly the "socket file exists but nothing
+        // will ever accept a connection on it" condition a bare
+        // file-type check cannot distinguish from "healthy".
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backend.sock");
+        {
+            let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            drop(listener);
+        }
+        use std::os::unix::fs::FileTypeExt;
+        assert!(
+            std::fs::metadata(&path).unwrap().file_type().is_socket(),
+            "sanity: the stale file must still look like a socket to a bare file-type check"
+        );
+        assert!(
+            !socket_ready(&path).await,
+            "a stale socket file with no listener must not be considered ready"
+        );
+    }
+
+    #[tokio::test]
+    async fn socket_ready_is_true_for_a_real_listener() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backend.sock");
+        let _listener = tokio::net::UnixListener::bind(&path).unwrap();
+        assert!(socket_ready(&path).await);
     }
 
     #[tokio::test]
