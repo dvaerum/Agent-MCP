@@ -2774,6 +2774,18 @@ mod tests {
     }
 
     #[test]
+    fn a_terminal_source_is_a_sink_even_targeting_a_different_terminal_status() {
+        // test_cancelled_to_completed_rejected: a cancelled task must
+        // not be resurrected as completed either -- the sink rule is
+        // unconditional on the source, not just for non-terminal
+        // targets.
+        assert!(!is_status_transition_allowed(
+            Some("cancelled"),
+            "completed"
+        ));
+    }
+
+    #[test]
     fn a_terminal_same_state_rewrite_is_rejected_not_a_noop() {
         // A re-complete must NOT be treated as an allowed idempotent
         // no-op -- it would re-fire dependency-advance side effects.
@@ -2828,6 +2840,22 @@ mod tests {
     fn agent_assignable_false_for_an_unknown_agent() {
         let conn = test_conn();
         assert!(!agent_assignable(&conn, "nobody"));
+    }
+
+    #[test]
+    fn agent_assignable_false_for_a_tombstone_row() {
+        // BL-R31-3b: a tombstone row (`[deleted-<id>]`, a purge-cascade
+        // FK artefact) is not a live agent -- pinning work onto it is
+        // unreachable work attributed to a deleted identity.
+        let conn = test_conn();
+        conexus_db::agent_repository::AgentRepository::insert_tombstone(
+            &conn,
+            "__tombstone_ghost",
+            "[deleted-ghost]",
+            "2026-01-01T00:00:00Z",
+        )
+        .unwrap();
+        assert!(!agent_assignable(&conn, "[deleted-ghost]"));
     }
 
     /// SEC-R2 (ported from `tests/test_sec_r2_task_toctou.py`'s
@@ -3614,13 +3642,27 @@ impl Tool for BulkTaskOperationsTool {
                                 message: "Database error in bulk operations".to_string(),
                             };
                         }
-                        let _ = AgentRepository::reconcile_current_task_on_reassign(
+                        // BUG (BL-R30-1 sibling, found while porting
+                        // test_sec_r30_reassign_current_task.py): this
+                        // call used to be `let _ =`-swallowed, unlike
+                        // every other DB write in this function (see
+                        // the update_fields call right above) -- a
+                        // genuine DB error here was silently dropped,
+                        // reporting a false success while leaving the
+                        // stale current_task pointer unreconciled.
+                        if AgentRepository::reconcile_current_task_on_reassign(
                             &tx,
                             task_id,
                             task_data.assigned_to.as_deref(),
                             Some(new_assigned_to),
                             now,
-                        );
+                        )
+                        .is_err()
+                        {
+                            return ToolResult::Failed {
+                                message: "Database error in bulk operations".to_string(),
+                            };
+                        }
                         outcomes.push(BulkOpOutcome {
                             line: format!(
                                 "Operation {}: Task '{task_id}' reassigned to '{new_assigned_to}'",
@@ -4653,6 +4695,73 @@ mod create_task_tests {
     }
 
     #[tokio::test]
+    async fn create_task_with_a_busy_assignee_does_not_clobber_current_task() {
+        // BL-R30-1 sibling: create-with-assignee must not clobber an
+        // agent that already holds a current_task (set only when NULL),
+        // mirroring the reassign path's own no-clobber guarantee.
+        let conn = test_conn();
+        seed_agent(&conn, "carol").await;
+        let busy_id = {
+            let guard = conn.lock().await;
+            let busy = task_repository::create(
+                &guard,
+                NewTask {
+                    task_id: None,
+                    title: "carol's busy root",
+                    description: None,
+                    assigned_to: Some("carol"),
+                    created_by: "admin",
+                    status: "in_progress",
+                    priority: "medium",
+                    parent_task: None,
+                    child_tasks: None,
+                    depends_on_tasks: None,
+                    notes: None,
+                    now: NOW,
+                },
+            )
+            .unwrap();
+            conexus_db::agent_repository::AgentRepository::reconcile_current_task_on_reassign(
+                &guard,
+                &busy.task_id,
+                None,
+                Some("carol"),
+                NOW,
+            )
+            .unwrap();
+            busy.task_id
+        };
+        let registry = WaiterRegistry::new();
+        let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
+        CreateTaskTool::call(
+            Some(&manager("alice")),
+            &serde_json::json!({
+                "task_title": "another for carol",
+                "assigned_to": "carol",
+                "parent_task_id": busy_id
+            }),
+            &conn,
+            NOW,
+            &ctx,
+        )
+        .await;
+        let guard = conn.lock().await;
+        let agent = conexus_db::agent_repository::AgentRepository::get_by_id(&guard, "carol")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            agent.current_task.as_deref(),
+            Some(busy_id.as_str()),
+            "create-with-assignee clobbered carol's existing current_task"
+        );
+    }
+
+    #[tokio::test]
     async fn create_task_links_the_new_task_into_the_parents_child_tasks() {
         let conn = test_conn();
         {
@@ -5100,6 +5209,166 @@ mod update_task_status_tests {
         assert!(matches!(result, ToolResult::Ok { .. }));
         assert_eq!(rx.try_recv(), Ok(WakeSignal::Wake));
     }
+
+    #[tokio::test]
+    async fn worker_completing_own_task_advances_a_cross_agent_dependent_and_wakes_its_owner() {
+        // BL-R29-1: the dependency auto-advance runs as a system
+        // transition, so it must cross agent ownership even when the
+        // COMPLETER is a plain worker (not admin) -- the dependent
+        // (owned by a DIFFERENT agent) still advances, and that
+        // dependent's owner is woken, not the completer.
+        let conn = test_conn();
+        seed_agent(&conn, "carol").await;
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "blocker", "in_progress", Some("bob"), None);
+            seed_task(
+                &guard,
+                "dependent",
+                "pending",
+                Some("carol"),
+                Some("blocker"),
+            );
+            task_repository::update_fields(
+                &guard,
+                "dependent",
+                &TaskFields {
+                    depends_on_tasks: NullableUpdate::Set(vec!["blocker".to_string()]),
+                    ..Default::default()
+                },
+                NOW,
+            )
+            .unwrap();
+        }
+        let registry = WaiterRegistry::new();
+        let (_tx, mut rx_carol) = registry.register("carol");
+        let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
+        let result = UpdateTaskStatusTool::call(
+            Some(&worker("bob")),
+            &serde_json::json!({"task_id": "blocker", "status": "completed"}),
+            &conn,
+            NOW,
+            &ctx,
+        )
+        .await;
+        let msg = message_of(&result);
+        assert!(msg.contains("Auto-advanced 1 dependent tasks."));
+        let guard = conn.lock().await;
+        let dependent = task_repository::get_by_id(&guard, "dependent")
+            .unwrap()
+            .unwrap();
+        assert_eq!(dependent.status, "in_progress");
+        drop(guard);
+        assert_eq!(
+            rx_carol.try_recv(),
+            Ok(WakeSignal::Wake),
+            "cross-agent dependent's owner carol must be woken"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_cascade_to_children_crosses_agents() {
+        // BL-R29-1 sibling: cascade_to_children is also a system
+        // transition -- a worker cancelling their OWN parent task must
+        // still cascade to a child owned by a DIFFERENT agent.
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "parent", "in_progress", Some("alice"), None);
+            seed_task(&guard, "child", "in_progress", Some("bob"), Some("parent"));
+            task_repository::update_fields(
+                &guard,
+                "parent",
+                &TaskFields {
+                    child_tasks: NullableUpdate::Set(vec!["child".to_string()]),
+                    ..Default::default()
+                },
+                NOW,
+            )
+            .unwrap();
+        }
+        let result = call(
+            &worker("alice"),
+            serde_json::json!({
+                "task_id": "parent",
+                "status": "cancelled",
+                "cascade_to_children": true
+            }),
+            &conn,
+        )
+        .await;
+        let msg = message_of(&result);
+        assert!(msg.contains("Cascaded to 1 child tasks."));
+        let guard = conn.lock().await;
+        let child = task_repository::get_by_id(&guard, "child")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            child.status, "cancelled",
+            "cross-agent child (owned by bob) must be cascade-cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_cannot_directly_update_a_foreign_task_via_the_normal_path() {
+        // Regression guard paired with the two tests above: the
+        // system-transition bypass is scoped to the internal
+        // dependency-advance/cascade reconcile ONLY -- a worker still
+        // cannot drive another agent's task through the normal
+        // (non-system) update_task_status path.
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "t1", "in_progress", Some("alice"), None);
+        }
+        let result = call(
+            &worker("bob"),
+            serde_json::json!({"task_id": "t1", "status": "completed"}),
+            &conn,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::NotFound { .. }));
+        let guard = conn.lock().await;
+        let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+        assert_ne!(row.status, "completed");
+    }
+
+    #[tokio::test]
+    async fn update_status_reassign_to_terminated_agent_rejected() {
+        // test_update_status_reassign_to_terminated_agent_rejected: the
+        // update_task_status `assigned_to` field must not reassign to
+        // a TERMINATED agent.
+        let conn = test_conn();
+        seed_agent(&conn, "bob").await;
+        {
+            let guard = conn.lock().await;
+            AgentRepository::terminate(&guard, "bob", NOW).unwrap();
+            seed_task(&guard, "t1", "pending", None, None);
+        }
+        let result = call(
+            &admin("alice"),
+            serde_json::json!({"task_id": "t1", "status": "pending", "assigned_to": "bob"}),
+            &conn,
+        )
+        .await;
+        let msg = message_of(&result);
+        assert!(
+            msg.to_lowercase().contains("terminated") || msg.to_lowercase().contains("not exist"),
+            "expected a terminated-agent rejection; got {msg:?}"
+        );
+        let guard = conn.lock().await;
+        let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+        assert_ne!(
+            row.assigned_to.as_deref(),
+            Some("bob"),
+            "update_task_status must not reassign to a terminated agent"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -5271,6 +5540,117 @@ mod update_task_tests {
             .unwrap()
             .unwrap();
         assert_eq!(agent.current_task.as_deref(), Some("t1"));
+    }
+
+    #[tokio::test]
+    async fn reassigning_does_not_clobber_a_busy_gainers_current_task() {
+        // BL-R30-1: if the gaining agent already holds a DIFFERENT
+        // current_task, reassign must not overwrite it (mirrors the
+        // create-with-assignee path: set only when NULL).
+        let conn = test_conn();
+        seed_agent(&conn, "carol").await;
+        let guard = conn.lock().await;
+        seed_task(&guard, "t1", "pending", None);
+        task_repository::create(
+            &guard,
+            NewTask {
+                task_id: Some("carols-own"),
+                title: "carol's own",
+                description: None,
+                assigned_to: Some("carol"),
+                created_by: "alice",
+                status: "in_progress",
+                priority: "medium",
+                parent_task: Some("t1"),
+                child_tasks: None,
+                depends_on_tasks: None,
+                notes: None,
+                now: NOW,
+            },
+        )
+        .unwrap();
+        AgentRepository::reconcile_current_task_on_reassign(
+            &guard,
+            "carols-own",
+            None,
+            Some("carol"),
+            NOW,
+        )
+        .unwrap();
+        drop(guard);
+
+        call(
+            serde_json::json!({"task_id": "t1", "assigned_to": "carol"}),
+            &conn,
+        )
+        .await;
+        let guard = conn.lock().await;
+        let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+        assert_eq!(row.assigned_to.as_deref(), Some("carol"));
+        let agent = AgentRepository::get_by_id(&guard, "carol")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            agent.current_task.as_deref(),
+            Some("carols-own"),
+            "reassign clobbered carol's existing current_task"
+        );
+    }
+
+    #[tokio::test]
+    async fn reassigning_leaves_an_unrelated_losers_current_task_pointer_untouched() {
+        // BL-R30-1: if the LOSING agent's current_task points at a
+        // DIFFERENT task than the one being reassigned, it must be
+        // left alone (scoped clear).
+        let conn = test_conn();
+        seed_agent(&conn, "alice").await;
+        seed_agent(&conn, "bob").await;
+        let guard = conn.lock().await;
+        seed_task(&guard, "t1", "pending", Some("alice"));
+        task_repository::create(
+            &guard,
+            NewTask {
+                task_id: Some("alices-other"),
+                title: "alice's other",
+                description: None,
+                assigned_to: Some("alice"),
+                created_by: "alice",
+                status: "in_progress",
+                priority: "medium",
+                parent_task: Some("t1"),
+                child_tasks: None,
+                depends_on_tasks: None,
+                notes: None,
+                now: NOW,
+            },
+        )
+        .unwrap();
+        AgentRepository::reconcile_current_task_on_reassign(
+            &guard,
+            "alices-other",
+            None,
+            Some("alice"),
+            NOW,
+        )
+        .unwrap();
+        drop(guard);
+
+        call(
+            serde_json::json!({"task_id": "t1", "assigned_to": "bob"}),
+            &conn,
+        )
+        .await;
+        let guard = conn.lock().await;
+        let alice = AgentRepository::get_by_id(&guard, "alice")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            alice.current_task.as_deref(),
+            Some("alices-other"),
+            "reassign wrongly cleared alice's unrelated current_task"
+        );
+        let bob = AgentRepository::get_by_id(&guard, "bob").unwrap().unwrap();
+        assert_eq!(bob.current_task.as_deref(), Some("t1"));
     }
 
     #[tokio::test]
@@ -6666,6 +7046,35 @@ mod bulk_task_operations_tests {
     }
 
     #[tokio::test]
+    async fn bulk_reassign_to_terminated_agent_rejected() {
+        // test_bulk_reassign_to_terminated_agent_rejected: the bulk
+        // reassign op must refuse a TERMINATED target -- the
+        // agent_assignable check at the top of this arm already
+        // covers this; this pins it as its own regression.
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_agent(&guard, "carol");
+            AgentRepository::terminate(&guard, "carol", NOW).unwrap();
+            seed_task(&guard, "t1", "pending", None, "alice");
+        }
+        let result = call(
+            serde_json::json!({"operations": [{"type": "reassign", "task_id": "t1", "assigned_to": "carol"}]}),
+            &admin("alice"),
+            &conn,
+        )
+        .await;
+        let msg = message_of(&result);
+        assert!(
+            msg.contains("agent does not exist or is terminated"),
+            "expected a terminated-agent rejection; got {msg:?}"
+        );
+        let guard = conn.lock().await;
+        let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+        assert_ne!(row.assigned_to.as_deref(), Some("carol"));
+    }
+
+    #[tokio::test]
     async fn admin_reassigns_and_reconciles_current_task() {
         let conn = test_conn();
         {
@@ -6687,6 +7096,88 @@ mod bulk_task_operations_tests {
             .unwrap()
             .unwrap();
         assert_eq!(agent.current_task.as_deref(), Some("t1"));
+    }
+
+    #[tokio::test]
+    async fn admin_reassigns_and_clears_the_losing_agents_current_task() {
+        // R30-BL-1 sibling: the bulk reassign op must clear the LOSING
+        // agent's stale current_task pointer, not just set the gainer's
+        // (admin_reassigns_and_reconciles_current_task above only
+        // exercises the gainer half -- bob was never pinned to t1).
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_agent(&guard, "bob");
+            seed_agent(&guard, "carol");
+            seed_task(&guard, "t1", "pending", Some("bob"), "alice");
+            AgentRepository::reconcile_current_task_on_reassign(
+                &guard,
+                "t1",
+                None,
+                Some("bob"),
+                NOW,
+            )
+            .unwrap();
+        }
+        {
+            let guard = conn.lock().await;
+            let bob = AgentRepository::get_by_id(&guard, "bob").unwrap().unwrap();
+            assert_eq!(bob.current_task.as_deref(), Some("t1"), "test setup sanity");
+        }
+        let result = call(
+            serde_json::json!({"operations": [{"type": "reassign", "task_id": "t1", "assigned_to": "carol"}]}),
+            &admin("alice"),
+            &conn,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        let guard = conn.lock().await;
+        let bob = AgentRepository::get_by_id(&guard, "bob").unwrap().unwrap();
+        assert_eq!(
+            bob.current_task, None,
+            "losing agent bob still points at the reassigned task"
+        );
+        let carol = AgentRepository::get_by_id(&guard, "carol")
+            .unwrap()
+            .unwrap();
+        assert_eq!(carol.current_task.as_deref(), Some("t1"));
+    }
+
+    #[tokio::test]
+    async fn bulk_reassign_propagates_a_reconcile_current_task_db_error_instead_of_silently_dropping_it(
+    ) {
+        // BUG (found while porting test_sec_r30_reassign_current_task.py):
+        // the reassign op's call to reconcile_current_task_on_reassign
+        // was `let _ = ...`-swallowed -- unlike every other DB write in
+        // this same function (e.g. the update_fields call right above
+        // it), a genuine DB error reconciling agents.current_task was
+        // silently dropped: the op still reported success and the stale
+        // current_task pointer was left unreconciled with no error
+        // surfaced anywhere. A trigger that only rejects writes to
+        // `agents.current_task` isolates that one call's failure --
+        // the preceding `tasks` UPDATE (assigned_to) still succeeds.
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_agent(&guard, "carol");
+            seed_task(&guard, "t1", "pending", Some("bob"), "alice");
+            guard
+                .execute_batch(
+                    "CREATE TRIGGER block_current_task_reconcile BEFORE UPDATE OF current_task \
+                     ON agents BEGIN SELECT RAISE(ABORT, 'induced failure'); END;",
+                )
+                .unwrap();
+        }
+        let result = call(
+            serde_json::json!({"operations": [{"type": "reassign", "task_id": "t1", "assigned_to": "carol"}]}),
+            &admin("alice"),
+            &conn,
+        )
+        .await;
+        assert!(
+            matches!(result, ToolResult::Failed { .. }),
+            "a genuine DB error reconciling current_task must not be silently swallowed; got {result:?}"
+        );
     }
 
     /// BL-R25-1 (ported from
@@ -6836,6 +7327,81 @@ mod bulk_task_operations_tests {
             .unwrap()
             .unwrap();
         assert_eq!(dependent.status, "in_progress");
+    }
+
+    #[tokio::test]
+    async fn worker_bulk_completing_own_task_advances_a_cross_agent_dependent_and_wakes_its_owner()
+    {
+        // BL-R29-1 on the bulk path: same as the single-task-path test
+        // in update_task_status_tests, but through bulk_task_operations
+        // -- a worker (not admin) completing their own task must still
+        // advance a dependent owned by a DIFFERENT agent and wake that
+        // agent, not the completer.
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_agent(&guard, "carol");
+            seed_task(&guard, "blocker", "in_progress", Some("bob"), "alice");
+            task_repository::create(
+                &guard,
+                NewTask {
+                    task_id: Some("dependent"),
+                    title: "Task dependent",
+                    description: None,
+                    assigned_to: Some("carol"),
+                    created_by: "alice",
+                    status: "pending",
+                    priority: "medium",
+                    parent_task: Some("blocker"),
+                    child_tasks: None,
+                    depends_on_tasks: None,
+                    notes: None,
+                    now: NOW,
+                },
+            )
+            .unwrap();
+            task_repository::update_fields(
+                &guard,
+                "dependent",
+                &task_repository::TaskFields {
+                    depends_on_tasks:
+                        conexus_db::scheduled_directive_repository::NullableUpdate::Set(vec![
+                            "blocker".to_string(),
+                        ]),
+                    ..Default::default()
+                },
+                NOW,
+            )
+            .unwrap();
+        }
+        let registry = WaiterRegistry::new();
+        let (_tx, mut rx_carol) = registry.register("carol");
+        let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
+        let result = BulkTaskOperationsTool::call(
+            Some(&worker("bob")),
+            &serde_json::json!({"operations": [{"type": "update_status", "task_id": "blocker", "status": "completed"}]}),
+            &conn,
+            NOW,
+            &ctx,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        let guard = conn.lock().await;
+        let dependent = task_repository::get_by_id(&guard, "dependent")
+            .unwrap()
+            .unwrap();
+        assert_eq!(dependent.status, "in_progress");
+        drop(guard);
+        assert_eq!(
+            rx_carol.try_recv(),
+            Ok(WakeSignal::Wake),
+            "cross-agent dependent's owner carol must be woken"
+        );
     }
 
     #[tokio::test]

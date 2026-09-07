@@ -1299,6 +1299,28 @@ mod tests {
     }
 
     #[test]
+    fn terminate_refuses_a_tombstone_row() {
+        // BL-R31-3b: a tombstone is already a purge artefact; flipping
+        // its status to 'terminated' would leak `[deleted-<id>]` into
+        // the terminated-agents listing. NOT_TERMINAL_SQL already
+        // excludes 'tombstone' from terminate()'s WHERE clause -- this
+        // pins that specific case (untested until now).
+        let conn = test_conn();
+        AgentRepository::insert_tombstone(&conn, "t1", "[deleted-ghost]", "2026-01-01T00:00:00Z")
+            .unwrap();
+        assert!(
+            !AgentRepository::terminate(&conn, "[deleted-ghost]", "2026-01-02T00:00:00Z").unwrap()
+        );
+        let row = AgentRepository::get_by_id(&conn, "[deleted-ghost]")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.status, "tombstone",
+            "terminate() mutated a tombstone row's status"
+        );
+    }
+
+    #[test]
     fn terminate_already_terminal_is_a_noop_not_a_re_stamp() {
         let conn = test_conn();
         seed(&conn, "alice", "tok-alice", "active");

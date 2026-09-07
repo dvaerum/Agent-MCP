@@ -1797,6 +1797,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mode0_worker_created_task_records_the_worker_as_creator() {
+        // OBS-R17-AZ / test_worker_mode0_created_by_records_worker: a
+        // worker filing an unassigned task via Mode 0 must be recorded
+        // as the REAL creator in both the task row and the audit row --
+        // not the forged literal "admin".
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "root", "pending", Some("bob"), "bob", None);
+        }
+        let result = call_assign(
+            serde_json::json!({
+                "task_title": "worker filed this",
+                "task_description": "triage me",
+                "parent_task_id": "root"
+            }),
+            &worker("bob"),
+            &conn,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        let guard = conn.lock().await;
+        let rows = task_repository::list_all(&guard, None).unwrap();
+        let new_task = rows
+            .iter()
+            .find(|t| t.title == "worker filed this")
+            .expect("new task not found");
+        assert_eq!(
+            new_task.created_by, "bob",
+            "Mode-0 must record the real worker as created_by, not 'admin'"
+        );
+        let audit_actor: String = guard
+            .query_row(
+                "SELECT agent_id FROM agent_actions WHERE action_type = 'created_unassigned_task' \
+                 ORDER BY timestamp DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            audit_actor, "bob",
+            "audit actor for the Mode-0 create must be the worker, not 'admin'"
+        );
+    }
+
+    #[tokio::test]
+    async fn mode0_worker_batch_no_parent_rejected() {
+        // Batch (multi) form of mode0_worker_cannot_file_a_root_task:
+        // a worker filing a batch of unassigned tasks with no
+        // parent_task_id on any entry must be rejected, and no row
+        // persisted.
+        let conn = test_conn();
+        let result = call_assign(
+            serde_json::json!({
+                "tasks": [
+                    {"title": "rootish", "description": "no parent"},
+                ],
+            }),
+            &worker("bob"),
+            &conn,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Conflict { .. }));
+        let guard = conn.lock().await;
+        let rows = task_repository::list_all(&guard, None).unwrap();
+        assert!(
+            rows.is_empty(),
+            "rejected Mode-0 batch create must not persist a row"
+        );
+    }
+
+    #[tokio::test]
     async fn mode0_admin_can_file_an_unassigned_root_task() {
         let conn = test_conn();
         let result = call_assign(
@@ -1810,6 +1882,10 @@ mod tests {
         let rows = task_repository::list_all(&guard, None).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status, "unassigned");
+        assert_eq!(
+            rows[0].created_by, "admin",
+            "regression guard: an operator/manager caller keeps created_by='admin'"
+        );
     }
 
     /// R5-F5 (ported from `tests/test_sec_r5_f5_bulk_task_single_root.py::
@@ -2082,6 +2158,35 @@ mod tests {
         assert_eq!(row.status, "completed");
     }
 
+    #[tokio::test]
+    async fn mode3_assign_existing_to_terminated_agent_rejected() {
+        // test_assign_existing_to_terminated_agent_rejected: assigning
+        // an existing unassigned task to a TERMINATED agent must be
+        // refused -- the row is untouched.
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_agent(&guard, "bob");
+            AgentRepository::terminate(&guard, "bob", NOW).unwrap();
+            seed_task(&guard, "root", "pending", None, "alice", None);
+            seed_task(&guard, "orphan", "pending", None, "alice", Some("root"));
+        }
+        let result = call_assign(
+            serde_json::json!({"agent_token": "tok-bob", "task_ids": ["orphan"]}),
+            &admin("alice"),
+            &conn,
+        )
+        .await;
+        let guard = conn.lock().await;
+        let row = task_repository::get_by_id(&guard, "orphan")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.assigned_to, None,
+            "must not assign to a terminated agent; got {result:?}"
+        );
+    }
+
     // -- AssignTaskTool: Mode 1 (single create+assign) ---------------------
 
     #[tokio::test]
@@ -2279,6 +2384,67 @@ mod tests {
         .await;
         let msg = message_of(&result);
         assert!(msg.contains("Tasks Created: 2"));
+    }
+
+    #[tokio::test]
+    async fn mode2_create_and_assign_multiple_to_terminated_agent_rejected() {
+        // test_create_and_assign_multiple_to_terminated_rejected: no
+        // task should be created+assigned to a TERMINATED agent.
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_agent(&guard, "bob");
+            AgentRepository::terminate(&guard, "bob", NOW).unwrap();
+        }
+        let result = call_assign(
+            serde_json::json!({
+                "agent_token": "tok-bob",
+                "tasks": [{"title": "t1", "description": "d1"}]
+            }),
+            &admin("alice"),
+            &conn,
+        )
+        .await;
+        let guard = conn.lock().await;
+        let n: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE assigned_to = 'bob'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            n, 0,
+            "must not create+assign tasks to a terminated agent; got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mode1_create_and_assign_single_to_terminated_agent_rejected() {
+        // Mode-1 sibling of the same finding (single create+assign,
+        // rather than the batch `tasks` array).
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_agent(&guard, "bob");
+            AgentRepository::terminate(&guard, "bob", NOW).unwrap();
+        }
+        let result = call_assign(
+            serde_json::json!({
+                "agent_token": "tok-bob",
+                "task_title": "new work",
+                "task_description": "desc"
+            }),
+            &admin("alice"),
+            &conn,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::NotFound { .. }));
+        let guard = conn.lock().await;
+        let n: i64 = guard
+            .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "must not create a task for a terminated agent");
     }
 
     /// R5-F5 (ported from `tests/test_sec_r5_f5_bulk_task_single_root.py::
