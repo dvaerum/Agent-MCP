@@ -826,4 +826,63 @@ mod tests {
             .ip()
             .is_loopback());
     }
+
+    // -- resolve_token_dir (test_sec_r2_token_dir.py, SEC round-2
+    // FINDING 5 [LOW]): `Path("")` is truthy in Python, so the old
+    // `Path(os.environ.get(...,  "")) or <default>` idiom silently
+    // resolved an UNSET env var to the process CWD. Already fixed here
+    // (branches on the env var's PRESENCE, not truthiness of the
+    // resulting path) but had no regression coverage at all. ---------
+
+    #[test]
+    fn resolve_token_dir_default_resolves_to_config_not_cwd() {
+        let got = resolve_token_dir(|key| match key {
+            "AGENT_MCP_TOKENS_DIR" => None,
+            "HOME" => Some("/home/example".to_string()),
+            _ => None,
+        });
+        assert_eq!(
+            got,
+            Some(std::path::PathBuf::from(
+                "/home/example/.config/agent-mcp/tokens"
+            ))
+        );
+        // The historical bug: an unset env var must never resolve to
+        // the empty path or the process CWD.
+        assert_ne!(got, Some(std::path::PathBuf::from("")));
+        assert_ne!(got, Some(std::path::PathBuf::from(".")));
+    }
+
+    #[test]
+    fn resolve_token_dir_empty_string_env_falls_back_to_default() {
+        // An explicitly-empty env var is treated as "unset" -- `Path("")`
+        // being truthy in Python is exactly the bug this fix closes.
+        let got = resolve_token_dir(|key| match key {
+            "AGENT_MCP_TOKENS_DIR" => Some(String::new()),
+            "HOME" => Some("/home/example".to_string()),
+            _ => None,
+        });
+        assert_eq!(
+            got,
+            Some(std::path::PathBuf::from(
+                "/home/example/.config/agent-mcp/tokens"
+            ))
+        );
+    }
+
+    #[test]
+    fn resolve_token_dir_honours_the_env_var_when_set() {
+        let got = resolve_token_dir(|key| match key {
+            "AGENT_MCP_TOKENS_DIR" => Some("/custom/tokens".to_string()),
+            "HOME" => Some("/home/example".to_string()),
+            _ => None,
+        });
+        assert_eq!(got, Some(std::path::PathBuf::from("/custom/tokens")));
+    }
+
+    #[test]
+    fn resolve_token_dir_is_none_with_neither_env_var_nor_home() {
+        let got = resolve_token_dir(|_| None);
+        assert_eq!(got, None);
+    }
 }

@@ -188,6 +188,23 @@ async fn systemctl_on_backend(
 }
 
 /// Port of `delete_project_handler`.
+///
+/// **Found-and-fixed bug (this PR)**: the outer `system.projects.
+/// manage` capability check ran ONLY inside `revalidated_lock`
+/// (well past `maybe_delete_workspace`'s real, recursive
+/// `remove_dir_all` on `?delete_workspace=true`) -- unlike Python,
+/// where `gated(project_lifecycle_gate(delete_project_handler))`
+/// wraps the ENTIRE handler at registration time, so the capability
+/// is confirmed before a single line of the handler body (workspace
+/// deletion included) ever runs. A project OPERATOR-tier member with
+/// no deployment-wide delegation of that capability -- a real,
+/// legitimate role this codebase's own docs describe as needing an
+/// EXTRA explicit group grant to reach lifecycle mutations at all --
+/// could trigger a real recursive workspace delete and only THEN get
+/// denied, by which point the damage was already done. Moved the
+/// check to this handler's own first line (mirrors
+/// `create_project_handler`'s established pattern) so no destructive
+/// step of any kind can run before it.
 pub async fn delete_project_handler(
     State(state): State<Arc<RouterState>>,
     Extension(identity): Extension<GateIdentity>,
@@ -196,6 +213,13 @@ pub async fn delete_project_handler(
     headers: HeaderMap,
 ) -> Response {
     let single_tenant_name = state.mcp_handler_config.single_tenant_name.as_deref();
+    if let Err(resp) = project_gate::require_capability(
+        &identity,
+        single_tenant_name,
+        Capability::SystemProjectsManage,
+    ) {
+        return resp.into_response();
+    }
     if crate::single_tenant::disables_write_endpoint(single_tenant_name) {
         return crate::single_tenant::single_tenant_disabled_response(single_tenant_name)
             .into_response();
@@ -290,6 +314,21 @@ pub async fn delete_project_handler(
         return HandlerResponse::from(e).into_response();
     }
 
+    // SC-R8-1 (mirrors admin_api.py's `ensure_locks.pop((name,
+    // "backend"), None)`): drop the per-name ensure lock too -- but
+    // only AFTER `_lock_guard` has actually released it (dropping the
+    // guard explicitly here, rather than waiting for it to fall out
+    // of scope at the end of the function, makes that ordering
+    // load-bearing rather than incidental). `finish_delete_project`'s
+    // own `store.forget(name, keep_hmac: false, keep_lock: true)`
+    // deliberately does NOT do this -- it runs WHILE the lock is
+    // still held, and popping the DashMap entry out from under a live
+    // guard would desync it from whatever `Arc` a concurrent waiter
+    // already cloned. Without this pop, create+delete of N distinct
+    // project names leaks N lock objects forever.
+    drop(_lock_guard);
+    state.runtime.drop_ensure_lock(&name, "backend");
+
     let mut payload = serde_json::json!({
         "unregistered": name,
         "workspace_deleted": workspace_outcome.deleted,
@@ -318,6 +357,26 @@ pub async fn stop_project_handler(
     Path(name): Path<String>,
     headers: HeaderMap,
 ) -> Response {
+    // Found-and-fixed bug (this PR, matches the sibling fix on
+    // `delete_project_handler` above): this capability check was
+    // previously reached ONLY via `revalidated_lock`, well after the
+    // cross-tenant membership precheck below -- unlike Python's
+    // `gated(project_lifecycle_gate(stop_project_handler))`, which
+    // confirms the capability before the handler body runs at all. No
+    // destructive step preceded the old, later check here (unlike
+    // delete's workspace removal), but the OBSERVABLE contract still
+    // diverged: a caller with membership but no delegated capability
+    // got a membership-shaped denial instead of the capability-shaped
+    // one Python (and `test_sec_router_admin_authz.py`) expects.
+    let single_tenant_name = state.mcp_handler_config.single_tenant_name.as_deref();
+    if let Err(resp) = project_gate::require_capability(
+        &identity,
+        single_tenant_name,
+        Capability::SystemProjectsManage,
+    ) {
+        return resp.into_response();
+    }
+
     let workspace_check = {
         let conn = state.conn.lock().await;
         project_teardown::project_mutation_precheck(
@@ -534,27 +593,58 @@ pub async fn rename_project_handler(
             to,
             grace_days,
             alias_expires_at,
-        }) => lifecycle::success_envelope(
-            serde_json::json!({
-                "renamed": {"from": from, "to": to},
-                "alias": {"name": from, "grace_days": grace_days, "expires_at": alias_expires_at},
-            }),
-            200,
-        )
-        .into_response(),
+        }) => {
+            // SC-R8-1 (mirrors delete): drop the per-OLD-name ensure
+            // lock now that `_lock_guard` has actually released it --
+            // see the identical comment on `delete_project_handler`
+            // above for why the ordering (drop the guard, THEN pop
+            // the DashMap entry) is load-bearing. Only reached on the
+            // success path -- a `Rejected` outcome below leaves
+            // `old_name` a live project whose lock must stay (mirrors
+            // `admin_api.py`'s own placement of this exact pop).
+            drop(_lock_guard);
+            state.runtime.drop_ensure_lock(&old_name, "backend");
+            lifecycle::success_envelope(
+                serde_json::json!({
+                    "renamed": {"from": from, "to": to},
+                    "alias": {"name": from, "grace_days": grace_days, "expires_at": alias_expires_at},
+                }),
+                200,
+            )
+            .into_response()
+        }
         Ok(project_rename::RenameOutcome::Rejected(resp)) => resp.into_response(),
         Err(e) => HandlerResponse::from(e).into_response(),
     }
 }
 
-/// Port of `alias_usage_handler`. Read-only, no capability check
-/// (session-gated + membership-scoped only, matching Python).
+/// Port of `alias_usage_handler`.
+///
+/// **Found-and-fixed bug (this PR)**: this module's own earlier doc
+/// claimed "no capability check at all... matching Python", but the
+/// real, CURRENT `admin_api.py` registers this route as `gated(
+/// project_lifecycle_gate(alias_usage_handler))` (SEC FINDING 1,
+/// 2026-07-09) -- the deployment-wide `system.projects.manage`
+/// capability gate applies here too, same as `stop`/`rename`/
+/// `delete`. Without it, ANY project member (viewer included --
+/// `decide_alias_usage`'s own entry gate has no `min_role`) could
+/// read the alias-usage roster with no delegated capability at all.
+/// Membership-scoping (closes the cross-tenant existence oracle for
+/// a HIDDEN project) still runs too, inside `decide_alias_usage`.
 pub async fn alias_usage_handler(
     State(state): State<Arc<RouterState>>,
     Extension(identity): Extension<GateIdentity>,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
+    let single_tenant_name = state.mcp_handler_config.single_tenant_name.as_deref();
+    if let Err(resp) = project_gate::require_capability(
+        &identity,
+        single_tenant_name,
+        Capability::SystemProjectsManage,
+    ) {
+        return resp.into_response();
+    }
     let alias = params.get("alias").map(String::as_str).unwrap_or("");
     let conn = state.conn.lock().await;
     match project_reads::decide_alias_usage(
@@ -666,12 +756,26 @@ pub async fn overview_handler(
 
 /// Port of `remove_alias_handler` -- closes gap 10 (no prior Rust
 /// coverage at all) via the new `project_reads::decide_remove_alias`.
+///
+/// **Found-and-fixed bug (this PR)**: same class as
+/// `alias_usage_handler` above -- the CURRENT `admin_api.py` registers
+/// `DELETE .../aliases/{alias}` as `gated(project_lifecycle_gate(
+/// remove_alias_handler))` too, and this port had no capability check
+/// at all. `decide_remove_alias`'s own `min_role: Some("operator")`
+/// closes the membership-rank half; this closes the capability half.
 pub async fn remove_alias_handler(
     State(state): State<Arc<RouterState>>,
     Extension(identity): Extension<GateIdentity>,
     Path((name, alias)): Path<(String, String)>,
 ) -> Response {
     let single_tenant_name = state.mcp_handler_config.single_tenant_name.as_deref();
+    if let Err(resp) = project_gate::require_capability(
+        &identity,
+        single_tenant_name,
+        Capability::SystemProjectsManage,
+    ) {
+        return resp.into_response();
+    }
     if crate::single_tenant::disables_write_endpoint(single_tenant_name) {
         return crate::single_tenant::single_tenant_disabled_response(single_tenant_name)
             .into_response();
@@ -761,5 +865,432 @@ mod tests {
             !text.contains("UnsupportedRole") && !text.contains("leaky"),
             "resolution-error detail leaked into body: {text:?}"
         );
+    }
+}
+
+/// Real handler-level tests -- each of these calls a `pub async fn`
+/// handler directly (no `axum::Router`/`oneshot` needed: every
+/// argument here is an ordinary extractor value a caller can
+/// construct by hand), proving the wiring fixes in this module's own
+/// doc comments above rather than re-testing the pure decision
+/// functions (`project_gate`/`project_teardown`/`project_rename`
+/// already have exhaustive coverage of those in their own modules).
+///
+/// Three `test_sec_*` pentest-regression findings land here:
+///
+/// - `test_sec_router_admin_authz.py` (SEC FINDING 1): `stop`/
+///   `aliases` (GET)/`aliases/{alias}` (DELETE) must be gated on
+///   `system.projects.manage`, matching the sibling create/rename/
+///   delete lifecycle routes -- found completely MISSING for the two
+///   alias routes, and present only as a LATE (post-destructive-step)
+///   re-check for delete/stop.
+/// - `test_sec_r8_lifecycle_hygiene.py` (SC-R8-1): delete/rename must
+///   drop their own `ensure_locks` entry once the surrounding lock
+///   releases, or create+delete/rename of N distinct names leaks N
+///   lock objects forever.
+#[cfg(test)]
+mod handler_tests {
+    use super::*;
+    use crate::identity::{self, UserRow};
+    use crate::orchestrator::ensure::EnsureConfig;
+    use crate::project_registry::ProjectRegistry;
+    use crate::rate_limit::RateLimitConfig;
+    use crate::session_gate::GateIdentity;
+    use crate::state::RouterStateConfig;
+    use conexus_core::capability::Capabilities;
+    use conexus_core::principal::{Principal, PrincipalKind};
+    use conexus_db::schema::init_router_schema;
+    use std::collections::HashSet;
+
+    const NOW_STR: &str = "2026-01-01T00:00:00.000+00:00";
+
+    fn test_state_config(dir: &std::path::Path) -> RouterStateConfig {
+        RouterStateConfig {
+            sock_dir: dir.join("sockets"),
+            dashboard_dir: None,
+            external_url: None,
+            idle_sec: 14400,
+            asset_prefix: None,
+            single_tenant_name: None,
+            single_tenant_workspace: None,
+            max_streams_per_agent: 4,
+            max_streams_global: 64,
+            default_workspace_parent: dir.join("workspaces"),
+            token_dir: None,
+        }
+    }
+
+    /// `_dir` must outlive the state (the project registry's backing
+    /// file, and every real workspace dir a test creates, live under
+    /// it).
+    fn test_state() -> (tempfile::TempDir, Arc<RouterState>) {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_router_schema(&conn).unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
+        let state = Arc::new(RouterState::new(
+            conn,
+            registry,
+            RateLimitConfig::resolve_from_process_env(),
+            EnsureConfig::from_env(|_| None),
+            test_state_config(dir.path()),
+        ));
+        (dir, state)
+    }
+
+    /// Builds a `GateIdentity` directly, exactly like
+    /// `project_gate.rs`'s own `identity_with` helper -- `require_
+    /// capability` is a pure in-memory check on `principal.
+    /// capabilities`, so a caller-lacks/holds-the-capability scenario
+    /// needs no DB group/capability grant plumbing at all. `user_id`
+    /// only needs to resolve to a REAL row when the test expects the
+    /// handler to reach a later fresh-DB revalidation
+    /// (`perm_gates::revalidated_lock`/`read_body_and_revalidate`).
+    fn identity_for(user_id: &str, is_sysadmin: bool, caps: HashSet<Capability>) -> GateIdentity {
+        GateIdentity {
+            user: UserRow {
+                user_id: user_id.to_string(),
+                username: user_id.to_string(),
+                email: None,
+                password_hash: None,
+                created_at: NOW_STR.to_string(),
+                last_login_at: None,
+                is_sysadmin,
+                sso_subject: None,
+            },
+            is_sysadmin,
+            project: None,
+            project_role: None,
+            principal: Principal {
+                kind: PrincipalKind::OperatorSession,
+                user_id: Some(user_id.to_string()),
+                agent_id: None,
+                project_name: None,
+                project_role: None,
+                agent_role: None,
+                can_wake_loop: false,
+                source_token: None,
+                capabilities: if is_sysadmin {
+                    Capabilities::Sysadmin
+                } else {
+                    Capabilities::Set(caps)
+                },
+            },
+        }
+    }
+
+    /// A real sysadmin user, seeded as the first (auto-bootstrapped)
+    /// row so `revalidated_lock`/`read_body_and_revalidate`'s own
+    /// fresh DB-based re-derivation ALSO sees them as sysadmin -- for
+    /// tests that need a genuine end-to-end success path, not just an
+    /// entry-gate denial.
+    async fn seed_real_sysadmin(state: &RouterState, username: &str) -> String {
+        let mut conn = state.conn.lock().await;
+        identity::create_user(
+            &mut conn,
+            username,
+            "correct horse battery staple",
+            None,
+            false,
+            true,
+            &[],
+            NOW_STR,
+        )
+        .unwrap()
+    }
+
+    fn register(state: &RouterState, name: &str, workspace: &std::path::Path) {
+        std::fs::create_dir_all(workspace).unwrap();
+        state
+            .registry
+            .register(name, &workspace.to_string_lossy(), "python", Utc::now())
+            .unwrap();
+    }
+
+    async fn json_body(resp: Response) -> serde_json::Value {
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    // -- test_sec_router_admin_authz.py: the capability gate must be
+    // the FIRST thing every one of these handlers checks -----------
+
+    #[tokio::test]
+    async fn delete_project_handler_denies_a_non_cap_caller_before_any_destructive_step() {
+        let (dir, state) = test_state();
+        let ws = dir.path().join("workspaces").join("proj-a");
+        register(&state, "proj-a", &ws);
+        std::fs::write(ws.join("marker.txt"), b"still here").unwrap();
+
+        // No sysadmin bit, no `system.projects.manage` grant at all --
+        // exactly `test_cross_tenant_viewer_denied`'s "vera" shape.
+        let identity = identity_for("vera", false, HashSet::new());
+        let resp = delete_project_handler(
+            State(state.clone()),
+            Extension(identity),
+            Path("proj-a".to_string()),
+            Query(HashMap::from([(
+                "delete_workspace".to_string(),
+                "true".to_string(),
+            )])),
+            HeaderMap::new(),
+        )
+        .await;
+
+        assert_eq!(resp.status(), 403);
+        let body = json_body(resp).await;
+        assert_eq!(body["error"], "forbidden");
+        assert!(body["message"]
+            .as_str()
+            .unwrap()
+            .contains("system.projects.manage"));
+        // The found-and-fixed bug: this workspace must NEVER have been
+        // touched -- the capability denial must land before any
+        // destructive step, not after.
+        assert!(
+            ws.join("marker.txt").exists(),
+            "workspace was deleted despite the caller lacking the capability"
+        );
+        assert!(state.registry.get("proj-a").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn stop_project_handler_denies_a_non_cap_caller() {
+        let (_dir, state) = test_state();
+        let identity = identity_for("vera", false, HashSet::new());
+        let resp = stop_project_handler(
+            State(state.clone()),
+            Extension(identity),
+            Path("no-such-project".to_string()),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(resp.status(), 403);
+        let body = json_body(resp).await;
+        assert_eq!(body["error"], "forbidden");
+        assert!(body["message"]
+            .as_str()
+            .unwrap()
+            .contains("system.projects.manage"));
+    }
+
+    #[tokio::test]
+    async fn alias_usage_handler_denies_a_non_cap_caller() {
+        let (_dir, state) = test_state();
+        let identity = identity_for("vera", false, HashSet::new());
+        let resp = alias_usage_handler(
+            State(state.clone()),
+            Extension(identity),
+            Path("victim".to_string()),
+            Query(HashMap::from([(
+                "alias".to_string(),
+                "oldname".to_string(),
+            )])),
+        )
+        .await;
+        assert_eq!(resp.status(), 403);
+        let body = json_body(resp).await;
+        assert_eq!(body["error"], "forbidden");
+    }
+
+    #[tokio::test]
+    async fn remove_alias_handler_denies_a_non_cap_caller() {
+        let (_dir, state) = test_state();
+        let identity = identity_for("vera", false, HashSet::new());
+        let resp = remove_alias_handler(
+            State(state.clone()),
+            Extension(identity),
+            Path(("victim".to_string(), "oldname".to_string())),
+        )
+        .await;
+        assert_eq!(resp.status(), 403);
+        let body = json_body(resp).await;
+        assert_eq!(body["error"], "forbidden");
+    }
+
+    #[tokio::test]
+    async fn alias_usage_handler_admits_a_cap_holding_non_sysadmin_member() {
+        // Regression: a delegated (non-sysadmin) cap-holder who is
+        // ALSO a resolved project member must still be admitted --
+        // the new capability gate must not over-reject the legitimate
+        // Wave-9 delegation shape every other lifecycle route already
+        // supports.
+        let (dir, state) = test_state();
+        register(
+            &state,
+            "victim",
+            &dir.path().join("workspaces").join("victim"),
+        );
+        let uid = {
+            let mut conn = state.conn.lock().await;
+            let uid = identity::create_user(
+                &mut conn,
+                "alice",
+                "correct horse battery staple",
+                None,
+                false,
+                true, // first user -> sysadmin bootstrap; harmless, we override is_sysadmin below
+                &[],
+                NOW_STR,
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO project_membership (project_name, user_id, role) VALUES ('victim', ?1, 'viewer')",
+                [&uid],
+            )
+            .unwrap();
+            // Undo the bootstrap auto-sysadmin so this is a genuine
+            // delegated-cap-only (non-sysadmin) caller.
+            conn.execute(
+                "UPDATE users SET is_sysadmin = 0 WHERE user_id = ?1",
+                [&uid],
+            )
+            .unwrap();
+            uid
+        };
+        let identity = identity_for(
+            &uid,
+            false,
+            HashSet::from([Capability::SystemProjectsManage]),
+        );
+        let resp = alias_usage_handler(
+            State(state.clone()),
+            Extension(identity),
+            Path("victim".to_string()),
+            Query(HashMap::from([(
+                "alias".to_string(),
+                "oldname".to_string(),
+            )])),
+        )
+        .await;
+        // Denied for a DIFFERENT reason (no such alias) is fine -- the
+        // point is it must not be 403 forbidden (the cap gate must not
+        // be what stops this caller).
+        assert_ne!(resp.status(), 403, "{:?}", json_body(resp).await);
+    }
+
+    // -- test_sec_r8_lifecycle_hygiene.py (SC-R8-1): delete/rename pop
+    // their own ensure_locks entry once the surrounding lock releases
+
+    #[tokio::test]
+    async fn delete_project_handler_drops_its_own_ensure_lock_on_success() {
+        let (dir, state) = test_state();
+        let uid = seed_real_sysadmin(&state, "root").await;
+        register(
+            &state,
+            "proj-a",
+            &dir.path().join("workspaces").join("proj-a"),
+        );
+        let before = state.runtime.ensure_lock("proj-a", "backend");
+
+        let identity = identity_for(&uid, true, HashSet::new());
+        let resp = delete_project_handler(
+            State(state.clone()),
+            Extension(identity),
+            Path("proj-a".to_string()),
+            Query(HashMap::new()),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(resp.status(), 200, "{:?}", json_body(resp).await);
+
+        let after = state.runtime.ensure_lock("proj-a", "backend");
+        assert!(
+            !std::sync::Arc::ptr_eq(&before, &after),
+            "delete must drop its own ensure_locks entry -- a fresh call \
+             must mint a NEW lock instance, not find the leaked old one"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_project_handler_leaves_a_sibling_project_lock_untouched() {
+        let (dir, state) = test_state();
+        let uid = seed_real_sysadmin(&state, "root").await;
+        register(&state, "gone", &dir.path().join("workspaces").join("gone"));
+        register(
+            &state,
+            "stays",
+            &dir.path().join("workspaces").join("stays"),
+        );
+        let stays_lock_before = state.runtime.ensure_lock("stays", "backend");
+
+        let identity = identity_for(&uid, true, HashSet::new());
+        let resp = delete_project_handler(
+            State(state.clone()),
+            Extension(identity),
+            Path("gone".to_string()),
+            Query(HashMap::new()),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+
+        let stays_lock_after = state.runtime.ensure_lock("stays", "backend");
+        assert!(std::sync::Arc::ptr_eq(
+            &stays_lock_before,
+            &stays_lock_after
+        ));
+    }
+
+    #[tokio::test]
+    async fn rename_project_handler_drops_its_own_ensure_lock_on_success() {
+        let (dir, state) = test_state();
+        let uid = seed_real_sysadmin(&state, "root").await;
+        register(
+            &state,
+            "old-name",
+            &dir.path().join("workspaces").join("old-name"),
+        );
+        let before = state.runtime.ensure_lock("old-name", "backend");
+
+        let identity = identity_for(&uid, true, HashSet::new());
+        let resp = rename_project_handler(
+            State(state.clone()),
+            Extension(identity),
+            Path("old-name".to_string()),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"name": "new-name", "grace_days": 7}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), 200, "{:?}", json_body(resp).await);
+
+        let after = state.runtime.ensure_lock("old-name", "backend");
+        assert!(
+            !std::sync::Arc::ptr_eq(&before, &after),
+            "rename must drop its own ensure_locks entry keyed on OLD_NAME"
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_project_handler_never_touches_the_lock_when_rejected_pre_lock() {
+        // Sanity check on the placement of the pop: a rename REJECTED
+        // by `rename_precheck` (here, a name collision -- renaming
+        // "old-name" onto itself collides with its own registry row)
+        // never reaches `revalidated_lock` at all, so no lock is ever
+        // minted for it -- the pop only ever runs on the SUCCESS path,
+        // mirroring `admin_api.py`'s own placement of this exact call
+        // strictly after the block that acquires the lock.
+        let (dir, state) = test_state();
+        let uid = seed_real_sysadmin(&state, "root").await;
+        register(
+            &state,
+            "old-name",
+            &dir.path().join("workspaces").join("old-name"),
+        );
+
+        let identity = identity_for(&uid, true, HashSet::new());
+        let resp = rename_project_handler(
+            State(state.clone()),
+            Extension(identity),
+            Path("old-name".to_string()),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"name": "old-name", "grace_days": 7}"#), // collides with itself
+        )
+        .await;
+        assert_eq!(resp.status(), 409, "{:?}", json_body(resp).await);
+        assert!(state.registry.get("old-name").unwrap().is_some());
     }
 }

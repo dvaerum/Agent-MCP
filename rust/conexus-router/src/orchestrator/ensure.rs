@@ -716,6 +716,72 @@ exit 0
         );
     }
 
+    /// SC-R8-2 (test_sec_r8_lifecycle_hygiene.py): the systemctl-
+    /// failure path is reachable by any project MEMBER (a warm-start),
+    /// not just an operator -- the client-observable error must never
+    /// reflect the raw systemd stderr (unit-file paths, "Failed at
+    /// step EXEC ..."). `EnsureFailureReason::message()` already makes
+    /// this structurally impossible (`EnsureError::Failed` carries only
+    /// the closed `EnsureFailureReason` enum, never a string derived
+    /// from `result.stderr`) -- this test proves it end to end anyway,
+    /// with a REAL subprocess emitting secret-shaped stderr, mirroring
+    /// `lifecycle_rest.rs`'s identical-shaped regression on the
+    /// sibling `stop_result_to_failure_response`.
+    #[tokio::test]
+    async fn ensure_never_reflects_the_real_systemctl_stderr_on_a_start_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_dir = dir.path().join("sockets");
+        let registry = registry_with(dir.path(), "proj-a", "python");
+        let store = RuntimeStore::new();
+
+        let secret = "/nix/store/SECRET-unit-path/agent-mcp-leaky-backend.service";
+        let log = dir.path().join("calls.log");
+        let script_path = dir.path().join("fake-systemctl-secret.sh");
+        std::fs::write(
+            &script_path,
+            format!(
+                r#"#!/bin/sh
+echo "$@" >> "{log}"
+verb=""
+for a in "$@"; do
+  case "$a" in
+    is-active|start|restart|stop) verb="$a" ;;
+  esac
+done
+case "$verb" in
+  is-active) exit 3 ;;
+  start|restart) echo "Failed at step EXEC spawning {secret}: No such file" 1>&2; exit 1 ;;
+esac
+exit 0
+"#,
+                log = log.display(),
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script_path, perms).unwrap();
+        }
+
+        let cfg = fast_cfg(&script_path);
+        let err = ensure(&store, &registry, &sock_dir, "proj-a", "backend", &cfg)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            EnsureError::Failed(EnsureFailureReason::SystemctlFailed)
+        ));
+        let observable = err.to_string();
+        assert!(!observable.contains(secret), "leaked: {observable:?}");
+        assert!(
+            !observable.contains("EXEC") && !observable.contains("leaky"),
+            "leaked: {observable:?}"
+        );
+    }
+
     #[tokio::test]
     async fn ensure_unknown_project_is_unknown_project() {
         let dir = tempfile::tempdir().unwrap();
