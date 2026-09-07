@@ -175,6 +175,41 @@ fn principal_from_context(context: &RequestContext<RoleServer>) -> Option<Princi
         .map(|p| p.0.clone())
 }
 
+/// Port of `test_sec_r8_toolresult_generic.py`'s "detail retained
+/// server-side" half (SEC-R8-1) -- a real gap found while porting
+/// that test: `ToolResult::Failed`'s real message is genericized to
+/// `"Operation failed"` on every wire (`render_as_text_content`/
+/// `to_http`), correctly, but nothing anywhere in this crate ever
+/// logged the real detail before this fix -- unlike Python's own two
+/// render choke-points (`render_as_text_content`/
+/// `_dispatch_through_tool`), which both log the raw message via
+/// `logger.error`/`logger.warning` before genericizing the client-
+/// facing text. Without this, a real production `Failed` result left
+/// the operator with ZERO trace of what actually happened -- not a
+/// security bug (the opposite: overly conservative), but a real
+/// operational-visibility regression. `conexus_core::tool_result`
+/// itself stays zero-I/O (its own documented role) -- logging lives
+/// at the two real call sites instead, matching Python's own choke-
+/// point placement (`main_app.py`'s MCP handler,
+/// `_dispatch_helpers.py`'s REST dispatch).
+/// Pure half of [`log_failed_tool_result`] -- isolated so the "only
+/// `Failed` produces a line, every other variant is silent" logic is
+/// unit-testable without capturing real stderr.
+fn failed_tool_result_log_line(tool_name: &str, result: &ToolResult) -> Option<String> {
+    match result {
+        ToolResult::Failed { message } => Some(format!(
+            "conexus-backend: tool '{tool_name}' failed: {message}"
+        )),
+        _ => None,
+    }
+}
+
+fn log_failed_tool_result(tool_name: &str, result: &ToolResult) {
+    if let Some(line) = failed_tool_result_log_line(tool_name, result) {
+        eprintln!("{line}");
+    }
+}
+
 fn tool_result_to_call_tool_result(result: &ToolResult) -> CallToolResult {
     let content: Vec<ContentBlock> = result
         .render_as_text_content()
@@ -349,6 +384,7 @@ pub(crate) async fn dispatch_rest_tool(
     )
     .await;
     publish_dashboard_change(shared, tool_name, &result);
+    log_failed_tool_result(tool_name, &result);
     Ok(result)
 }
 
@@ -515,6 +551,7 @@ impl ServerHandler for ConexusServer {
         )
         .await;
         publish_dashboard_change(&self.shared, &name, &result);
+        log_failed_tool_result(&name, &result);
         Ok(tool_result_to_call_tool_result(&result).into())
     }
 
@@ -691,6 +728,52 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         assert!(!rendered.contains("leaked path"));
+    }
+
+    #[test]
+    fn failed_tool_result_produces_a_log_line_carrying_the_real_message() {
+        // Port of test_sec_r8_toolresult_generic.py's "detail retained
+        // server-side" assertion (SEC-R8-1) -- the client-facing text
+        // is genericized (proven above), but the real detail must
+        // still reach the operator somewhere.
+        let result = ToolResult::Failed {
+            message: "sqlite3.OperationalError: no such table: rag_chunks".to_string(),
+        };
+        let line = failed_tool_result_log_line("ask_project_rag", &result).unwrap();
+        assert!(line.contains("ask_project_rag"));
+        assert!(line.contains("no such table: rag_chunks"));
+    }
+
+    #[test]
+    fn every_other_tool_result_variant_produces_no_log_line() {
+        // The genuine, controlled variants already carry their own
+        // deliberate user-facing text -- logging them too would just
+        // be noise, matching Python's own choke-points (which only
+        // ever special-case Failed).
+        let non_failed = [
+            ToolResult::Ok {
+                data: None,
+                message: Some("done".into()),
+            },
+            ToolResult::NotFound {
+                resource: "task".into(),
+                identifier: "t-9".into(),
+                hint: None,
+            },
+            ToolResult::PermissionDenied {
+                reason: "not the author".into(),
+            },
+            ToolResult::Invalid {
+                message: "must be positive".into(),
+                field: None,
+            },
+            ToolResult::Conflict {
+                reason: "dup".into(),
+            },
+        ];
+        for result in &non_failed {
+            assert!(failed_tool_result_log_line("some_tool", result).is_none());
+        }
     }
 
     fn test_conn() -> AsyncMutex<rusqlite::Connection> {
