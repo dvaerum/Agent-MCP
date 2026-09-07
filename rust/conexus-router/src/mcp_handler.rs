@@ -785,6 +785,51 @@ mod tests {
         assert!(!message.contains("agent-mcp@"), "leaked unit: {message:?}");
     }
 
+    #[test]
+    fn proxy_error_response_maps_backend_unavailable_to_a_clean_502_without_leaking_the_raw_error()
+    {
+        // R3-F3 (defense-in-depth half, `test_sec_r3f3_proxy_backend_
+        // gone.py` port): a backend reaped between `ensure()`
+        // resolving its socket and `proxy_to_backend`'s own connect
+        // (see `proxy_core.rs`'s `ProxyError::BackendUnavailable` doc)
+        // must answer with a clean, retryable 502 -- never reflecting
+        // the raw `ClientConnectorError`'s OS errno text into the
+        // client-visible body. Both real connect-failure shapes
+        // (ECONNREFUSED/ENOENT) map to this SAME variant (`proxy_core.
+        // rs` line: `Err(UdsClientError::Connect(e)) => Err(ProxyError::
+        // BackendUnavailable(e))`) and are confirmed against a genuine
+        // UDS in `proxy_client.rs`'s own
+        // `send_reports_a_connect_error_for_a_missing_socket`/
+        // `..._for_a_refused_socket` tests -- this pins the OTHER half
+        // of the fix: what the router does with that error once it has
+        // it.
+        let io_err = std::io::Error::from_raw_os_error(111); // ECONNREFUSED
+                                                             // Sanity: the raw io::Error's own message really does contain
+                                                             // errno-style OS text -- proving the assertion below is a real
+                                                             // check, not a vacuous one.
+        assert!(io_err.to_string().to_lowercase().contains("refused"));
+
+        let response = proxy_error_response(ProxyError::BackendUnavailable(io_err));
+
+        assert_eq!(response.status, 502);
+        assert_eq!(
+            response.headers,
+            vec![("Retry-After".to_string(), "2".to_string())]
+        );
+        match response.body {
+            HandlerBody::Text(body) => {
+                assert!(
+                    !body.to_lowercase().contains("refused")
+                        && !body.to_lowercase().contains("errno")
+                        && !body.to_lowercase().contains("os error"),
+                    "must never reflect the raw connector error's OS-level \
+                     text into the client-visible body, got {body:?}"
+                );
+            }
+            other => panic!("expected a text body, got {other:?}"),
+        }
+    }
+
     fn fast_cfg() -> McpHandlerConfig {
         McpHandlerConfig {
             single_tenant_name: None,
@@ -1102,6 +1147,189 @@ mod tests {
             resp.status, 401,
             "an oversized body must collapse into the uniform pre-auth 401"
         );
+    }
+
+    // ── SEC round-2 (test_sec_r2_preauth_timing_413.py port) ─────────
+    //
+    // The above three tests already prove each individual pre-auth-401
+    // path (no bearer / unknown project / backend-401 collapse /
+    // oversized body) returns 401. These three close the remaining
+    // gaps the Python regression suite specifically targeted: the
+    // KNOWN-project path is also timed against the floor (not just
+    // collapsed in shape), the floor's absorb-vs-stack sleep math, and
+    // the WWW-Authenticate challenge surviving on every path.
+
+    #[tokio::test]
+    async fn backend_mcp_handler_floors_a_known_projects_backend_401_to_the_same_latency() {
+        // Finding 1's other half: `backend_mcp_handler_proxies_a_real_
+        // request_and_collapses_a_backend_401` above proves the KNOWN
+        // path's backend-401 gets collapsed into the canonical
+        // envelope; this proves it's also actually FLOORED (not just
+        // reshaped) -- the mechanism that hides the backend's real UDS
+        // round-trip latency behind the same wall-clock target the
+        // UNKNOWN path (tested above) is held to.
+        let dir = tempfile::tempdir().unwrap();
+        let sock_dir = dir.path().join("sockets");
+        std::fs::create_dir_all(sock_dir.join("proj-a")).unwrap();
+        spawn_backend(sock_dir.join("proj-a").join("backend.sock"), |_req| {
+            Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .body(Full::new(Bytes::from_static(
+                    b"{\"error\":\"invalid_bearer\"}",
+                )))
+                .unwrap()
+        })
+        .await;
+
+        let registry = registry_with(dir.path(), "proj-a", "python");
+        let store = RuntimeStore::new();
+        let stream_caps = Arc::new(StreamCapRegistry::new(4, 64));
+        let cfg = McpHandlerConfig {
+            preauth_401_floor: Duration::from_millis(80),
+            ..fast_cfg()
+        };
+
+        let t0 = Instant::now();
+        let resp = backend_mcp_handler(
+            &store,
+            &stream_caps,
+            &registry,
+            &sock_dir,
+            &fast_ensure_cfg(),
+            &cfg,
+            test_now(),
+            base_req("proj-a", "/agent-mcp/proj-a/mcp"),
+        )
+        .await;
+        let elapsed = t0.elapsed();
+        assert_eq!(resp.status, 401);
+        assert!(
+            elapsed >= Duration::from_millis(75),
+            "a known project's backend-401 must ALSO be floored to ~the \
+             configured latency (not just collapsed in shape), got {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn floored_unauthorized_absorbs_elapsed_since_t0() {
+        // Port of Python's test_floored_unauthorized_absorbs_elapsed_
+        // since_t0: the floor must ABSORB time already spent since
+        // handler entry (e.g. the KNOWN-project backend round-trip
+        // above) rather than stacking a full extra sleep on top of it
+        // -- this is the actual mechanism that keeps a slow KNOWN path
+        // and a fast UNKNOWN path timing-indistinguishable. Asserted
+        // directly on `floored_unauthorized`'s own real-time behavior
+        // with generous tolerances (not a cross-request differential),
+        // matching this crate's existing floor tests' style rather
+        // than introducing tokio's `test-util` time-pausing just for
+        // this one case.
+        let cfg = McpHandlerConfig {
+            preauth_401_floor: Duration::from_millis(200),
+            ..fast_cfg()
+        };
+
+        // A FRESH t0 (as if the handler just entered) sleeps close to
+        // the full floor.
+        let fresh_t0 = Instant::now();
+        let start = Instant::now();
+        floored_unauthorized(&cfg, fresh_t0).await;
+        let fresh_elapsed = start.elapsed();
+
+        // A t0 already 120ms old (as if a backend round-trip had
+        // already spent that much time before reaching this call)
+        // sleeps only the REMAINDER of the floor.
+        let backdated_t0 = Instant::now() - Duration::from_millis(120);
+        let start2 = Instant::now();
+        floored_unauthorized(&cfg, backdated_t0).await;
+        let backdated_elapsed = start2.elapsed();
+
+        assert!(
+            fresh_elapsed >= Duration::from_millis(180),
+            "a fresh t0 should sleep close to the full floor, got {fresh_elapsed:?}"
+        );
+        assert!(
+            backdated_elapsed < Duration::from_millis(120),
+            "a t0 already 120ms old should sleep for roughly the \
+             REMAINDER of the floor (~80ms), not the full floor stacked \
+             on top -- a backend round-trip would otherwise re-open the \
+             timing oracle by adding on top of the floor instead of \
+             being absorbed by it; got {backdated_elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_mcp_handler_401_paths_all_carry_the_bearer_challenge() {
+        // Port of Python's test_preauth_floor_keeps_www_authenticate:
+        // the floored 401 must still carry the WWW-Authenticate
+        // challenge on EVERY pre-auth-401 path -- the hardening must
+        // not degrade the legitimate auth-challenge UX for a genuinely
+        // unauthenticated caller. `unauthorized_response`'s header is
+        // structurally shared by every `floored_unauthorized` call
+        // site, but that guarantee had never been pinned by a test
+        // exercising more than one of those sites.
+        let dir = tempfile::tempdir().unwrap();
+        let sock_dir = dir.path().join("sockets");
+        let registry = registry_with(dir.path(), "proj-a", "python");
+        let store = RuntimeStore::new();
+        let stream_caps = Arc::new(StreamCapRegistry::new(4, 64));
+
+        let mut no_bearer_req = base_req("proj-a", "/agent-mcp/proj-a/mcp");
+        no_bearer_req.headers = HeaderMap::new();
+        let resp_no_bearer = backend_mcp_handler(
+            &store,
+            &stream_caps,
+            &registry,
+            &sock_dir,
+            &fast_ensure_cfg(),
+            &fast_cfg(),
+            test_now(),
+            no_bearer_req,
+        )
+        .await;
+
+        let resp_unknown_project = backend_mcp_handler(
+            &store,
+            &stream_caps,
+            &registry,
+            &sock_dir,
+            &fast_ensure_cfg(),
+            &fast_cfg(),
+            test_now(),
+            base_req("does-not-exist", "/agent-mcp/does-not-exist/mcp"),
+        )
+        .await;
+
+        let tiny_cfg = McpHandlerConfig {
+            mcp_max_body_bytes: 4,
+            ..fast_cfg()
+        };
+        let mut big_req = base_req("proj-a", "/agent-mcp/proj-a/mcp");
+        big_req.body = Bytes::from_static(b"way too big for the cap");
+        let resp_oversized_body = backend_mcp_handler(
+            &store,
+            &stream_caps,
+            &registry,
+            &sock_dir,
+            &fast_ensure_cfg(),
+            &tiny_cfg,
+            test_now(),
+            big_req,
+        )
+        .await;
+
+        for (label, resp) in [
+            ("no-bearer", &resp_no_bearer),
+            ("unknown-project", &resp_unknown_project),
+            ("oversized-body", &resp_oversized_body),
+        ] {
+            assert_eq!(resp.status, 401, "{label}");
+            assert!(
+                resp.headers.iter().any(
+                    |(k, v)| k.eq_ignore_ascii_case("WWW-Authenticate") && v.contains("Bearer")
+                ),
+                "{label} 401 must carry the WWW-Authenticate challenge"
+            );
+        }
     }
 
     #[tokio::test]

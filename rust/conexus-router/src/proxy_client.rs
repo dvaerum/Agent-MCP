@@ -177,6 +177,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn send_reports_a_connect_error_for_a_refused_socket() {
+        // R3-F3 (`test_sec_r3f3_proxy_backend_gone.py` port), the OTHER
+        // real OS-level shape besides ENOENT above: the socket FILE
+        // survives a `systemctl stop` (`RuntimeDirectoryPreserve=yes`,
+        // see `admin_api.py`'s BL-R35-1) but nothing is listening
+        // anymore -- exactly what a backend reaped moments earlier by
+        // a concurrent delete/rename/stop leaves behind. `bind()` +
+        // `listen()` (implicit in `std::os::unix::net::UnixListener::
+        // bind`) then dropping the listener closes it while leaving
+        // the path on disk.
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("backend.sock");
+        {
+            let listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
+            drop(listener); // path stays on disk; nothing is listening anymore
+        }
+        assert!(sock_path.exists(), "the socket file must survive the drop");
+
+        let request = Request::builder()
+            .uri("/mcp")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let err = send(&sock_path, request).await.unwrap_err();
+        assert!(matches!(err, UdsClientError::Connect(_)));
+    }
+
+    #[tokio::test]
     async fn send_opens_a_fresh_connection_per_call() {
         // Two sequential calls against the same server must both
         // succeed independently -- proving no connection state (or a
