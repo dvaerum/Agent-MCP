@@ -3231,6 +3231,86 @@ mod tests {
         assert_eq!(row.description, None);
     }
 
+    /// test_sec_r22_context_description_parity.py's RED-before-fix
+    /// scenario for the BULK path specifically (the single-path
+    /// equivalent is `single_update_without_description_preserves_the_
+    /// existing_one` above): a value-only bulk item (no `description`
+    /// key at all) must PRESERVE the existing row's description, not
+    /// overwrite it with the `"Bulk update operation N"` placeholder
+    /// that exists only to seed a brand-new key's first CREATE (see
+    /// BL-R22-1's comment at this tool's `description_provided` site).
+    #[tokio::test]
+    async fn bulk_tool_value_only_update_preserves_existing_description() {
+        let conn = setup().await;
+        {
+            let guard = conn.lock().await;
+            project_context_repository::create_new(
+                &guard,
+                "r22_bulk",
+                "\"v1\"",
+                Some("original bulk description"),
+                "alice",
+                "2026-06-01T00:00:00Z",
+            )
+            .unwrap();
+        }
+        let alice = worker();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = BulkUpdateProjectContextTool::call(
+            Some(&alice),
+            &serde_json::json!({"updates": [
+                {"context_key": "r22_bulk", "context_value": "v2"},
+            ]}),
+            &conn,
+            "2026-06-01T00:01:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        let guard = conn.lock().await;
+        let row = project_context_repository::get(&guard, "r22_bulk")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.value, "\"v2\"");
+        assert_eq!(
+            row.description.as_deref(),
+            Some("original bulk description"),
+            "value-only bulk update must PRESERVE the existing description \
+             (REST parity), not clobber it with the placeholder"
+        );
+    }
+
+    /// Regression: a bulk CREATE (brand-new key) with no `description`
+    /// still stores the historical `"Bulk update operation N"`
+    /// placeholder -- BL-R22-1 only narrows the placeholder to the
+    /// CREATE case, it doesn't remove it.
+    #[tokio::test]
+    async fn bulk_tool_create_without_description_gets_placeholder_default() {
+        let conn = setup().await;
+        let alice = worker();
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = BulkUpdateProjectContextTool::call(
+            Some(&alice),
+            &serde_json::json!({"updates": [
+                {"context_key": "r22_bulk_create", "context_value": "v1"},
+            ]}),
+            &conn,
+            "2026-06-01T00:00:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        let guard = conn.lock().await;
+        let row = project_context_repository::get(&guard, "r22_bulk_create")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.description.as_deref(), Some("Bulk update operation 1"));
+    }
+
     #[tokio::test]
     async fn bulk_tool_applies_every_authorized_item_in_the_batch() {
         // Phase 2 applies each authorized item independently -- with
