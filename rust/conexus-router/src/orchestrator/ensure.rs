@@ -1047,4 +1047,225 @@ exit 0
              accumulating on top of the exhausted one"
         );
     }
+
+    // -- BL-R6-1: TOCTOU re-check aborts a spawn for a project deleted
+    // while `ensure()` held the lock -----------------------------------
+
+    /// Like [`write_fake_systemctl`], but `is-active` BLOCKS until a
+    /// `release` marker file appears (bounded, so a genuine regression
+    /// fails the test rather than hanging the suite), touching a
+    /// `started` marker first. Gives a test a deterministic window
+    /// between "`ensure()` has acquired its lock and is mid-`is-active`"
+    /// and "the caller lets it proceed" to land a concurrent registry
+    /// mutation in -- no wall-clock timing guess needed.
+    fn write_fake_systemctl_blocking_on_is_active(
+        dir: &Path,
+        started: &Path,
+        release: &Path,
+        is_active_rc: i32,
+        action_rc: i32,
+    ) -> (PathBuf, PathBuf) {
+        let log = dir.join("calls.log");
+        let script_path = dir.join("fake-systemctl-blocking.sh");
+        let script = format!(
+            r#"#!/bin/sh
+echo "$@" >> "{log}"
+verb=""
+for a in "$@"; do
+  case "$a" in
+    is-active|start|restart|stop) verb="$a" ;;
+  esac
+done
+if [ "$verb" = "is-active" ]; then
+  touch "{started}"
+  i=0
+  while [ ! -f "{release}" ] && [ $i -lt 100 ]; do
+    sleep 0.05
+    i=$((i+1))
+  done
+fi
+case "$verb" in
+  is-active) exit {is_active_rc} ;;
+  start|restart) exit {action_rc} ;;
+esac
+exit 0
+"#,
+            log = log.display(),
+            started = started.display(),
+            release = release.display(),
+        );
+        std::fs::write(&script_path, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script_path, perms).unwrap();
+        }
+        (script_path, log)
+    }
+
+    #[tokio::test]
+    async fn ensure_aborts_when_project_deleted_while_lock_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_dir = std::sync::Arc::new(dir.path().join("sockets"));
+        let registry = std::sync::Arc::new(registry_with(dir.path(), "victim", "python"));
+        let store = std::sync::Arc::new(RuntimeStore::new());
+        let started = dir.path().join("started");
+        let release = dir.path().join("release");
+        // is-active reports inactive (3) -> `ensure()` decides `needs_start`
+        // and proceeds toward a `start`, blocking mid-flight on `is-active`
+        // itself so this test can land the concurrent delete before the
+        // BL-R6-1 re-check (or the `start` shell-out) ever runs.
+        let (program, log) =
+            write_fake_systemctl_blocking_on_is_active(dir.path(), &started, &release, 3, 0);
+        let cfg = std::sync::Arc::new(fast_cfg(&program));
+
+        let ensure_task = {
+            let store = std::sync::Arc::clone(&store);
+            let registry = std::sync::Arc::clone(&registry);
+            let sock_dir = std::sync::Arc::clone(&sock_dir);
+            let cfg = std::sync::Arc::clone(&cfg);
+            tokio::spawn(async move {
+                ensure(&store, &registry, &sock_dir, "victim", "backend", &cfg).await
+            })
+        };
+
+        // Bounded wait for the fake systemctl's `is-active` to actually
+        // start (i.e. `ensure()` has acquired `ensure_lock` and is
+        // mid-shell-out) -- deterministic synchronization, not a sleep
+        // guess.
+        for _ in 0..100 {
+            if started.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            started.exists(),
+            "fake systemctl's is-active never started -- ensure() did not reach its shell-out"
+        );
+
+        // Stand-in for a concurrent `delete_project_handler` landing
+        // while `ensure()` holds the lock: drop the registry row mid-
+        // critical-section, then let the blocked `is-active` proceed.
+        registry.unregister("victim").unwrap();
+        std::fs::write(&release, b"go").unwrap();
+
+        let err = ensure_task
+            .await
+            .expect("ensure() task must not panic")
+            .unwrap_err();
+        assert!(
+            matches!(err, EnsureError::UnknownProject),
+            "expected UnknownProject from the BL-R6-1 re-check, got {err:?}"
+        );
+
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            !calls
+                .lines()
+                .any(|l| l.contains("start") || l.contains("restart")),
+            "must NOT systemctl-start/restart a project deleted while ensure() held the lock \
+             (TOCTOU orphan) -- got calls: {calls:?}"
+        );
+    }
+
+    // -- BL-R6-2b: the systemctl shell-out runs off the event loop -------
+
+    /// Like [`write_fake_systemctl`], but `start`/`restart` sleeps for
+    /// `block` before exiting -- long enough that a regression back to a
+    /// truly blocking shell-out (rather than `tokio::process::Command`'s
+    /// genuinely async wait) would starve this test's own single-
+    /// threaded runtime for the whole duration.
+    fn write_slow_fake_systemctl(
+        dir: &Path,
+        is_active_rc: i32,
+        action_rc: i32,
+        block: Duration,
+    ) -> PathBuf {
+        let log = dir.join("calls.log");
+        let script_path = dir.join("fake-systemctl-slow.sh");
+        let script = format!(
+            r#"#!/bin/sh
+echo "$@" >> "{log}"
+verb=""
+for a in "$@"; do
+  case "$a" in
+    is-active|start|restart|stop) verb="$a" ;;
+  esac
+done
+case "$verb" in
+  is-active) exit {is_active_rc} ;;
+  start|restart) sleep {sleep_secs}; exit {action_rc} ;;
+esac
+exit 0
+"#,
+            log = log.display(),
+            sleep_secs = block.as_secs_f64(),
+        );
+        std::fs::write(&script_path, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script_path, perms).unwrap();
+        }
+        script_path
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ensure_systemctl_shell_out_does_not_block_the_event_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_dir = std::sync::Arc::new(dir.path().join("sockets"));
+        let registry = std::sync::Arc::new(registry_with(dir.path(), "slow", "python"));
+        let store = std::sync::Arc::new(RuntimeStore::new());
+        // A real socket, already listening, so `ensure()` succeeds right
+        // after the slow `start` returns instead of also paying the
+        // socket-poll budget -- this test's assertion is about the
+        // shell-out's effect on the event loop, not backend lifecycle.
+        std::fs::create_dir_all(sock_dir.join("slow")).unwrap();
+        let sock_path = sock_dir.join("slow").join("backend.sock");
+        let _listener = UnixListener::bind(&sock_path).unwrap();
+        let block = Duration::from_millis(400);
+        // is-active reports inactive -> `ensure()` proceeds straight to
+        // a `start`, which is the slow call under test.
+        let program = write_slow_fake_systemctl(dir.path(), 3, 0, block);
+        let cfg = std::sync::Arc::new(fast_cfg(&program));
+
+        let ensure_task = {
+            let store = std::sync::Arc::clone(&store);
+            let registry = std::sync::Arc::clone(&registry);
+            let sock_dir = std::sync::Arc::clone(&sock_dir);
+            let cfg = std::sync::Arc::clone(&cfg);
+            tokio::spawn(async move {
+                ensure(&store, &registry, &sock_dir, "slow", "backend", &cfg).await
+            })
+        };
+
+        // A `current_thread` runtime has exactly ONE worker thread. If
+        // `run_systemctl`'s await genuinely never blocks that thread
+        // (the `tokio::process::Command`-based fix this pins), this
+        // sibling probe keeps ticking on ~10ms cadence WHILE the fake
+        // `start` sleeps for `block` on its own (child-process) thread.
+        // A regression to a real blocking shell-out would starve this
+        // same thread for the whole `block` duration, so the probe
+        // would almost never get to run its own `tokio::time::sleep`
+        // ticks in between.
+        let probe_start = Instant::now();
+        let mut ticks = 0u32;
+        while probe_start.elapsed() < block {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            ticks += 1;
+        }
+        assert!(
+            ticks > 5,
+            "the event loop appears blocked by the shelled-out systemctl call \
+             ({ticks} probe ticks observed in {block:?})"
+        );
+
+        let result = ensure_task.await.expect("ensure() task must not panic");
+        assert_eq!(result.unwrap(), sock_path);
+    }
 }

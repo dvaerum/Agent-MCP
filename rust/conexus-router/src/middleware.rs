@@ -294,6 +294,33 @@ mod tests {
     use crate::state::RouterStateConfig;
     use conexus_db::schema::init_router_schema;
 
+    fn test_router_state() -> (tempfile::TempDir, Arc<RouterState>) {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_router_schema(&conn).unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
+        let state = Arc::new(RouterState::new(
+            conn,
+            registry,
+            RateLimitConfig::resolve(|_| None),
+            EnsureConfig::from_env(|_| None),
+            RouterStateConfig {
+                sock_dir: dir.path().join("sockets"),
+                dashboard_dir: None,
+                external_url: None,
+                idle_sec: 14400,
+                asset_prefix: None,
+                single_tenant_name: None,
+                single_tenant_workspace: None,
+                max_streams_per_agent: 4,
+                max_streams_global: 64,
+                default_workspace_parent: dir.path().join("projects"),
+                token_dir: None,
+            },
+        ));
+        (dir, state)
+    }
+
     // -- pure sub-logic --------------------------------------------------
 
     #[test]
@@ -336,5 +363,121 @@ mod tests {
         let untrusted_peer = peer_info("203.0.113.9:1".parse().unwrap());
         assert!(is_request_trusted(&state, &trusted_peer));
         assert!(!is_request_trusted(&state, &untrusted_peer));
+    }
+
+    // -- SD-R5-1: security headers survive an inner-layer/handler error --
+    //
+    // Python's aiohttp needed an explicit exception-classification catch
+    // ladder because its core 500 renderer bypasses custom middleware for
+    // any non-`HTTPException`. That specific bypass mechanism has no axum
+    // analogue: `security_headers_layer` is wired as the OUTERMOST
+    // `.layer()` in `main.rs` (confirmed by reading the file, not
+    // assumed), so `next.run(req).await` returns whatever `Response` the
+    // ENTIRE inner stack produces -- a plain handler-returned error status,
+    // or an inner middleware's own `Reject` -- and stamps headers on it
+    // unconditionally. These tests drive that claim through a REAL
+    // `axum::Router` + real `.layer()` calls (via `tower::ServiceExt::
+    // oneshot`, no socket needed, matching `login_setup_rest.rs`'s own
+    // precedent), not just `security_headers()`'s pure list in isolation.
+    mod full_stack_headers {
+        use super::*;
+        use axum::body::Body;
+        use axum::http::{Request as HttpRequest, StatusCode};
+        use axum::routing::get;
+        use axum::Router;
+        use tower::ServiceExt;
+
+        fn assert_hardened(headers: &axum::http::HeaderMap) {
+            assert_eq!(
+                headers.get("server").and_then(|v| v.to_str().ok()),
+                Some("agent-mcp")
+            );
+            assert_eq!(
+                headers
+                    .get("x-content-type-options")
+                    .and_then(|v| v.to_str().ok()),
+                Some("nosniff")
+            );
+            assert_eq!(
+                headers.get("x-frame-options").and_then(|v| v.to_str().ok()),
+                Some("DENY")
+            );
+            assert!(headers.get("content-security-policy").is_some());
+            assert_eq!(
+                headers.get("cache-control").and_then(|v| v.to_str().ok()),
+                Some("no-store")
+            );
+        }
+
+        async fn oneshot_get(router: Router, uri: &str, accept: Option<&str>) -> Response {
+            let mut builder = HttpRequest::builder().method("GET").uri(uri);
+            if let Some(accept) = accept {
+                builder = builder.header(axum::http::header::ACCEPT, accept);
+            }
+            let mut req = builder.body(Body::empty()).unwrap();
+            req.extensions_mut()
+                .insert(ConnectInfo("127.0.0.1:9999".parse::<SocketAddr>().unwrap()));
+            router.oneshot(req).await.unwrap()
+        }
+
+        /// A handler that returns a bare 500 via `Result::Err` (the
+        /// closest Rust analogue to Python's "bare exception reaches the
+        /// framework's own 500 renderer" -- no headers of its own, no
+        /// panic, just an ordinary error-shaped `Response` flowing back
+        /// up through the same call chain as any 200).
+        async fn boom() -> Result<&'static str, StatusCode> {
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+
+        #[tokio::test]
+        async fn a_handler_returned_500_still_carries_the_full_hardened_header_set() {
+            let (_dir, state) = test_router_state();
+            let app = Router::new()
+                .route("/boom", get(boom))
+                .layer(axum::middleware::from_fn_with_state(
+                    Arc::clone(&state),
+                    security_headers_layer,
+                ))
+                .with_state(state);
+
+            let resp = oneshot_get(app, "/boom", None).await;
+            assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            assert_hardened(resp.headers());
+        }
+
+        /// The REAL `session_gate_layer` layered as the inner (innermost)
+        /// middleware -- matching `main.rs`'s own admin-router composition
+        /// exactly -- rejects an unauthenticated request to a protected
+        /// path with a 401. `security_headers_layer`, wired OUTERMOST the
+        /// same way `main.rs` wires it, must still stamp that Reject
+        /// response, proving the "even one an inner layer rejects" claim
+        /// end to end against the real production layering, not just a
+        /// synthetic error status.
+        #[tokio::test]
+        async fn an_inner_session_gate_rejection_still_carries_the_full_hardened_header_set() {
+            let (_dir, state) = test_router_state();
+            let protected = Router::new()
+                .route(
+                    "/agent-mcp/app/secret/",
+                    get(|| async { "should never run" }),
+                )
+                .layer(axum::middleware::from_fn_with_state(
+                    Arc::clone(&state),
+                    session_gate_layer,
+                ));
+            let app = protected
+                .layer(axum::middleware::from_fn_with_state(
+                    Arc::clone(&state),
+                    security_headers_layer,
+                ))
+                .with_state(state);
+
+            // No cookie at all + a JSON Accept header -> session_gate's
+            // own `unauthorized_response` (401), not the HTML login
+            // redirect -- exercises `SessionGateOutcome::Reject` cleanly.
+            let resp = oneshot_get(app, "/agent-mcp/app/secret/", Some("application/json")).await;
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{resp:?}");
+            assert_hardened(resp.headers());
+        }
     }
 }
