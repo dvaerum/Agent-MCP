@@ -11,18 +11,19 @@
 //!
 //! **Scope, deliberately narrower than the full Python function**:
 //! Python's `_proxy_to_backend` takes an `inject_header_resolver`
-//! parameter used ONLY by the cookie-authenticated dashboard path
-//! (`backend_mcp_handler`'s cookie branch, via
-//! `_forwarding_header_from_cookie`) -- neither of that path's
-//! dependencies (session-cookie resolution, `is_project_member`,
-//! `resolve_user_project_role`) are ported to this crate yet. Both
-//! REAL Python call sites (`backend_mcp_handler`'s bearer branch,
-//! `backend_api_handler`) pass `inject_header_resolver=None` when no
-//! cookie is involved -- this port covers exactly that (bearer-only)
-//! path faithfully, and adds the resolver parameter back once the
-//! cookie path's own identity plumbing lands in a later PR. `inject_
-//! bearer` is dropped entirely -- Python's own docstring already
-//! states it has no production caller.
+//! parameter -- an async CLOSURE, re-invoked AFTER the body-read yield
+//! point, so a slow-drip caller's pre-demotion role can't survive a
+//! concurrent revocation for the header's full TTL (the R7-F3 fix this
+//! module's own doc discusses above). This port takes a plain
+//! `forwarding_header_value: Option<&str>` instead -- an ALREADY-signed
+//! value, not a resolver -- because [`ProxyRequest::body`] being a
+//! structurally pre-buffered `Bytes` (this module's own R7-F3
+//! invariant) means there is no yield point on attacker-controlled I/O
+//! between resolving the header and attaching it in the first place;
+//! the closure-based re-check Python needs to close that window has
+//! nothing to protect against here. `inject_bearer` is dropped
+//! entirely -- Python's own docstring already states it has no
+//! production caller.
 //!
 //! **The R7-F3 invariant is structural here, not conventional**:
 //! [`ProxyRequest::body`] is a plain `Bytes` -- there is no code path
@@ -321,10 +322,26 @@ pub async fn proxy_to_backend(
     ensure_cfg: &EnsureConfig,
     req: ProxyRequest,
     alias_info: Option<&AliasInfo>,
+    forwarding_header_value: Option<&str>,
 ) -> Result<ProxyResponse, ProxyError> {
     let sock = ensure(store, registry, sock_dir, name, "backend", ensure_cfg).await?;
 
     let mut headers = filter_headers(&req.headers);
+    // The caller's own resolver already proved membership and signed
+    // this value (see `cookie_forwarding::resolve_cookie_project_role`
+    // + `mcp_handler::backend_api_handler`) -- `filter_headers` just
+    // stripped any CLIENT-supplied header of the same name above, so
+    // this is the only place a forwarding header can end up on the
+    // outbound request, exactly as intended (the router alone is
+    // authoritative for signing it).
+    if let Some(value) = forwarding_header_value {
+        if let Ok(header_value) = HeaderValue::from_str(value) {
+            headers.insert(
+                HeaderName::from_static(FORWARDING_HEADER_NAME),
+                header_value,
+            );
+        }
+    }
     // Python's `_proxy_to_backend` builds the outbound aiohttp request
     // against `f"http://localhost{backend_path}"`, so aiohttp
     // implicitly synthesizes `Host: localhost` for the backend leg
@@ -651,6 +668,7 @@ mod tests {
                 body: Bytes::from_static(b"{}"),
             },
             None,
+            None,
         )
         .await
         .unwrap();
@@ -716,6 +734,7 @@ mod tests {
                 body: Bytes::from_static(b"{}"),
             },
             None,
+            None,
         )
         .await
         .unwrap();
@@ -766,6 +785,7 @@ mod tests {
                 name: "old-name".to_string(),
                 expires_at: "2026-02-01T00:00:00Z".to_string(),
             }),
+            None,
         )
         .await
         .unwrap();
@@ -774,6 +794,115 @@ mod tests {
             ProxyResponseBody::Buffered(b) => {
                 assert_eq!(b.as_ref(), b"old-name,2026-02-01T00:00:00Z")
             }
+            ProxyResponseBody::Streaming(_) => panic!("expected a buffered response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_to_backend_attaches_a_provided_forwarding_header_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_dir = dir.path().join("sockets");
+        std::fs::create_dir_all(sock_dir.join("proj-a")).unwrap();
+        spawn_backend(sock_dir.join("proj-a").join("backend.sock"), |req| {
+            let header = req
+                .headers()
+                .get("x-agent-mcp-forwarded-operator")
+                .map(|v| v.to_str().unwrap().to_string())
+                .unwrap_or_default();
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Full::new(Bytes::from(header)))
+                .unwrap()
+        })
+        .await;
+
+        let registry = registry_with(dir.path(), "proj-a");
+        let store = RuntimeStore::new();
+        let stream_caps = Arc::new(StreamCapRegistry::new(4, 64));
+
+        let response = proxy_to_backend(
+            &store,
+            &stream_caps,
+            &registry,
+            &sock_dir,
+            "proj-a",
+            &fast_ensure_cfg(),
+            ProxyRequest {
+                method: Method::GET,
+                path_and_query: "/api/agents".to_string(),
+                headers: HeaderMap::new(),
+                body: Bytes::new(),
+            },
+            None,
+            Some("op1.operator.9999999999.deadbeef"),
+        )
+        .await
+        .unwrap();
+
+        match response.body {
+            ProxyResponseBody::Buffered(b) => {
+                assert_eq!(b.as_ref(), b"op1.operator.9999999999.deadbeef")
+            }
+            ProxyResponseBody::Streaming(_) => panic!("expected a buffered response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_to_backend_never_forwards_a_client_supplied_forwarding_header() {
+        // The router alone is authoritative for this header (see
+        // `filter_headers`'s own doc) -- a client that sneaks one in
+        // must never reach the backend, whether or not the caller ALSO
+        // supplies a genuinely-resolved `forwarding_header_value`.
+        let dir = tempfile::tempdir().unwrap();
+        let sock_dir = dir.path().join("sockets");
+        std::fs::create_dir_all(sock_dir.join("proj-a")).unwrap();
+        spawn_backend(sock_dir.join("proj-a").join("backend.sock"), |req| {
+            let header = req
+                .headers()
+                .get("x-agent-mcp-forwarded-operator")
+                .map(|v| v.to_str().unwrap().to_string())
+                .unwrap_or_default();
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Full::new(Bytes::from(header)))
+                .unwrap()
+        })
+        .await;
+
+        let registry = registry_with(dir.path(), "proj-a");
+        let store = RuntimeStore::new();
+        let stream_caps = Arc::new(StreamCapRegistry::new(4, 64));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-agent-mcp-forwarded-operator",
+            HeaderValue::from_static("mallory.operator.9999999999.forged"),
+        );
+
+        let response = proxy_to_backend(
+            &store,
+            &stream_caps,
+            &registry,
+            &sock_dir,
+            "proj-a",
+            &fast_ensure_cfg(),
+            ProxyRequest {
+                method: Method::GET,
+                path_and_query: "/api/agents".to_string(),
+                headers,
+                body: Bytes::new(),
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        match response.body {
+            ProxyResponseBody::Buffered(b) => assert_eq!(
+                b.as_ref(),
+                b"",
+                "a client-supplied forwarding header must never reach the backend"
+            ),
             ProxyResponseBody::Streaming(_) => panic!("expected a buffered response"),
         }
     }
@@ -809,6 +938,7 @@ mod tests {
                 headers: HeaderMap::new(),
                 body: Bytes::new(),
             },
+            None,
             None,
         )
         .await
@@ -861,6 +991,7 @@ mod tests {
                 body: Bytes::new(),
             },
             None,
+            None,
         )
         .await
         .unwrap_err();
@@ -899,6 +1030,7 @@ mod tests {
                 body: Bytes::new(),
             },
             None,
+            None,
         )
         .await
         .unwrap();
@@ -924,6 +1056,7 @@ mod tests {
                 headers: HeaderMap::new(),
                 body: Bytes::new(),
             },
+            None,
             None,
         )
         .await;
@@ -958,6 +1091,7 @@ mod tests {
                 headers: HeaderMap::new(),
                 body: Bytes::new(),
             },
+            None,
             None,
         )
         .await
@@ -996,6 +1130,7 @@ mod tests {
                 headers: HeaderMap::new(),
                 body: Bytes::new(),
             },
+            None,
             None,
         )
         .await

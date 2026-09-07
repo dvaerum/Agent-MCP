@@ -31,6 +31,7 @@ mod admin_users_users;
 mod asset_prefix;
 mod boot;
 mod client_disconnect;
+mod cookie_forwarding;
 mod dashboard_handlers;
 mod dashboard_static;
 mod identity;
