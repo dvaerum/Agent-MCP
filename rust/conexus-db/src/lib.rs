@@ -1,5 +1,6 @@
 pub mod agent_action_repository;
 pub mod agent_repository;
+pub mod claude_code_session_repository;
 pub mod file_metadata_repository;
 pub mod group_capability_repository;
 pub mod group_membership_repository;

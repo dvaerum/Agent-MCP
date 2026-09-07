@@ -80,6 +80,27 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_agent_actions_task_id_timestamp
             ON agent_actions (task_id, timestamp);
 
+        CREATE TABLE IF NOT EXISTS claude_code_sessions (
+            session_id         TEXT PRIMARY KEY,
+            pid                INTEGER NOT NULL,
+            parent_pid         INTEGER NOT NULL,
+            first_detected     TEXT NOT NULL,
+            last_activity      TEXT NOT NULL,
+            working_directory  TEXT,
+            agent_id           TEXT,
+            status             TEXT DEFAULT 'detected',
+            git_commits        TEXT,
+            metadata           TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_claude_sessions_pid
+            ON claude_code_sessions (pid, parent_pid);
+        CREATE INDEX IF NOT EXISTS idx_claude_sessions_activity
+            ON claude_code_sessions (last_activity);
+        CREATE INDEX IF NOT EXISTS idx_claude_sessions_agent
+            ON claude_code_sessions (agent_id);
+        CREATE INDEX IF NOT EXISTS idx_claude_sessions_status
+            ON claude_code_sessions (status);
+
         CREATE TABLE IF NOT EXISTS pending_directive (
             poke_id       TEXT PRIMARY KEY,
             agent_id      TEXT NOT NULL,
