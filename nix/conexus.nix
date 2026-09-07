@@ -74,28 +74,27 @@ let
   # currently need (no TLS client in conexus-backend) — added here
   # only if/when a later Phase D module needs them, not speculatively.
   commonArgs = {
-    src = craneLib.cleanCargoSource "${src}/rust";
+    # `craneLib.cleanCargoSource` filters the tree down to `.rs`/
+    # `.toml`/`Cargo.lock` only (see crane's own `filterCargoSources.nix`
+    # -- an unconditional extension allowlist, unrelated to git-tracking
+    # or location) -- so the two non-Rust asset directories genuinely
+    # embedded via `include_str!` (`conexus-router/templates/*.html`,
+    # `conexus-tools/prompts/catalog.json`, Phase F deletion-prep step 1)
+    # would be silently stripped even now that they live inside `rust/`
+    # itself. This is what the OLD cross-repo `postUnpack` hack (PR
+    # #850/#925) was really working around -- moving the files here
+    # alone doesn't fix it, since crane's filter runs on file extension
+    # everywhere, not just outside the workspace. Union crane's own
+    # filter with an explicit include for those two directories instead
+    # of re-adding a postUnpack copy step.
+    src = lib.cleanSourceWith {
+      src = lib.cleanSource "${src}/rust";
+      filter = path: type:
+        craneLib.filterCargoSources path type
+        || lib.hasInfix "/conexus-router/templates/" path
+        || lib.hasInfix "/conexus-tools/prompts/" path;
+    };
     strictDeps = true;
-    # Two crates reach out of the rust/ workspace via a sandbox-
-    # escaping `include_str!` (a deliberate, temporary cross-language
-    # coupling per the migration plan, retired only in Phase F) --
-    # cleanCargoSource above scopes the build to rust/ alone, so both
-    # sibling paths are missing from the sandbox unless copied in at
-    # the same relative path each include_str! resolves against (one
-    # directory above $sourceRoot, matching rust/ and agent_mcp/ being
-    # siblings in a real checkout):
-    #   - conexus-tools/src/prompts.rs: agent_mcp/prompts/catalog.json
-    #   - conexus-router/src/templates.rs: agent_mcp/router/templates/
-    #     {base,login,setup}.html (Phase E2 PR23 step 4, login-setup --
-    #     found missing here the same way catalog.json was, PR #850,
-    #     while packaging conexus-router for Phase F; conexus-router
-    #     had never been built through this Nix path before).
-    postUnpack = ''
-      mkdir -p "$sourceRoot/../agent_mcp/prompts"
-      cp ${src}/agent_mcp/prompts/catalog.json "$sourceRoot/../agent_mcp/prompts/catalog.json"
-      mkdir -p "$sourceRoot/../agent_mcp/router/templates"
-      cp ${src}/agent_mcp/router/templates/*.html "$sourceRoot/../agent_mcp/router/templates/"
-    '';
     # rust/Cargo.toml is a virtual workspace manifest (no [package]
     # section of its own — see the crate list in rust/Cargo.toml), so
     # crane can't infer a name/version from it the way it can for a

@@ -7,12 +7,17 @@
 //! matching this crate's own "tool-catalogue logic, not transport"
 //! role).
 //!
-//! Source of truth stays the real `agent_mcp/prompts/catalog.json`,
-//! embedded via `include_str!` at compile time -- a real, deliberate
-//! cross-language coupling for the duration of the migration (avoids
-//! a second, independently-maintained copy that could drift; this
-//! file is retired only in Phase F, when the Python tree it lives in
-//! is deleted). Parsed fields: `id`/`title`/`description`/`template`/
+//! Embedded via `include_str!` from `rust/conexus-tools/prompts/
+//! catalog.json` (Phase F deletion-prep step 1) -- a real COPY of
+//! `agent_mcp/prompts/catalog.json`, not a cross-repo `include_str!`
+//! reach-out anymore (that pattern broke `cargo build` outside a Nix
+//! sandbox unless the sibling `agent_mcp/` tree happened to exist at
+//! the exact relative path -- PR #850 only patched the Nix-specific
+//! symptom). The two trees are temporarily duplicated: the Python
+//! original is still live (Python's own `prompts/__init__.py`/tests
+//! still read it) until the bulk Phase F Python deletion removes it,
+//! at which point this becomes the single source of truth. Parsed
+//! fields: `id`/`title`/`description`/`template`/
 //! `variables`/`visibility`. `categories` is dashboard-only (read by
 //! a separate `GET /api/prompts/catalog` REST endpoint, out of scope
 //! here) and deliberately not parsed.
@@ -46,7 +51,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-const CATALOG_JSON: &str = include_str!("../../../agent_mcp/prompts/catalog.json");
+const CATALOG_JSON: &str = include_str!("../prompts/catalog.json");
 const EVENT_LOOP_PROMPT_ID: &str = "event-loop";
 
 #[derive(Deserialize)]

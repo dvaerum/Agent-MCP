@@ -16,18 +16,21 @@
 //! without remembering to escape it) this project's own pentest
 //! history keeps finding.
 //!
-//! `include_str!`'d directly from the canonical Python location
-//! rather than duplicated into this crate -- one source of truth,
-//! the identical, already-established
-//! `conexus_tools::prompts::CATALOG_JSON` pattern (a deliberate,
-//! temporary cross-language coupling per the migration plan, retired
-//! only in Phase F). **Not yet exercised by any Nix packaging**: no
-//! `conexusRouter` derivation exists in `nix/conexus.nix` yet (only
-//! `conexusBackend` does, scoped via `cargoExtraArgs = "-p
-//! conexus-backend"`) -- whoever adds one will need the identical
-//! `postUnpack` copy-in fix PR #850 added for `conexus-backend`'s own
-//! `catalog.json` embed, or this same class of Nix-sandbox gap
-//! recurs.
+//! `include_str!`'d from `rust/conexus-router/templates/` (Phase F
+//! deletion-prep step 1, `prancy-napping-pie`) -- a real COPY of
+//! `agent_mcp/router/templates/*.html`, not a cross-repo `include_str!`
+//! reach-out anymore. The two trees are temporarily duplicated: the
+//! Python originals under `agent_mcp/router/templates/` are still
+//! live (Python's own `login.py`/tests still read them) until the
+//! bulk Phase F Python deletion removes `agent_mcp/router/*.py`
+//! entirely, at which point the Python-side copies are deleted and
+//! this becomes the single source of truth. This resolved a real,
+//! previously-undiagnosed problem: the OLD cross-repo
+//! `include_str!("../../../agent_mcp/router/templates/...")` broke
+//! `cargo build` outside a Nix sandbox unless the sibling `agent_mcp/`
+//! tree happened to exist at that exact relative path -- PR #850/#925
+//! only patched the Nix-specific symptom (a `postUnpack` copy-in
+//! hook), not the underlying cross-crate-boundary reach-out itself.
 //!
 //! **Confirmed, not assumed**: minijinja's HTML autoescape is
 //! STRICTER than Python markupsafe's -- it additionally escapes `/`
@@ -45,9 +48,9 @@ use std::sync::LazyLock;
 
 use minijinja::{context, AutoEscape, Environment};
 
-const BASE_HTML: &str = include_str!("../../../agent_mcp/router/templates/base.html");
-const LOGIN_HTML: &str = include_str!("../../../agent_mcp/router/templates/login.html");
-const SETUP_HTML: &str = include_str!("../../../agent_mcp/router/templates/setup.html");
+const BASE_HTML: &str = include_str!("../templates/base.html");
+const LOGIN_HTML: &str = include_str!("../templates/login.html");
+const SETUP_HTML: &str = include_str!("../templates/setup.html");
 
 static ENV: LazyLock<Environment<'static>> = LazyLock::new(|| {
     let mut env = Environment::new();
