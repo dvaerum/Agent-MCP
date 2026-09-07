@@ -848,6 +848,53 @@ mod tests {
     }
 
     #[test]
+    fn create_project_mkdir_failure_does_not_reflect_the_absolute_workspace_path() {
+        // SD-R15-2: an `mkdir` failure (e.g. a permission error, or --
+        // as forced here -- an ENOTDIR from a real filesystem
+        // collision) must return only the generic OS error text, never
+        // the resolved ABSOLUTE workspace path (server home dir /
+        // username in production).
+        let c = conn();
+        let dir = tempfile::tempdir().unwrap();
+        let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
+        // A regular FILE standing where the workspace-parent directory
+        // should be -- `create_dir_all` cannot create a directory
+        // component through it, a REAL mkdir failure rather than a
+        // simulated one.
+        let bogus_parent = dir.path().join("not-a-directory");
+        std::fs::write(&bogus_parent, b"not a directory").unwrap();
+
+        let outcome = decide_create_project(
+            &c,
+            &registry,
+            &bogus_parent,
+            false,
+            None,
+            Some(&serde_json::json!("path-leak")),
+            now_dt(),
+        )
+        .unwrap();
+        let CreateProjectOutcome::Rejected(resp) = outcome else {
+            panic!("expected Rejected on mkdir failure, got {outcome:?}");
+        };
+        assert_eq!(resp.status, 500);
+        let HandlerBody::Json(body) = resp.body else {
+            panic!("expected a JSON body");
+        };
+        assert_eq!(body["success"], serde_json::json!(false));
+        let message = body["message"].as_str().unwrap();
+        let leaked_path = bogus_parent.join("path-leak");
+        assert!(
+            !message.contains(&leaked_path.to_string_lossy().to_string()),
+            "mkdir-failure message leaked the absolute workspace path: {message:?}"
+        );
+        assert!(
+            !message.contains(dir.path().to_str().unwrap()),
+            "mkdir-failure message leaked the server-side temp-root path: {message:?}"
+        );
+    }
+
+    #[test]
     fn rejects_a_non_string_name() {
         let c = conn();
         let dir = tempfile::tempdir().unwrap();

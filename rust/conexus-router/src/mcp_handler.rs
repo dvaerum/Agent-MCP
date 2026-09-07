@@ -742,6 +742,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn proxy_error_response_maps_socket_timeout_to_a_generic_504_reason() {
+        // SC-R9-1: the socket-poll-timeout branch of `_ensure` must
+        // not leak the raw unit name / absolute socket path into the
+        // client-facing reason -- same hygiene the systemctl-failure
+        // sibling (SC-R8-2) already gets from `EnsureFailureReason::
+        // message()`'s own fixed strings.
+        let response = proxy_error_response(ProxyError::Ensure(EnsureError::Failed(
+            EnsureFailureReason::SocketTimeout,
+        )));
+        assert_eq!(response.status, 504);
+        let HandlerBody::Text(message) = response.body else {
+            panic!("expected a text body");
+        };
+        assert_eq!(message, "backend not ready");
+        assert!(!message.contains("agent-mcp@"), "leaked unit: {message:?}");
+        assert!(
+            !message.contains(".sock"),
+            "leaked socket file: {message:?}"
+        );
+        assert!(!message.contains('/'), "leaked a path: {message:?}");
+        assert!(
+            !message.contains("did not create"),
+            "leaked internals: {message:?}"
+        );
+    }
+
+    #[test]
+    fn proxy_error_response_maps_systemctl_failed_to_a_generic_500_reason() {
+        // SC-R8-2's sibling assertion, kept alongside the SocketTimeout
+        // case above so both `EnsureFailureReason` variants have an
+        // explicit regression test at this mapping layer.
+        let response = proxy_error_response(ProxyError::Ensure(EnsureError::Failed(
+            EnsureFailureReason::SystemctlFailed,
+        )));
+        assert_eq!(response.status, 500);
+        let HandlerBody::Text(message) = response.body else {
+            panic!("expected a text body");
+        };
+        assert_eq!(message, "backend failed to start");
+        assert!(!message.contains("agent-mcp@"), "leaked unit: {message:?}");
+    }
+
     fn fast_cfg() -> McpHandlerConfig {
         McpHandlerConfig {
             single_tenant_name: None,
