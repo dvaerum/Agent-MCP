@@ -3842,4 +3842,713 @@ mod tests {
     fn require_str_allows_a_real_string() {
         assert!(require_str(Some(&json!("a real subject")), "subject").is_none());
     }
+
+    // ---------------------------------------------------------------
+    // Shared handler-level test scaffolding: an in-memory-DB
+    // `SharedState`, seed helpers matching the schema exactly, and
+    // `ResolvedRestPrincipal` builders -- calling a handler function
+    // directly (bypassing the router/middleware) is this crate's own
+    // established pattern (see e.g. `server.rs`'s `test_conn`).
+    // ---------------------------------------------------------------
+
+    use std::collections::HashMap;
+
+    fn test_conn() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conexus_db::schema::init_schema(&conn).unwrap();
+        conn
+    }
+
+    fn test_shared_state(conn: rusqlite::Connection) -> Arc<SharedState> {
+        Arc::new(SharedState {
+            conn: tokio::sync::Mutex::new(conn),
+            forwarding_hmac_key: None,
+            waiter_registry: conexus_wakeloop::waiter_registry::WaiterRegistry::new(),
+            file_map: conexus_wakeloop::file_map::FileMap::new(),
+            project_dir: std::env::temp_dir(),
+            operator_events: crate::operator_events::OperatorEventsHub::new(),
+            delivery_transport: crate::delivery_transport::DeliveryTransportHub::new(),
+        })
+    }
+
+    fn resolved_forwarding(
+        operator_id: &str,
+        role: conexus_core::capability::ProjectRole,
+    ) -> ResolvedRestPrincipal {
+        let admission = RestPrincipal::Forwarding {
+            operator_id: operator_id.to_string(),
+            project_role: role,
+        };
+        let dispatch_principal = crate::rest_principal::build_dispatch_principal(&admission);
+        let confirmed_operator_tier = crate::rest_principal::is_confirmed_operator_tier(&admission);
+        ResolvedRestPrincipal {
+            admission,
+            dispatch_principal,
+            confirmed_operator_tier,
+        }
+    }
+
+    fn resolved_operator_bearer(token: &str) -> ResolvedRestPrincipal {
+        let admission = RestPrincipal::OperatorBearer {
+            bearer_token: token.to_string(),
+        };
+        let dispatch_principal = crate::rest_principal::build_dispatch_principal(&admission);
+        let confirmed_operator_tier = crate::rest_principal::is_confirmed_operator_tier(&admission);
+        ResolvedRestPrincipal {
+            admission,
+            dispatch_principal,
+            confirmed_operator_tier,
+        }
+    }
+
+    async fn body_json(resp: Response) -> Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn body_text(resp: Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    fn query(pairs: &[(&str, &str)]) -> axum::extract::Query<HashMap<String, String>> {
+        axum::extract::Query(
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        )
+    }
+
+    /// Seed `n` tasks with a single root + N-1 children
+    /// (`idx_tasks_single_root` forbids a second `parent_task IS NULL`
+    /// row), strictly increasing `created_at` so read order is
+    /// deterministic. Returns task_ids in ascending-created_at order.
+    fn seed_tasks(conn: &rusqlite::Connection, n: usize, prefix: &str) -> Vec<String> {
+        let mut ids = Vec::with_capacity(n);
+        let mut root_id: Option<String> = None;
+        for i in 0..n {
+            let task_id = format!("{prefix}_{i:05}");
+            let created_at = format!("2026-01-01T00:00:00.{i:06}");
+            conn.execute(
+                "INSERT INTO tasks (task_id, title, description, status, priority, \
+                 assigned_to, created_by, created_at, updated_at, notes, \
+                 depends_on_tasks, parent_task, child_tasks) \
+                 VALUES (?1, ?2, 'seed', 'pending', 'low', NULL, 'admin', ?3, ?3, \
+                 '[]', '[]', ?4, '[]')",
+                rusqlite::params![task_id, format!("Task {i}"), created_at, root_id],
+            )
+            .unwrap();
+            if root_id.is_none() {
+                root_id = Some(task_id.clone());
+            }
+            ids.push(task_id);
+        }
+        ids
+    }
+
+    /// Same single-root discipline as [`seed_tasks`], but with an
+    /// explicit per-status count map (order matters -- the FIRST task
+    /// inserted overall becomes the root).
+    fn seed_tasks_with_statuses(conn: &rusqlite::Connection, counts: &[(&str, usize)]) {
+        let mut root_id: Option<String> = None;
+        let mut i = 0usize;
+        for (status, n) in counts {
+            for _ in 0..*n {
+                let task_id = format!("t_{i:05}");
+                let created_at = format!("2026-01-01T00:00:00.{i:06}");
+                conn.execute(
+                    "INSERT INTO tasks (task_id, title, description, status, priority, \
+                     assigned_to, created_by, created_at, updated_at, notes, \
+                     depends_on_tasks, parent_task, child_tasks) \
+                     VALUES (?1, ?2, 'seed', ?3, 'low', NULL, 'admin', ?4, ?4, \
+                     '[]', '[]', ?5, '[]')",
+                    rusqlite::params![task_id, format!("Task {i}"), status, created_at, root_id],
+                )
+                .unwrap();
+                if root_id.is_none() {
+                    root_id = Some(task_id.clone());
+                }
+                i += 1;
+            }
+        }
+    }
+
+    fn seed_agents(conn: &rusqlite::Connection, n: usize, prefix: &str, status: &str) {
+        for i in 0..n {
+            let created_at = format!("2026-03-01T00:00:00.{i:06}");
+            conn.execute(
+                "INSERT INTO agents (token, agent_id, created_at, status, \
+                 working_directory, color) VALUES (?1, ?2, ?3, ?4, '/tmp', '#123456')",
+                rusqlite::params![
+                    format!("tok_{prefix}_{i:05}"),
+                    format!("{prefix}_{i:05}"),
+                    created_at,
+                    status
+                ],
+            )
+            .unwrap();
+        }
+    }
+
+    fn seed_context_rows(conn: &rusqlite::Connection, n: usize, prefix: &str) {
+        for i in 0..n {
+            let updated_at = format!("2026-01-01T00:00:00.{i:06}");
+            conn.execute(
+                "INSERT INTO project_context (context_key, value, description, \
+                 created_at, created_by, updated_at, updated_by) \
+                 VALUES (?1, ?2, ?3, ?4, 'admin', ?4, 'admin')",
+                rusqlite::params![
+                    format!("{prefix}_{i:05}"),
+                    format!("\"value {i}\""),
+                    format!("desc {i}"),
+                    updated_at
+                ],
+            )
+            .unwrap();
+        }
+    }
+
+    fn seed_live_agents(conn: &rusqlite::Connection, n: usize, prefix: &str) {
+        for i in 0..n {
+            let created_at = format!("2026-04-01T00:00:00.{i:06}");
+            conn.execute(
+                "INSERT INTO agents (token, agent_id, created_at, status, \
+                 working_directory, color) VALUES (?1, ?2, ?3, 'created', '/tmp', '#123456')",
+                rusqlite::params![
+                    format!("tok_{prefix}_{i:05}"),
+                    format!("{prefix}_{i:05}"),
+                    created_at
+                ],
+            )
+            .unwrap();
+        }
+    }
+
+    fn seed_tombstone_messages(conn: &rusqlite::Connection, n: usize, prefix: &str) {
+        for i in 0..n {
+            let marker = format!("[deleted-{prefix}_{i:05}]");
+            let ts = format!("2026-05-01T00:00:00.{i:06}");
+            conn.execute(
+                "INSERT INTO agent_messages (message_id, sender_id, recipient_id, \
+                 message_content, message_type, priority, timestamp, delivered, read) \
+                 VALUES (?1, ?2, 'admin', 'hi', 'text', 'normal', ?3, 0, 0)",
+                rusqlite::params![format!("msg_{prefix}_{i:05}"), marker, ts],
+            )
+            .unwrap();
+        }
+    }
+
+    // -----------------------------------------------------------
+    // Pentest R3-F3 / R2-F2: /api/tasks, /api/agents, /api/context-data
+    // bounded-read clamp -- `read_limits::clamp_section_limit` is
+    // already unit-tested on its own bounds; these pin the SAME clamp
+    // wired correctly through each real handler.
+    // -----------------------------------------------------------
+
+    #[tokio::test]
+    async fn list_tasks_bounded_by_default_limit() {
+        let conn = test_conn();
+        seed_tasks(&conn, 600, "t");
+        let shared = test_shared_state(conn);
+        let resp = list_tasks(State(shared), query(&[])).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await.as_array().unwrap().len(), 500);
+    }
+
+    #[tokio::test]
+    async fn list_tasks_explicit_limit_honored_and_clamped_to_max() {
+        let conn = test_conn();
+        seed_tasks(&conn, 600, "t");
+        let shared = test_shared_state(conn);
+
+        let resp = list_tasks(State(shared.clone()), query(&[("limit", "10")])).await;
+        assert_eq!(body_json(resp).await.as_array().unwrap().len(), 10);
+
+        // Above the upper bound and above the seeded row count -> every
+        // seeded row comes back, never truncated to the cap.
+        let resp = list_tasks(State(shared), query(&[("limit", "999999")])).await;
+        assert_eq!(body_json(resp).await.as_array().unwrap().len(), 600);
+    }
+
+    #[tokio::test]
+    async fn list_tasks_newest_first_order_preserved() {
+        let conn = test_conn();
+        let ids = seed_tasks(&conn, 505, "ord");
+        let shared = test_shared_state(conn);
+        let resp = list_tasks(State(shared), query(&[("limit", "5")])).await;
+        let got: Vec<String> = body_json(resp)
+            .await
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["task_id"].as_str().unwrap().to_string())
+            .collect();
+        let mut expected: Vec<String> = ids[ids.len() - 5..].to_vec();
+        expected.reverse();
+        assert_eq!(got, expected);
+    }
+
+    #[tokio::test]
+    async fn list_tasks_small_corpus_not_truncated() {
+        let conn = test_conn();
+        seed_tasks(&conn, 3, "small");
+        let shared = test_shared_state(conn);
+        let resp = list_tasks(State(shared), query(&[])).await;
+        let body = body_json(resp).await;
+        let arr = body.as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        assert!(arr
+            .iter()
+            .all(|t| t.get("task_id").is_some() && t.get("status").is_some()));
+    }
+
+    #[tokio::test]
+    async fn list_agents_dashboard_bounded_by_default_limit() {
+        let conn = test_conn();
+        seed_agents(&conn, 600, "ag", "created");
+        let shared = test_shared_state(conn);
+        let resp = list_agents_dashboard(State(shared), query(&[])).await;
+        assert_eq!(body_json(resp).await.as_array().unwrap().len(), 500);
+    }
+
+    #[tokio::test]
+    async fn list_agents_dashboard_explicit_limit_honored() {
+        let conn = test_conn();
+        seed_agents(&conn, 600, "ag", "created");
+        let shared = test_shared_state(conn);
+        let resp = list_agents_dashboard(State(shared), query(&[("limit", "12")])).await;
+        assert_eq!(body_json(resp).await.as_array().unwrap().len(), 12);
+    }
+
+    #[tokio::test]
+    async fn context_data_bounded_by_default_limit() {
+        let conn = test_conn();
+        seed_context_rows(&conn, 550, "ctx");
+        let shared = test_shared_state(conn);
+        let resp = context_data(State(shared), query(&[])).await;
+        assert_eq!(body_json(resp).await.as_array().unwrap().len(), 500);
+    }
+
+    #[tokio::test]
+    async fn context_data_explicit_limit_honored() {
+        let conn = test_conn();
+        seed_context_rows(&conn, 550, "ctx");
+        let shared = test_shared_state(conn);
+        let resp = context_data(State(shared), query(&[("limit", "7")])).await;
+        assert_eq!(body_json(resp).await.as_array().unwrap().len(), 7);
+    }
+
+    #[tokio::test]
+    async fn context_data_small_dataset_not_truncated() {
+        let conn = test_conn();
+        seed_context_rows(&conn, 4, "smallctx");
+        let shared = test_shared_state(conn);
+        let resp = context_data(State(shared), query(&[])).await;
+        assert_eq!(body_json(resp).await.as_array().unwrap().len(), 4);
+    }
+
+    // -----------------------------------------------------------
+    // Pentest R4-F1: /api/status counts via SQL aggregate. The
+    // "never materialises the full table" property is already pinned
+    // at the repository level (`task_repository::count_by_status_
+    // groups_correctly` / `agent_repository::count_active_by_status_
+    // excludes_terminal_and_groups_correctly`, both `GROUP BY` queries
+    // this handler is the only caller of) -- this closes the remaining
+    // gap: the handler assembles those counts into the right response
+    // shape.
+    // -----------------------------------------------------------
+
+    #[tokio::test]
+    async fn simple_status_counts_correct_via_sql_aggregate() {
+        let conn = test_conn();
+        seed_tasks_with_statuses(
+            &conn,
+            &[("pending", 7), ("completed", 4), ("in_progress", 2)],
+        );
+        seed_agents(&conn, 5, "act", "active");
+        seed_agents(&conn, 3, "cre", "created");
+        let shared = test_shared_state(conn);
+        let resp = simple_status(State(shared)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["total_tasks"], 13);
+        assert_eq!(body["pending_tasks"], 7);
+        assert_eq!(body["completed_tasks"], 4);
+        assert_eq!(body["total_agents"], 8);
+        assert_eq!(body["active_agents"], 5);
+    }
+
+    // -----------------------------------------------------------
+    // Pentest R4-F2: POST /api/messages/participants bounded reads.
+    // -----------------------------------------------------------
+
+    #[tokio::test]
+    async fn list_participants_bounded_by_default_limit() {
+        let conn = test_conn();
+        seed_live_agents(&conn, 700, "live");
+        let shared = test_shared_state(conn);
+        let resp = list_participants(State(shared), query(&[]), Bytes::from_static(b"{}")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        // The synthetic "admin" row may be prepended -> allow +1; nowhere
+        // near the 700 seeded rows.
+        assert!(body["live"].as_array().unwrap().len() <= 501);
+    }
+
+    #[tokio::test]
+    async fn list_participants_limit_honored() {
+        let conn = test_conn();
+        seed_live_agents(&conn, 700, "live");
+        let shared = test_shared_state(conn);
+        let resp = list_participants(
+            State(shared),
+            query(&[("limit", "5")]),
+            Bytes::from_static(b"{}"),
+        )
+        .await;
+        let body = body_json(resp).await;
+        let live = body["live"].as_array().unwrap();
+        assert!(live.len() >= 5 && live.len() <= 6);
+    }
+
+    #[tokio::test]
+    async fn list_participants_tombstones_bounded() {
+        let conn = test_conn();
+        seed_tombstone_messages(&conn, 550, "tmb");
+        let shared = test_shared_state(conn);
+        let resp = list_participants(
+            State(shared),
+            query(&[("limit", "5")]),
+            Bytes::from_static(b"{}"),
+        )
+        .await;
+        let body = body_json(resp).await;
+        assert!(body["tombstones"].as_array().unwrap().len() <= 5);
+    }
+
+    #[tokio::test]
+    async fn list_participants_small_corpus_full_and_shape_preserved() {
+        let conn = test_conn();
+        seed_live_agents(&conn, 3, "sm");
+        seed_tombstone_messages(&conn, 2, "smtmb");
+        let shared = test_shared_state(conn);
+        let resp = list_participants(State(shared), query(&[]), Bytes::from_static(b"{}")).await;
+        let body = body_json(resp).await;
+        let mut keys: Vec<&str> = body
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["live", "tombstones"]);
+        let live_ids: std::collections::HashSet<String> = body["live"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["agent_id"].as_str().unwrap().to_string())
+            .collect();
+        for id in ["sm_00000", "sm_00001", "sm_00002", "admin"] {
+            assert!(live_ids.contains(id), "missing {id} in {live_ids:?}");
+        }
+        let tombstones: Vec<String> = body["tombstones"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t.as_str().unwrap().to_string())
+            .collect();
+        assert!(tombstones.contains(&"[deleted-smtmb_00000]".to_string()));
+        assert!(tombstones.contains(&"[deleted-smtmb_00001]".to_string()));
+    }
+
+    // -----------------------------------------------------------
+    // test_sec_composition_secret_exposure.py: all-data must never ship
+    // the AoE side-channel session id, to any tier.
+    // -----------------------------------------------------------
+
+    #[tokio::test]
+    async fn all_data_strips_aoe_session_id_even_when_present_in_db() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO agents (token, agent_id, created_at, status, \
+             working_directory, color, aoe_session_id) VALUES \
+             ('tok-aoe', 'aoe-agent', '2026-01-01T00:00:00Z', 'active', '/tmp', \
+             '#abc', 'deadbeefcafe0011')",
+            [],
+        )
+        .unwrap();
+        let shared = test_shared_state(conn);
+        let resolved = resolved_forwarding("op1", conexus_core::capability::ProjectRole::Operator);
+        let resp = all_data(State(shared), Extension(resolved), query(&[])).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let text = body_text(resp).await;
+        assert!(!text.contains("deadbeefcafe0011"));
+        let json: Value = serde_json::from_str(&text).unwrap();
+        for agent in json["agents"].as_array().unwrap() {
+            assert!(agent.get("aoe_session_id").is_none());
+        }
+    }
+
+    // -----------------------------------------------------------
+    // ADR-0017 (test_sec_r4_composition_backstop.py /
+    // test_sec_r5_composition_description.py): content-based secret
+    // detection is REMOVED entirely -- project_context is shared
+    // project knowledge, returned AS-IS (value AND description) to
+    // any authorized reader, confirmed-operator-tier or not.
+    // -----------------------------------------------------------
+
+    #[tokio::test]
+    async fn all_data_and_context_data_return_embedded_secret_shaped_content_in_full() {
+        let conn = test_conn();
+        let aws_like = "AKIAIOSFODNN7EXAMPLE";
+        let secret_desc =
+            "Deploy creds: ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789xx -- do not share.";
+        conn.execute(
+            "INSERT INTO project_context (context_key, value, description, \
+             created_at, created_by, updated_at, updated_by) VALUES \
+             ('deploy_runbook', ?1, ?2, '2026-01-01T00:00:00Z', 'admin', \
+             '2026-01-01T00:00:00Z', 'admin')",
+            rusqlite::params![
+                format!("\"Deploy steps: use {aws_like} to ship.\""),
+                secret_desc
+            ],
+        )
+        .unwrap();
+        let shared = test_shared_state(conn);
+
+        let resolved = resolved_forwarding("op1", conexus_core::capability::ProjectRole::Operator);
+        let resp = all_data(State(shared.clone()), Extension(resolved), query(&[])).await;
+        let text = body_text(resp).await;
+        assert!(text.contains(aws_like));
+        assert!(text.contains(secret_desc));
+
+        let resp = context_data(State(shared), query(&[])).await;
+        let text = body_text(resp).await;
+        assert!(text.contains(aws_like));
+        assert!(text.contains(secret_desc));
+    }
+
+    #[tokio::test]
+    async fn all_data_500_never_leaks_internal_error_detail() {
+        let conn = test_conn();
+        // Force a real internal DB error deterministically (no
+        // dependency-injection seam exists for `Connection` in this
+        // crate) -- every internal-error branch in this handler
+        // discards the real `rusqlite::Error` via `Err(_)`, so this
+        // must 500 with a STATIC message, never the real "no such
+        // table" text.
+        conn.execute("DROP TABLE agents", []).unwrap();
+        let shared = test_shared_state(conn);
+        let resolved = resolved_forwarding("op1", conexus_core::capability::ProjectRole::Operator);
+        let resp = all_data(State(shared), Extension(resolved), query(&[])).await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let text = body_text(resp).await.to_lowercase();
+        assert!(!text.contains("no such table"));
+        assert!(!text.contains("sql"));
+    }
+
+    // -----------------------------------------------------------
+    // F009 (test_sec_composition_policy_readback.py): settings_data
+    // threads `resolved.confirmed_operator_tier` from the REAL
+    // resolved principal through to `redact_settings_row`, so a
+    // non-secret policy toggle reads back its true value to a
+    // forwarding (non-confirmed) operator. `redact_settings_row`
+    // itself is unit-tested in `project_settings_tools.rs`; this pins
+    // the plumbing between the handler and that function.
+    // -----------------------------------------------------------
+
+    #[tokio::test]
+    async fn settings_data_threads_confirmed_operator_tier_from_resolved_principal() {
+        let conn = test_conn();
+        conexus_db::project_settings_repository::upsert(
+            &conn,
+            "config_allow_worker_to_worker",
+            "true",
+            None,
+            false,
+            "operator",
+            "2026-01-01T00:00:00Z",
+        )
+        .unwrap();
+        let shared = test_shared_state(conn);
+        let resolved = resolved_forwarding("op1", conexus_core::capability::ProjectRole::Operator);
+        let resp = settings_data(State(shared), Extension(resolved)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let rows = body["settings"].as_array().unwrap();
+        let row = rows
+            .iter()
+            .find(|r| r["context_key"] == "config_allow_worker_to_worker")
+            .unwrap();
+        assert_ne!(row["value"], "[redacted]");
+        assert_eq!(row["value"], "true");
+    }
+
+    // -----------------------------------------------------------
+    // BL-R22-1 REST reference (test_sec_r22_context_description_
+    // parity.py): `update_memory` only threads `description` into the
+    // tool call when the caller supplied it -- proven end-to-end here
+    // through the real `create_memory`/`update_memory` handlers and
+    // the tool they dispatch through (already unit-tested on its own
+    // in `project_context_tools.rs`).
+    // -----------------------------------------------------------
+
+    #[tokio::test]
+    async fn update_memory_value_only_update_preserves_description_end_to_end() {
+        let conn = test_conn();
+        let shared = test_shared_state(conn);
+        let resolved = resolved_operator_bearer("dummy-token");
+
+        let create_body = Bytes::from(
+            json!({
+                "context_key": "r22_rest",
+                "context_value": {"v": 1},
+                "description": "original rest description",
+            })
+            .to_string(),
+        );
+        let resp = create_memory(
+            State(shared.clone()),
+            Extension(resolved.clone()),
+            create_body,
+        )
+        .await;
+        let status = resp.status();
+        let text = body_text(resp).await;
+        assert_eq!(status, StatusCode::OK, "create failed: {text}");
+
+        let update_body = Bytes::from(json!({"context_value": {"v": 2}}).to_string());
+        let resp = update_memory(
+            Path("r22_rest".to_string()),
+            State(shared.clone()),
+            Extension(resolved),
+            update_body,
+        )
+        .await;
+        let status = resp.status();
+        let text = body_text(resp).await;
+        assert_eq!(status, StatusCode::OK, "update failed: {text}");
+
+        let guard = shared.conn.lock().await;
+        let row = conexus_db::project_context_repository::get(&guard, "r22_rest")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.value, "{\"v\":2}");
+        assert_eq!(
+            row.description.as_deref(),
+            Some("original rest description"),
+            "value-only REST update must preserve the existing description"
+        );
+    }
+
+    // -----------------------------------------------------------
+    // R20-F2 (test_sec_r20_f2_f3_settings_key_allowlist_and_recursion_
+    // leak.py): unlike Python's original bug (settings.py used ONLY
+    // the `has_unsafe_unicode_for_identifier` denylist, unlike
+    // memories.py's denylist+allowlist pair), this port's settings
+    // handlers already gate on BOTH `has_unsafe_unicode_for_identifier`
+    // AND the ASCII-allowlist `is_valid_memory_key` -- architecturally
+    // symmetric with memories from the start. These invisible Lo/So
+    // codepoints are outside the denylist's ranges but rejected by the
+    // allowlist regardless, so they pin the class is closed here too.
+    // -----------------------------------------------------------
+
+    const INVISIBLE_LO_SO_CODEPOINTS: [(&str, char); 5] = [
+        ("hangul_choseong_filler", '\u{115F}'),
+        ("hangul_jungseong_filler", '\u{1160}'),
+        ("hangul_filler", '\u{3164}'),
+        ("halfwidth_hangul_filler", '\u{FFA0}'),
+        ("braille_pattern_blank", '\u{2800}'),
+    ];
+
+    #[tokio::test]
+    async fn create_setting_rejects_invisible_lo_so_codepoints_in_body_key() {
+        for (label, ch) in INVISIBLE_LO_SO_CODEPOINTS {
+            let conn = test_conn();
+            let shared = test_shared_state(conn);
+            let resolved = resolved_operator_bearer("dummy-token");
+            let bad_key = format!("config_test_{ch}_key");
+            let body =
+                Bytes::from(json!({"context_key": bad_key, "context_value": true}).to_string());
+            let resp = create_setting(State(shared), Extension(resolved), body).await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{label}");
+            let body = body_json(resp).await;
+            assert_eq!(body["error"], "invalid_key_character", "{label}");
+        }
+    }
+
+    #[tokio::test]
+    async fn update_setting_rejects_invisible_lo_so_codepoints_in_url_key() {
+        for (label, ch) in INVISIBLE_LO_SO_CODEPOINTS {
+            let conn = test_conn();
+            let shared = test_shared_state(conn);
+            let resolved = resolved_operator_bearer("dummy-token");
+            let bad_key = format!("config_test_{ch}_key");
+            let body = Bytes::from(json!({"context_value": true}).to_string());
+            let resp =
+                update_setting(Path(bad_key), State(shared), Extension(resolved), body).await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{label}");
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_setting_rejects_invisible_lo_so_codepoint_in_url_key() {
+        let conn = test_conn();
+        let shared = test_shared_state(conn);
+        let resolved = resolved_operator_bearer("dummy-token");
+        let bad_key = format!("config_test_{}_key", INVISIBLE_LO_SO_CODEPOINTS[0].1);
+        let resp = delete_setting(Path(bad_key), State(shared), Extension(resolved)).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn update_setting_normal_ascii_key_round_trips() {
+        let conn = test_conn();
+        let shared = test_shared_state(conn);
+        let resolved = resolved_operator_bearer("dummy-token");
+        let body = Bytes::from(json!({"context_value": true}).to_string());
+        let resp = update_setting(
+            Path("config_allow_worker_to_worker".to_string()),
+            State(shared.clone()),
+            Extension(resolved.clone()),
+            body,
+        )
+        .await;
+        let status = resp.status();
+        let text = body_text(resp).await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+
+        let resp = settings_data(State(shared), Extension(resolved)).await;
+        let body = body_json(resp).await;
+        assert!(body["settings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["context_key"] == "config_allow_worker_to_worker"));
+    }
+
+    // -----------------------------------------------------------
+    // R20-F3: the deep-recursion guard lives in the ONE shared
+    // `decode_untrusted_body` chokepoint (already exhaustively pinned
+    // in `json_sanitize.rs`); this proves the plumbing through a real
+    // settings-router call site end-to-end.
+    // -----------------------------------------------------------
+
+    #[tokio::test]
+    async fn create_setting_deep_json_body_no_recursion_leak() {
+        let conn = test_conn();
+        let shared = test_shared_state(conn);
+        let resolved = resolved_operator_bearer("dummy-token");
+        let depth = 400; // clears json_sanitize::MAX_NESTING_DEPTH (200)
+        let body_str = format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
+        let resp = create_setting(State(shared), Extension(resolved), Bytes::from(body_str)).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let text = body_text(resp).await.to_lowercase();
+        assert!(!text.contains("recursion"));
+    }
 }

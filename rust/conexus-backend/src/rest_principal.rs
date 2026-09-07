@@ -456,4 +456,61 @@ mod tests {
         assert_eq!(dispatched.source_token.as_deref(), Some("tok123"));
         assert!(dispatched.has_capability(conexus_core::capability::Capability::SystemConfigWrite));
     }
+
+    /// test_sec_r4_operator_identity_race.py (AC-race): Python's bug was
+    /// `AuthHeaderMiddleware` stamping the forwarding operator onto
+    /// `g.current_operator` -- a process-wide MUTABLE global -- before an
+    /// `await`, so a concurrent request's write could be read back by an
+    /// unrelated request's dep call (cross-attribution in the audit log).
+    ///
+    /// This class is architecturally eliminated here, not just fixed:
+    /// `resolve_rest_principal` is a pure function of its own arguments
+    /// (no `static`/global/`OnceLock` it reads or writes), and
+    /// [`rest_gate::require_rest_identity`] stamps its result onto
+    /// THIS request's `Extensions` (axum's per-request storage, never
+    /// shared across requests) -- there is no shared mutable carrier a
+    /// second call could clobber for a first call to read back wrong.
+    /// Pinned directly rather than left to code-review: two distinct
+    /// forwarding operators resolved back-to-back (and a third,
+    /// re-resolving the first) must each get their OWN identity, never a
+    /// neighboring call's.
+    #[test]
+    fn resolving_distinct_forwarding_operators_never_cross_attributes() {
+        let conn = test_conn();
+        let key = b"race-test-key-bytes";
+        let alice_header = conexus_auth::forwarding_header::sign(
+            "alice",
+            conexus_auth::forwarding_header::ForwardedRole::Operator,
+            key,
+            1000,
+            30,
+        );
+        let bob_header = conexus_auth::forwarding_header::sign(
+            "bob",
+            conexus_auth::forwarding_header::ForwardedRole::Operator,
+            key,
+            1000,
+            30,
+        );
+
+        let alice =
+            resolve_rest_principal(&conn, None, Some(&alice_header), Some(key.as_slice()), 1005)
+                .unwrap();
+        let bob =
+            resolve_rest_principal(&conn, None, Some(&bob_header), Some(key.as_slice()), 1005)
+                .unwrap();
+        // Re-resolve alice AFTER bob -- a process-global carrier (the
+        // historical Python bug) would have bob's id sitting in it by now.
+        let alice_again =
+            resolve_rest_principal(&conn, None, Some(&alice_header), Some(key.as_slice()), 1005)
+                .unwrap();
+
+        let expect = |id: &str| RestPrincipal::Forwarding {
+            operator_id: id.to_string(),
+            project_role: ProjectRole::Operator,
+        };
+        assert_eq!(alice, expect("alice"));
+        assert_eq!(bob, expect("bob"));
+        assert_eq!(alice_again, expect("alice"));
+    }
 }
