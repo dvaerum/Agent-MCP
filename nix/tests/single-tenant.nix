@@ -128,6 +128,9 @@ pkgs.testers.nixosTest {
         ];
         RuntimeDirectory = "agent-mcp/%i";
         RuntimeDirectoryMode = "0700";
+        # See agent-mcp-router's own RuntimeDirectoryPreserve comment
+        # below -- same bare-parent-vs-%i-child sharing, same fix.
+        RuntimeDirectoryPreserve = "yes";
         # R8-F2 discovery: F015 v4 (see nix/module.nix) generates the
         # per-project forwarding-HMAC key via ExecStartPre; the
         # launcher's ``--forwarding-hmac-in`` is click-validated with
@@ -193,8 +196,18 @@ pkgs.testers.nixosTest {
         Type = "simple";
         User = "testuser";
         Group = "testuser";
+        # RuntimeDirectoryPreserve=yes (live incident 2026-09-07, see
+        # nix/home-manager-module.nix's agent-mcp-router unit for the
+        # full writeup): this bare, single-component RuntimeDirectory
+        # is a strict parent of agent-mcp@'s own "agent-mcp/%i" above --
+        # per systemd.exec(5), that makes it THIS unit's own innermost
+        # subdirectory, so without `=yes` every stop of this router
+        # (crash-loop, redeploy) recursively deletes the whole
+        # /run/agent-mcp tree, including any live per-project backend's
+        # own subdirectory and socket.
         RuntimeDirectory = "agent-mcp";
         RuntimeDirectoryMode = "0700";
+        RuntimeDirectoryPreserve = "yes";
         ExecStartPre = [
           "${pkgs.coreutils}/bin/mkdir -p /home/testuser/.config/agent-mcp /home/testuser/projects ${singleWorkspace}"
           # Seed projects.local.json with the single-tenant entry —
