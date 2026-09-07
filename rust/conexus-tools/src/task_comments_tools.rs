@@ -526,6 +526,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_worker_can_comment_on_another_workers_assigned_task_by_default() {
+        // Port of test_sec_comment_ownership_rag_gate.py's
+        // test_worker_can_comment_on_foreign_task_by_default --
+        // config_allow_worker_comment_foreign_tasks defaults to
+        // `true` in BOTH languages (confirmed by reading the real
+        // Python source directly, not assumed): a worker CAN comment
+        // on another agent's ASSIGNED task out of the box. An earlier
+        // draft of this exact test wrongly assumed strict same-owner-
+        // only denial and failed against the real, correct,
+        // documented behavior -- caught by running it, not assumed.
+        let conn = setup().await;
+        {
+            let c = conn.lock().await;
+            seed_task(&c, "t1", Some("bob"), "bob");
+        }
+        let alice = worker("alice", &[]);
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = AddTaskCommentTool::call(
+            Some(&alice),
+            &serde_json::json!({"task_id": "t1", "text": "cross-agent note"}),
+            &conn,
+            "2026-06-01T00:00:00Z",
+            &c,
+        )
+        .await;
+        assert!(
+            matches!(result, ToolResult::Ok { .. }),
+            "expected Ok, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_worker_cannot_comment_on_another_workers_task_when_the_toggle_is_off() {
+        // Port of test_sec_comment_ownership_rag_gate.py's
+        // test_worker_cannot_note_foreign_task_when_toggle_off -- the
+        // sibling to the default-permissive test above. With
+        // config_allow_worker_comment_foreign_tasks explicitly off,
+        // a worker is denied commenting on a task assigned to a
+        // DIFFERENT worker (the sibling `_is_unassigned` test above
+        // only covers the NO-owner case, not this one). A manager
+        // (tasks.assign) still succeeds regardless of the toggle.
+        //
+        // PF-1 (confirmed against the real Python test, not assumed):
+        // the denial is a NotFound, IDENTICAL to a nonexistent task --
+        // an earlier draft of this test wrongly expected
+        // PermissionDenied, caught by actually running it against the
+        // real (correct) implementation, which already matches
+        // Python's own `assert isinstance(result, NotFound)`.
+        let conn = setup().await;
+        {
+            let c = conn.lock().await;
+            seed_task(&c, "t1", Some("bob"), "bob");
+            project_settings_repository::upsert(
+                &c,
+                "config_allow_worker_comment_foreign_tasks",
+                "false",
+                None,
+                false,
+                "test",
+                "2026-06-01T00:00:00Z",
+            )
+            .unwrap();
+        }
+        let alice = worker("alice", &[]);
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = AddTaskCommentTool::call(
+            Some(&alice),
+            &serde_json::json!({"task_id": "t1", "text": "cross-agent injection attempt"}),
+            &conn,
+            "2026-06-01T00:00:00Z",
+            &c,
+        )
+        .await;
+        let ToolResult::NotFound { hint, .. } = &result else {
+            panic!("expected NotFound, got {result:?}");
+        };
+        // The owner's identity must never leak through the denial.
+        assert!(!format!("{result:?}").contains("bob"));
+        assert!(hint.is_none());
+        let manager = worker("mgr", &[Capability::TasksAssign]);
+        let result2 = AddTaskCommentTool::call(
+            Some(&manager),
+            &serde_json::json!({"task_id": "t1", "text": "manager note"}),
+            &conn,
+            "2026-06-01T00:00:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result2, ToolResult::Ok { .. }));
+    }
+
+    #[tokio::test]
     async fn commenting_on_a_terminal_task_is_conflict() {
         let conn = setup().await;
         {
