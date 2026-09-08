@@ -14,32 +14,36 @@
 //! both feed the same unified delivery-scheduler push mechanism.
 //!
 //! A module of plain functions, matching Python's own design (no
-//! cache). Every function takes the `&Connection` it should run
-//! against — this crate has no separate "opens its own connection"
-//! path, matching every other repository here. Unlike
-//! `group_capability_repository`, this table lives on the per-project
-//! AGENT database (confirmed via the ORM model,
-//! `agent_mcp/db/models/pending_directive.py`), not the router DB —
-//! don't assume from a sibling repository's placement.
+//! cache). Every function that touches the DB takes the
+//! `&DatabaseConnection` it should run against — this crate has no
+//! separate "opens its own connection" path, matching every other
+//! repository here. Unlike `group_capability_repository`, this table
+//! lives on the per-project AGENT database (confirmed via the ORM
+//! model, `agent_mcp/db/models/pending_directive.py`), not the router
+//! DB — don't assume from a sibling repository's placement.
 //!
 //! `agent_id` has NO database-level foreign key to `agents.agent_id`
 //! — Python's model/migration comments call it a "logical FK" only,
 //! so this port doesn't assume referential-integrity enforcement at
 //! the DB layer either.
+//!
+//! Phase G (sea-orm migration): the sixth repository converted, and
+//! the first whose own collector inside `assemble_event_feed`'s
+//! wake-loop pipeline is now sea-orm-backed too — the prerequisite PR
+//! (#975) threaded a `&sea_orm::DatabaseConnection` through that
+//! function's async plumbing specifically so this conversion could
+//! land without reshaping its signature again. [`poke_event`] stays a
+//! pure, connection-less function throughout — it builds the wire
+//! shape from already-fetched fields, nothing else in this module
+//! changes that.
 
-use rusqlite::{Connection, Result};
+use sea_orm::{
+    ActiveValue::Set, ColumnTrait, DatabaseConnection, DbErr, EntityTrait, PaginatorTrait,
+    QueryFilter, QueryOrder,
+};
 
-/// One row of the `pending_directive` table.
-#[derive(Debug, Clone, PartialEq)]
-pub struct PendingDirectiveRow {
-    pub poke_id: String,
-    pub agent_id: String,
-    pub prompt: String,
-    pub priority: String,
-    pub created_at: String,
-    pub created_by: Option<String>,
-    pub delivered_at: Option<String>,
-}
+pub use crate::entity::pending_directive::Model as PendingDirectiveRow;
+use crate::entity::pending_directive::{ActiveModel, Column, Entity};
 
 /// The wire shape both poke and scheduled directives converge on.
 /// `event_type` serializes as `"type"` to match the JSON key Python's
@@ -92,25 +96,31 @@ pub fn poke_event(poke_id: &str, prompt: &str, priority: &str, timestamp: &str) 
 /// INSERT an undelivered poke row. Returns the row as constructed
 /// from the INSERT's own parameters — matching Python exactly, this
 /// does NOT re-`SELECT` afterward. A duplicate `poke_id` surfaces as
-/// a real `rusqlite::Error` (PK violation), not a special variant —
-/// matching Python, which lets the underlying `sqlite3.IntegrityError`
-/// propagate uncaught.
+/// a real `DbErr` (PK violation), not a special variant — matching
+/// Python, which lets the underlying `sqlite3.IntegrityError`
+/// propagate uncaught, and matching the rusqlite version's own
+/// uncaught-`rusqlite::Error` behavior before this port.
 #[allow(clippy::too_many_arguments)]
-pub fn create_poke(
-    conn: &Connection,
+pub async fn create_poke(
+    db: &DatabaseConnection,
     poke_id: &str,
     agent_id: &str,
     prompt: &str,
     priority: Option<&str>,
     created_by: Option<&str>,
     now_iso: &str,
-) -> Result<PendingDirectiveRow> {
+) -> Result<PendingDirectiveRow, DbErr> {
     let priority = priority.unwrap_or("urgent");
-    conn.execute(
-        "INSERT INTO pending_directive (poke_id, agent_id, prompt, priority, created_at, created_by, delivered_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
-        (poke_id, agent_id, prompt, priority, now_iso, created_by),
-    )?;
+    let am = ActiveModel {
+        poke_id: Set(poke_id.to_string()),
+        agent_id: Set(agent_id.to_string()),
+        prompt: Set(prompt.to_string()),
+        priority: Set(priority.to_string()),
+        created_at: Set(now_iso.to_string()),
+        created_by: Set(created_by.map(str::to_string)),
+        delivered_at: Set(None),
+    };
+    Entity::insert(am).exec(db).await?;
     Ok(PendingDirectiveRow {
         poke_id: poke_id.to_string(),
         agent_id: agent_id.to_string(),
@@ -131,60 +141,73 @@ pub fn create_poke(
 /// `_sort_events_priority_then_time`), NOT this repository's job;
 /// don't conflate SQL ordering with delivery-order guarantees.
 /// Empty (never an error) when nothing is undelivered.
-pub fn collect_undelivered(
-    conn: &Connection,
+pub async fn collect_undelivered(
+    db: &DatabaseConnection,
     agent_id: &str,
     now_iso: &str,
-) -> Result<Vec<DirectiveEvent>> {
-    let mut stmt = conn.prepare(
-        "SELECT poke_id, prompt, priority FROM pending_directive \
-         WHERE agent_id = ?1 AND delivered_at IS NULL ORDER BY created_at ASC",
-    )?;
-    let rows: Vec<(String, String, String)> = stmt
-        .query_map([agent_id], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })?
-        .collect::<Result<Vec<_>>>()?;
-    drop(stmt);
+) -> Result<Vec<DirectiveEvent>, DbErr> {
+    let rows = Entity::find()
+        .filter(Column::AgentId.eq(agent_id))
+        .filter(Column::DeliveredAt.is_null())
+        .order_by_asc(Column::CreatedAt)
+        .all(db)
+        .await?;
 
     let mut events = Vec::with_capacity(rows.len());
-    for (poke_id, prompt, priority) in rows {
-        conn.execute(
-            "UPDATE pending_directive SET delivered_at = ?1 WHERE poke_id = ?2",
-            (now_iso, &poke_id),
-        )?;
-        events.push(poke_event(&poke_id, &prompt, &priority, now_iso));
+    for row in rows {
+        Entity::update_many()
+            .col_expr(
+                Column::DeliveredAt,
+                sea_orm::sea_query::Expr::value(now_iso),
+            )
+            .filter(Column::PokeId.eq(row.poke_id.clone()))
+            .exec(db)
+            .await?;
+        events.push(poke_event(
+            &row.poke_id,
+            &row.prompt,
+            &row.priority,
+            now_iso,
+        ));
     }
     Ok(events)
 }
 
 /// Count of undelivered pokes for `agent_id`. `0`, never an error,
-/// when there are none (a `COUNT(*)` query always returns exactly one
-/// row).
-pub fn count_undelivered(conn: &Connection, agent_id: &str) -> Result<i64> {
-    conn.query_row(
-        "SELECT COUNT(*) FROM pending_directive WHERE agent_id = ?1 AND delivered_at IS NULL",
-        [agent_id],
-        |row| row.get(0),
-    )
+/// when there are none (`COUNT(*)` always returns exactly one row).
+pub async fn count_undelivered(db: &DatabaseConnection, agent_id: &str) -> Result<i64, DbErr> {
+    let count = Entity::find()
+        .filter(Column::AgentId.eq(agent_id))
+        .filter(Column::DeliveredAt.is_null())
+        .count(db)
+        .await?;
+    Ok(count as i64)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::schema::init_schema;
+    use sea_orm::Database;
 
-    fn test_conn() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        init_schema(&conn).unwrap();
-        conn
+    async fn test_conn() -> (tempfile::TempDir, DatabaseConnection) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        {
+            let c = rusqlite::Connection::open(&path).unwrap();
+            init_schema(&c).unwrap();
+        }
+        let db = Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        (dir, db)
     }
 
-    #[test]
-    fn create_poke_returns_the_row_it_just_inserted() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn create_poke_returns_the_row_it_just_inserted() {
+        let (_dir, db) = test_conn().await;
         let row = create_poke(
-            &conn,
+            &db,
             "poke-1",
             "alice",
             "check in",
@@ -192,6 +215,7 @@ mod tests {
             Some("admin"),
             "2026-01-01T00:00:00Z",
         )
+        .await
         .unwrap();
 
         assert_eq!(row.poke_id, "poke-1");
@@ -205,11 +229,11 @@ mod tests {
         assert_eq!(row.delivered_at, None);
     }
 
-    #[test]
-    fn create_poke_duplicate_poke_id_is_a_real_error() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn create_poke_duplicate_poke_id_is_a_real_error() {
+        let (_dir, db) = test_conn().await;
         create_poke(
-            &conn,
+            &db,
             "poke-1",
             "alice",
             "first",
@@ -217,25 +241,27 @@ mod tests {
             None,
             "2026-01-01T00:00:00Z",
         )
+        .await
         .unwrap();
         let err = create_poke(
-            &conn,
+            &db,
             "poke-1",
             "alice",
             "second",
             None,
             None,
             "2026-01-01T00:00:01Z",
-        );
+        )
+        .await;
         assert!(err.is_err());
     }
 
-    #[test]
-    fn count_undelivered_reflects_only_undelivered_rows() {
-        let conn = test_conn();
-        assert_eq!(count_undelivered(&conn, "alice").unwrap(), 0);
+    #[tokio::test]
+    async fn count_undelivered_reflects_only_undelivered_rows() {
+        let (_dir, db) = test_conn().await;
+        assert_eq!(count_undelivered(&db, "alice").await.unwrap(), 0);
         create_poke(
-            &conn,
+            &db,
             "poke-1",
             "alice",
             "p1",
@@ -243,9 +269,10 @@ mod tests {
             None,
             "2026-01-01T00:00:00Z",
         )
+        .await
         .unwrap();
         create_poke(
-            &conn,
+            &db,
             "poke-2",
             "alice",
             "p2",
@@ -253,15 +280,16 @@ mod tests {
             None,
             "2026-01-01T00:00:01Z",
         )
+        .await
         .unwrap();
-        assert_eq!(count_undelivered(&conn, "alice").unwrap(), 2);
+        assert_eq!(count_undelivered(&db, "alice").await.unwrap(), 2);
     }
 
-    #[test]
-    fn count_undelivered_is_scoped_per_agent() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn count_undelivered_is_scoped_per_agent() {
+        let (_dir, db) = test_conn().await;
         create_poke(
-            &conn,
+            &db,
             "poke-1",
             "alice",
             "p1",
@@ -269,9 +297,10 @@ mod tests {
             None,
             "2026-01-01T00:00:00Z",
         )
+        .await
         .unwrap();
         create_poke(
-            &conn,
+            &db,
             "poke-2",
             "bob",
             "p2",
@@ -279,16 +308,17 @@ mod tests {
             None,
             "2026-01-01T00:00:00Z",
         )
+        .await
         .unwrap();
-        assert_eq!(count_undelivered(&conn, "alice").unwrap(), 1);
-        assert_eq!(count_undelivered(&conn, "bob").unwrap(), 1);
+        assert_eq!(count_undelivered(&db, "alice").await.unwrap(), 1);
+        assert_eq!(count_undelivered(&db, "bob").await.unwrap(), 1);
     }
 
-    #[test]
-    fn collect_undelivered_marks_delivered_exactly_once() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn collect_undelivered_marks_delivered_exactly_once() {
+        let (_dir, db) = test_conn().await;
         create_poke(
-            &conn,
+            &db,
             "poke-1",
             "alice",
             "check in",
@@ -296,9 +326,12 @@ mod tests {
             None,
             "2026-01-01T00:00:00Z",
         )
+        .await
         .unwrap();
 
-        let events = collect_undelivered(&conn, "alice", "2026-01-01T00:00:05Z").unwrap();
+        let events = collect_undelivered(&db, "alice", "2026-01-01T00:00:05Z")
+            .await
+            .unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "directive");
         assert_eq!(events[0].ref_id, "poke-1");
@@ -306,18 +339,20 @@ mod tests {
         assert_eq!(events[0].data.prompt, "check in");
         assert_eq!(events[0].data.source, "poke");
         assert_eq!(events[0].data.schedule_id, None);
-        assert_eq!(count_undelivered(&conn, "alice").unwrap(), 0);
+        assert_eq!(count_undelivered(&db, "alice").await.unwrap(), 0);
 
         // Second call: nothing left to collect -- delivered exactly once.
-        let second = collect_undelivered(&conn, "alice", "2026-01-01T00:00:06Z").unwrap();
+        let second = collect_undelivered(&db, "alice", "2026-01-01T00:00:06Z")
+            .await
+            .unwrap();
         assert_eq!(second, Vec::new());
     }
 
-    #[test]
-    fn collect_undelivered_orders_by_created_at_ascending() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn collect_undelivered_orders_by_created_at_ascending() {
+        let (_dir, db) = test_conn().await;
         create_poke(
-            &conn,
+            &db,
             "poke-2",
             "alice",
             "second",
@@ -325,9 +360,10 @@ mod tests {
             None,
             "2026-01-01T00:00:02Z",
         )
+        .await
         .unwrap();
         create_poke(
-            &conn,
+            &db,
             "poke-1",
             "alice",
             "first",
@@ -335,18 +371,21 @@ mod tests {
             None,
             "2026-01-01T00:00:01Z",
         )
+        .await
         .unwrap();
 
-        let events = collect_undelivered(&conn, "alice", "2026-01-01T00:00:05Z").unwrap();
+        let events = collect_undelivered(&db, "alice", "2026-01-01T00:00:05Z")
+            .await
+            .unwrap();
         let ids: Vec<&str> = events.iter().map(|e| e.ref_id.as_str()).collect();
         assert_eq!(ids, vec!["poke-1", "poke-2"]);
     }
 
-    #[test]
-    fn collect_undelivered_is_scoped_per_agent() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn collect_undelivered_is_scoped_per_agent() {
+        let (_dir, db) = test_conn().await;
         create_poke(
-            &conn,
+            &db,
             "poke-1",
             "alice",
             "for alice",
@@ -354,9 +393,10 @@ mod tests {
             None,
             "2026-01-01T00:00:00Z",
         )
+        .await
         .unwrap();
         create_poke(
-            &conn,
+            &db,
             "poke-2",
             "bob",
             "for bob",
@@ -364,20 +404,25 @@ mod tests {
             None,
             "2026-01-01T00:00:00Z",
         )
+        .await
         .unwrap();
 
-        let events = collect_undelivered(&conn, "alice", "2026-01-01T00:00:05Z").unwrap();
+        let events = collect_undelivered(&db, "alice", "2026-01-01T00:00:05Z")
+            .await
+            .unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].ref_id, "poke-1");
         // bob's poke must still be sitting undelivered.
-        assert_eq!(count_undelivered(&conn, "bob").unwrap(), 1);
+        assert_eq!(count_undelivered(&db, "bob").await.unwrap(), 1);
     }
 
-    #[test]
-    fn collect_undelivered_empty_is_not_an_error() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn collect_undelivered_empty_is_not_an_error() {
+        let (_dir, db) = test_conn().await;
         assert_eq!(
-            collect_undelivered(&conn, "alice", "2026-01-01T00:00:00Z").unwrap(),
+            collect_undelivered(&db, "alice", "2026-01-01T00:00:00Z")
+                .await
+                .unwrap(),
             Vec::new()
         );
     }

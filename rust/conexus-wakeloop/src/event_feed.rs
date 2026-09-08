@@ -38,23 +38,24 @@
 //! revisit it ONLY if a future change reintroduces a payload-carrying
 //! wake channel.
 //!
-//! ## Phase G async-plumbing prerequisite (this is a prerequisite PR,
-//! not a repository conversion)
+//! ## Phase G: sea-orm lands in `assemble_event_feed`, one collector
+//! at a time
 //!
 //! [`assemble_event_feed`] is `async fn` and takes a `&sea_orm::
 //! DatabaseConnection` alongside its legacy `conn: &AsyncMutex<
-//! Connection>`, but does not read from it yet -- NOTHING in this
-//! function's body has been converted to sea-orm in this PR. Every
-//! internal collector (`collect_events_with_cap`,
-//! `collect_unassigned_task_events_for`, `collect_agent_profile_
-//! events_for`, `collect_pending_pokes_for`,
-//! `collect_scheduled_directive_events_for`) still reads from the
-//! SAME legacy rusqlite connection it always has, locked once at the
-//! top of the function body. This PR only settles the async plumbing
-//! (see the module-level comment near `AsyncMutex`'s Phase D1/D2/D3
-//! precedent in `conexus_auth::tool` for the `!Send`-future hazard
-//! this pattern avoids) so a future batch PR can flip each collector
-//! call from legacy to sea-orm one at a time without touching this
+//! Connection>` (async plumbing settled by a prerequisite PR, #975,
+//! before any collector was actually converted -- see the module-level
+//! comment near `AsyncMutex`'s Phase D1/D2/D3 precedent in
+//! `conexus_auth::tool` for the `!Send`-future hazard that plumbing
+//! avoids). [`collect_pending_pokes_for`] is the first collector
+//! actually flipped to sea-orm, reading `sea_orm_db` via
+//! `pending_directive_repository`. Every other internal collector --
+//! `collect_events_with_cap`, `collect_unassigned_task_events_for`,
+//! `collect_agent_profile_events_for`,
+//! `collect_scheduled_directive_events_for` -- is still legacy
+//! rusqlite, reading from the SAME connection locked once at the top
+//! of the function body, exactly as before. A future batch PR flips
+//! the remaining collectors one at a time without touching this
 //! function's signature again.
 
 use conexus_core::ToolResult;
@@ -589,13 +590,29 @@ pub fn collect_scheduled_directive_events_for(
 /// Collect + mark-delivered every undelivered operator/admin poke for
 /// `agent_id` and return the `directive` events (`data.source ==
 /// "poke"`). Port of `_collect_pending_pokes_for` -- a thin wrapper
-/// over the already-ported
-/// [`pending_directive_repository::collect_undelivered`], which owns
-/// the mark-delivered-in-loop semantics. Best-effort, matching Python:
-/// a DB failure yields no events (the poke waits for the next
+/// over [`pending_directive_repository::collect_undelivered`], which
+/// owns the mark-delivered-in-loop semantics. Best-effort, matching
+/// Python: a DB failure yields no events (the poke waits for the next
 /// check-in).
-pub fn collect_pending_pokes_for(conn: &Connection, agent_id: &str, now_iso: &str) -> Vec<Value> {
-    match pending_directive_repository::collect_undelivered(conn, agent_id, now_iso) {
+///
+/// Phase G: `pending_directive_repository` is sea-orm-backed now --
+/// the first collector in this pipeline actually converted (every
+/// other collector `assemble_event_feed` calls is still legacy
+/// rusqlite). No `&Connection` parameter here at all -- this function
+/// reads nothing through the legacy connection any more, and an
+/// unused `&Connection` parameter would make this `async fn`'s own
+/// returned future `!Send` regardless of whether the body ever
+/// touches it (an async fn's future captures every parameter's TYPE
+/// into its pre-first-poll state; see `conexus_auth::tool::BoxFuture`'s
+/// doc comment for the same rule stated the other way around, and
+/// `assemble_event_feed`'s own doc comment below for why that would
+/// have propagated into ITS future too).
+pub async fn collect_pending_pokes_for(
+    sea_orm_db: &sea_orm::DatabaseConnection,
+    agent_id: &str,
+    now_iso: &str,
+) -> Vec<Value> {
+    match pending_directive_repository::collect_undelivered(sea_orm_db, agent_id, now_iso).await {
         Ok(events) => events.into_iter().map(directive_event_to_value).collect(),
         Err(_) => Vec::new(),
     }
@@ -646,14 +663,32 @@ pub struct AssembledFeed {
 /// `!Send` across the `.await` point (the exact hazard `conexus_auth::
 /// tool::ToolCallContext`'s own doc explains, already hit and fixed 3
 /// times elsewhere in this migration). Locked ONCE at the top of the
-/// body; every internal collector below still receives the same
-/// `&Connection` it always has, just borrowed from the guard instead
-/// of a bare parameter.
+/// body and held as `guard: MutexGuard<Connection>` for the whole
+/// function -- the guard itself IS `Send` (only needs `Connection:
+/// Send`, which it is), so holding it across the `sea_orm_db` `.await`
+/// below is fine. What is NOT fine, and what Phase G's own poke
+/// conversion below just proved by hitting the compile error: a
+/// REBORROWED `let conn = &*guard;` local binding, if it's still live
+/// after an `.await` point, IS a `!Sync`-derived `&Connection` held
+/// across a suspension, which poisons this whole future's `Send`ness
+/// exactly the same way a bare parameter would. Every collector below
+/// therefore takes `&guard` directly at its own call site (a
+/// synchronous, non-async fn call whose transient reborrow ends the
+/// moment it returns) rather than through a named `conn` variable that
+/// would span the `collect_pending_pokes_for(...).await` in the
+/// middle.
 ///
-/// `sea_orm_db` is unused in this PR -- see this module's own doc
-/// comment for why: no collector has been converted to sea-orm yet,
-/// this signature only settles the async plumbing a future batch PR
-/// will build on.
+/// `sea_orm_db` feeds [`collect_pending_pokes_for`] (Phase G: the
+/// first collector below actually converted to sea-orm -- and,
+/// correspondingly, the reason this function takes NO `&Connection`
+/// parameter at all any more, per that function's own doc comment).
+/// Every other collector -- `collect_events_with_cap`,
+/// `collect_unassigned_task_events_for`,
+/// `collect_agent_profile_events_for`,
+/// `collect_scheduled_directive_events_for` -- is still legacy
+/// rusqlite, reading from the locked `guard` below exactly as before;
+/// this signature just carries `sea_orm_db` through for whichever of
+/// them a future batch PR converts next.
 #[allow(clippy::too_many_arguments)]
 pub async fn assemble_event_feed(
     conn: &AsyncMutex<Connection>,
@@ -663,15 +698,16 @@ pub async fn assemble_event_feed(
     drain_queue: Vec<Value>,
     fire_scheduled: bool,
     get_env: impl Fn(&str) -> Option<String>,
-    _sea_orm_db: &sea_orm::DatabaseConnection,
+    sea_orm_db: &sea_orm::DatabaseConnection,
 ) -> rusqlite::Result<AssembledFeed> {
     let guard = conn.lock().await;
-    let conn = &*guard;
-    let collected = collect_events_with_cap(conn, agent_id, cursor, now_iso, get_env)?;
+    let collected = collect_events_with_cap(&guard, agent_id, cursor, now_iso, get_env)?;
     let mut events = collected.events;
     let msg_cap_ts = collected.msg_cap_ts;
-    events.extend(collect_unassigned_task_events_for(conn, agent_id, cursor)?);
-    events.extend(collect_agent_profile_events_for(conn, agent_id, cursor)?);
+    events.extend(collect_unassigned_task_events_for(
+        &guard, agent_id, cursor,
+    )?);
+    events.extend(collect_agent_profile_events_for(&guard, agent_id, cursor)?);
     events.extend(drain_queue);
 
     // BL-R21-1: cap the MERGED batch to the message-truncation boundary
@@ -683,9 +719,9 @@ pub async fn assemble_event_feed(
         // Ad-hoc pokes first (highest-priority delivery), then
         // scheduled fires -- both mutate delivery state, so both run
         // only when the message backlog isn't truncated.
-        events.extend(collect_pending_pokes_for(conn, agent_id, now_iso));
+        events.extend(collect_pending_pokes_for(sea_orm_db, agent_id, now_iso).await);
         events.extend(collect_scheduled_directive_events_for(
-            conn, agent_id, now_iso,
+            &guard, agent_id, now_iso,
         ));
     }
 
@@ -922,13 +958,27 @@ mod tests {
         None
     }
 
-    /// A throwaway sea-orm connection for `assemble_event_feed`'s tests
-    /// -- nothing in this PR reads from or writes to it (see this
-    /// module's own doc comment), so `sqlite::memory:` is fine here
-    /// even though it's never backed by the same file as the rusqlite
-    /// `Connection` under test.
-    async fn test_sea_orm_db() -> sea_orm::DatabaseConnection {
-        sea_orm::Database::connect("sqlite::memory:").await.unwrap()
+    /// A real temp-file-backed sea-orm connection for `assemble_event_
+    /// feed`'s tests, schema-initialized the same way `test_conn`'s
+    /// rusqlite connection is -- `pending_directive_repository` reads
+    /// and writes through this connection now (Phase G), so it needs
+    /// the real `pending_directive` table, not a schema-less
+    /// `sqlite::memory:`. A SEPARATE temp file from `test_conn`'s is
+    /// fine here: nothing in this module's tests needs the rusqlite
+    /// and sea-orm sides to see each other's data -- `pending_
+    /// directive` is read and written exclusively through this
+    /// connection, never through the rusqlite one.
+    async fn test_sea_orm_db() -> (tempfile::TempDir, sea_orm::DatabaseConnection) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        {
+            let c = Connection::open(&path).unwrap();
+            init_schema(&c).unwrap();
+        }
+        let db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        (dir, db)
     }
 
     fn send_message(conn: &Connection, id: &str, to: &str, ts: &str, message_type: &str) {
@@ -1342,12 +1392,13 @@ mod tests {
 
     // -- collect_pending_pokes_for -----------------------------------------
 
-    #[test]
-    fn collect_pending_pokes_for_returns_and_marks_delivered() {
+    #[tokio::test]
+    async fn collect_pending_pokes_for_returns_and_marks_delivered() {
         let conn = test_conn();
         seed_agent(&conn, "alice");
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         pending_directive_repository::create_poke(
-            &conn,
+            &sea_orm_db,
             "poke_1",
             "alice",
             "check your inbox",
@@ -1355,15 +1406,16 @@ mod tests {
             Some("operator"),
             "2026-01-01T00:00:00Z",
         )
+        .await
         .unwrap();
 
-        let events = collect_pending_pokes_for(&conn, "alice", "2026-01-01T00:00:01Z");
+        let events = collect_pending_pokes_for(&sea_orm_db, "alice", "2026-01-01T00:00:01Z").await;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["data"]["prompt"], "check your inbox");
         assert_eq!(events[0]["data"]["source"], "poke");
 
         // Delivered -- a second collection must not re-fire it.
-        let again = collect_pending_pokes_for(&conn, "alice", "2026-01-01T00:00:02Z");
+        let again = collect_pending_pokes_for(&sea_orm_db, "alice", "2026-01-01T00:00:02Z").await;
         assert!(again.is_empty());
     }
 
@@ -1431,7 +1483,7 @@ mod tests {
         task_repository::create(&conn, unassigned).unwrap();
 
         let conn = AsyncMutex::new(conn);
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let feed = assemble_event_feed(
             &conn,
             "alice",
@@ -1461,7 +1513,7 @@ mod tests {
         let queued = event("hold_advisory", "2026-01-01T00:00:05Z");
 
         let conn = AsyncMutex::new(conn);
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let feed = assemble_event_feed(
             &conn,
             "alice",
@@ -1496,7 +1548,7 @@ mod tests {
         .unwrap();
 
         let conn = AsyncMutex::new(conn);
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let not_fired = assemble_event_feed(
             &conn,
             "alice",
@@ -1532,8 +1584,9 @@ mod tests {
         let conn = test_conn();
         seed_agent(&conn, "alice");
         send_message(&conn, "m1", "alice", "2026-01-01T00:00:01Z", "text");
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         pending_directive_repository::create_poke(
-            &conn,
+            &sea_orm_db,
             "poke_1",
             "alice",
             "URGENT",
@@ -1541,10 +1594,10 @@ mod tests {
             Some("operator"),
             "2026-01-01T00:00:02Z",
         )
+        .await
         .unwrap();
 
         let conn = AsyncMutex::new(conn);
-        let sea_orm_db = test_sea_orm_db().await;
         let feed = assemble_event_feed(
             &conn,
             "alice",
@@ -1617,7 +1670,7 @@ mod tests {
         .unwrap();
 
         let conn = AsyncMutex::new(conn);
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
 
         // ---- Poll 1: truncated at the cap; the task event held back.
         let poll1 = assemble_event_feed(
@@ -1701,7 +1754,7 @@ mod tests {
         let conn = test_conn();
         seed_agent(&conn, "alice");
         let conn = AsyncMutex::new(conn);
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let feed = assemble_event_feed(
             &conn,
             "alice",

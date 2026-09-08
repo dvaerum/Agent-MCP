@@ -28,3 +28,7 @@ sea-orm = { version = "2", default-features = false, features = [
 [dev-dependencies]
 # Tests drive RevalidatingStream's real bounded waits.
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "test-util"] }
+# `event_feed`'s tests need a real temp-file-backed sea-orm connection
+# for pending_directive_repository (Phase G) -- :memory: has no schema
+# and isn't shared across separate connections.
+tempfile = "3"
