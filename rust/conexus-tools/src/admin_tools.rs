@@ -3218,6 +3218,63 @@ mod tests {
         assert!(matches!(result, ToolResult::Conflict { .. }));
     }
 
+    /// BL-R13-2 (ported from `tests/router/test_sec_r13_restore_workdir_
+    /// cache.py::test_restore_repopulates_agent_working_dirs_cache`):
+    /// Python kept a SECOND in-memory view of `working_directory`
+    /// (`g.agent_working_dirs`, keyed by agent_id) that `get_working_
+    /// directory()` read FIRST -- restore repopulated `g.active_agents`
+    /// but historically skipped that sibling, so file-tool lookups kept
+    /// resolving stale/missing data after a restore. This port has no
+    /// such sibling cache: `working_directory_for` (the one thing file
+    /// tools/`get_agent_details` call) always reads `agents.working_
+    /// directory` fresh from the DB, and `RestoreAgentTool` never
+    /// touches that column -- so there is no second view that can go
+    /// stale, and the class of bug BL-R13-2 fixed cannot occur here.
+    /// Pinned directly rather than left to architecture: a restored
+    /// agent's working directory is immediately visible post-restore.
+    #[tokio::test]
+    async fn restore_agent_working_directory_is_immediately_visible_after_restore() {
+        let conn = setup().await;
+        seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
+        {
+            let guard = conn.lock().await;
+            conexus_db::agent_repository::AgentRepository::update_field(
+                &guard,
+                "alice",
+                conexus_db::agent_repository::AgentField::WorkingDirectory,
+                conexus_db::agent_repository::FieldValue::Text("/tmp/alice-wd".to_string()),
+                "2026-06-01T00:00:00Z",
+            )
+            .unwrap();
+            conexus_db::agent_repository::AgentRepository::terminate(
+                &guard,
+                "alice",
+                "2026-06-01T00:00:01Z",
+            )
+            .unwrap();
+        }
+        let op = operator_with(&[Capability::AgentsTerminate]);
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = RestoreAgentTool::call(
+            Some(&op),
+            &serde_json::json!({"agent_id": "alice"}),
+            &conn,
+            "2026-06-01T00:02:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        let guard = conn.lock().await;
+        assert_eq!(
+            crate::file_management_tools::working_directory_for(&guard, "alice"),
+            "/tmp/alice-wd",
+            "the restored agent's working directory must be immediately \
+             visible to file tools"
+        );
+    }
+
     #[tokio::test]
     async fn restore_agent_missing_agent_is_not_found() {
         let conn = setup().await;
@@ -3382,6 +3439,74 @@ mod tests {
         )
         .await;
         assert!(matches!(result, ToolResult::NotFound { .. }));
+    }
+
+    /// BL-R11-1 (ported from `tests/router/test_sec_r11_agent_workdir_
+    /// cache.py::test_edit_working_directory_updates_agent_working_dirs_
+    /// cache`): Python's edit route reconciled `g.active_agents` (keyed
+    /// by token) but historically skipped the SECOND in-memory view of
+    /// the working directory, `g.agent_working_dirs` (keyed by
+    /// agent_id) -- and `get_working_directory()` read that sibling
+    /// FIRST, so a stale cached dir won every file-tool lookup after an
+    /// edit. This port has no such sibling cache to reconcile:
+    /// `working_directory_for` reads `agents.working_directory` fresh
+    /// from the DB on every call, so `EditAgentTool`'s own
+    /// `AgentRepository::update_field` write is the only place that
+    /// value ever lives -- there is no second, independently-cached
+    /// view that can go stale. Pinned directly: a `working_directory`
+    /// edit is immediately visible to file tools with no reconcile step
+    /// needed.
+    #[tokio::test]
+    async fn edit_agent_working_directory_change_is_immediately_visible() {
+        let conn = setup().await;
+        seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
+        let op = operator_with(&[Capability::AgentsTerminate]);
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = EditAgentTool::call(
+            Some(&op),
+            &serde_json::json!({"agent_id": "alice", "working_directory": "/tmp/new-wd"}),
+            &conn,
+            "2026-06-01T00:01:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        let guard = conn.lock().await;
+        assert_eq!(
+            crate::file_management_tools::working_directory_for(&guard, "alice"),
+            "/tmp/new-wd",
+            "an edited working directory must be immediately visible to file tools"
+        );
+    }
+
+    /// Regression sibling of the above: editing a NON-working_directory
+    /// field (color) must succeed and must leave the working directory
+    /// file tools resolve completely untouched.
+    #[tokio::test]
+    async fn edit_agent_non_workdir_field_leaves_working_directory_untouched() {
+        let conn = setup().await;
+        seed_agent(&conn, "bob", "tok-b", "2026-06-01T00:00:00Z").await;
+        let op = operator_with(&[Capability::AgentsTerminate]);
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = EditAgentTool::call(
+            Some(&op),
+            &serde_json::json!({"agent_id": "bob", "color": "#abcdef"}),
+            &conn,
+            "2026-06-01T00:01:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        let guard = conn.lock().await;
+        assert_eq!(
+            crate::file_management_tools::working_directory_for(&guard, "bob"),
+            "/tmp",
+            "a non-workdir edit must not disturb the working directory"
+        );
     }
 
     // ── TerminateAgentTool ───────────────────────────────────────────
@@ -3898,6 +4023,46 @@ mod tests {
         .await;
         assert!(matches!(result, ToolResult::Ok { .. }));
         assert!(receiver.try_recv().is_ok());
+    }
+
+    /// BL-R17-2 (ported from `tests/router/test_sec_r17_purge_terminal_
+    /// carveout.py::test_purge_does_not_notify_for_terminal_task`): a
+    /// terminal task never enters `reassigned_tasks` (see the
+    /// terminal-carveout `if`/`else` above this test module), and the
+    /// wake fan-out is gated on that list being non-empty -- so when
+    /// the ONLY task the purged agent held is terminal, nobody must be
+    /// woken to re-execute already-finished work.
+    #[tokio::test]
+    async fn purge_agent_with_only_a_terminal_task_wakes_nobody() {
+        let conn = setup().await;
+        seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
+        seed_agent(&conn, "bob", "tok-b", "2026-06-01T00:00:00Z").await;
+        seed_task(
+            &conn,
+            "task-done",
+            Some("alice"),
+            "completed",
+            "2026-06-01T00:00:00Z",
+        )
+        .await;
+        let op = operator_with(&[Capability::AgentsTerminate]);
+        let registry = WaiterRegistry::new();
+        let (_sender, mut receiver) = registry.register("bob");
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = PurgeAgentTool::call(
+            Some(&op),
+            &serde_json::json!({"agent_id": "alice"}),
+            &conn,
+            "2026-06-01T00:01:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        assert!(
+            receiver.try_recv().is_err(),
+            "purging an agent whose only task is terminal must wake nobody"
+        );
     }
 
     #[tokio::test]

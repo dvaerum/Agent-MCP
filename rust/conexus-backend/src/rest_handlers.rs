@@ -4551,4 +4551,164 @@ mod tests {
         let text = body_text(resp).await.to_lowercase();
         assert!(!text.contains("recursion"));
     }
+
+    // -----------------------------------------------------------
+    // BL-R13-3 (ported from `tests/router/test_sec_r13_dashboard_
+    // message_ghost.py`): the canonical MCP send path
+    // (`send_agent_message_tool_impl`) catches the recipient-not-found
+    // error and returns a clean 404; `create_message` (the dashboard's
+    // `POST /api/messages`) must mirror that contract via
+    // `message_repository::send`'s `SendMessageError::RecipientNotFound`
+    // -> `StatusCode::NOT_FOUND` mapping, not fall through to a 500.
+    // -----------------------------------------------------------
+
+    #[tokio::test]
+    async fn create_message_to_a_ghost_recipient_is_404() {
+        let conn = test_conn();
+        let shared = test_shared_state(conn);
+        let resolved = resolved_operator_bearer("dummy-token");
+        let resp = create_message(
+            State(shared),
+            Extension(resolved),
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "recipient_id": "ghost-does-not-exist",
+                    "message_content": "hello nobody",
+                }))
+                .unwrap(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "a message to a nonexistent recipient must be 404, not 500"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_message_to_a_live_recipient_still_succeeds() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO agents (token, agent_id, created_at, status, \
+             working_directory, color) VALUES \
+             ('tok-alice', 'alice', '2026-01-01T00:00:00Z', 'active', '/tmp', '#abc')",
+            [],
+        )
+        .unwrap();
+        let shared = test_shared_state(conn);
+        let resolved = resolved_operator_bearer("dummy-token");
+        let resp = create_message(
+            State(shared),
+            Extension(resolved),
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "recipient_id": "alice",
+                    "message_content": "hello alice",
+                }))
+                .unwrap(),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["success"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn create_message_to_the_admin_label_still_succeeds() {
+        // The special 'admin' recipient label is a valid destination
+        // with no agents-table parent row -- `recipient_exists` special-
+        // cases it (see message_repository.rs), so it must never 404.
+        let conn = test_conn();
+        let shared = test_shared_state(conn);
+        let resolved = resolved_operator_bearer("dummy-token");
+        let resp = create_message(
+            State(shared),
+            Extension(resolved),
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "recipient_id": "admin",
+                    "message_content": "escalation",
+                }))
+                .unwrap(),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // -----------------------------------------------------------
+    // PF-R14-1 (ported from `tests/router/test_sec_r14_messages_query_
+    // int_coercion.py`): `coerce_int_field` already handles a
+    // list/dict-typed `limit`/`offset` -- this closes the coverage gap
+    // through the real `list_messages` handler end-to-end (a list/dict
+    // must 400, matching the already-caught non-numeric-string case,
+    // never fall through to a 500).
+    // -----------------------------------------------------------
+
+    #[tokio::test]
+    async fn list_messages_query_list_limit_is_400_not_500() {
+        let conn = test_conn();
+        let shared = test_shared_state(conn);
+        let resp = list_messages(
+            State(shared),
+            Bytes::from(serde_json::to_vec(&json!({"limit": [1, 2]})).unwrap()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn list_messages_query_dict_offset_is_400_not_500() {
+        let conn = test_conn();
+        let shared = test_shared_state(conn);
+        let resp = list_messages(
+            State(shared),
+            Bytes::from(serde_json::to_vec(&json!({"offset": {"x": 1}})).unwrap()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn list_messages_query_string_limit_still_400() {
+        let conn = test_conn();
+        let shared = test_shared_state(conn);
+        let resp = list_messages(
+            State(shared),
+            Bytes::from(serde_json::to_vec(&json!({"limit": "abc"})).unwrap()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn list_messages_query_valid_int_limit_offset_succeeds() {
+        let conn = test_conn();
+        let shared = test_shared_state(conn);
+        let resp = list_messages(
+            State(shared),
+            Bytes::from(serde_json::to_vec(&json!({"limit": 10, "offset": 0})).unwrap()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["limit"], json!(10));
+        assert_eq!(body["offset"], json!(0));
+    }
+
+    #[tokio::test]
+    async fn list_messages_query_negative_offset_is_clamped() {
+        let conn = test_conn();
+        let shared = test_shared_state(conn);
+        let resp = list_messages(
+            State(shared),
+            Bytes::from(serde_json::to_vec(&json!({"offset": -5})).unwrap()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["offset"], json!(0));
+    }
 }
