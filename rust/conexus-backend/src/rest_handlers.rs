@@ -3458,8 +3458,8 @@ pub async fn poke_agent_directive(
     let target = conexus_db::agent_repository::AgentRepository::get_by_id(&guard, &agent_id);
     let live =
         matches!(&target, Ok(Some(a)) if a.status != "terminated" && a.status != "tombstone");
+    drop(guard);
     if !live {
-        drop(guard);
         return (
             StatusCode::NOT_FOUND,
             Json(json!({"error": "Agent not found"})),
@@ -3468,36 +3468,36 @@ pub async fn poke_agent_directive(
     }
 
     let poke_id = format!("poke_{:016x}", random_id_u64());
-    let created = (|| -> bool {
-        let tx = match guard.unchecked_transaction() {
-            Ok(tx) => tx,
-            Err(_) => return false,
+    // `pending_directive_repository` is sea-orm-backed (Phase G);
+    // `agent_action_repository`'s audit write below is not yet -- the
+    // two writes are no longer inside a shared transaction, so they're
+    // no longer atomic with each other (the same non-atomic-audit-log
+    // tradeoff every prior Phase G PR touching `agent_action_repository`
+    // has already accepted).
+    let created = conexus_db::pending_directive_repository::create_poke(
+        &shared.sea_orm_db,
+        &poke_id,
+        &agent_id,
+        prompt,
+        Some(priority),
+        Some(&operator_id),
+        &now,
+    )
+    .await
+    .is_ok()
+        && {
+            let guard = shared.conn.lock().await;
+            let details = json!({"poke_id": poke_id, "agent_id": agent_id, "priority": priority});
+            let log_result = conexus_db::agent_action_repository::log_agent_action(
+                &guard,
+                &operator_id,
+                "poke_agent_directive",
+                None,
+                Some(&details),
+                &now,
+            );
+            log_result.is_ok()
         };
-        if conexus_db::pending_directive_repository::create_poke(
-            &tx,
-            &poke_id,
-            &agent_id,
-            prompt,
-            Some(priority),
-            Some(&operator_id),
-            &now,
-        )
-        .is_err()
-        {
-            return false;
-        }
-        let details = json!({"poke_id": poke_id, "agent_id": agent_id, "priority": priority});
-        let log_result = conexus_db::agent_action_repository::log_agent_action(
-            &tx,
-            &operator_id,
-            "poke_agent_directive",
-            None,
-            Some(&details),
-            &now,
-        );
-        log_result.is_ok() && tx.commit().is_ok()
-    })();
-    drop(guard);
 
     if !created {
         return (
