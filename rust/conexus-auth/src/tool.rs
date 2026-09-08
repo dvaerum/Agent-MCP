@@ -125,14 +125,26 @@ pub struct ToolCallContext<'a> {
     /// `file_map`'s own "construct it once per process, thread it
     /// everywhere, ignore it where irrelevant" convention.
     pub project_dir: &'a Path,
+    /// Phase G (sea-orm migration): the sea-orm connection repositories
+    /// converted onto sea-orm use, alongside the legacy `conn:
+    /// &tokio::sync::Mutex<rusqlite::Connection>` every `Tool::call` still
+    /// receives. Threaded the same explicit way as `waiter_registry`/
+    /// `file_map`/`project_dir` -- every tool not yet touching a
+    /// sea-orm-converted repository simply ignores this field. Both
+    /// connection types point at the SAME underlying SQLite file; this
+    /// does not replace the legacy connection, it coexists with it during
+    /// the migration (see the plan's own "Phase G real architectural
+    /// fork" note for why -- repositories convert one at a time, each
+    /// repository's rewrite converts its own callers in the same PR).
+    pub sea_orm_db: &'a sea_orm::DatabaseConnection,
 }
 
 impl<'a> ToolCallContext<'a> {
     /// An off-wire context: no progress token, no client identity, no
     /// progress sink -- what a REST caller or a test harness gets. A
-    /// `WaiterRegistry`/`FileMap`/`project_dir` are still required
-    /// (never `Option`d away): every real boot path constructs them
-    /// and every tool that doesn't need one simply ignores it,
+    /// `WaiterRegistry`/`FileMap`/`project_dir`/`sea_orm_db` are still
+    /// required (never `Option`d away): every real boot path constructs
+    /// them and every tool that doesn't need one simply ignores it,
     /// matching the explicit-input convention rather than
     /// special-casing "off-wire" as a reason to skip constructing
     /// shared state that costs nothing to create.
@@ -140,6 +152,7 @@ impl<'a> ToolCallContext<'a> {
         waiter_registry: &'a WaiterRegistry,
         file_map: &'a FileMap,
         project_dir: &'a Path,
+        sea_orm_db: &'a sea_orm::DatabaseConnection,
     ) -> Self {
         ToolCallContext {
             progress_token_present: false,
@@ -148,6 +161,7 @@ impl<'a> ToolCallContext<'a> {
             waiter_registry,
             file_map,
             project_dir,
+            sea_orm_db,
         }
     }
 }
@@ -398,7 +412,13 @@ mod tests {
         let conn = AsyncMutex::new(Connection::open_in_memory().unwrap());
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let sea_orm_db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
+        let ctx = ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+            &sea_orm_db,
+        );
         let d = ToolDescriptor::of::<EchoTool>();
         let denied_principal = agent_bearer(Capabilities::from_iter([])); // missing TasksView
         let denial = dispatch(
@@ -441,11 +461,24 @@ mod tests {
         );
     }
 
-    #[test]
-    fn off_wire_context_has_no_progress_token_or_client_identity() {
+    // Phase G note: this test was a plain `#[test]` (no async runtime)
+    // before `off_wire` grew its `sea_orm_db` parameter -- flagged per
+    // the migration's own convention rather than guessed past: the
+    // minimal, behavior-preserving fix is promoting it to
+    // `#[tokio::test]` the same way every other `off_wire` call site
+    // in this file already is (`Tool::call` being async means every
+    // OTHER caller already had a runtime; this was the one exception).
+    #[tokio::test]
+    async fn off_wire_context_has_no_progress_token_or_client_identity() {
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let sea_orm_db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
+        let ctx = ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+            &sea_orm_db,
+        );
         assert!(!ctx.progress_token_present);
         assert_eq!(ctx.client_name, None);
         assert!(ctx.progress_sink.is_none());
@@ -500,6 +533,7 @@ mod tests {
         let sink = FakeSink {
             sent: std::sync::atomic::AtomicU32::new(0),
         };
+        let sea_orm_db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
         let ctx = ToolCallContext {
             progress_token_present: true,
             client_name: Some("claude-code"),
@@ -507,6 +541,7 @@ mod tests {
             waiter_registry: &registry,
             file_map: &file_map,
             project_dir: std::path::Path::new("/tmp"),
+            sea_orm_db: &sea_orm_db,
         };
         let conn = AsyncMutex::new(Connection::open_in_memory().unwrap());
         let result =

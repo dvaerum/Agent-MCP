@@ -18,6 +18,15 @@ conexus-tools = { path = "../conexus-tools" }
 # SharedState::waiter_registry (Phase D3 wait_for_events).
 conexus-wakeloop = { path = "../conexus-wakeloop" }
 rusqlite = { version = "0.32", features = ["bundled"] }
+# SharedState::sea_orm_db (Phase G) -- opened once at boot alongside
+# the existing rusqlite connection, threaded into every real
+# ToolCallContext. Matches conexus-db's own sea-orm entry exactly
+# (same version/features).
+sea-orm = { version = "2", default-features = false, features = [
+    "macros",
+    "sqlx-sqlite",
+    "runtime-tokio-rustls",
+] }
 serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # CLI flag parsing -- matches the real invocation contract

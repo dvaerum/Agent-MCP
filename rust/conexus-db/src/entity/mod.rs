@@ -23,3 +23,4 @@
 pub mod agent_action;
 pub mod file_metadata;
 pub mod group_capability;
+pub mod task_comment;

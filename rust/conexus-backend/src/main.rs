@@ -93,6 +93,23 @@ async fn main() -> Result<()> {
 
     boot::ensure_project_dirs(&cli.project_dir)?;
     let conn = boot::open_and_init_db(&cli.project_dir)?;
+    // Phase G (sea-orm migration): a second, sea-orm-flavored handle
+    // onto the SAME SQLite file `conn` above just opened/initialized --
+    // see `SharedState::sea_orm_db`'s own doc for why this coexists
+    // with the legacy rusqlite connection rather than replacing it.
+    // Opened AFTER `open_and_init_db` so the schema already exists (this
+    // exact rusqlite-creates-then-sea-orm-connects sequencing is the
+    // same one `conexus_db::task_comments_repository`'s own tests
+    // already prove works, see its `conn_with_task` test helper).
+    let sea_orm_db_path = boot::db_path(&cli.project_dir);
+    let sea_orm_db = sea_orm::Database::connect(format!("sqlite://{}", sea_orm_db_path.display()))
+        .await
+        .with_context(|| {
+            format!(
+                "open sea-orm connection to project database {}",
+                sea_orm_db_path.display()
+            )
+        })?;
     let forwarding_hmac_key = boot::load_forwarding_hmac_key(cli.forwarding_hmac_in.as_deref());
     if cli.forwarding_hmac_in.is_some() && forwarding_hmac_key.is_none() {
         eprintln!(
@@ -110,6 +127,7 @@ async fn main() -> Result<()> {
         project_dir: cli.project_dir.clone(),
         operator_events: operator_events::OperatorEventsHub::new(),
         delivery_transport: delivery_transport::DeliveryTransportHub::new(),
+        sea_orm_db,
     });
 
     background_tasks::spawn_all(&shared);

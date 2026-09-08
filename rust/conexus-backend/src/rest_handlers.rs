@@ -3859,7 +3859,8 @@ mod tests {
         conn
     }
 
-    fn test_shared_state(conn: rusqlite::Connection) -> Arc<SharedState> {
+    async fn test_shared_state(conn: rusqlite::Connection) -> Arc<SharedState> {
+        let sea_orm_db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
         Arc::new(SharedState {
             conn: tokio::sync::Mutex::new(conn),
             forwarding_hmac_key: None,
@@ -3868,6 +3869,7 @@ mod tests {
             project_dir: std::env::temp_dir(),
             operator_events: crate::operator_events::OperatorEventsHub::new(),
             delivery_transport: crate::delivery_transport::DeliveryTransportHub::new(),
+            sea_orm_db,
         })
     }
 
@@ -4054,7 +4056,7 @@ mod tests {
     async fn list_tasks_bounded_by_default_limit() {
         let conn = test_conn();
         seed_tasks(&conn, 600, "t");
-        let shared = test_shared_state(conn);
+        let shared = test_shared_state(conn).await;
         let resp = list_tasks(State(shared), query(&[])).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(body_json(resp).await.as_array().unwrap().len(), 500);
@@ -4064,7 +4066,7 @@ mod tests {
     async fn list_tasks_explicit_limit_honored_and_clamped_to_max() {
         let conn = test_conn();
         seed_tasks(&conn, 600, "t");
-        let shared = test_shared_state(conn);
+        let shared = test_shared_state(conn).await;
 
         let resp = list_tasks(State(shared.clone()), query(&[("limit", "10")])).await;
         assert_eq!(body_json(resp).await.as_array().unwrap().len(), 10);
@@ -4079,7 +4081,7 @@ mod tests {
     async fn list_tasks_newest_first_order_preserved() {
         let conn = test_conn();
         let ids = seed_tasks(&conn, 505, "ord");
-        let shared = test_shared_state(conn);
+        let shared = test_shared_state(conn).await;
         let resp = list_tasks(State(shared), query(&[("limit", "5")])).await;
         let got: Vec<String> = body_json(resp)
             .await
@@ -4097,7 +4099,7 @@ mod tests {
     async fn list_tasks_small_corpus_not_truncated() {
         let conn = test_conn();
         seed_tasks(&conn, 3, "small");
-        let shared = test_shared_state(conn);
+        let shared = test_shared_state(conn).await;
         let resp = list_tasks(State(shared), query(&[])).await;
         let body = body_json(resp).await;
         let arr = body.as_array().unwrap();
@@ -4111,7 +4113,7 @@ mod tests {
     async fn list_agents_dashboard_bounded_by_default_limit() {
         let conn = test_conn();
         seed_agents(&conn, 600, "ag", "created");
-        let shared = test_shared_state(conn);
+        let shared = test_shared_state(conn).await;
         let resp = list_agents_dashboard(State(shared), query(&[])).await;
         assert_eq!(body_json(resp).await.as_array().unwrap().len(), 500);
     }
@@ -4120,7 +4122,7 @@ mod tests {
     async fn list_agents_dashboard_explicit_limit_honored() {
         let conn = test_conn();
         seed_agents(&conn, 600, "ag", "created");
-        let shared = test_shared_state(conn);
+        let shared = test_shared_state(conn).await;
         let resp = list_agents_dashboard(State(shared), query(&[("limit", "12")])).await;
         assert_eq!(body_json(resp).await.as_array().unwrap().len(), 12);
     }
@@ -4129,7 +4131,7 @@ mod tests {
     async fn context_data_bounded_by_default_limit() {
         let conn = test_conn();
         seed_context_rows(&conn, 550, "ctx");
-        let shared = test_shared_state(conn);
+        let shared = test_shared_state(conn).await;
         let resp = context_data(State(shared), query(&[])).await;
         assert_eq!(body_json(resp).await.as_array().unwrap().len(), 500);
     }
@@ -4138,7 +4140,7 @@ mod tests {
     async fn context_data_explicit_limit_honored() {
         let conn = test_conn();
         seed_context_rows(&conn, 550, "ctx");
-        let shared = test_shared_state(conn);
+        let shared = test_shared_state(conn).await;
         let resp = context_data(State(shared), query(&[("limit", "7")])).await;
         assert_eq!(body_json(resp).await.as_array().unwrap().len(), 7);
     }
@@ -4147,7 +4149,7 @@ mod tests {
     async fn context_data_small_dataset_not_truncated() {
         let conn = test_conn();
         seed_context_rows(&conn, 4, "smallctx");
-        let shared = test_shared_state(conn);
+        let shared = test_shared_state(conn).await;
         let resp = context_data(State(shared), query(&[])).await;
         assert_eq!(body_json(resp).await.as_array().unwrap().len(), 4);
     }
@@ -4172,7 +4174,7 @@ mod tests {
         );
         seed_agents(&conn, 5, "act", "active");
         seed_agents(&conn, 3, "cre", "created");
-        let shared = test_shared_state(conn);
+        let shared = test_shared_state(conn).await;
         let resp = simple_status(State(shared)).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp).await;
@@ -4191,7 +4193,7 @@ mod tests {
     async fn list_participants_bounded_by_default_limit() {
         let conn = test_conn();
         seed_live_agents(&conn, 700, "live");
-        let shared = test_shared_state(conn);
+        let shared = test_shared_state(conn).await;
         let resp = list_participants(State(shared), query(&[]), Bytes::from_static(b"{}")).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp).await;
@@ -4204,7 +4206,7 @@ mod tests {
     async fn list_participants_limit_honored() {
         let conn = test_conn();
         seed_live_agents(&conn, 700, "live");
-        let shared = test_shared_state(conn);
+        let shared = test_shared_state(conn).await;
         let resp = list_participants(
             State(shared),
             query(&[("limit", "5")]),
@@ -4220,7 +4222,7 @@ mod tests {
     async fn list_participants_tombstones_bounded() {
         let conn = test_conn();
         seed_tombstone_messages(&conn, 550, "tmb");
-        let shared = test_shared_state(conn);
+        let shared = test_shared_state(conn).await;
         let resp = list_participants(
             State(shared),
             query(&[("limit", "5")]),
@@ -4236,7 +4238,7 @@ mod tests {
         let conn = test_conn();
         seed_live_agents(&conn, 3, "sm");
         seed_tombstone_messages(&conn, 2, "smtmb");
-        let shared = test_shared_state(conn);
+        let shared = test_shared_state(conn).await;
         let resp = list_participants(State(shared), query(&[]), Bytes::from_static(b"{}")).await;
         let body = body_json(resp).await;
         let mut keys: Vec<&str> = body
@@ -4282,7 +4284,7 @@ mod tests {
             [],
         )
         .unwrap();
-        let shared = test_shared_state(conn);
+        let shared = test_shared_state(conn).await;
         let resolved = resolved_forwarding("op1", conexus_core::capability::ProjectRole::Operator);
         let resp = all_data(State(shared), Extension(resolved), query(&[])).await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -4319,7 +4321,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let shared = test_shared_state(conn);
+        let shared = test_shared_state(conn).await;
 
         let resolved = resolved_forwarding("op1", conexus_core::capability::ProjectRole::Operator);
         let resp = all_data(State(shared.clone()), Extension(resolved), query(&[])).await;
@@ -4343,7 +4345,7 @@ mod tests {
         // must 500 with a STATIC message, never the real "no such
         // table" text.
         conn.execute("DROP TABLE agents", []).unwrap();
-        let shared = test_shared_state(conn);
+        let shared = test_shared_state(conn).await;
         let resolved = resolved_forwarding("op1", conexus_core::capability::ProjectRole::Operator);
         let resp = all_data(State(shared), Extension(resolved), query(&[])).await;
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
@@ -4369,7 +4371,7 @@ mod tests {
     async fn create_task_500_never_leaks_internal_error_detail() {
         let conn = test_conn();
         conn.execute("DROP TABLE tasks", []).unwrap();
-        let shared = test_shared_state(conn);
+        let shared = test_shared_state(conn).await;
         let resolved = resolved_forwarding("op1", conexus_core::capability::ProjectRole::Operator);
         let resp = create_task(
             State(shared),
@@ -4394,7 +4396,7 @@ mod tests {
         )
         .unwrap();
         conn.execute("DROP TABLE agent_messages", []).unwrap();
-        let shared = test_shared_state(conn);
+        let shared = test_shared_state(conn).await;
         let resolved = resolved_operator_bearer("dummy-token");
         let resp = create_message(
             State(shared),
@@ -4418,7 +4420,7 @@ mod tests {
     async fn register_agent_500_never_leaks_internal_error_detail() {
         let conn = test_conn();
         conn.execute("DROP TABLE agents", []).unwrap();
-        let shared = test_shared_state(conn);
+        let shared = test_shared_state(conn).await;
         let resolved = resolved_forwarding("op1", conexus_core::capability::ProjectRole::Operator);
         let resp = register_agent_dashboard(
             State(shared),
@@ -4436,7 +4438,7 @@ mod tests {
     async fn tokens_500_never_leaks_internal_error_detail() {
         let conn = test_conn();
         conn.execute("DROP TABLE agents", []).unwrap();
-        let shared = test_shared_state(conn);
+        let shared = test_shared_state(conn).await;
         let resolved = resolved_operator_bearer("dummy-token");
         let resp = tokens(State(shared), Extension(resolved)).await;
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
@@ -4468,7 +4470,7 @@ mod tests {
             "2026-01-01T00:00:00Z",
         )
         .unwrap();
-        let shared = test_shared_state(conn);
+        let shared = test_shared_state(conn).await;
         let resolved = resolved_forwarding("op1", conexus_core::capability::ProjectRole::Operator);
         let resp = settings_data(State(shared), Extension(resolved)).await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -4494,7 +4496,7 @@ mod tests {
     #[tokio::test]
     async fn update_memory_value_only_update_preserves_description_end_to_end() {
         let conn = test_conn();
-        let shared = test_shared_state(conn);
+        let shared = test_shared_state(conn).await;
         let resolved = resolved_operator_bearer("dummy-token");
 
         let create_body = Bytes::from(
@@ -4563,7 +4565,7 @@ mod tests {
     async fn create_setting_rejects_invisible_lo_so_codepoints_in_body_key() {
         for (label, ch) in INVISIBLE_LO_SO_CODEPOINTS {
             let conn = test_conn();
-            let shared = test_shared_state(conn);
+            let shared = test_shared_state(conn).await;
             let resolved = resolved_operator_bearer("dummy-token");
             let bad_key = format!("config_test_{ch}_key");
             let body =
@@ -4579,7 +4581,7 @@ mod tests {
     async fn update_setting_rejects_invisible_lo_so_codepoints_in_url_key() {
         for (label, ch) in INVISIBLE_LO_SO_CODEPOINTS {
             let conn = test_conn();
-            let shared = test_shared_state(conn);
+            let shared = test_shared_state(conn).await;
             let resolved = resolved_operator_bearer("dummy-token");
             let bad_key = format!("config_test_{ch}_key");
             let body = Bytes::from(json!({"context_value": true}).to_string());
@@ -4592,7 +4594,7 @@ mod tests {
     #[tokio::test]
     async fn delete_setting_rejects_invisible_lo_so_codepoint_in_url_key() {
         let conn = test_conn();
-        let shared = test_shared_state(conn);
+        let shared = test_shared_state(conn).await;
         let resolved = resolved_operator_bearer("dummy-token");
         let bad_key = format!("config_test_{}_key", INVISIBLE_LO_SO_CODEPOINTS[0].1);
         let resp = delete_setting(Path(bad_key), State(shared), Extension(resolved)).await;
@@ -4602,7 +4604,7 @@ mod tests {
     #[tokio::test]
     async fn update_setting_normal_ascii_key_round_trips() {
         let conn = test_conn();
-        let shared = test_shared_state(conn);
+        let shared = test_shared_state(conn).await;
         let resolved = resolved_operator_bearer("dummy-token");
         let body = Bytes::from(json!({"context_value": true}).to_string());
         let resp = update_setting(
@@ -4635,7 +4637,7 @@ mod tests {
     #[tokio::test]
     async fn create_setting_deep_json_body_no_recursion_leak() {
         let conn = test_conn();
-        let shared = test_shared_state(conn);
+        let shared = test_shared_state(conn).await;
         let resolved = resolved_operator_bearer("dummy-token");
         let depth = 400; // clears json_sanitize::MAX_NESTING_DEPTH (200)
         let body_str = format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
@@ -4658,7 +4660,7 @@ mod tests {
     #[tokio::test]
     async fn create_message_to_a_ghost_recipient_is_404() {
         let conn = test_conn();
-        let shared = test_shared_state(conn);
+        let shared = test_shared_state(conn).await;
         let resolved = resolved_operator_bearer("dummy-token");
         let resp = create_message(
             State(shared),
@@ -4689,7 +4691,7 @@ mod tests {
             [],
         )
         .unwrap();
-        let shared = test_shared_state(conn);
+        let shared = test_shared_state(conn).await;
         let resolved = resolved_operator_bearer("dummy-token");
         let resp = create_message(
             State(shared),
@@ -4714,7 +4716,7 @@ mod tests {
         // with no agents-table parent row -- `recipient_exists` special-
         // cases it (see message_repository.rs), so it must never 404.
         let conn = test_conn();
-        let shared = test_shared_state(conn);
+        let shared = test_shared_state(conn).await;
         let resolved = resolved_operator_bearer("dummy-token");
         let resp = create_message(
             State(shared),
@@ -4743,7 +4745,7 @@ mod tests {
     #[tokio::test]
     async fn list_messages_query_list_limit_is_400_not_500() {
         let conn = test_conn();
-        let shared = test_shared_state(conn);
+        let shared = test_shared_state(conn).await;
         let resp = list_messages(
             State(shared),
             Bytes::from(serde_json::to_vec(&json!({"limit": [1, 2]})).unwrap()),
@@ -4755,7 +4757,7 @@ mod tests {
     #[tokio::test]
     async fn list_messages_query_dict_offset_is_400_not_500() {
         let conn = test_conn();
-        let shared = test_shared_state(conn);
+        let shared = test_shared_state(conn).await;
         let resp = list_messages(
             State(shared),
             Bytes::from(serde_json::to_vec(&json!({"offset": {"x": 1}})).unwrap()),
@@ -4767,7 +4769,7 @@ mod tests {
     #[tokio::test]
     async fn list_messages_query_string_limit_still_400() {
         let conn = test_conn();
-        let shared = test_shared_state(conn);
+        let shared = test_shared_state(conn).await;
         let resp = list_messages(
             State(shared),
             Bytes::from(serde_json::to_vec(&json!({"limit": "abc"})).unwrap()),
@@ -4779,7 +4781,7 @@ mod tests {
     #[tokio::test]
     async fn list_messages_query_valid_int_limit_offset_succeeds() {
         let conn = test_conn();
-        let shared = test_shared_state(conn);
+        let shared = test_shared_state(conn).await;
         let resp = list_messages(
             State(shared),
             Bytes::from(serde_json::to_vec(&json!({"limit": 10, "offset": 0})).unwrap()),
@@ -4794,7 +4796,7 @@ mod tests {
     #[tokio::test]
     async fn list_messages_query_negative_offset_is_clamped() {
         let conn = test_conn();
-        let shared = test_shared_state(conn);
+        let shared = test_shared_state(conn).await;
         let resp = list_messages(
             State(shared),
             Bytes::from(serde_json::to_vec(&json!({"offset": -5})).unwrap()),

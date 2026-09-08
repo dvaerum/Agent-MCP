@@ -108,6 +108,15 @@ impl Tool for ViewAgentsTool {
 
 #[cfg(test)]
 mod tests {
+    // Phase G (sea-orm migration infra): a throwaway in-memory
+    // sea-orm connection for ToolCallContext::sea_orm_db -- no test in
+    // this file queries through it yet, it only needs to exist so
+    // off_wire's now-mandatory last argument has something to point
+    // at.
+    async fn test_sea_orm_db() -> sea_orm::DatabaseConnection {
+        sea_orm::Database::connect("sqlite::memory:").await.unwrap()
+    }
+
     use super::*;
     use conexus_auth::ToolCallContext;
     use conexus_core::capability::Capabilities;
@@ -185,7 +194,13 @@ mod tests {
         let principal = agent_bearer_with(Capability::AgentsUse);
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let sea_orm_db = test_sea_orm_db().await;
+        let ctx = ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+            &sea_orm_db,
+        );
         let result = ViewAgentsTool::call(
             Some(&principal),
             &Value::Null,
@@ -218,7 +233,13 @@ mod tests {
         principal.agent_id = None;
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let sea_orm_db = test_sea_orm_db().await;
+        let ctx = ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+            &sea_orm_db,
+        );
         let result = ViewAgentsTool::call(
             Some(&principal),
             &Value::Null,

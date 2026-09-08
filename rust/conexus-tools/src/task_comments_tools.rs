@@ -153,7 +153,7 @@ impl Tool for AddTaskCommentTool {
         arguments: &'a Value,
         conn: &'a AsyncMutex<Connection>,
         now: &'a str,
-        _ctx: &'a conexus_auth::ToolCallContext<'a>,
+        ctx: &'a conexus_auth::ToolCallContext<'a>,
     ) -> conexus_auth::BoxFuture<'a, ToolResult> {
         Box::pin(async move {
             let Some(task_id) = str_arg(arguments, "task_id").filter(|s| !s.is_empty()) else {
@@ -242,13 +242,16 @@ impl Tool for AddTaskCommentTool {
             }
 
             let author = principal.and_then(|p| p.agent_id.clone().or_else(|| p.user_id.clone()));
+            drop(guard);
             match task_comments_repository::add_comment(
-                &guard,
+                ctx.sea_orm_db,
                 &task_id,
                 author.as_deref(),
                 &text,
                 now,
-            ) {
+            )
+            .await
+            {
                 Ok(note_id) => ToolResult::Ok {
                     data: Some(serde_json::json!({"note_id": note_id, "task_id": task_id})),
                     message: Some(format!("Comment {note_id} added to task '{task_id}'.")),
@@ -303,9 +306,9 @@ impl Tool for EditTaskCommentTool {
     fn call<'a>(
         principal: Option<&'a Principal>,
         arguments: &'a Value,
-        conn: &'a AsyncMutex<Connection>,
+        _conn: &'a AsyncMutex<Connection>,
         _now: &'a str,
-        _ctx: &'a conexus_auth::ToolCallContext<'a>,
+        ctx: &'a conexus_auth::ToolCallContext<'a>,
     ) -> conexus_auth::BoxFuture<'a, ToolResult> {
         Box::pin(async move {
             let note_id = match note_id_arg(arguments) {
@@ -324,10 +327,15 @@ impl Tool for EditTaskCommentTool {
                 .unwrap_or_default();
             let is_admin = principal.is_some_and(|p| p.has_capability(Capability::TasksAssign));
 
-            let guard = conn.lock().await;
             match task_comments_repository::edit_comment(
-                &guard, note_id, &requester, &new_text, is_admin,
-            ) {
+                ctx.sea_orm_db,
+                note_id,
+                &requester,
+                &new_text,
+                is_admin,
+            )
+            .await
+            {
                 Ok(()) => ToolResult::Ok {
                     data: Some(serde_json::json!({"note_id": note_id})),
                     message: Some(format!("Comment {note_id} updated.")),
@@ -365,9 +373,9 @@ impl Tool for DeleteTaskCommentTool {
     fn call<'a>(
         principal: Option<&'a Principal>,
         arguments: &'a Value,
-        conn: &'a AsyncMutex<Connection>,
+        _conn: &'a AsyncMutex<Connection>,
         _now: &'a str,
-        _ctx: &'a conexus_auth::ToolCallContext<'a>,
+        ctx: &'a conexus_auth::ToolCallContext<'a>,
     ) -> conexus_auth::BoxFuture<'a, ToolResult> {
         Box::pin(async move {
             let note_id = match note_id_arg(arguments) {
@@ -380,8 +388,14 @@ impl Tool for DeleteTaskCommentTool {
                 .unwrap_or_default();
             let is_admin = principal.is_some_and(|p| p.has_capability(Capability::TasksAssign));
 
-            let guard = conn.lock().await;
-            match task_comments_repository::delete_comment(&guard, note_id, &requester, is_admin) {
+            match task_comments_repository::delete_comment(
+                ctx.sea_orm_db,
+                note_id,
+                &requester,
+                is_admin,
+            )
+            .await
+            {
                 Ok(()) => ToolResult::Ok {
                     data: Some(serde_json::json!({"note_id": note_id})),
                     message: Some(format!("Comment {note_id} deleted.")),
@@ -440,10 +454,26 @@ mod tests {
         }
     }
 
-    async fn setup() -> AsyncMutex<Connection> {
-        let conn = Connection::open_in_memory().unwrap();
+    /// Phase G: `add_comment`/`edit_comment`/`delete_comment` now
+    /// genuinely query through `ctx.sea_orm_db` -- an unrelated
+    /// `:memory:` connection (SQLite's `:memory:` databases are never
+    /// shared across separate connections) would silently see an
+    /// empty, schema-less database. Both connection types must point
+    /// at the SAME real temp file, matching the round-trip pattern
+    /// `conexus-db::entity::*`'s own Phase G tests already established.
+    async fn setup() -> (
+        tempfile::TempDir,
+        AsyncMutex<Connection>,
+        sea_orm::DatabaseConnection,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let conn = Connection::open(&path).unwrap();
         init_schema(&conn).unwrap();
-        AsyncMutex::new(conn)
+        let sea_orm_db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        (dir, AsyncMutex::new(conn), sea_orm_db)
     }
 
     fn seed_task(conn: &Connection, task_id: &str, assigned_to: Option<&str>, created_by: &str) {
@@ -456,13 +486,17 @@ mod tests {
         .unwrap();
     }
 
-    fn ctx<'a>(registry: &'a WaiterRegistry, file_map: &'a FileMap) -> ToolCallContext<'a> {
-        ToolCallContext::off_wire(registry, file_map, std::path::Path::new("/tmp"))
+    fn ctx<'a>(
+        registry: &'a WaiterRegistry,
+        file_map: &'a FileMap,
+        sea_orm_db: &'a sea_orm::DatabaseConnection,
+    ) -> ToolCallContext<'a> {
+        ToolCallContext::off_wire(registry, file_map, std::path::Path::new("/tmp"), sea_orm_db)
     }
 
     #[tokio::test]
     async fn a_worker_can_comment_on_their_own_assigned_task() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         {
             let c = conn.lock().await;
             seed_task(&c, "t1", Some("alice"), "alice");
@@ -470,7 +504,7 @@ mod tests {
         let alice = worker("alice", &[Capability::TasksCreate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = AddTaskCommentTool::call(
             Some(&alice),
             &serde_json::json!({"task_id": "t1", "text": "hello"}),
@@ -484,11 +518,11 @@ mod tests {
 
     #[tokio::test]
     async fn commenting_on_a_nonexistent_task_is_not_found() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         let alice = worker("alice", &[]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = AddTaskCommentTool::call(
             Some(&alice),
             &serde_json::json!({"task_id": "ghost", "text": "hi"}),
@@ -502,7 +536,7 @@ mod tests {
 
     #[tokio::test]
     async fn commenting_on_an_unassigned_task_is_permission_denied_with_claim_guidance() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         {
             let c = conn.lock().await;
             seed_task(&c, "t1", None, "bob");
@@ -510,7 +544,7 @@ mod tests {
         let alice = worker("alice", &[]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = AddTaskCommentTool::call(
             Some(&alice),
             &serde_json::json!({"task_id": "t1", "text": "hi"}),
@@ -536,7 +570,7 @@ mod tests {
         // draft of this exact test wrongly assumed strict same-owner-
         // only denial and failed against the real, correct,
         // documented behavior -- caught by running it, not assumed.
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         {
             let c = conn.lock().await;
             seed_task(&c, "t1", Some("bob"), "bob");
@@ -544,7 +578,7 @@ mod tests {
         let alice = worker("alice", &[]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = AddTaskCommentTool::call(
             Some(&alice),
             &serde_json::json!({"task_id": "t1", "text": "cross-agent note"}),
@@ -576,7 +610,7 @@ mod tests {
         // PermissionDenied, caught by actually running it against the
         // real (correct) implementation, which already matches
         // Python's own `assert isinstance(result, NotFound)`.
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         {
             let c = conn.lock().await;
             seed_task(&c, "t1", Some("bob"), "bob");
@@ -594,7 +628,7 @@ mod tests {
         let alice = worker("alice", &[]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = AddTaskCommentTool::call(
             Some(&alice),
             &serde_json::json!({"task_id": "t1", "text": "cross-agent injection attempt"}),
@@ -623,7 +657,7 @@ mod tests {
 
     #[tokio::test]
     async fn commenting_on_a_terminal_task_is_conflict() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         {
             let c = conn.lock().await;
             seed_task(&c, "t1", Some("alice"), "alice");
@@ -636,7 +670,7 @@ mod tests {
         let alice = worker("alice", &[]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = AddTaskCommentTool::call(
             Some(&alice),
             &serde_json::json!({"task_id": "t1", "text": "hi"}),
@@ -650,7 +684,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_author_can_edit_their_own_comment() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         {
             let c = conn.lock().await;
             seed_task(&c, "t1", Some("alice"), "alice");
@@ -658,7 +692,7 @@ mod tests {
         let alice = worker("alice", &[]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let add = AddTaskCommentTool::call(
             Some(&alice),
             &serde_json::json!({"task_id": "t1", "text": "v1"}),
@@ -684,7 +718,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_non_author_edit_and_a_missing_comment_edit_are_indistinguishable() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         {
             let c = conn.lock().await;
             seed_task(&c, "t1", Some("alice"), "alice");
@@ -693,7 +727,7 @@ mod tests {
         let bob = worker("bob", &[]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let add = AddTaskCommentTool::call(
             Some(&alice),
             &serde_json::json!({"task_id": "t1", "text": "v1"}),
@@ -734,7 +768,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_admin_can_delete_someone_elses_comment() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         {
             let c = conn.lock().await;
             seed_task(&c, "t1", Some("alice"), "alice");
@@ -743,7 +777,7 @@ mod tests {
         let op = operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let add = AddTaskCommentTool::call(
             Some(&alice),
             &serde_json::json!({"task_id": "t1", "text": "v1"}),
@@ -769,11 +803,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_non_integer_note_id_is_invalid_not_a_crash() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         let alice = worker("alice", &[]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = EditTaskCommentTool::call(
             Some(&alice),
             &serde_json::json!({"note_id": "not-a-number", "text": "x"}),
