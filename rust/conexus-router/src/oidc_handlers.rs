@@ -95,6 +95,20 @@ fn id_token_validation_failed() -> Response {
     plain_text_response(StatusCode::BAD_GATEWAY, "OIDC id_token validation failed")
 }
 
+/// SD-R10-1: the caller-facing body for every arm above stays the
+/// identical generic string (no `str(e)` interpolation -- each is a
+/// `&'static str` literal, so a leak is structurally impossible, not
+/// merely avoided). This is the OTHER half of that finding: the real
+/// detail must still be retained server-side rather than discarded by
+/// a bare `Err(_) => ...`. Pure half of the `eprintln!` call sites
+/// below -- isolated so the log-line format is unit-testable without
+/// capturing real stderr, matching `conexus-tools::rag_tools::
+/// rag_completion_error_log_line`'s precedent (this workspace has no
+/// tracing/logging crate -- see that module's own note).
+fn oidc_error_log_line(context: &str, err: &impl std::fmt::Display) -> String {
+    format!("conexus-router: oidc {context}: {err}")
+}
+
 /// Port of `_default_redirect_url`/`_resolve_redirect_url`. Explicit
 /// config wins, then `AGENT_MCP_EXTERNAL_URL`, then `derived_origin`
 /// -- the mount-aware origin `RequestMount::external_origin()`
@@ -207,7 +221,13 @@ pub async fn init_oidc_login_handler(
         .unwrap_or_default();
     let metadata = match fetch_oidc_metadata(&issuer, &http_client).await {
         Ok(m) => m,
-        Err(_) => return discovery_failed(),
+        Err(e) => {
+            eprintln!(
+                "{}",
+                oidc_error_log_line("login discovery fetch failed", &e)
+            );
+            return discovery_failed();
+        }
     };
 
     let redirect_uri = resolve_oidc_redirect_url(
@@ -218,7 +238,13 @@ pub async fn init_oidc_login_handler(
     let client =
         match build_oidc_client(metadata, &cfg.client_id, &cfg.client_secret, &redirect_uri) {
             Ok(c) => c,
-            Err(_) => return discovery_failed(),
+            Err(e) => {
+                eprintln!(
+                    "{}",
+                    oidc_error_log_line("login client construction failed", &e)
+                );
+                return discovery_failed();
+            }
         };
 
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
@@ -310,7 +336,13 @@ pub async fn handle_oidc_callback(
         .unwrap_or_default();
     let metadata = match fetch_oidc_metadata(&issuer, &http_client).await {
         Ok(m) => m,
-        Err(_) => return discovery_failed(),
+        Err(e) => {
+            eprintln!(
+                "{}",
+                oidc_error_log_line("callback discovery fetch failed", &e)
+            );
+            return discovery_failed();
+        }
     };
 
     let redirect_uri = resolve_oidc_redirect_url(
@@ -321,7 +353,13 @@ pub async fn handle_oidc_callback(
     let client =
         match build_oidc_client(metadata, &cfg.client_id, &cfg.client_secret, &redirect_uri) {
             Ok(c) => c,
-            Err(_) => return discovery_failed(),
+            Err(e) => {
+                eprintln!(
+                    "{}",
+                    oidc_error_log_line("callback client construction failed", &e)
+                );
+                return discovery_failed();
+            }
         };
 
     let token_response = client
@@ -331,7 +369,10 @@ pub async fn handle_oidc_callback(
         .await;
     let token_response = match token_response {
         Ok(resp) => resp,
-        Err(_) => return token_exchange_failed(),
+        Err(e) => {
+            eprintln!("{}", oidc_error_log_line("token exchange failed", &e));
+            return token_exchange_failed();
+        }
     };
 
     let Some(id_token) = token_response.extra_fields().id_token() else {
@@ -341,7 +382,10 @@ pub async fn handle_oidc_callback(
     let nonce = Nonce::new(flow.nonce);
     let claims = match id_token.claims(&client.id_token_verifier(), &nonce) {
         Ok(c) => c,
-        Err(_) => return id_token_validation_failed(),
+        Err(e) => {
+            eprintln!("{}", oidc_error_log_line("id_token decode failed", &e));
+            return id_token_validation_failed();
+        }
     };
 
     // Option B (see this module's own doc): every accessor below is
@@ -367,6 +411,7 @@ pub async fn handle_oidc_callback(
 
     let groups_claim = extract_groups_claim(&raw_id_token);
 
+    let (default_is_sysadmin, bootstrap_sysadmin) = oidc_reconcile_sysadmin_flags(&cfg);
     let now = Utc::now();
     let now_str = now.to_rfc3339();
     let mut conn = state.conn.lock().await;
@@ -377,8 +422,8 @@ pub async fn handle_oidc_callback(
             email_verified,
             preferred_username,
             subject: &oidc_subject,
-            default_is_sysadmin: cfg.default_is_sysadmin,
-            bootstrap_sysadmin: cfg.default_is_sysadmin,
+            default_is_sysadmin,
+            bootstrap_sysadmin,
         },
         &now_str,
     ) {
@@ -460,6 +505,26 @@ pub async fn handle_oidc_callback(
     (StatusCode::SEE_OTHER, headers).into_response()
 }
 
+/// AC-R9-2 (round-9): derives the two [`OidcReconcileInput`] sysadmin
+/// flags from `cfg.default_is_sysadmin` for the ONE real OIDC call
+/// site. Per `sso.py`'s own `find_or_create_sso_user` docstring,
+/// `default_is_sysadmin` (an UNCONDITIONAL sysadmin flip on every
+/// freshly JIT-created row) is "only the proxy-header path passes
+/// True today" -- Python's real OIDC callback never sets it, only
+/// ever threading its own env flag through `bootstrap_sysadmin` (the
+/// empty-table FIRST-user-only promotion). A prior version of this
+/// wiring passed `cfg.default_is_sysadmin` to BOTH fields, which
+/// silently promoted EVERY subsequent OIDC-JIT-created user to
+/// sysadmin whenever an operator opted into
+/// `AGENT_MCP_SSO_OIDC_DEFAULT_SYSADMIN` -- not just the first, as the
+/// finding's whole premise requires. Extracted as its own pure
+/// function (this crate's own `resolve_oidc_redirect_url` precedent)
+/// so the wiring contract is directly unit-testable without a live
+/// IdP round trip.
+fn oidc_reconcile_sysadmin_flags(cfg: &sso::OidcSettings) -> (bool, bool) {
+    (false, cfg.default_is_sysadmin)
+}
+
 /// Hand-rolled, lenient query-param extraction -- same rationale as
 /// `login_setup_rest.rs::query_param`: this is an unauthenticated
 /// route, so a malformed query string degrades to "param absent"
@@ -534,6 +599,140 @@ mod tests {
             resolve_oidc_redirect_url(&cfg, None, "https://derived.example.test"),
             "https://derived.example.test/agent-mcp/sso/callback"
         );
+    }
+
+    // -- AC-R9-2 (round-9): OIDC bootstrap-gate wiring ------------------
+    //
+    // Port of `test_sec_r9_sso_deprovision_bootstrap.py`'s bootstrap-gate
+    // half. A genuine gap was found (and fixed) here during this port:
+    // this wiring used to thread `cfg.default_is_sysadmin` into BOTH
+    // `OidcReconcileInput` sysadmin fields, which (per
+    // `oidc_reconcile.rs`'s own already-passing
+    // `default_is_sysadmin_flips_the_bit_on_a_jit_created_row` test --
+    // that function honours `default_is_sysadmin` UNCONDITIONALLY,
+    // regardless of table emptiness) silently promoted EVERY
+    // subsequently JIT-created OIDC user to sysadmin whenever an
+    // operator opted into `AGENT_MCP_SSO_OIDC_DEFAULT_SYSADMIN` -- not
+    // just the very first bootstrap user the finding's whole premise
+    // requires. `sso.py`'s own `find_or_create_sso_user` docstring is
+    // the ground truth: "only the proxy-header path passes
+    // [default_is_sysadmin=]True today"; the real OIDC callback (see
+    // `sso.py` line ~1691) only ever threads its flag through
+    // `bootstrap_sysadmin`.
+
+    #[test]
+    fn oidc_reconcile_sysadmin_flags_never_flips_default_is_sysadmin() {
+        let mut cfg = oidc_settings(None);
+
+        cfg.default_is_sysadmin = true;
+        let (default_is_sysadmin, bootstrap_sysadmin) = oidc_reconcile_sysadmin_flags(&cfg);
+        assert!(
+            !default_is_sysadmin,
+            "OIDC must never unconditionally flip the per-row sysadmin bit \
+             (that's the proxy-header-only knob) -- only the empty-table \
+             bootstrap gate may promote a user"
+        );
+        assert!(
+            bootstrap_sysadmin,
+            "the operator's opt-in must still thread through to the \
+             first-user-only bootstrap gate"
+        );
+
+        cfg.default_is_sysadmin = false;
+        let (default_is_sysadmin, bootstrap_sysadmin) = oidc_reconcile_sysadmin_flags(&cfg);
+        assert!(!default_is_sysadmin);
+        assert!(
+            !bootstrap_sysadmin,
+            "gate stays off end to end when the operator never opted in"
+        );
+    }
+
+    #[test]
+    fn oidc_reconcile_sysadmin_flags_composes_with_the_real_reconcile_function_to_never_auto_sysadmin_a_second_user(
+    ) {
+        // End-to-end proof (function-level, no live IdP needed): wire
+        // this module's own derived flags into the REAL
+        // `find_or_create_oidc_user` against a NON-empty table (a
+        // pre-existing operator already occupies "first user"). Mirrors
+        // Python's `test_second_oidc_user_never_auto_sysadmin_function_
+        // level`.
+        use crate::identity::create_user;
+        use crate::oidc_reconcile::{find_or_create_oidc_user, OidcReconcileInput};
+        use crate::sso_subject::{SsoSubject, SsoSubjectValue};
+        use conexus_db::schema::init_router_schema;
+
+        let mut c = rusqlite::Connection::open_in_memory().unwrap();
+        init_router_schema(&c).unwrap();
+        const NOW: &str = "2026-09-08T00:00:00Z";
+        create_user(
+            &mut c,
+            "existing_admin",
+            "correct horse battery staple",
+            None,
+            false,
+            true,
+            &[],
+            NOW,
+        )
+        .unwrap();
+
+        let mut cfg = oidc_settings(None);
+        cfg.default_is_sysadmin = true; // operator opted in
+        let (default_is_sysadmin, bootstrap_sysadmin) = oidc_reconcile_sysadmin_flags(&cfg);
+
+        let subject = SsoSubject::new(
+            "https://idp.example.test",
+            SsoSubjectValue::Str("second".into()),
+        )
+        .unwrap();
+        let row = find_or_create_oidc_user(
+            &mut c,
+            &OidcReconcileInput {
+                email: None,
+                email_verified: false,
+                preferred_username: Some("second-oidc-user"),
+                subject: &subject,
+                default_is_sysadmin,
+                bootstrap_sysadmin,
+            },
+            NOW,
+        )
+        .unwrap();
+
+        assert!(
+            !row.is_sysadmin,
+            "second OIDC user must NOT auto-promote to sysadmin even with \
+             the bootstrap gate opted in -- the gate is first-user-only"
+        );
+    }
+
+    // -- SD-R10-1: server-side error-detail retention -------------------
+
+    #[test]
+    fn oidc_error_log_line_carries_the_real_detail() {
+        // Port of `test_sec_r10_oidc_error_prose.py`'s server-side-
+        // logging assertion. The caller-facing body is already proven
+        // generic elsewhere (`discovery_failed`/`token_exchange_failed`/
+        // `id_token_validation_failed` are `&'static str` literals with
+        // no `str(e)` interpolation -- a leak is structurally
+        // impossible, not merely avoided). This proves the OTHER half:
+        // the real detail this handler used to discard via a bare
+        // `Err(_) => ...` is now actually captured for a server-side
+        // log line, matching `rag_tools::rag_completion_error_log_line`'s
+        // precedent (this workspace has no tracing/logging crate).
+        struct FakeError(&'static str);
+        impl std::fmt::Display for FakeError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}", self.0)
+            }
+        }
+        let leak = "https://secret-issuer.internal.corp/.well-known/openid-configuration";
+        let line = oidc_error_log_line("discovery fetch failed", &FakeError(leak));
+        assert!(
+            line.contains(leak),
+            "log line must retain the real detail: {line:?}"
+        );
+        assert!(line.contains("discovery fetch failed"));
     }
 
     #[test]

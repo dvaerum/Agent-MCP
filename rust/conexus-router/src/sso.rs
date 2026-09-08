@@ -521,6 +521,26 @@ mod tests {
     }
 
     #[test]
+    fn oidc_mode_rejects_a_non_http_scheme_issuer_even_with_the_insecure_optin() {
+        // Ported from `test_sec_r17_sso_discovery_originpin.py::
+        // test_non_http_scheme_issuer_rejected`: the insecure opt-in
+        // only ever widens the accepted scheme set to include plain
+        // `http://` -- it must never accept an arbitrary non-http(s)
+        // scheme like `ftp://`.
+        let err = load_sso_config(
+            env_map(&[
+                ("AGENT_MCP_SSO_OIDC_ISSUER", "ftp://idp.example.test"),
+                ("AGENT_MCP_SSO_OIDC_ALLOW_INSECURE", "true"),
+                ("AGENT_MCP_SSO_OIDC_CLIENT_ID", "abc"),
+                ("AGENT_MCP_SSO_OIDC_CLIENT_SECRET_FILE", "/tmp/secret"),
+            ]),
+            no_secret_file,
+        )
+        .unwrap_err();
+        assert!(err.0.contains("https"));
+    }
+
+    #[test]
     fn oidc_mode_allows_http_issuer_with_the_insecure_opt_in() {
         let settings = load_sso_config(
             env_map(&[
