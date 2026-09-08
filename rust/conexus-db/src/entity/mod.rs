@@ -21,6 +21,7 @@
 //! tables before repeating it 11 more times.
 
 pub mod agent_action;
+pub mod claude_code_session;
 pub mod file_metadata;
 pub mod group_capability;
 pub mod task_comment;

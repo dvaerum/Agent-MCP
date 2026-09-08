@@ -274,59 +274,70 @@ mod claude_session_monitor {
             .cloned()
             .collect();
 
-        {
-            let conn = shared.conn.lock().await;
-            for (id, data) in &sessions {
-                let last_activity = str_field(data, "last_activity").unwrap_or(&now).to_string();
-                let metadata = data.to_string();
-                if state.known_sessions.contains_key(id) {
-                    if let Err(e) = conexus_db::claude_code_session_repository::update_activity(
-                        &conn,
-                        id,
-                        &last_activity,
-                        &metadata,
-                    ) {
-                        eprintln!("conexus-backend: error updating claude session {id}: {e}");
-                    }
-                } else {
-                    let new_session = conexus_db::claude_code_session_repository::NewSession {
-                        session_id: id,
-                        pid: int_field(data, "pid"),
-                        parent_pid: int_field(data, "parent_pid"),
-                        working_directory: str_field(data, "working_directory"),
-                        metadata: &metadata,
-                    };
-                    if let Err(e) = conexus_db::claude_code_session_repository::register_new_session(
-                        &conn,
-                        &new_session,
-                        &last_activity,
-                        &now,
-                    ) {
-                        eprintln!("conexus-backend: error registering claude session {id}: {e}");
-                        continue;
-                    }
-                    let details = serde_json::json!({
-                        "session_id": id,
-                        "pid": int_field(data, "pid"),
-                        "parent_pid": int_field(data, "parent_pid"),
-                        "working_directory": str_field(data, "working_directory"),
-                    });
-                    let _ = conexus_db::agent_action_repository::log_agent_action(
-                        &conn,
-                        "system",
-                        "claude_session_detected",
-                        None,
-                        Some(&details),
-                        &now,
-                    );
-                }
-            }
-            for id in &stale {
-                if let Err(e) =
-                    conexus_db::claude_code_session_repository::mark_inactive(&conn, id, &now)
+        // `claude_code_session_repository` is sea-orm-backed (Phase G);
+        // `agent_action_repository`'s audit write below is not yet --
+        // both connections point at the SAME underlying SQLite file
+        // (opened together at boot, see `SharedState`'s own doc), so
+        // interleaving them here is safe.
+        for (id, data) in &sessions {
+            let last_activity = str_field(data, "last_activity").unwrap_or(&now).to_string();
+            let metadata = data.to_string();
+            if state.known_sessions.contains_key(id) {
+                if let Err(e) = conexus_db::claude_code_session_repository::update_activity(
+                    &shared.sea_orm_db,
+                    id,
+                    &last_activity,
+                    &metadata,
+                )
+                .await
                 {
-                    eprintln!("conexus-backend: error marking claude session {id} inactive: {e}");
+                    eprintln!("conexus-backend: error updating claude session {id}: {e}");
                 }
+            } else {
+                let new_session = conexus_db::claude_code_session_repository::NewSession {
+                    session_id: id,
+                    pid: int_field(data, "pid"),
+                    parent_pid: int_field(data, "parent_pid"),
+                    working_directory: str_field(data, "working_directory"),
+                    metadata: &metadata,
+                };
+                if let Err(e) = conexus_db::claude_code_session_repository::register_new_session(
+                    &shared.sea_orm_db,
+                    &new_session,
+                    &last_activity,
+                    &now,
+                )
+                .await
+                {
+                    eprintln!("conexus-backend: error registering claude session {id}: {e}");
+                    continue;
+                }
+                let details = serde_json::json!({
+                    "session_id": id,
+                    "pid": int_field(data, "pid"),
+                    "parent_pid": int_field(data, "parent_pid"),
+                    "working_directory": str_field(data, "working_directory"),
+                });
+                let conn = shared.conn.lock().await;
+                let _ = conexus_db::agent_action_repository::log_agent_action(
+                    &conn,
+                    "system",
+                    "claude_session_detected",
+                    None,
+                    Some(&details),
+                    &now,
+                );
+            }
+        }
+        for id in &stale {
+            if let Err(e) = conexus_db::claude_code_session_repository::mark_inactive(
+                &shared.sea_orm_db,
+                id,
+                &now,
+            )
+            .await
+            {
+                eprintln!("conexus-backend: error marking claude session {id} inactive: {e}");
             }
         }
 
@@ -653,11 +664,15 @@ mod claude_session_monitor_tests {
     use conexus_wakeloop::waiter_registry::WaiterRegistry;
     use std::sync::Arc;
 
-    async fn test_shared(project_dir: std::path::PathBuf) -> Arc<SharedState> {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
+    async fn test_shared(project_dir: std::path::PathBuf) -> (tempfile::TempDir, Arc<SharedState>) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
         init_schema(&conn).unwrap();
-        let sea_orm_db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
-        Arc::new(SharedState {
+        let sea_orm_db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        let shared = Arc::new(SharedState {
             conn: tokio::sync::Mutex::new(conn),
             forwarding_hmac_key: None,
             waiter_registry: WaiterRegistry::new(),
@@ -666,7 +681,8 @@ mod claude_session_monitor_tests {
             operator_events: crate::operator_events::OperatorEventsHub::new(),
             delivery_transport: crate::delivery_transport::DeliveryTransportHub::new(),
             sea_orm_db,
-        })
+        });
+        (dir, shared)
     }
 
     fn scratch_dir(name: &str) -> std::path::PathBuf {
@@ -685,12 +701,12 @@ mod claude_session_monitor_tests {
     #[tokio::test]
     async fn no_registry_file_is_a_silent_no_op() {
         let dir = scratch_dir("missing");
-        let shared = test_shared(dir.clone()).await;
+        let (_db_dir, shared) = test_shared(dir.clone()).await;
         let mut state = MonitorState::default();
         check_registry_changes(&shared, &mut state).await;
-        let conn = shared.conn.lock().await;
         assert!(
-            conexus_db::claude_code_session_repository::list_active(&conn)
+            conexus_db::claude_code_session_repository::list_active(&shared.sea_orm_db)
+                .await
                 .unwrap()
                 .is_empty()
         );
@@ -701,12 +717,12 @@ mod claude_session_monitor_tests {
     async fn malformed_json_is_a_silent_no_op() {
         let dir = scratch_dir("malformed");
         write_registry(&dir, "not json");
-        let shared = test_shared(dir.clone()).await;
+        let (_db_dir, shared) = test_shared(dir.clone()).await;
         let mut state = MonitorState::default();
         check_registry_changes(&shared, &mut state).await;
-        let conn = shared.conn.lock().await;
         assert!(
-            conexus_db::claude_code_session_repository::list_active(&conn)
+            conexus_db::claude_code_session_repository::list_active(&shared.sea_orm_db)
+                .await
                 .unwrap()
                 .is_empty()
         );
@@ -720,13 +736,13 @@ mod claude_session_monitor_tests {
             &dir,
             r#"{"sessions": {"s1": {"pid": 111, "parent_pid": 222, "working_directory": "/repo"}}}"#,
         );
-        let shared = test_shared(dir.clone()).await;
+        let (_db_dir, shared) = test_shared(dir.clone()).await;
         let mut state = MonitorState::default();
         check_registry_changes(&shared, &mut state).await;
 
         assert!(state.known_sessions.contains_key("s1"));
-        let conn = shared.conn.lock().await;
-        let row = conexus_db::claude_code_session_repository::get_by_id(&conn, "s1")
+        let row = conexus_db::claude_code_session_repository::get_by_id(&shared.sea_orm_db, "s1")
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(row.pid, 111);
@@ -734,6 +750,7 @@ mod claude_session_monitor_tests {
         assert_eq!(row.working_directory.as_deref(), Some("/repo"));
         assert_eq!(row.status.as_deref(), Some("detected"));
 
+        let conn = shared.conn.lock().await;
         let actions: Vec<String> = {
             let mut stmt = conn
                 .prepare("SELECT action_type FROM agent_actions WHERE agent_id = 'system'")
@@ -752,7 +769,7 @@ mod claude_session_monitor_tests {
     async fn an_unchanged_mtime_skips_the_second_read_entirely() {
         let dir = scratch_dir("unchanged");
         write_registry(&dir, r#"{"sessions": {"s1": {"pid": 1, "parent_pid": 2}}}"#);
-        let shared = test_shared(dir.clone()).await;
+        let (_db_dir, shared) = test_shared(dir.clone()).await;
         let mut state = MonitorState::default();
         check_registry_changes(&shared, &mut state).await;
         assert_eq!(state.known_sessions.len(), 1);
@@ -772,7 +789,7 @@ mod claude_session_monitor_tests {
             &dir,
             r#"{"sessions": {"s1": {"pid": 1, "parent_pid": 2, "last_activity": "2026-01-01T00:00:00Z"}}}"#,
         );
-        let shared = test_shared(dir.clone()).await;
+        let (_db_dir, shared) = test_shared(dir.clone()).await;
         let mut state = MonitorState::default();
         check_registry_changes(&shared, &mut state).await;
 
@@ -784,14 +801,15 @@ mod claude_session_monitor_tests {
         );
         check_registry_changes(&shared, &mut state).await;
 
-        let conn = shared.conn.lock().await;
-        let row = conexus_db::claude_code_session_repository::get_by_id(&conn, "s1")
+        let row = conexus_db::claude_code_session_repository::get_by_id(&shared.sea_orm_db, "s1")
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(row.last_activity, "2026-01-02T00:00:00Z");
         assert_eq!(row.status.as_deref(), Some("active"));
         // Only ONE detection audit row -- the second sweep updated,
         // it did not re-register/re-audit.
+        let conn = shared.conn.lock().await;
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM agent_actions WHERE action_type = 'claude_session_detected'",
@@ -808,7 +826,7 @@ mod claude_session_monitor_tests {
     async fn a_session_dropped_from_the_registry_is_marked_inactive() {
         let dir = scratch_dir("drop");
         write_registry(&dir, r#"{"sessions": {"s1": {"pid": 1, "parent_pid": 2}}}"#);
-        let shared = test_shared(dir.clone()).await;
+        let (_db_dir, shared) = test_shared(dir.clone()).await;
         let mut state = MonitorState::default();
         check_registry_changes(&shared, &mut state).await;
 
@@ -817,12 +835,11 @@ mod claude_session_monitor_tests {
         check_registry_changes(&shared, &mut state).await;
 
         assert!(!state.known_sessions.contains_key("s1"));
-        let conn = shared.conn.lock().await;
-        let row = conexus_db::claude_code_session_repository::get_by_id(&conn, "s1")
+        let row = conexus_db::claude_code_session_repository::get_by_id(&shared.sea_orm_db, "s1")
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(row.status.as_deref(), Some("inactive"));
-        drop(conn);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

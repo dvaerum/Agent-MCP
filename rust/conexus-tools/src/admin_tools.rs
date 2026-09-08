@@ -1736,9 +1736,15 @@ impl Tool for PurgeAgentTool {
             // this crate's schema has no FK on this column, so only
             // the orphan half applies, but the observable contract is
             // identical: no session row survives referencing a
-            // deleted agent).
-            let _ =
-                conexus_db::claude_code_session_repository::delete_by_agent_id(&guard, agent_id);
+            // deleted agent). `claude_code_session_repository` is
+            // sea-orm-backed (Phase G); `guard` (the legacy connection)
+            // stays alive for the other still-unconverted calls in this
+            // function (task_repository, agent_action_repository, ...).
+            let _ = conexus_db::claude_code_session_repository::delete_by_agent_id(
+                ctx.sea_orm_db,
+                agent_id,
+            )
+            .await;
 
             // Note: Python also snapshots+signals this agent's open MCP
             // push streams for immediate teardown (AC-R29-1 symmetry
@@ -2349,10 +2355,19 @@ mod tests {
         }
     }
 
-    async fn setup() -> AsyncMutex<Connection> {
-        let conn = Connection::open_in_memory().unwrap();
+    async fn setup() -> (
+        tempfile::TempDir,
+        AsyncMutex<Connection>,
+        sea_orm::DatabaseConnection,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let conn = Connection::open(&path).unwrap();
         init_schema(&conn).unwrap();
-        AsyncMutex::new(conn)
+        let sea_orm_db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        (dir, AsyncMutex::new(conn), sea_orm_db)
     }
 
     fn ctx<'a>(
@@ -2366,14 +2381,6 @@ mod tests {
             std::path::Path::new("/tmp"),
             sea_orm_db,
         )
-    }
-
-    // Phase G (sea-orm migration infra): a throwaway in-memory sea-orm
-    // connection for ToolCallContext::sea_orm_db -- no test in this
-    // file queries through it yet, it only needs to exist so ctx()'s
-    // now-mandatory last argument has something to point at.
-    async fn test_sea_orm_db() -> sea_orm::DatabaseConnection {
-        sea_orm::Database::connect("sqlite::memory:").await.unwrap()
     }
 
     async fn seed(conn: &AsyncMutex<Connection>, agent_id: &str, action_type: &str, ts: &str) {
@@ -2392,13 +2399,12 @@ mod tests {
 
     #[tokio::test]
     async fn view_audit_log_returns_recent_entries_for_an_operator() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         seed(&conn, "alice", "created_task", "2026-06-01T00:00:00Z").await;
         seed(&conn, "bob", "deleted_task", "2026-06-01T00:00:01Z").await;
         let op = operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = ViewAuditLogTool::call(
             Some(&op),
@@ -2420,14 +2426,13 @@ mod tests {
 
     #[tokio::test]
     async fn view_audit_log_filters_by_agent_id_and_action() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         seed(&conn, "alice", "created_task", "2026-06-01T00:00:00Z").await;
         seed(&conn, "alice", "deleted_task", "2026-06-01T00:00:01Z").await;
         seed(&conn, "bob", "deleted_task", "2026-06-01T00:00:02Z").await;
         let op = operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = ViewAuditLogTool::call(
             Some(&op),
@@ -2460,11 +2465,10 @@ mod tests {
 
     #[tokio::test]
     async fn view_audit_log_on_an_empty_table_reports_zero_entries() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         let op = operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = ViewAuditLogTool::call(
             Some(&op),
@@ -2553,12 +2557,11 @@ mod tests {
 
     #[tokio::test]
     async fn get_agent_tokens_masks_tokens_by_default_even_for_a_confirmed_operator() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         seed_agent(&conn, "alice", "tok-alice-secret", "2026-06-01T00:00:00Z").await;
         let op = confirmed_operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = GetAgentTokensTool::call(
             Some(&op),
@@ -2578,12 +2581,11 @@ mod tests {
 
     #[tokio::test]
     async fn get_agent_tokens_exposes_tokens_only_for_a_confirmed_operator_who_opts_in() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         seed_agent(&conn, "alice", "tok-alice-secret", "2026-06-01T00:00:00Z").await;
         let op = confirmed_operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = GetAgentTokensTool::call(
             Some(&op),
@@ -2605,12 +2607,11 @@ mod tests {
     async fn get_agent_tokens_masks_a_cap_only_non_confirmed_caller_even_with_opt_in() {
         // Finding 2's second layer: passing the coarse Cap gate is not
         // enough on its own -- confirmed operator tier is required too.
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         seed_agent(&conn, "alice", "tok-alice-secret", "2026-06-01T00:00:00Z").await;
         let op = cap_only_non_confirmed();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = GetAgentTokensTool::call(
             Some(&op),
@@ -2628,14 +2629,13 @@ mod tests {
 
     #[tokio::test]
     async fn get_agent_tokens_pagination_reports_has_more() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
         seed_agent(&conn, "bob", "tok-b", "2026-06-01T00:00:01Z").await;
         seed_agent(&conn, "carol", "tok-c", "2026-06-01T00:00:02Z").await;
         let op = confirmed_operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = GetAgentTokensTool::call(
             Some(&op),
@@ -2656,7 +2656,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_agent_tokens_filters_by_status() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
         {
             let guard = conn.lock().await;
@@ -2670,7 +2670,6 @@ mod tests {
         let op = confirmed_operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = GetAgentTokensTool::call(
             Some(&op),
@@ -2712,12 +2711,11 @@ mod tests {
 
     #[tokio::test]
     async fn get_agent_tokens_writes_a_durable_audit_row() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
         let op = confirmed_operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = GetAgentTokensTool::call(
             Some(&op),
@@ -2750,7 +2748,7 @@ mod tests {
 
     #[tokio::test]
     async fn view_status_reports_live_agents_and_excludes_the_system_pseudo_agent() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
         {
             let guard = conn.lock().await;
@@ -2772,7 +2770,6 @@ mod tests {
         let op = operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = ViewStatusTool::call(
             Some(&op),
@@ -2794,7 +2791,7 @@ mod tests {
 
     #[tokio::test]
     async fn view_status_excludes_a_terminated_agent() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
         {
             let guard = conn.lock().await;
@@ -2808,7 +2805,6 @@ mod tests {
         let op = operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = ViewStatusTool::call(
             Some(&op),
@@ -2826,12 +2822,11 @@ mod tests {
 
     #[tokio::test]
     async fn view_status_reports_the_file_map_size_and_preview() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         let op = operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
         file_map.claim("/tmp/a.txt", "alice", "editing", "2026-06-01T00:00:00Z");
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = ViewStatusTool::call(
             Some(&op),
@@ -2877,11 +2872,10 @@ mod tests {
 
     #[tokio::test]
     async fn register_agent_creates_a_worker_with_default_role() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         let op = confirmed_operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = RegisterAgentTool::call(
             Some(&op),
@@ -2912,11 +2906,10 @@ mod tests {
 
     #[tokio::test]
     async fn register_agent_seeds_the_manager_default_profile() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         let op = confirmed_operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = RegisterAgentTool::call(
             Some(&op),
@@ -2937,11 +2930,10 @@ mod tests {
 
     #[tokio::test]
     async fn register_agent_rejects_an_invalid_role() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         let op = confirmed_operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = RegisterAgentTool::call(
             Some(&op),
@@ -2956,11 +2948,10 @@ mod tests {
 
     #[tokio::test]
     async fn register_agent_rejects_a_bracketed_name() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         let op = confirmed_operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = RegisterAgentTool::call(
             Some(&op),
@@ -2975,11 +2966,10 @@ mod tests {
 
     #[tokio::test]
     async fn register_agent_rejects_a_reserved_admin_prefixed_name() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         let op = confirmed_operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = RegisterAgentTool::call(
             Some(&op),
@@ -2994,12 +2984,11 @@ mod tests {
 
     #[tokio::test]
     async fn register_agent_duplicate_name_is_a_conflict() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
         let op = confirmed_operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = RegisterAgentTool::call(
             Some(&op),
@@ -3014,11 +3003,10 @@ mod tests {
 
     #[tokio::test]
     async fn register_agent_snippet_includes_the_project_and_host() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         let op = confirmed_operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = RegisterAgentTool::call(
             Some(&op),
@@ -3046,11 +3034,10 @@ mod tests {
 
     #[tokio::test]
     async fn register_agent_writes_a_durable_audit_row() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         let op = confirmed_operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = RegisterAgentTool::call(
             Some(&op),
@@ -3098,12 +3085,11 @@ mod tests {
 
     #[tokio::test]
     async fn rotate_agent_token_replaces_the_bearer_and_returns_it_once() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         seed_agent(&conn, "alice", "old-token-value", "2026-06-01T00:00:00Z").await;
         let op = operator_with(&[Capability::AgentsRotateToken]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = RotateAgentTokenTool::call(
             Some(&op),
@@ -3128,11 +3114,10 @@ mod tests {
 
     #[tokio::test]
     async fn rotate_agent_token_missing_agent_is_not_found() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         let op = operator_with(&[Capability::AgentsRotateToken]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = RotateAgentTokenTool::call(
             Some(&op),
@@ -3147,7 +3132,7 @@ mod tests {
 
     #[tokio::test]
     async fn rotate_agent_token_refuses_a_terminated_agent() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
         {
             let guard = conn.lock().await;
@@ -3161,7 +3146,6 @@ mod tests {
         let op = operator_with(&[Capability::AgentsRotateToken]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = RotateAgentTokenTool::call(
             Some(&op),
@@ -3176,12 +3160,11 @@ mod tests {
 
     #[tokio::test]
     async fn rotate_agent_token_writes_a_durable_audit_row_with_suffixes_only() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         seed_agent(&conn, "alice", "old-token-value", "2026-06-01T00:00:00Z").await;
         let op = operator_with(&[Capability::AgentsRotateToken]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = RotateAgentTokenTool::call(
             Some(&op),
@@ -3214,7 +3197,7 @@ mod tests {
 
     #[tokio::test]
     async fn restore_agent_flips_a_terminated_agent_back_to_created() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
         {
             let guard = conn.lock().await;
@@ -3228,7 +3211,6 @@ mod tests {
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = RestoreAgentTool::call(
             Some(&op),
@@ -3249,12 +3231,11 @@ mod tests {
 
     #[tokio::test]
     async fn restore_agent_refuses_a_non_terminated_agent() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = RestoreAgentTool::call(
             Some(&op),
@@ -3283,7 +3264,7 @@ mod tests {
     /// agent's working directory is immediately visible post-restore.
     #[tokio::test]
     async fn restore_agent_working_directory_is_immediately_visible_after_restore() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
         {
             let guard = conn.lock().await;
@@ -3305,7 +3286,6 @@ mod tests {
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = RestoreAgentTool::call(
             Some(&op),
@@ -3327,11 +3307,10 @@ mod tests {
 
     #[tokio::test]
     async fn restore_agent_missing_agent_is_not_found() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = RestoreAgentTool::call(
             Some(&op),
@@ -3353,12 +3332,11 @@ mod tests {
 
     #[tokio::test]
     async fn edit_agent_updates_the_color() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = EditAgentTool::call(
             Some(&op),
@@ -3381,12 +3359,11 @@ mod tests {
 
     #[tokio::test]
     async fn edit_agent_no_editable_fields_is_invalid() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = EditAgentTool::call(
             Some(&op),
@@ -3401,12 +3378,11 @@ mod tests {
 
     #[tokio::test]
     async fn edit_agent_rejects_an_invalid_agent_role() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = EditAgentTool::call(
             Some(&op),
@@ -3421,7 +3397,7 @@ mod tests {
 
     #[tokio::test]
     async fn edit_agent_clears_aoe_session_id_with_an_empty_string() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
         {
             let guard = conn.lock().await;
@@ -3439,7 +3415,6 @@ mod tests {
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = EditAgentTool::call(
             Some(&op),
@@ -3459,13 +3434,12 @@ mod tests {
 
     #[tokio::test]
     async fn edit_agent_toggling_auto_event_loop_wakes_the_agents_waiter() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let (_sender, mut receiver) = registry.register("alice");
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = EditAgentTool::call(
             Some(&op),
@@ -3481,11 +3455,10 @@ mod tests {
 
     #[tokio::test]
     async fn edit_agent_missing_agent_is_not_found() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = EditAgentTool::call(
             Some(&op),
@@ -3515,12 +3488,11 @@ mod tests {
     /// needed.
     #[tokio::test]
     async fn edit_agent_working_directory_change_is_immediately_visible() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = EditAgentTool::call(
             Some(&op),
@@ -3544,12 +3516,11 @@ mod tests {
     /// file tools resolve completely untouched.
     #[tokio::test]
     async fn edit_agent_non_workdir_field_leaves_working_directory_untouched() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         seed_agent(&conn, "bob", "tok-b", "2026-06-01T00:00:00Z").await;
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = EditAgentTool::call(
             Some(&op),
@@ -3619,12 +3590,11 @@ mod tests {
 
     #[tokio::test]
     async fn terminate_agent_flips_status_and_revokes_the_token() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = TerminateAgentTool::call(
             Some(&op),
@@ -3645,11 +3615,10 @@ mod tests {
 
     #[tokio::test]
     async fn terminate_agent_missing_agent_is_not_found() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = TerminateAgentTool::call(
             Some(&op),
@@ -3666,7 +3635,7 @@ mod tests {
     async fn terminate_agent_on_an_already_terminated_agent_is_not_found_not_conflict() {
         // Matches Python's real combined outcome: no separate Conflict
         // branch exists for terminate (unlike rotate_agent_token).
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
         {
             let guard = conn.lock().await;
@@ -3680,7 +3649,6 @@ mod tests {
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = TerminateAgentTool::call(
             Some(&op),
@@ -3695,7 +3663,7 @@ mod tests {
 
     #[tokio::test]
     async fn terminate_agent_reassigns_active_tasks_but_preserves_terminal_ones() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
         seed_task(
             &conn,
@@ -3717,7 +3685,6 @@ mod tests {
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = TerminateAgentTool::call(
             Some(&op),
@@ -3743,7 +3710,7 @@ mod tests {
 
     #[tokio::test]
     async fn terminate_agent_wakes_every_active_agent_when_a_task_is_reassigned() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
         seed_agent(&conn, "bob", "tok-b", "2026-06-01T00:00:00Z").await;
         seed_task(
@@ -3758,7 +3725,6 @@ mod tests {
         let registry = WaiterRegistry::new();
         let (_sender, mut receiver) = registry.register("bob");
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = TerminateAgentTool::call(
             Some(&op),
@@ -3774,12 +3740,11 @@ mod tests {
 
     #[tokio::test]
     async fn terminate_agent_writes_a_durable_audit_row_attributed_to_admin() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = TerminateAgentTool::call(
             Some(&op),
@@ -3839,11 +3804,10 @@ mod tests {
 
     #[tokio::test]
     async fn purge_agent_missing_agent_is_not_found() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = PurgeAgentTool::call(
             Some(&op),
@@ -3858,12 +3822,11 @@ mod tests {
 
     #[tokio::test]
     async fn purge_agent_hard_deletes_the_row() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = PurgeAgentTool::call(
             Some(&op),
@@ -3888,12 +3851,11 @@ mod tests {
 
     #[tokio::test]
     async fn purge_agent_inserts_a_tombstone_row() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = PurgeAgentTool::call(
             Some(&op),
@@ -3914,7 +3876,7 @@ mod tests {
 
     #[tokio::test]
     async fn purge_agent_tombstones_sent_and_received_messages() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
         seed_agent(&conn, "bob", "tok-b", "2026-06-01T00:00:00Z").await;
         seed_message(&conn, "msg-1", "alice", "bob").await;
@@ -3922,7 +3884,6 @@ mod tests {
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = PurgeAgentTool::call(
             Some(&op),
@@ -3960,7 +3921,7 @@ mod tests {
 
     #[tokio::test]
     async fn purge_agent_reassigns_active_tasks_and_clears_but_preserves_terminal_ones() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
         seed_task(
             &conn,
@@ -3982,7 +3943,6 @@ mod tests {
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = PurgeAgentTool::call(
             Some(&op),
@@ -4010,7 +3970,7 @@ mod tests {
 
     #[tokio::test]
     async fn purge_agent_tombstones_created_tasks_and_audit_rows() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
         seed_task(&conn, "task-1", None, "unassigned", "2026-06-01T00:00:00Z").await;
         {
@@ -4028,7 +3988,6 @@ mod tests {
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = PurgeAgentTool::call(
             Some(&op),
@@ -4068,7 +4027,7 @@ mod tests {
 
     #[tokio::test]
     async fn purge_agent_wakes_every_active_agent_when_a_task_is_reassigned() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
         seed_agent(&conn, "bob", "tok-b", "2026-06-01T00:00:00Z").await;
         seed_task(
@@ -4083,7 +4042,6 @@ mod tests {
         let registry = WaiterRegistry::new();
         let (_sender, mut receiver) = registry.register("bob");
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = PurgeAgentTool::call(
             Some(&op),
@@ -4106,7 +4064,7 @@ mod tests {
     /// woken to re-execute already-finished work.
     #[tokio::test]
     async fn purge_agent_with_only_a_terminal_task_wakes_nobody() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
         seed_agent(&conn, "bob", "tok-b", "2026-06-01T00:00:00Z").await;
         seed_task(
@@ -4121,7 +4079,6 @@ mod tests {
         let registry = WaiterRegistry::new();
         let (_sender, mut receiver) = registry.register("bob");
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = PurgeAgentTool::call(
             Some(&op),
@@ -4143,7 +4100,7 @@ mod tests {
     /// leave a `claude_code_sessions` row referencing the deleted agent.
     #[tokio::test]
     async fn purge_agent_deletes_claude_code_session_rows() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
         {
             let guard = conn.lock().await;
@@ -4159,7 +4116,6 @@ mod tests {
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = PurgeAgentTool::call(
             Some(&op),
@@ -4170,9 +4126,9 @@ mod tests {
         )
         .await;
         assert!(matches!(result, ToolResult::Ok { .. }));
-        let guard = conn.lock().await;
         assert!(
-            conexus_db::claude_code_session_repository::get_by_id(&guard, "s1")
+            conexus_db::claude_code_session_repository::get_by_id(&sea_orm_db, "s1")
+                .await
                 .unwrap()
                 .is_none(),
             "purge must delete the purged agent's claude_code_sessions rows"
@@ -4183,7 +4139,7 @@ mod tests {
     /// bystander's session must survive.
     #[tokio::test]
     async fn purge_agent_leaves_a_bystanders_claude_code_session_intact() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
         seed_agent(&conn, "bob", "tok-b", "2026-06-01T00:00:00Z").await;
         {
@@ -4200,7 +4156,6 @@ mod tests {
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = PurgeAgentTool::call(
             Some(&op),
@@ -4211,9 +4166,9 @@ mod tests {
         )
         .await;
         assert!(matches!(result, ToolResult::Ok { .. }));
-        let guard = conn.lock().await;
         assert!(
-            conexus_db::claude_code_session_repository::get_by_id(&guard, "s-bob")
+            conexus_db::claude_code_session_repository::get_by_id(&sea_orm_db, "s-bob")
+                .await
                 .unwrap()
                 .is_some(),
             "a bystander agent's session row must survive"
@@ -4228,12 +4183,11 @@ mod tests {
         // at the tool level (INSERT OR IGNORE on the tombstone row
         // only guards a hypothetical duplicate-insert race, not a
         // genuine "re-purge succeeds silently" contract).
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let first = PurgeAgentTool::call(
             Some(&op),
@@ -4257,13 +4211,12 @@ mod tests {
 
     #[tokio::test]
     async fn purge_agent_purging_two_distinct_agents_never_conflicts() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
         seed_agent(&conn, "bob", "tok-b", "2026-06-01T00:00:00Z").await;
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let first = PurgeAgentTool::call(
             Some(&op),
