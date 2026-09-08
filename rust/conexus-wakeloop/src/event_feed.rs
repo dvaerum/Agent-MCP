@@ -47,16 +47,23 @@
 //! before any collector was actually converted -- see the module-level
 //! comment near `AsyncMutex`'s Phase D1/D2/D3 precedent in
 //! `conexus_auth::tool` for the `!Send`-future hazard that plumbing
-//! avoids). [`collect_pending_pokes_for`] is the first collector
-//! actually flipped to sea-orm, reading `sea_orm_db` via
-//! `pending_directive_repository`. Every other internal collector --
-//! `collect_events_with_cap`, `collect_unassigned_task_events_for`,
-//! `collect_agent_profile_events_for`,
-//! `collect_scheduled_directive_events_for` -- is still legacy
-//! rusqlite, reading from the SAME connection locked once at the top
-//! of the function body, exactly as before. A future batch PR flips
-//! the remaining collectors one at a time without touching this
-//! function's signature again.
+//! avoids). [`collect_pending_pokes_for`] was the first collector
+//! flipped to sea-orm, reading `sea_orm_db` via
+//! `pending_directive_repository`; [`collect_scheduled_directive_events_for`]
+//! is the second, reading/writing `sea_orm_db` via
+//! `scheduled_directive_repository::collect_due_and_fire` while its
+//! `agent_actions` audit-log side effect stays on the legacy
+//! connection (that repository isn't converted yet) -- taking the
+//! whole `&AsyncMutex<Connection>` so it can lock fresh AFTER its own
+//! internal sea-orm await, matching this migration's established
+//! "keep legacy alive for a not-yet-converted call in the same
+//! function body" pattern. `collect_events_with_cap`,
+//! `collect_unassigned_task_events_for`, and
+//! `collect_agent_profile_events_for` are still legacy rusqlite,
+//! reading from a guard locked and dropped BEFORE the `fire_scheduled`
+//! block (which needs to `.await`) -- see `assemble_event_feed`'s own
+//! body comment. A future batch PR flips the remaining collectors one
+//! at a time without touching this function's signature again.
 
 use conexus_core::ToolResult;
 use conexus_db::agent_repository::{AgentField, AgentRepository, FieldValue};
@@ -552,37 +559,58 @@ fn directive_event_to_value(event: pending_directive_repository::DirectiveEvent)
 
 /// Fire every due scheduled directive for `agent_id` and return the
 /// `directive` events. Port of `_collect_scheduled_directive_events_for`
-/// -- a thin wrapper over the already-ported
-/// [`scheduled_directive_repository::collect_due_and_fire`] (which
-/// already implements the interval-reset-from-delivery /
-/// terminal-but-kept / closed-window-reaped-without-firing invariants),
-/// plus the `agent_actions` audit-log side effect per fired event.
+/// -- a thin wrapper over [`scheduled_directive_repository::
+/// collect_due_and_fire`] (which already implements the
+/// interval-reset-from-delivery / terminal-but-kept /
+/// closed-window-reaped-without-firing invariants), plus the
+/// `agent_actions` audit-log side effect per fired event.
 ///
 /// Best-effort, matching Python: a DB failure yields no events (the
 /// schedule fires on the next check-in) rather than failing the whole
 /// poll -- callers must never propagate this as a hard error.
-pub fn collect_scheduled_directive_events_for(
-    conn: &Connection,
+///
+/// Phase G: `scheduled_directive_repository` is sea-orm-backed now, so
+/// the firing step itself reads/writes through `sea_orm_db`. The
+/// audit-log write is a SEPARATE, not-yet-converted repository
+/// (`agent_action_repository`) that still needs the legacy connection
+/// -- matching this migration's established "keep legacy alive for a
+/// not-yet-converted call in the same function body" pattern (see
+/// `conexus_tools::project_context_tools`'s own worked example). `conn`
+/// is `&AsyncMutex<Connection>`, not a bare `&Connection`: the audit
+/// write happens AFTER the `collect_due_and_fire(...).await` below, so
+/// it's locked fresh at that point rather than held live across the
+/// await (a `MutexGuard<Connection>` parameter captured across an
+/// `.await` would poison this function's own generated future's
+/// `Send`ness the same way a bare `&Connection` parameter would --
+/// see [`assemble_event_feed`]'s own doc comment for the full rule).
+pub async fn collect_scheduled_directive_events_for(
+    conn: &AsyncMutex<Connection>,
+    sea_orm_db: &sea_orm::DatabaseConnection,
     agent_id: &str,
     now_iso: &str,
 ) -> Vec<Value> {
-    let events = match scheduled_directive_repository::collect_due_and_fire(conn, agent_id, now_iso)
-    {
-        Ok(events) => events,
-        Err(_) => return Vec::new(),
-    };
-    for ev in &events {
-        let details = json!({"directive_id": ev.ref_id, "prompt": ev.data.prompt});
-        // Best-effort: an audit-log write failure must not un-fire an
-        // already-committed directive or fail the poll.
-        let _ = agent_action_repository::log_agent_action(
-            conn,
-            agent_id,
-            "scheduled_directive_fired",
-            None,
-            Some(&details),
-            now_iso,
-        );
+    let events =
+        match scheduled_directive_repository::collect_due_and_fire(sea_orm_db, agent_id, now_iso)
+            .await
+        {
+            Ok(events) => events,
+            Err(_) => return Vec::new(),
+        };
+    if !events.is_empty() {
+        let guard = conn.lock().await;
+        for ev in &events {
+            let details = json!({"directive_id": ev.ref_id, "prompt": ev.data.prompt});
+            // Best-effort: an audit-log write failure must not un-fire an
+            // already-committed directive or fail the poll.
+            let _ = agent_action_repository::log_agent_action(
+                &guard,
+                agent_id,
+                "scheduled_directive_fired",
+                None,
+                Some(&details),
+                now_iso,
+            );
+        }
     }
     events.into_iter().map(directive_event_to_value).collect()
 }
@@ -661,34 +689,37 @@ pub struct AssembledFeed {
 /// function is `async fn`, and embedding a `!Sync` `&Connection` in an
 /// async fn's own generated future would make every CALLER's future
 /// `!Send` across the `.await` point (the exact hazard `conexus_auth::
-/// tool::ToolCallContext`'s own doc explains, already hit and fixed 3
-/// times elsewhere in this migration). Locked ONCE at the top of the
-/// body and held as `guard: MutexGuard<Connection>` for the whole
-/// function -- the guard itself IS `Send` (only needs `Connection:
-/// Send`, which it is), so holding it across the `sea_orm_db` `.await`
-/// below is fine. What is NOT fine, and what Phase G's own poke
-/// conversion below just proved by hitting the compile error: a
-/// REBORROWED `let conn = &*guard;` local binding, if it's still live
-/// after an `.await` point, IS a `!Sync`-derived `&Connection` held
-/// across a suspension, which poisons this whole future's `Send`ness
-/// exactly the same way a bare parameter would. Every collector below
+/// tool::ToolCallContext`'s own doc explains, already hit and fixed
+/// several times elsewhere in this migration). The legacy connection is
+/// locked ONCE for the synchronous `collect_events_with_cap`/
+/// `collect_unassigned_task_events_for`/`collect_agent_profile_events_for`
+/// trio, in a scope that ends BEFORE the `fire_scheduled` block below --
+/// that block needs to `.await` on `sea_orm_db`, and a
+/// `MutexGuard<Connection>` (or a reborrowed `let conn = &*guard;`
+/// local, if still live) held across an `.await` point IS a `!Sync`-
+/// derived reference held across a suspension, which poisons this
+/// whole future's `Send`ness exactly the same way a bare `&Connection`
+/// parameter would (Phase G's own poke conversion originally proved
+/// this by hitting the compile error). Every synchronous collector
 /// therefore takes `&guard` directly at its own call site (a
-/// synchronous, non-async fn call whose transient reborrow ends the
-/// moment it returns) rather than through a named `conn` variable that
-/// would span the `collect_pending_pokes_for(...).await` in the
-/// middle.
+/// transient reborrow that ends the moment the call returns) rather
+/// than through a named `conn` variable spanning an `.await`.
 ///
-/// `sea_orm_db` feeds [`collect_pending_pokes_for`] (Phase G: the
-/// first collector below actually converted to sea-orm -- and,
-/// correspondingly, the reason this function takes NO `&Connection`
-/// parameter at all any more, per that function's own doc comment).
-/// Every other collector -- `collect_events_with_cap`,
-/// `collect_unassigned_task_events_for`,
-/// `collect_agent_profile_events_for`,
-/// `collect_scheduled_directive_events_for` -- is still legacy
-/// rusqlite, reading from the locked `guard` below exactly as before;
-/// this signature just carries `sea_orm_db` through for whichever of
-/// them a future batch PR converts next.
+/// `sea_orm_db` feeds [`collect_pending_pokes_for`] and
+/// [`collect_scheduled_directive_events_for`] (Phase G: the first two
+/// collectors converted to sea-orm). The latter also takes the whole
+/// `conn: &AsyncMutex<Connection>` (not `&guard`) so it can lock fresh,
+/// itself, AFTER its own internal `collect_due_and_fire(...).await`,
+/// for its still-legacy `agent_actions` audit write -- passing the
+/// already-consumed `guard` from the scope above would be a use-after-
+/// drop, and passing `&guard` while it's still locked would deadlock
+/// on the inner `conn.lock().await` (the same connection can't be
+/// locked twice from one task). `collect_events_with_cap`,
+/// `collect_unassigned_task_events_for`, and
+/// `collect_agent_profile_events_for` are still legacy rusqlite, reading
+/// from the scoped `guard` above; this signature just carries
+/// `sea_orm_db` through for whichever collector a future batch PR
+/// converts next.
 #[allow(clippy::too_many_arguments)]
 pub async fn assemble_event_feed(
     conn: &AsyncMutex<Connection>,
@@ -700,14 +731,25 @@ pub async fn assemble_event_feed(
     get_env: impl Fn(&str) -> Option<String>,
     sea_orm_db: &sea_orm::DatabaseConnection,
 ) -> rusqlite::Result<AssembledFeed> {
-    let guard = conn.lock().await;
-    let collected = collect_events_with_cap(&guard, agent_id, cursor, now_iso, get_env)?;
-    let mut events = collected.events;
-    let msg_cap_ts = collected.msg_cap_ts;
-    events.extend(collect_unassigned_task_events_for(
-        &guard, agent_id, cursor,
-    )?);
-    events.extend(collect_agent_profile_events_for(&guard, agent_id, cursor)?);
+    // Scoped so `guard` is dropped before the `fire_scheduled` block
+    // below, which needs to `.await` on `sea_orm_db` -- see this
+    // function's own doc comment on why a live `MutexGuard<Connection>`
+    // can never span an `.await` point, and
+    // `collect_scheduled_directive_events_for`'s doc comment for why it
+    // takes the whole `&AsyncMutex<Connection>` (to lock fresh, itself,
+    // after its own internal `collect_due_and_fire` await) rather than
+    // an already-locked `&guard`.
+    let (mut events, msg_cap_ts) = {
+        let guard = conn.lock().await;
+        let collected = collect_events_with_cap(&guard, agent_id, cursor, now_iso, get_env)?;
+        let mut events = collected.events;
+        let msg_cap_ts = collected.msg_cap_ts;
+        events.extend(collect_unassigned_task_events_for(
+            &guard, agent_id, cursor,
+        )?);
+        events.extend(collect_agent_profile_events_for(&guard, agent_id, cursor)?);
+        (events, msg_cap_ts)
+    };
     events.extend(drain_queue);
 
     // BL-R21-1: cap the MERGED batch to the message-truncation boundary
@@ -720,9 +762,9 @@ pub async fn assemble_event_feed(
         // scheduled fires -- both mutate delivery state, so both run
         // only when the message backlog isn't truncated.
         events.extend(collect_pending_pokes_for(sea_orm_db, agent_id, now_iso).await);
-        events.extend(collect_scheduled_directive_events_for(
-            &guard, agent_id, now_iso,
-        ));
+        events.extend(
+            collect_scheduled_directive_events_for(conn, sea_orm_db, agent_id, now_iso).await,
+        );
     }
 
     // Priority-aware ordering: urgent directives/pokes sort ahead of
@@ -1421,12 +1463,13 @@ mod tests {
 
     // -- collect_scheduled_directive_events_for ------------------------------
 
-    #[test]
-    fn collect_scheduled_directive_events_for_fires_a_due_schedule_and_logs_it() {
+    #[tokio::test]
+    async fn collect_scheduled_directive_events_for_fires_a_due_schedule_and_logs_it() {
         let conn = test_conn();
         seed_agent(&conn, "alice");
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         scheduled_directive_repository::create(
-            &conn,
+            &sea_orm_db,
             "sched_1",
             "alice",
             "daily check-in",
@@ -1437,15 +1480,25 @@ mod tests {
             Some("operator"),
             "2025-12-31T00:00:00Z",
         )
+        .await
         .unwrap();
 
-        let events = collect_scheduled_directive_events_for(&conn, "alice", "2026-01-01T00:00:01Z");
+        let conn = AsyncMutex::new(conn);
+        let events = collect_scheduled_directive_events_for(
+            &conn,
+            &sea_orm_db,
+            "alice",
+            "2026-01-01T00:00:01Z",
+        )
+        .await;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["data"]["prompt"], "daily check-in");
         assert_eq!(events[0]["data"]["source"], "schedule");
 
         // The audit-log side effect actually landed.
         let logged: i64 = conn
+            .lock()
+            .await
             .query_row(
                 "SELECT COUNT(*) FROM agent_actions WHERE action_type = 'scheduled_directive_fired'",
                 [],
@@ -1455,7 +1508,13 @@ mod tests {
         assert_eq!(logged, 1);
 
         // Not due again immediately (next_due_at was reset forward).
-        let again = collect_scheduled_directive_events_for(&conn, "alice", "2026-01-01T00:00:02Z");
+        let again = collect_scheduled_directive_events_for(
+            &conn,
+            &sea_orm_db,
+            "alice",
+            "2026-01-01T00:00:02Z",
+        )
+        .await;
         assert!(again.is_empty());
     }
 
@@ -1533,8 +1592,9 @@ mod tests {
     async fn assemble_event_feed_fires_scheduled_directives_only_when_fire_scheduled_is_true() {
         let conn = test_conn();
         seed_agent(&conn, "alice");
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         scheduled_directive_repository::create(
-            &conn,
+            &sea_orm_db,
             "sched_1",
             "alice",
             "ping",
@@ -1545,10 +1605,10 @@ mod tests {
             Some("operator"),
             "2025-12-31T00:00:00Z",
         )
+        .await
         .unwrap();
 
         let conn = AsyncMutex::new(conn);
-        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let not_fired = assemble_event_feed(
             &conn,
             "alice",
