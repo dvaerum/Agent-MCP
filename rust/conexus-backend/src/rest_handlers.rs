@@ -4353,6 +4353,99 @@ mod tests {
     }
 
     // -----------------------------------------------------------
+    // SD-R6-1 (ported from `tests/test_sec_r6_router_exc_strings.py`):
+    // the identical "raw exception reflected into a 500 body" pattern
+    // BL-R5-2 closed for `memories.py` must also never exist in the
+    // sibling handlers -- tasks/messages/agents/settings. One
+    // representative handler per file, matching the Python test's own
+    // documented scope. Forces a real internal DB error the same way
+    // `all_data_500_never_leaks_internal_error_detail` above does
+    // (no dependency-injection seam exists for `Connection` in this
+    // crate) rather than a mock -- proving the REAL error path, not an
+    // assumption from reading the code.
+    // -----------------------------------------------------------
+
+    #[tokio::test]
+    async fn create_task_500_never_leaks_internal_error_detail() {
+        let conn = test_conn();
+        conn.execute("DROP TABLE tasks", []).unwrap();
+        let shared = test_shared_state(conn);
+        let resolved = resolved_forwarding("op1", conexus_core::capability::ProjectRole::Operator);
+        let resp = create_task(
+            State(shared),
+            Extension(resolved),
+            Bytes::from(serde_json::to_vec(&json!({"task_title": "leak probe"})).unwrap()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let text = body_text(resp).await.to_lowercase();
+        assert!(!text.contains("no such table"));
+        assert!(!text.contains("sql"));
+    }
+
+    #[tokio::test]
+    async fn create_message_500_never_leaks_internal_error_detail() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO agents (token, agent_id, created_at, status, \
+             working_directory, color) VALUES \
+             ('tok-alice', 'alice', '2026-01-01T00:00:00Z', 'active', '/tmp', '#abc')",
+            [],
+        )
+        .unwrap();
+        conn.execute("DROP TABLE agent_messages", []).unwrap();
+        let shared = test_shared_state(conn);
+        let resolved = resolved_operator_bearer("dummy-token");
+        let resp = create_message(
+            State(shared),
+            Extension(resolved),
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "recipient_id": "alice",
+                    "message_content": "leak probe",
+                }))
+                .unwrap(),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let text = body_text(resp).await.to_lowercase();
+        assert!(!text.contains("no such table"));
+        assert!(!text.contains("sql"));
+    }
+
+    #[tokio::test]
+    async fn register_agent_500_never_leaks_internal_error_detail() {
+        let conn = test_conn();
+        conn.execute("DROP TABLE agents", []).unwrap();
+        let shared = test_shared_state(conn);
+        let resolved = resolved_forwarding("op1", conexus_core::capability::ProjectRole::Operator);
+        let resp = register_agent_dashboard(
+            State(shared),
+            Extension(resolved),
+            Bytes::from(serde_json::to_vec(&json!({"name": "leak-probe-agent"})).unwrap()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let text = body_text(resp).await.to_lowercase();
+        assert!(!text.contains("no such table"));
+        assert!(!text.contains("sql"));
+    }
+
+    #[tokio::test]
+    async fn tokens_500_never_leaks_internal_error_detail() {
+        let conn = test_conn();
+        conn.execute("DROP TABLE agents", []).unwrap();
+        let shared = test_shared_state(conn);
+        let resolved = resolved_operator_bearer("dummy-token");
+        let resp = tokens(State(shared), Extension(resolved)).await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let text = body_text(resp).await.to_lowercase();
+        assert!(!text.contains("no such table"));
+        assert!(!text.contains("sql"));
+    }
+
+    // -----------------------------------------------------------
     // F009 (test_sec_composition_policy_readback.py): settings_data
     // threads `resolved.confirmed_operator_tier` from the REAL
     // resolved principal through to `redact_settings_row`, so a

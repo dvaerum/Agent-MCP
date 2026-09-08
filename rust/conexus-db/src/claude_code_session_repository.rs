@@ -117,6 +117,25 @@ pub fn mark_inactive(conn: &Connection, session_id: &str, now: &str) -> Result<b
     Ok(changed > 0)
 }
 
+/// BL-R4-2: purging an agent must not leave a dangling
+/// `claude_code_sessions` row referencing it -- `agent_id` has no
+/// write path in this crate's own monitor (`register_new_session`
+/// never sets it, matching Python's real INSERT, which also omits the
+/// column), but the column exists and Python's own migrations FK it
+/// to `agents.agent_id`, so ANY writer (this crate's own future code,
+/// a raw-SQL fixture, a schema drift) that does populate it must still
+/// be cleaned up on purge -- matching the observable "no row survives
+/// referencing a deleted agent" contract, not just the current write
+/// path's own behavior. Deletes rather than reattributing to a
+/// tombstone (unlike `agent_actions`) since a session record is a
+/// disposable liveness signal, not an audit trail Python preserves.
+pub fn delete_by_agent_id(conn: &Connection, agent_id: &str) -> Result<usize> {
+    conn.execute(
+        "DELETE FROM claude_code_sessions WHERE agent_id = ?1",
+        [agent_id],
+    )
+}
+
 /// Every session currently `'detected'` or `'active'`, newest-activity
 /// first.
 pub fn list_active(conn: &Connection) -> Result<Vec<ClaudeCodeSessionRow>> {
@@ -267,5 +286,66 @@ mod tests {
         let active = list_active(&conn).unwrap();
         let ids: Vec<&str> = active.iter().map(|r| r.session_id.as_str()).collect();
         assert_eq!(ids, vec!["newer", "older"]);
+    }
+
+    /// BL-R4-2 (ported from `tests/test_sec_r4_purge_session_cascade.py::
+    /// test_purge_deletes_claude_code_session_rows`): `agent_id` has no
+    /// write path via `register_new_session` (matching Python's own
+    /// INSERT), so this seeds it directly the same way the Python test's
+    /// own fixture does -- proving the delete function works regardless
+    /// of how a row's `agent_id` got populated.
+    #[test]
+    fn delete_by_agent_id_removes_every_matching_row() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO claude_code_sessions \
+             (session_id, pid, parent_pid, first_detected, last_activity, agent_id, status) \
+             VALUES ('s1', 1, 2, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'alice', 'detected')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO claude_code_sessions \
+             (session_id, pid, parent_pid, first_detected, last_activity, agent_id, status) \
+             VALUES ('s2', 1, 2, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'alice', 'detected')",
+            [],
+        )
+        .unwrap();
+
+        let deleted = delete_by_agent_id(&conn, "alice").unwrap();
+
+        assert_eq!(deleted, 2);
+        assert!(get_by_id(&conn, "s1").unwrap().is_none());
+        assert!(get_by_id(&conn, "s2").unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_by_agent_id_leaves_a_bystanders_session_intact() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO claude_code_sessions \
+             (session_id, pid, parent_pid, first_detected, last_activity, agent_id, status) \
+             VALUES ('s1', 1, 2, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'alice', 'detected')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO claude_code_sessions \
+             (session_id, pid, parent_pid, first_detected, last_activity, agent_id, status) \
+             VALUES ('s2', 1, 2, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'bob', 'detected')",
+            [],
+        )
+        .unwrap();
+
+        assert_eq!(delete_by_agent_id(&conn, "alice").unwrap(), 1);
+
+        assert!(get_by_id(&conn, "s1").unwrap().is_none());
+        assert!(get_by_id(&conn, "s2").unwrap().is_some());
+    }
+
+    #[test]
+    fn delete_by_agent_id_on_no_matching_rows_is_a_clean_zero() {
+        let conn = test_conn();
+        assert_eq!(delete_by_agent_id(&conn, "ghost").unwrap(), 0);
     }
 }
