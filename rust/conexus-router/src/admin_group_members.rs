@@ -526,6 +526,71 @@ mod tests {
         assert_eq!(resp.status, 403);
     }
 
+    /// test_sec_r2_admin_users.py Finding 1's group-indirection
+    /// vector: nesting a GROUP the caller controls into a sysadmin-
+    /// flagged group is the same escalation as joining directly (the
+    /// nested group's own members would inherit sysadmin via the
+    /// transitive closure) -- the guard checks the PARENT group's
+    /// sysadmin status regardless of which member kind is being added,
+    /// so this must be denied identically to the direct-user-join
+    /// case above.
+    #[test]
+    fn a_non_sysadmin_cannot_nest_a_group_into_a_sysadmin_group() {
+        let mut c = conn();
+        let sysadmin_gid = group_membership_repository::create_group(&c, "real-admins", true, NOW)
+            .unwrap()
+            .group_id;
+        let pawn_gid = seed_group(&c, "pawn-group");
+        let outcome = decide_add_group_member(
+            &mut c,
+            false,
+            "bob",
+            None,
+            None,
+            &sysadmin_gid,
+            &serde_json::json!({"group_id": pawn_gid}),
+            NOW,
+        )
+        .unwrap();
+        let AddGroupMemberOutcome::Rejected(resp) = outcome else {
+            panic!("expected Rejected");
+        };
+        assert_eq!(resp.status, 403);
+    }
+
+    /// test_sec_r2_admin_users.py Finding 1's transitive vector: the
+    /// PARENT group itself is not flagged, but it's nested inside a
+    /// sysadmin group -- joining the parent still inherits sysadmin
+    /// via the resolver's transitive closure, so it must be denied
+    /// identically.
+    #[test]
+    fn a_non_sysadmin_cannot_join_a_group_that_is_transitively_sysadmin() {
+        let mut c = conn();
+        let top_gid = group_membership_repository::create_group(&c, "top-admins", true, NOW)
+            .unwrap()
+            .group_id;
+        let mid_gid = seed_group(&c, "middle-group");
+        // mid ∈ top -- members of mid inherit sysadmin from top.
+        group_membership_repository::add_group_member(&c, &top_gid, None, Some(&mid_gid), NOW)
+            .unwrap();
+        let alice = seed_user(&mut c, "alice");
+        let outcome = decide_add_group_member(
+            &mut c,
+            false,
+            "bob",
+            None,
+            None,
+            &mid_gid,
+            &serde_json::json!({"user_id": alice}),
+            NOW,
+        )
+        .unwrap();
+        let AddGroupMemberOutcome::Rejected(resp) = outcome else {
+            panic!("expected Rejected");
+        };
+        assert_eq!(resp.status, 403);
+    }
+
     #[test]
     fn a_non_sysadmin_cannot_add_a_member_to_a_group_with_unheld_capabilities() {
         let mut c = conn();

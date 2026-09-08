@@ -999,6 +999,230 @@ mod tests {
         resp.status().as_u16()
     }
 
+    async fn resp_json(resp: Response) -> serde_json::Value {
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    // -- test_sec_admin_reads_gating.py: the 3 GET routes must be ------
+    // -- gated on the SAME capability as their sibling mutations -------
+
+    /// A non-sysadmin caller with NO capability grant at all (the
+    /// "viewer" shape) must be denied 403 on every one of the three
+    /// admin-namespace GET routes -- these routes were flagged (owner-
+    /// authorized defensive review) as `gated(...)`-only (session
+    /// auth, no capability check) in the pre-port Python source. This
+    /// port's handlers already call `require_*_capability` as their
+    /// own first line (confirmed by reading the source directly), but
+    /// had zero test coverage proving it -- verified here end-to-end.
+    #[tokio::test]
+    async fn list_users_handler_denies_a_viewer_with_no_capability() {
+        let (_dir, state) = real_state();
+        let (_vera_id, _group_id, identity) = seed_delegate(&state, "vera", &[]).await;
+        let resp = list_users_handler(State(state.clone()), Extension(identity)).await;
+        assert_eq!(resp_status(&resp), 403);
+        let body = resp_json(resp).await;
+        assert_eq!(body["error"], "forbidden");
+        assert!(body["message"]
+            .as_str()
+            .unwrap()
+            .contains("system.users.manage"));
+    }
+
+    #[tokio::test]
+    async fn list_groups_handler_denies_a_viewer_with_no_capability() {
+        let (_dir, state) = real_state();
+        let (_vera_id, _group_id, identity) = seed_delegate(&state, "vera", &[]).await;
+        let resp = list_groups_handler(State(state.clone()), Extension(identity)).await;
+        assert_eq!(resp_status(&resp), 403);
+        let body = resp_json(resp).await;
+        assert_eq!(body["error"], "forbidden");
+        assert!(body["message"]
+            .as_str()
+            .unwrap()
+            .contains("system.groups.manage"));
+    }
+
+    #[tokio::test]
+    async fn list_project_memberships_handler_denies_a_viewer_with_no_capability() {
+        let (_dir, state) = real_state();
+        let (_vera_id, _group_id, identity) = seed_delegate(&state, "vera", &[]).await;
+        state
+            .registry
+            .register("alpha", "/ws/alpha", "python", chrono::Utc::now())
+            .unwrap();
+        let resp = list_project_memberships_handler(
+            State(state.clone()),
+            Extension(identity),
+            Path("alpha".to_string()),
+        )
+        .await;
+        assert_eq!(resp_status(&resp), 403);
+        let body = resp_json(resp).await;
+        assert_eq!(body["error"], "forbidden");
+        assert!(body["message"]
+            .as_str()
+            .unwrap()
+            .contains("system.projects.manage"));
+    }
+
+    /// Regression: a delegate holding the SAME capability as the
+    /// sibling mutation (Wave-9 group-delegation shape) is admitted --
+    /// the new gate must not over-reject the legitimate delegated
+    /// read path.
+    #[tokio::test]
+    async fn list_users_handler_admits_a_delegated_capability_holder() {
+        let (_dir, state) = real_state();
+        let (_alice_id, _group_id, identity) =
+            seed_delegate(&state, "alice", &[Capability::SystemUsersManage.as_str()]).await;
+        let resp = list_users_handler(State(state.clone()), Extension(identity)).await;
+        assert_eq!(resp_status(&resp), 200);
+    }
+
+    #[tokio::test]
+    async fn list_groups_handler_admits_a_delegated_capability_holder() {
+        let (_dir, state) = real_state();
+        let (_alice_id, _group_id, identity) =
+            seed_delegate(&state, "alice", &[Capability::SystemGroupsManage.as_str()]).await;
+        let resp = list_groups_handler(State(state.clone()), Extension(identity)).await;
+        assert_eq!(resp_status(&resp), 200);
+    }
+
+    #[tokio::test]
+    async fn list_project_memberships_handler_admits_a_sysadmin() {
+        let (_dir, state) = real_state();
+        state
+            .registry
+            .register("alpha", "/ws/alpha", "python", chrono::Utc::now())
+            .unwrap();
+        let identity = {
+            let mut conn = state.conn.lock().await;
+            let uid = identity::create_user(
+                &mut conn,
+                "root",
+                "correct horse battery staple",
+                None,
+                false,
+                true,
+                &[],
+                NOW,
+            )
+            .unwrap();
+            identity_for(&conn, &uid)
+        };
+        let resp = list_project_memberships_handler(
+            State(state.clone()),
+            Extension(identity),
+            Path("alpha".to_string()),
+        )
+        .await;
+        assert_eq!(resp_status(&resp), 200);
+    }
+
+    // -- PF-R20-1 (test_sec_r20_json_recursion_depth.py, Site 2) -------
+
+    /// `POST /api/router/users` -- the sibling site to `lifecycle_
+    /// rest.rs::create_project_handler`'s own R20 test. Both route
+    /// through the SAME `perm_gates::read_body_and_revalidate` ->
+    /// `json_sanitize::decode_untrusted_body` chokepoint, whose
+    /// pre-parse nesting-depth scan already rejects a body this deep
+    /// with a clean 400 before `serde_json` ever parses it -- verified
+    /// here end-to-end through the real handler.
+    #[tokio::test]
+    async fn create_user_handler_denies_deep_json_with_a_clean_400_not_a_crash() {
+        let (_dir, state) = real_state();
+        let (_dev_id, _group_id, identity) =
+            seed_delegate(&state, "dev", &[Capability::SystemUsersManage.as_str()]).await;
+
+        const DEEP_DEPTH: usize = 10_000;
+        let mut deep_body = "[".repeat(DEEP_DEPTH);
+        deep_body.push_str(&"]".repeat(DEEP_DEPTH));
+
+        let resp = create_user_handler(
+            State(state.clone()),
+            Extension(identity),
+            HeaderMap::new(),
+            Bytes::from(deep_body),
+        )
+        .await;
+        assert_eq!(resp_status(&resp), 400);
+    }
+
+    // -- R15-F2 (test_sec_r15_f2_admin_users_sanitizer.py) -------------
+
+    /// Hidden-Unicode spoofing characters (ZWSP, RTLO) in `email` must
+    /// be stripped before the row is ever written, and must not be
+    /// echoed back verbatim by a subsequent read -- exactly the R13-F2/
+    /// R14-F3 character classes stripped everywhere else. Already
+    /// guaranteed structurally in Rust (`create_user_handler` decodes
+    /// its body via `perm_gates::read_body_and_revalidate` ->
+    /// `json_sanitize::decode_untrusted_body`, the ONE chokepoint every
+    /// mutating `/api` body decodes through -- there was never a
+    /// bespoke, un-sanitized `_json_body` equivalent to bypass in this
+    /// port), but the file's own finding was flagged as untested at
+    /// the route level even though the sanitizer itself and
+    /// `identity::create_user_row`'s independent CLI/SSO-path
+    /// sanitization each have their own coverage -- verified here
+    /// end-to-end through the real handler.
+    #[tokio::test]
+    async fn create_user_handler_strips_hidden_unicode_from_email() {
+        let (_dir, state) = real_state();
+        let (_dev_id, _group_id, identity) =
+            seed_delegate(&state, "dev", &[Capability::SystemUsersManage.as_str()]).await;
+
+        let zwsp = "\u{200b}";
+        let rtlo = "\u{202e}";
+        let spoof_email = format!("abc{zwsp}{rtlo}def@example.com");
+        let body = json_body(serde_json::json!({
+            "username": "spoofuser",
+            "password": "longenoughpassword",
+            "email": spoof_email,
+        }));
+        let resp = create_user_handler(
+            State(state.clone()),
+            Extension(identity),
+            HeaderMap::new(),
+            body,
+        )
+        .await;
+        assert_eq!(resp_status(&resp), 201);
+        let body = resp_json(resp).await;
+        let created_email = body["user"]["email"].as_str().unwrap();
+        assert!(!created_email.contains(zwsp), "{created_email:?}");
+        assert!(!created_email.contains(rtlo), "{created_email:?}");
+        assert_eq!(created_email, "abcdef@example.com");
+    }
+
+    /// Regression: a real internationalised (non-Latin) email must
+    /// round-trip unchanged -- the sanitizer must not over-strip
+    /// legitimate content.
+    #[tokio::test]
+    async fn create_user_handler_preserves_real_non_latin_email() {
+        let (_dir, state) = real_state();
+        let (_dev_id, _group_id, identity) =
+            seed_delegate(&state, "dev", &[Capability::SystemUsersManage.as_str()]).await;
+
+        let real_email = "用户@例え.jp";
+        let body = json_body(serde_json::json!({
+            "username": "intluser",
+            "password": "longenoughpassword",
+            "email": real_email,
+        }));
+        let resp = create_user_handler(
+            State(state.clone()),
+            Extension(identity),
+            HeaderMap::new(),
+            body,
+        )
+        .await;
+        assert_eq!(resp_status(&resp), 201);
+        let body = resp_json(resp).await;
+        assert_eq!(body["user"]["email"], real_email);
+    }
+
     // -- R6-F2: capability revoked between entry gate and revalidation --
 
     #[tokio::test]
@@ -1301,6 +1525,123 @@ mod tests {
         );
     }
 
+    /// R9-F3/R5-F1/R7-F1 (test_sec_r5_membership_self_escalation.py /
+    /// test_sec_r7_membership_write_oracle.py): a delegate holding
+    /// `system.projects.manage` via a group, with ZERO membership on
+    /// the target project, must get the SAME uniform 404 `not_found` a
+    /// nonexistent project produces -- never a 403, which would leak
+    /// that the project genuinely exists (the project-existence oracle
+    /// `project_gate::deny_cross_tenant_project_read` exists to
+    /// close). Found-and-fixed bug (this PR): `perm_gates::revalidate`
+    /// mapped `RevalidateOutcome::DeniedMembership` (Python's
+    /// `_deny_cross_tenant_project_read`'s `role is None` branch, a
+    /// 404) to a bespoke 403 "project membership revoked" instead --
+    /// this is the FIRST call `add_project_membership_handler` makes
+    /// (`read_body_and_revalidate`, before `decide_add_project_
+    /// membership`'s own already-correct 404 ever gets a chance to
+    /// run), so every non-racing request from a zero-membership
+    /// delegate hit this wrong 403, not just the TOCTOU-race shape.
+    #[tokio::test]
+    async fn add_project_membership_handler_denies_a_zero_membership_delegate_with_uniform_404() {
+        let (_dir, state) = real_state();
+        let (alice_id, _group_id, identity) = seed_delegate(
+            &state,
+            "alice",
+            &[Capability::SystemProjectsManage.as_str()],
+        )
+        .await;
+        state
+            .registry
+            .register("proj-x", "/ws/proj-x", "python", chrono::Utc::now())
+            .unwrap();
+        // Deliberately NO project_membership row for alice on proj-x.
+
+        let body = json_body(serde_json::json!({"user_id": alice_id, "role": "operator"}));
+        let resp = add_project_membership_handler(
+            State(state.clone()),
+            Extension(identity),
+            Path("proj-x".to_string()),
+            HeaderMap::new(),
+            body,
+        )
+        .await;
+        assert_eq!(resp_status(&resp), 404);
+        let body = resp_json(resp).await;
+        assert_eq!(body["success"], false);
+        assert_eq!(body["error"], "not_found");
+
+        let conn = state.conn.lock().await;
+        let role = group_membership_repository::resolve_user_project_role(
+            &conn, &alice_id, "proj-x", None,
+        )
+        .unwrap();
+        assert!(
+            role.is_none(),
+            "alice must NOT have self-granted membership"
+        );
+    }
+
+    /// Same finding, TOCTOU-race shape (the exact R9-F3 Python repro):
+    /// alice has BOTH the capability AND a real `operator` membership
+    /// at entry time, but her membership is stripped (capability left
+    /// untouched) before this handler's own revalidation runs -- the
+    /// SAME uniform 404 must fire, not the old 403.
+    #[tokio::test]
+    async fn add_project_membership_handler_denies_off_a_membership_revoked_before_the_call() {
+        let (_dir, state) = real_state();
+        let (alice_id, _group_id, identity) = seed_delegate(
+            &state,
+            "alice",
+            &[Capability::SystemProjectsManage.as_str()],
+        )
+        .await;
+        let (mallory_id, _mallory_group, _mallory_identity) =
+            seed_delegate(&state, "mallory", &[]).await;
+        state
+            .registry
+            .register("proj-y", "/ws/proj-y", "python", chrono::Utc::now())
+            .unwrap();
+        {
+            let conn = state.conn.lock().await;
+            identity::grant_project_membership(&conn, "proj-y", Some(&alice_id), None, "operator")
+                .unwrap();
+            // Strip it again before the handler ever runs -- capability
+            // is untouched, mirroring the "membership revoked mid-
+            // flight" repro without needing a real concurrent task
+            // (axum's `Bytes` extractor already resolves the body
+            // before any handler code runs -- see this module's own
+            // doc on why the real yield-point race isn't reproducible
+            // here).
+            identity::remove_project_membership(&conn, "proj-y", Some(&alice_id), None).unwrap();
+        }
+
+        let body = json_body(serde_json::json!({"user_id": mallory_id, "role": "operator"}));
+        let resp = add_project_membership_handler(
+            State(state.clone()),
+            Extension(identity),
+            Path("proj-y".to_string()),
+            HeaderMap::new(),
+            body,
+        )
+        .await;
+        assert_eq!(resp_status(&resp), 404);
+        let body = resp_json(resp).await;
+        assert_eq!(body["error"], "not_found");
+
+        let conn = state.conn.lock().await;
+        let role = group_membership_repository::resolve_user_project_role(
+            &conn,
+            &mallory_id,
+            "proj-y",
+            None,
+        )
+        .unwrap();
+        assert!(
+            role.is_none(),
+            "mallory must NOT have been granted membership"
+        );
+    }
+
     #[tokio::test]
     async fn change_project_membership_role_handler_denies_off_a_capability_revoked_before_the_call(
     ) {
@@ -1342,6 +1683,112 @@ mod tests {
             role.as_deref(),
             Some("viewer"),
             "target's role must NOT have been changed off the stale grant"
+        );
+    }
+
+    /// R9-F3 (test_sec_r9f3_membership_grant_toctou.py "Test B"),
+    /// `change_project_membership_role_handler`'s sibling of the
+    /// `add_project_membership_handler` fix above: a delegate with
+    /// capability but ZERO membership on the target project must get
+    /// the uniform 404, never the old 403.
+    #[tokio::test]
+    async fn change_project_membership_role_handler_denies_a_zero_membership_delegate_with_uniform_404(
+    ) {
+        let (_dir, state) = real_state();
+        let (_alice_id, _group_id, identity) = seed_delegate(
+            &state,
+            "alice",
+            &[Capability::SystemProjectsManage.as_str()],
+        )
+        .await;
+        let (target_id, _target_group, _target_identity) =
+            seed_delegate(&state, "target", &[]).await;
+        state
+            .registry
+            .register("proj-z", "/ws/proj-z", "python", chrono::Utc::now())
+            .unwrap();
+        {
+            let conn = state.conn.lock().await;
+            identity::grant_project_membership(&conn, "proj-z", Some(&target_id), None, "viewer")
+                .unwrap();
+        }
+        // Deliberately NO project_membership row for alice on proj-z.
+
+        let body = json_body(serde_json::json!({"role": "operator"}));
+        let resp = change_project_membership_role_handler(
+            State(state.clone()),
+            Extension(identity),
+            Path(("proj-z".to_string(), format!("u:{target_id}"))),
+            HeaderMap::new(),
+            body,
+        )
+        .await;
+        assert_eq!(resp_status(&resp), 404);
+        let body = resp_json(resp).await;
+        assert_eq!(body["error"], "not_found");
+
+        let conn = state.conn.lock().await;
+        let role = group_membership_repository::resolve_user_project_role(
+            &conn, &target_id, "proj-z", None,
+        )
+        .unwrap();
+        assert_eq!(
+            role.as_deref(),
+            Some("viewer"),
+            "target's role must NOT have been changed by a non-member delegate"
+        );
+    }
+
+    /// R7-F1 sibling for `delete_project_membership_handler`: no
+    /// prior route-level test existed for this handler at all. Unlike
+    /// add/change it has no body-read yield point (confirmed in its
+    /// own doc comment), so it never hit the `read_body_and_revalidate`
+    /// bug the other two did -- `decide_delete_project_membership`'s
+    /// own `deny_cross_tenant_project_read` call was already correct.
+    /// Verified here end-to-end through the real handler for parity
+    /// with its two siblings' new coverage.
+    #[tokio::test]
+    async fn delete_project_membership_handler_denies_a_zero_membership_delegate_with_uniform_404()
+    {
+        let (_dir, state) = real_state();
+        let (_alice_id, _group_id, identity) = seed_delegate(
+            &state,
+            "alice",
+            &[Capability::SystemProjectsManage.as_str()],
+        )
+        .await;
+        let (target_id, _target_group, _target_identity) =
+            seed_delegate(&state, "target", &[]).await;
+        state
+            .registry
+            .register("proj-w", "/ws/proj-w", "python", chrono::Utc::now())
+            .unwrap();
+        {
+            let conn = state.conn.lock().await;
+            identity::grant_project_membership(&conn, "proj-w", Some(&target_id), None, "viewer")
+                .unwrap();
+        }
+        // Deliberately NO project_membership row for alice on proj-w.
+
+        let resp = delete_project_membership_handler(
+            State(state.clone()),
+            Extension(identity),
+            Path(("proj-w".to_string(), format!("u:{target_id}"))),
+        )
+        .await;
+        assert_eq!(resp_status(&resp), 404);
+        let body = resp_json(resp).await;
+        assert_eq!(body["error"], "not_found");
+
+        let conn = state.conn.lock().await;
+        let role = group_membership_repository::resolve_user_project_role(
+            &conn, &target_id, "proj-w", None,
+        )
+        .unwrap();
+        assert_eq!(
+            role.as_deref(),
+            Some("viewer"),
+            "target's membership must NOT have been removed by a non-member delegate"
         );
     }
 

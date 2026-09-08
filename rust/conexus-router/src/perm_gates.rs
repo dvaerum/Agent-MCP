@@ -83,6 +83,34 @@ fn forbidden(message: &str) -> HandlerResponse {
     }
 }
 
+/// Port of `_deny_cross_tenant_project_read`'s `role is None` branch
+/// (`_error(error=_ERROR_NOT_FOUND, ..., status=404)`) -- the SAME
+/// uniform 404 `not_found` envelope a nonexistent project produces.
+/// **Found-and-fixed bug (this PR)**: [`RevalidateOutcome::
+/// DeniedMembership`] used to map to [`forbidden`] (403) below, which
+/// reopens the exact project-existence oracle
+/// `deny_cross_tenant_project_read` exists to close -- a non-member
+/// delegate's response for an EXISTING (hidden) project must be
+/// indistinguishable from a NONEXISTENT one, not a distinct status
+/// that confirms the project is real. Python's own
+/// `_revalidate_capability_and_membership_or_403` composes
+/// `revalidate_capability_or_403` (genuinely 403 on a stale/revoked
+/// capability) with `_deny_cross_tenant_project_read` (404 when the
+/// caller resolves NO role at all; 403 only when a role resolves but
+/// its rank is below `min_role` -- see that function's own docstring)
+/// -- never a bespoke 403 for "no role".
+fn not_found(message: &str) -> HandlerResponse {
+    HandlerResponse {
+        status: 404,
+        headers: Vec::new(),
+        body: HandlerBody::Json(serde_json::json!({
+            "success": false,
+            "error": "not_found",
+            "message": message,
+        })),
+    }
+}
+
 fn internal_error(message: &str) -> HandlerResponse {
     HandlerResponse {
         status: 500,
@@ -141,9 +169,10 @@ fn revalidate(
                     Err(forbidden("session no longer valid"))
                 }
                 Ok(RevalidateOutcome::DeniedCapability) => Err(forbidden("capability revoked")),
-                Ok(RevalidateOutcome::DeniedMembership) => {
-                    Err(forbidden("project membership revoked"))
-                }
+                Ok(RevalidateOutcome::DeniedMembership) => Err(not_found(&format!(
+                    "unknown project: {:?}",
+                    project.project_name
+                ))),
                 Ok(RevalidateOutcome::DeniedRank { role, min_role }) => Err(forbidden(&format!(
                     "role {role:?} no longer meets the required {min_role:?}"
                 ))),
@@ -316,6 +345,35 @@ mod tests {
         assert!(principal.has_capability(Capability::SystemProjectsManage));
     }
 
+    /// Grants `user_id` `cap` via a fresh, dedicated group -- the
+    /// Wave-9 delegation shape every pentest fixture uses, so the
+    /// capability check the revalidator runs FIRST always passes and
+    /// the membership/rank branch under test is what actually decides
+    /// the outcome.
+    fn grant_capability_via_group(c: &Connection, user_id: &str, cap: Capability) {
+        let group =
+            conexus_db::group_membership_repository::create_group(c, "g-delegated", false, NOW)
+                .unwrap();
+        conexus_db::group_capability_repository::replace(c, &group.group_id, [cap.as_str()])
+            .unwrap();
+        conexus_db::group_membership_repository::add_group_member(
+            c,
+            &group.group_id,
+            Some(user_id),
+            None,
+            NOW,
+        )
+        .unwrap();
+    }
+
+    /// Bob holds the capability (via a delegated group) but resolves
+    /// NO role at all on `proj-a` -- Python's
+    /// `_deny_cross_tenant_project_read` (`role is None`) closes the
+    /// project-existence oracle with a uniform 404 `not_found` here,
+    /// reserving 403 for a resolved-but-under-ranked role (see the
+    /// sibling test below). Found-and-fixed bug (this PR): this used
+    /// to assert 403, matching `DeniedMembership`'s old (wrong)
+    /// mapping -- see `perm_gates::not_found`'s own doc.
     #[tokio::test]
     async fn revalidated_lock_denies_a_non_member_even_while_holding_the_lock() {
         let mut c = conn();
@@ -329,6 +387,55 @@ mod tests {
             true,
             &[],
             NOW,
+        )
+        .unwrap();
+        grant_capability_via_group(&c, &bob, Capability::SystemProjectsManage);
+        let db = AsyncMutex::new(c);
+        let store = RuntimeStore::new();
+        let spec = RevalidationSpec {
+            stale_user_id: &bob,
+            cookie_header: None,
+            now: NOW,
+            cap: Capability::SystemProjectsManage,
+            project: Some(RevalidationProject {
+                project_name: "proj-a",
+                min_role: Some("operator"),
+            }),
+        };
+        let resp = revalidated_lock(&store, &db, "proj-a", "backend", &spec)
+            .await
+            .unwrap_err();
+        assert_eq!(resp.status, 404);
+        let HandlerBody::Json(body) = resp.body else {
+            panic!("expected JSON");
+        };
+        assert_eq!(body["error"], "not_found");
+    }
+
+    /// The sibling of the test above: bob DOES resolve a role
+    /// (`viewer`), but it's below `min_role` ("operator") -- this is
+    /// the genuine 403 branch (`DeniedRank`), since bob is a real,
+    /// already-disclosed member and there's no existence oracle to
+    /// close for him.
+    #[tokio::test]
+    async fn revalidated_lock_denies_an_under_ranked_member_with_403_not_404() {
+        let mut c = conn();
+        seed_sysadmin(&mut c, "alice");
+        let bob = crate::identity::create_user(
+            &mut c,
+            "bob",
+            "correct horse battery staple",
+            None,
+            false,
+            true,
+            &[],
+            NOW,
+        )
+        .unwrap();
+        grant_capability_via_group(&c, &bob, Capability::SystemProjectsManage);
+        c.execute(
+            "INSERT INTO project_membership (project_name, user_id, role) VALUES ('proj-a', ?1, 'viewer')",
+            [&bob],
         )
         .unwrap();
         let db = AsyncMutex::new(c);
@@ -543,7 +650,16 @@ mod tests {
         let (_unit, revalidate_result) = revalidate_after(awaitable, &db, &spec).await;
         revoker.await.unwrap();
 
+        // Found-and-fixed bug (this PR): bob's membership row is
+        // GONE post-race (`resolve_user_project_role` -> None), the
+        // SAME "role is None" shape `deny_cross_tenant_project_read`
+        // closes with a uniform 404 `not_found` -- not the 403 this
+        // used to assert (see `perm_gates::not_found`'s own doc).
         let resp = revalidate_result.unwrap_err();
-        assert_eq!(resp.status, 403);
+        assert_eq!(resp.status, 404);
+        let HandlerBody::Json(body) = resp.body else {
+            panic!("expected JSON");
+        };
+        assert_eq!(body["error"], "not_found");
     }
 }

@@ -560,6 +560,59 @@ mod tests {
         assert!(identity::get_user_public_by_id(&c, &bob).unwrap().is_none());
     }
 
+    /// Regression (test_sec_r9_delete_sysadmin_guard.py): a non-
+    /// sysadmin delegate (AZ-R9-1's own caller shape) may still delete
+    /// an ORDINARY (non-sysadmin) user -- the sysadmin-target guard
+    /// must fire only for a sysadmin target, never over-reject a plain
+    /// delete.
+    #[test]
+    fn a_non_sysadmin_can_delete_a_normal_user() {
+        let mut c = conn();
+        seed_sysadmin(&mut c, "root"); // keeps the global invariant satisfied
+        let normie = identity::create_user(
+            &mut c,
+            "normie",
+            "correct horse battery staple",
+            None,
+            false,
+            false,
+            &[],
+            NOW,
+        )
+        .unwrap();
+        let outcome = decide_delete_user(&mut c, false, "bob", &normie).unwrap();
+        assert!(matches!(outcome, DeleteUserOutcome::Deleted(_)));
+        assert!(identity::get_user_public_by_id(&c, &normie)
+            .unwrap()
+            .is_none());
+    }
+
+    /// Regression: a sysadmin caller may still delete a NON-LAST
+    /// sysadmin account (the AZ-R9-1 guard only blocks a non-sysadmin
+    /// caller from deleting a sysadmin target -- it must not shadow
+    /// the legitimate sysadmin-deletes-sysadmin path).
+    #[test]
+    fn a_sysadmin_can_delete_a_non_last_sysadmin() {
+        let mut c = conn();
+        seed_sysadmin(&mut c, "root"); // stays behind as the surviving sysadmin
+        let victim = identity::create_user(
+            &mut c,
+            "deletable-admin",
+            "correct horse battery staple",
+            None,
+            true,
+            false,
+            &[],
+            NOW,
+        )
+        .unwrap();
+        let outcome = decide_delete_user(&mut c, true, "admin", &victim).unwrap();
+        assert!(matches!(outcome, DeleteUserOutcome::Deleted(_)));
+        assert!(identity::get_user_public_by_id(&c, &victim)
+            .unwrap()
+            .is_none());
+    }
+
     #[test]
     fn rejects_deleting_an_unknown_user() {
         let mut c = conn();
