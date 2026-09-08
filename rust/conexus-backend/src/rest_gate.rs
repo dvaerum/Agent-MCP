@@ -120,10 +120,22 @@ pub async fn require_rest_identity(
 mod tests {
     use super::*;
 
+    /// A real temp-file-backed connection shared with a sea-orm
+    /// connection to the SAME file -- `/create-sample-memories` writes
+    /// `project_context` rows through `ctx.sea_orm_db` (Phase G), so
+    /// two independent `:memory:` connections would leave this
+    /// module's own rusqlite-side assertions unable to see them (this
+    /// exact bug has bitten every prior PR in this migration). The
+    /// tempdir is deliberately leaked via `keep()` rather than
+    /// threaded through every call site.
     async fn test_shared_state(forwarding_hmac_key: Option<Vec<u8>>) -> Arc<SharedState> {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap().keep();
+        let conn = rusqlite::Connection::open(dir.join("test.db")).unwrap();
         conexus_db::schema::init_schema(&conn).unwrap();
-        let sea_orm_db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
+        let sea_orm_db =
+            sea_orm::Database::connect(format!("sqlite://{}", dir.join("test.db").display()))
+                .await
+                .unwrap();
         Arc::new(SharedState {
             conn: tokio::sync::Mutex::new(conn),
             forwarding_hmac_key,

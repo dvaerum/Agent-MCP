@@ -227,7 +227,11 @@ struct Dump {
     project_context: Vec<ProjectContextRow>,
 }
 
-fn apply(conn: &Connection, op: Operation) -> Result<(), String> {
+async fn apply(
+    conn: &Connection,
+    sea_orm_db: &sea_orm::DatabaseConnection,
+    op: Operation,
+) -> Result<(), String> {
     match op {
         Operation::AgentCreate {
             token,
@@ -301,7 +305,7 @@ fn apply(conn: &Connection, op: Operation) -> Result<(), String> {
             actor,
             now,
         } => project_context_repository::upsert(
-            conn,
+            sea_orm_db,
             &context_key,
             &value,
             description.as_deref(),
@@ -309,6 +313,7 @@ fn apply(conn: &Connection, op: Operation) -> Result<(), String> {
             &actor,
             &now,
         )
+        .await
         .map(|_| ())
         .map_err(|e| e.to_string()),
 
@@ -319,26 +324,28 @@ fn apply(conn: &Connection, op: Operation) -> Result<(), String> {
             actor,
             now,
         } => project_context_repository::create_new(
-            conn,
+            sea_orm_db,
             &context_key,
             &value,
             description.as_deref(),
             &actor,
             &now,
         )
+        .await
         .map(|_| ())
         .map_err(|e| e.to_string()),
 
         Operation::ContextDeleteMany { context_keys } => {
             let refs: Vec<&str> = context_keys.iter().map(String::as_str).collect();
-            project_context_repository::delete_many(conn, &refs)
+            project_context_repository::delete_many(sea_orm_db, &refs)
+                .await
                 .map(|_| ())
                 .map_err(|e| e.to_string())
         }
     }
 }
 
-fn run() -> Result<String, String> {
+async fn run() -> Result<String, String> {
     let mut input = String::new();
     std::io::stdin()
         .read_to_string(&mut input)
@@ -349,14 +356,26 @@ fn run() -> Result<String, String> {
 
     let conn = Connection::open(&request.db_path)
         .map_err(|e| format!("failed to open {}: {e}", request.db_path))?;
+    // project_context_repository is sea-orm-backed (Phase G); every
+    // other repository this binary drives (AgentRepository) is not
+    // yet, so both connections stay open against the SAME file for
+    // the life of this run -- matching every other Phase G call
+    // site's "legacy connection stays alive for not-yet-converted
+    // calls" pattern.
+    let sea_orm_db = sea_orm::Database::connect(format!("sqlite://{}", request.db_path))
+        .await
+        .map_err(|e| format!("failed to open {} via sea-orm: {e}", request.db_path))?;
 
     for op in request.operations {
-        apply(&conn, op).map_err(|e| format!("operation failed: {e}"))?;
+        apply(&conn, &sea_orm_db, op)
+            .await
+            .map_err(|e| format!("operation failed: {e}"))?;
     }
 
     let agents =
         AgentRepository::dump_all(&conn).map_err(|e| format!("failed to dump agents: {e}"))?;
-    let project_context = project_context_repository::list_all(&conn)
+    let project_context = project_context_repository::list_all(&sea_orm_db)
+        .await
         .map_err(|e| format!("failed to dump project_context: {e}"))?;
 
     serde_json::to_string(&Dump {
@@ -372,14 +391,15 @@ fn run_dump_router_tables(db_path: &str) -> Result<String, String> {
     serde_json::to_string(&dump).map_err(|e| format!("failed to serialize dump: {e}"))
 }
 
-fn main() -> ExitCode {
+#[tokio::main]
+async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     let result = match args.get(1).map(String::as_str) {
         Some("--dump-router-tables") => match args.get(2) {
             Some(db_path) => run_dump_router_tables(db_path),
             None => Err("--dump-router-tables requires a <db_path> argument".to_string()),
         },
-        _ => run(),
+        _ => run().await,
     };
     match result {
         Ok(json) => {

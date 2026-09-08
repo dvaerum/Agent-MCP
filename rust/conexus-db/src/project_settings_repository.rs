@@ -478,12 +478,24 @@ mod tests {
         assert_eq!(get(&conn, "b").unwrap(), None);
     }
 
-    #[test]
-    fn project_settings_and_project_context_are_independent_tables() {
+    #[tokio::test]
+    async fn project_settings_and_project_context_are_independent_tables() {
         // The whole point of this repository's existence (ADR-0016):
         // a key in one table must not collide with, shadow, or be
-        // visible through the other.
-        let conn = test_conn();
+        // visible through the other. `project_context_repository` is
+        // sea-orm-backed (Phase G) while this repository stays
+        // rusqlite -- a real temp file shared between both connection
+        // types (never `:memory:` for either side, since separate
+        // `:memory:` connections never see each other's data) is
+        // required for both to observe the same underlying table.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn).unwrap();
+        let sea_orm_db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+
         upsert(
             &conn,
             "shared_key",
@@ -495,7 +507,7 @@ mod tests {
         )
         .unwrap();
         crate::project_context_repository::upsert(
-            &conn,
+            &sea_orm_db,
             "shared_key",
             "context-value",
             None,
@@ -503,6 +515,7 @@ mod tests {
             "alice",
             "2026-01-01T00:00:00Z",
         )
+        .await
         .unwrap();
 
         assert_eq!(
@@ -510,7 +523,8 @@ mod tests {
             "settings-value"
         );
         assert_eq!(
-            crate::project_context_repository::get(&conn, "shared_key")
+            crate::project_context_repository::get(&sea_orm_db, "shared_key")
+                .await
                 .unwrap()
                 .unwrap()
                 .value,

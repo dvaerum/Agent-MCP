@@ -34,6 +34,13 @@ sea-orm = { version = "2", default-features = false, features = [
     "sqlx-sqlite",
     "runtime-tokio-rustls",
 ] }
+# Phase G PR 5: `project_context_repository` is the first repository
+# genuinely rewritten onto sea-orm, and `bin/conexus-db-differential.rs`
+# -- a real production binary, not a test -- drives it directly, so a
+# real async runtime is now needed to BUILD this crate, not just test
+# it. Promoted out of dev-dependencies (where it lived for Phase G PR
+# 1's entity round-trip tests only) for exactly that reason.
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [dev-dependencies]
 # Only needed to register the real sqlite-vec extension for THIS
@@ -42,12 +49,6 @@ sea-orm = { version = "2", default-features = false, features = [
 # `rag_embeddings` exists in sqlite_master, a plain SQL query), so
 # this stays a dev-dependency, not a real one.
 conexus-vec = { path = "../conexus-vec" }
-# Phase G entity round-trip tests need a real async runtime to drive
-# sea-orm's `DatabaseConnection` -- dev-only for now; conexus-db's
-# production code stays 100% sync until a repository is actually
-# rewritten onto sea-orm (PR 2+), matching this crate's own "never
-# introduce a dependency before a real caller needs it" discipline.
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 tempfile = "3"
 
 [[bin]]

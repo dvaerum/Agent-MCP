@@ -477,13 +477,12 @@ impl Tool for ValidateContextConsistencyTool {
     fn call<'a>(
         _principal: Option<&'a Principal>,
         _arguments: &'a Value,
-        conn: &'a AsyncMutex<Connection>,
+        _conn: &'a AsyncMutex<Connection>,
         now: &'a str,
-        _ctx: &'a conexus_auth::ToolCallContext<'a>,
+        ctx: &'a conexus_auth::ToolCallContext<'a>,
     ) -> conexus_auth::BoxFuture<'a, ToolResult> {
         Box::pin(async move {
-            let guard = conn.lock().await;
-            let entries = match project_context_repository::list_all(&guard) {
+            let entries = match project_context_repository::list_all(ctx.sea_orm_db).await {
                 Ok(rows) => rows,
                 Err(_e) => {
                     return ToolResult::Failed {
@@ -829,9 +828,9 @@ impl Tool for ViewProjectContextTool {
     fn call<'a>(
         _principal: Option<&'a Principal>,
         arguments: &'a Value,
-        conn: &'a AsyncMutex<Connection>,
+        _conn: &'a AsyncMutex<Connection>,
         now: &'a str,
-        _ctx: &'a conexus_auth::ToolCallContext<'a>,
+        ctx: &'a conexus_auth::ToolCallContext<'a>,
     ) -> conexus_auth::BoxFuture<'a, ToolResult> {
         Box::pin(async move {
             let context_key_filter = arguments
@@ -872,8 +871,7 @@ impl Tool for ViewProjectContextTool {
                 sort_by_raw
             };
 
-            let guard = conn.lock().await;
-            let all_rows = match project_context_repository::list_all(&guard) {
+            let all_rows = match project_context_repository::list_all(ctx.sea_orm_db).await {
                 Ok(rows) => rows,
                 Err(_e) => {
                     return ToolResult::Failed {
@@ -883,7 +881,6 @@ impl Tool for ViewProjectContextTool {
                     }
                 }
             };
-            drop(guard);
 
             let now_dt: DateTime<Utc> = match parse_flexible(now) {
                 Ok(dt) => dt,
@@ -972,8 +969,8 @@ fn config_key_error() -> ToolResult {
 /// Port of `_check_write_authorization` -- the per-key creator-
 /// ownership matrix every mutating tool in this module funnels
 /// through. `None` = the caller may write/delete `context_key`.
-fn check_write_authorization(
-    conn: &Connection,
+async fn check_write_authorization(
+    sea_orm_db: &sea_orm::DatabaseConnection,
     requesting_agent_id: &str,
     context_key: &str,
     is_admin: bool,
@@ -997,7 +994,7 @@ fn check_write_authorization(
     if is_admin {
         return None;
     }
-    let existing = match project_context_repository::get(conn, context_key) {
+    let existing = match project_context_repository::get(sea_orm_db, context_key).await {
         Ok(row) => row,
         Err(_e) => {
             return Some(ToolResult::Failed {
@@ -1102,21 +1099,26 @@ impl Tool for CreateProjectContextTool {
             let requesting_agent_id = principal.map(Principal::actor_label).unwrap_or("unknown");
             let is_admin = principal.is_some_and(conexus_core::principal::is_operator_tier);
 
-            let guard = conn.lock().await;
-            if let Some(denial) =
-                check_write_authorization(&guard, requesting_agent_id, context_key, is_admin)
+            if let Some(denial) = check_write_authorization(
+                ctx.sea_orm_db,
+                requesting_agent_id,
+                context_key,
+                is_admin,
+            )
+            .await
             {
                 return denial;
             }
 
             let created = project_context_repository::create_new(
-                &guard,
+                ctx.sea_orm_db,
                 context_key,
                 &value_json_str,
                 description,
                 requesting_agent_id,
                 now,
-            );
+            )
+            .await;
             match created {
                 Ok(Some(_row)) => {}
                 Ok(None) => {
@@ -1136,6 +1138,7 @@ impl Tool for CreateProjectContextTool {
                     }
                 }
             };
+            let guard = conn.lock().await;
             let _ = agent_action_repository::log_agent_action(
                 &guard,
                 requesting_agent_id,
@@ -1171,8 +1174,21 @@ impl Tool for CreateProjectContextTool {
 /// [`check_write_authorization`]. `Ok(true)` if the key was newly
 /// created (matches `upsert`'s own `created` flag; unused by the
 /// caller's response shape today but kept for parity/future use).
-fn single_update_project_context(
-    conn: &Connection,
+///
+/// Takes the whole `&AsyncMutex<Connection>`, not an already-locked
+/// `&Connection` -- a bare `&Connection` isn't `Send` (rusqlite's
+/// `Connection` holds a `RefCell` internally), so storing one as an
+/// `async fn`'s own parameter and holding it live across the
+/// `sea_orm_db` awaits above would make this function's generated
+/// future non-`Send`, which `Tool::call`'s `BoxFuture` requires. Only
+/// locking the legacy connection AFTER those awaits, for the single
+/// synchronous `log_agent_action` call, keeps the lock scope (and any
+/// non-`Send` value) off the future's live-across-await state
+/// entirely.
+#[allow(clippy::too_many_arguments)]
+async fn single_update_project_context(
+    conn: &AsyncMutex<Connection>,
+    sea_orm_db: &sea_orm::DatabaseConnection,
     requesting_agent_id: &str,
     context_key: &str,
     value_json_str: &str,
@@ -1181,12 +1197,12 @@ fn single_update_project_context(
     now: &str,
 ) -> Result<bool, ToolResult> {
     if let Some(denial) =
-        check_write_authorization(conn, requesting_agent_id, context_key, is_admin)
+        check_write_authorization(sea_orm_db, requesting_agent_id, context_key, is_admin).await
     {
         return Err(denial);
     }
     let (_, created) = project_context_repository::upsert(
-        conn,
+        sea_orm_db,
         context_key,
         value_json_str,
         description,
@@ -1194,13 +1210,15 @@ fn single_update_project_context(
         requesting_agent_id,
         now,
     )
+    .await
     .map_err(|_e| ToolResult::Failed {
         message: "A database error occurred; it has been logged. Retry, or ask an operator to \
             check logs."
             .to_string(),
     })?;
+    let guard = conn.lock().await;
     let _ = agent_action_repository::log_agent_action(
-        conn,
+        &guard,
         requesting_agent_id,
         "updated_context",
         None,
@@ -1228,8 +1246,17 @@ enum BulkUpdateOutcome {
 /// `json.dumps`) is recorded and does NOT abort the batch, matching
 /// Python's "atomic on authorization, not on per-item success"
 /// design.
-fn bulk_update_project_context_entries(
-    conn: &Connection,
+///
+/// Takes the whole `&AsyncMutex<Connection>`, not an already-locked
+/// `&Connection` -- see [`single_update_project_context`]'s doc for
+/// why a bare `&Connection` can't be held live across this function's
+/// own `sea_orm_db` awaits without breaking `Tool::call`'s `Send`
+/// future requirement. Each Phase 2 iteration locks the legacy
+/// connection fresh, only for its own synchronous `log_agent_action`
+/// call.
+async fn bulk_update_project_context_entries(
+    conn: &AsyncMutex<Connection>,
+    sea_orm_db: &sea_orm::DatabaseConnection,
     requesting_agent_id: &str,
     updates: &[Value],
     is_admin: bool,
@@ -1240,7 +1267,9 @@ fn bulk_update_project_context_entries(
         let Some(key) = update.get("context_key").and_then(Value::as_str) else {
             continue;
         };
-        if let Some(denial) = check_write_authorization(conn, requesting_agent_id, key, is_admin) {
+        if let Some(denial) =
+            check_write_authorization(sea_orm_db, requesting_agent_id, key, is_admin).await
+        {
             return Err(denial);
         }
     }
@@ -1275,21 +1304,23 @@ fn bulk_update_project_context_entries(
 
         let value_json_str = context_value.to_string();
         let result = project_context_repository::upsert(
-            conn,
+            sea_orm_db,
             context_key,
             &value_json_str,
             description.as_deref(),
             description_provided,
             requesting_agent_id,
             now,
-        );
+        )
+        .await;
         match result {
             Ok(_) => {
                 outcomes.push(BulkUpdateOutcome::Updated {
                     context_key: context_key.to_string(),
                 });
+                let guard = conn.lock().await;
                 let _ = agent_action_repository::log_agent_action(
-                    conn,
+                    &guard,
                     requesting_agent_id,
                     "bulk_updated_context",
                     None,
@@ -1411,18 +1442,19 @@ impl Tool for UpdateProjectContextTool {
                     };
                 };
 
-                let guard = conn.lock().await;
                 let outcomes = match bulk_update_project_context_entries(
-                    &guard,
+                    conn,
+                    ctx.sea_orm_db,
                     requesting_agent_id,
                     updates,
                     is_admin,
                     now,
-                ) {
+                )
+                .await
+                {
                     Ok(o) => o,
                     Err(denial) => return denial,
                 };
-                drop(guard);
 
                 let keys: Vec<&str> = updates
                     .iter()
@@ -1468,19 +1500,20 @@ impl Tool for UpdateProjectContextTool {
             let description = arguments.get("description").and_then(Value::as_str);
             let value_json_str = context_value.to_string();
 
-            let guard = conn.lock().await;
             if let Err(denial) = single_update_project_context(
-                &guard,
+                conn,
+                ctx.sea_orm_db,
                 requesting_agent_id,
                 context_key,
                 &value_json_str,
                 description,
                 is_admin,
                 now,
-            ) {
+            )
+            .await
+            {
                 return denial;
             }
-            drop(guard);
 
             let wakes: Vec<&str> = {
                 let guard = conn.lock().await;
@@ -1598,18 +1631,19 @@ impl Tool for BulkUpdateProjectContextTool {
             let requesting_agent_id = principal.map(Principal::actor_label).unwrap_or("unknown");
             let is_admin = principal.is_some_and(conexus_core::principal::is_operator_tier);
 
-            let guard = conn.lock().await;
             let outcomes = match bulk_update_project_context_entries(
-                &guard,
+                conn,
+                ctx.sea_orm_db,
                 requesting_agent_id,
                 updates,
                 is_admin,
                 now,
-            ) {
+            )
+            .await
+            {
                 Ok(o) => o,
                 Err(denial) => return denial,
             };
-            drop(guard);
 
             let keys: Vec<&str> = updates
                 .iter()
@@ -1742,27 +1776,27 @@ impl Tool for DeleteProjectContextTool {
             let requesting_agent_id = principal.map(Principal::actor_label).unwrap_or("unknown");
             let is_admin = principal.is_some_and(conexus_core::principal::is_operator_tier);
 
-            let guard = conn.lock().await;
-
             for key in &keys_to_delete {
                 if let Some(denial) =
-                    check_write_authorization(&guard, requesting_agent_id, key, is_admin)
+                    check_write_authorization(ctx.sea_orm_db, requesting_agent_id, key, is_admin)
+                        .await
                 {
                     return denial;
                 }
             }
 
             let key_refs: Vec<&str> = keys_to_delete.iter().map(String::as_str).collect();
-            let deleted_rows = match project_context_repository::delete_many(&guard, &key_refs) {
-                Ok(rows) => rows,
-                Err(_e) => {
-                    return ToolResult::Failed {
-                        message: "A database error occurred; it has been logged. Retry, or ask \
-                            an operator to check logs."
-                            .to_string(),
+            let deleted_rows =
+                match project_context_repository::delete_many(ctx.sea_orm_db, &key_refs).await {
+                    Ok(rows) => rows,
+                    Err(_e) => {
+                        return ToolResult::Failed {
+                            message: "A database error occurred; it has been logged. Retry, or \
+                                ask an operator to check logs."
+                                .to_string(),
+                        }
                     }
-                }
-            };
+                };
 
             if deleted_rows.is_empty() {
                 return ToolResult::NotFound {
@@ -1788,6 +1822,7 @@ impl Tool for DeleteProjectContextTool {
                 .map(|(k, _, _)| k.as_str())
                 .collect();
 
+            let guard = conn.lock().await;
             let _ = agent_action_repository::log_agent_action(
                 &guard,
                 requesting_agent_id,
@@ -1961,7 +1996,7 @@ impl Tool for BackupProjectContextTool {
             };
 
             let guard = conn.lock().await;
-            let entries = match project_context_repository::list_all(&guard) {
+            let entries = match project_context_repository::list_all(ctx.sea_orm_db).await {
                 Ok(rows) => rows,
                 Err(_e) => {
                     return ToolResult::Failed {
@@ -2342,10 +2377,25 @@ mod tests {
     use conexus_wakeloop::file_map::FileMap;
     use conexus_wakeloop::waiter_registry::WaiterRegistry;
 
-    async fn setup() -> AsyncMutex<Connection> {
-        let conn = Connection::open_in_memory().unwrap();
+    /// Phase G: `project_context_repository`'s calls now genuinely
+    /// query through `ctx.sea_orm_db` -- an unrelated `:memory:`
+    /// connection (SQLite's `:memory:` databases are never shared
+    /// across separate connections) would silently see an empty,
+    /// schema-less database. Both connection types must point at the
+    /// SAME real temp file.
+    async fn setup() -> (
+        tempfile::TempDir,
+        AsyncMutex<Connection>,
+        sea_orm::DatabaseConnection,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let conn = Connection::open(&path).unwrap();
         init_schema(&conn).unwrap();
-        AsyncMutex::new(conn)
+        let sea_orm_db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        (dir, AsyncMutex::new(conn), sea_orm_db)
     }
 
     fn ctx<'a>(
@@ -2368,22 +2418,12 @@ mod tests {
         ToolCallContext::off_wire(registry, file_map, project_dir, sea_orm_db)
     }
 
-    // Phase G (sea-orm migration infra): a throwaway in-memory sea-orm
-    // connection for ToolCallContext::sea_orm_db -- no test in this
-    // file queries through it yet, it only needs to exist so ctx()'s/
-    // ctx_with_project_dir()'s now-mandatory last argument has
-    // something to point at.
-    async fn test_sea_orm_db() -> sea_orm::DatabaseConnection {
-        sea_orm::Database::connect("sqlite::memory:").await.unwrap()
-    }
-
     #[tokio::test]
     async fn an_empty_context_is_a_benign_ok_not_an_error() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = ValidateContextConsistencyTool::call(
             Some(&alice),
@@ -2402,23 +2442,20 @@ mod tests {
 
     #[tokio::test]
     async fn a_clean_populated_context_reports_no_issues() {
-        let conn = setup().await;
-        {
-            let guard = conn.lock().await;
-            project_context_repository::create_new(
-                &guard,
-                "a.key",
-                "\"value\"",
-                Some("a description"),
-                "alice",
-                "2026-06-01T00:00:00Z",
-            )
-            .unwrap();
-        }
+        let (_dir, conn, sea_orm_db) = setup().await;
+        project_context_repository::create_new(
+            &sea_orm_db,
+            "a.key",
+            "\"value\"",
+            Some("a description"),
+            "alice",
+            "2026-06-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = ValidateContextConsistencyTool::call(
             Some(&alice),
@@ -2437,10 +2474,9 @@ mod tests {
 
     #[tokio::test]
     async fn an_unauthenticated_caller_is_denied() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let denied =
             ValidateContextConsistencyTool::REQUIRED.check(None, &conexus_auth::NoPolicyOverrides);
@@ -2462,21 +2498,25 @@ mod tests {
 
     // ── ViewProjectContextTool ───────────────────────────────────────
 
-    async fn seed_context(conn: &AsyncMutex<Connection>, key: &str, value: &str, now: &str) {
-        let guard = conn.lock().await;
-        project_context_repository::create_new(&guard, key, value, Some("d"), "alice", now)
+    async fn seed_context(
+        sea_orm_db: &sea_orm::DatabaseConnection,
+        key: &str,
+        value: &str,
+        now: &str,
+    ) {
+        project_context_repository::create_new(sea_orm_db, key, value, Some("d"), "alice", now)
+            .await
             .unwrap();
     }
 
     #[tokio::test]
     async fn view_returns_all_entries_by_default() {
-        let conn = setup().await;
-        seed_context(&conn, "a", "\"one\"", "2026-06-01T00:00:00Z").await;
-        seed_context(&conn, "b", "\"two\"", "2026-06-01T00:01:00Z").await;
+        let (_dir, conn, sea_orm_db) = setup().await;
+        seed_context(&sea_orm_db, "a", "\"one\"", "2026-06-01T00:00:00Z").await;
+        seed_context(&sea_orm_db, "b", "\"two\"", "2026-06-01T00:01:00Z").await;
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = ViewProjectContextTool::call(
             Some(&alice),
@@ -2494,13 +2534,12 @@ mod tests {
 
     #[tokio::test]
     async fn view_filters_by_exact_context_key() {
-        let conn = setup().await;
-        seed_context(&conn, "a", "\"one\"", "2026-06-01T00:00:00Z").await;
-        seed_context(&conn, "b", "\"two\"", "2026-06-01T00:01:00Z").await;
+        let (_dir, conn, sea_orm_db) = setup().await;
+        seed_context(&sea_orm_db, "a", "\"one\"", "2026-06-01T00:00:00Z").await;
+        seed_context(&sea_orm_db, "b", "\"two\"", "2026-06-01T00:01:00Z").await;
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = ViewProjectContextTool::call(
             Some(&alice),
@@ -2520,26 +2559,31 @@ mod tests {
 
     #[tokio::test]
     async fn view_search_query_matches_key_description_and_value() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         seed_context(
-            &conn,
+            &sea_orm_db,
             "matching-key",
             "\"irrelevant\"",
             "2026-06-01T00:00:00Z",
         )
         .await;
         seed_context(
-            &conn,
+            &sea_orm_db,
             "other",
             "\"has matching text\"",
             "2026-06-01T00:01:00Z",
         )
         .await;
-        seed_context(&conn, "unrelated", "\"nothing\"", "2026-06-01T00:02:00Z").await;
+        seed_context(
+            &sea_orm_db,
+            "unrelated",
+            "\"nothing\"",
+            "2026-06-01T00:02:00Z",
+        )
+        .await;
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = ViewProjectContextTool::call(
             Some(&alice),
@@ -2557,13 +2601,12 @@ mod tests {
 
     #[tokio::test]
     async fn view_show_stale_entries_filters_to_only_stale_rows() {
-        let conn = setup().await;
-        seed_context(&conn, "fresh", "\"v\"", "2026-06-01T00:00:00Z").await;
-        seed_context(&conn, "stale", "\"v\"", "2026-01-01T00:00:00Z").await;
+        let (_dir, conn, sea_orm_db) = setup().await;
+        seed_context(&sea_orm_db, "fresh", "\"v\"", "2026-06-01T00:00:00Z").await;
+        seed_context(&sea_orm_db, "stale", "\"v\"", "2026-01-01T00:00:00Z").await;
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = ViewProjectContextTool::call(
             Some(&alice),
@@ -2583,13 +2626,12 @@ mod tests {
 
     #[tokio::test]
     async fn view_sorts_by_key_ascending() {
-        let conn = setup().await;
-        seed_context(&conn, "zebra", "\"v\"", "2026-06-01T00:00:00Z").await;
-        seed_context(&conn, "alpha", "\"v\"", "2026-06-01T00:01:00Z").await;
+        let (_dir, conn, sea_orm_db) = setup().await;
+        seed_context(&sea_orm_db, "zebra", "\"v\"", "2026-06-01T00:00:00Z").await;
+        seed_context(&sea_orm_db, "alpha", "\"v\"", "2026-06-01T00:01:00Z").await;
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = ViewProjectContextTool::call(
             Some(&alice),
@@ -2609,13 +2651,12 @@ mod tests {
 
     #[tokio::test]
     async fn view_last_updated_is_accepted_as_a_deprecated_alias_for_updated_at() {
-        let conn = setup().await;
-        seed_context(&conn, "older", "\"v\"", "2026-06-01T00:00:00Z").await;
-        seed_context(&conn, "newer", "\"v\"", "2026-06-01T00:05:00Z").await;
+        let (_dir, conn, sea_orm_db) = setup().await;
+        seed_context(&sea_orm_db, "older", "\"v\"", "2026-06-01T00:00:00Z").await;
+        seed_context(&sea_orm_db, "newer", "\"v\"", "2026-06-01T00:05:00Z").await;
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = ViewProjectContextTool::call(
             Some(&alice),
@@ -2636,10 +2677,10 @@ mod tests {
 
     #[tokio::test]
     async fn view_max_results_is_clamped_into_range() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         for i in 0..3 {
             seed_context(
-                &conn,
+                &sea_orm_db,
                 &format!("k{i}"),
                 "\"v\"",
                 &format!("2026-06-01T00:0{i}:00Z"),
@@ -2649,7 +2690,6 @@ mod tests {
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = ViewProjectContextTool::call(
             Some(&alice),
@@ -2667,23 +2707,20 @@ mod tests {
 
     #[tokio::test]
     async fn view_flags_invalid_json_and_renders_it_unquoted_in_the_preview() {
-        let conn = setup().await;
-        {
-            let guard = conn.lock().await;
-            project_context_repository::create_new(
-                &guard,
-                "raw-string",
-                "not valid json",
-                Some("d"),
-                "alice",
-                "2026-06-01T00:00:00Z",
-            )
-            .unwrap();
-        }
+        let (_dir, conn, sea_orm_db) = setup().await;
+        project_context_repository::create_new(
+            &sea_orm_db,
+            "raw-string",
+            "not valid json",
+            Some("d"),
+            "alice",
+            "2026-06-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = ViewProjectContextTool::call(
             Some(&alice),
@@ -2704,12 +2741,11 @@ mod tests {
 
     #[tokio::test]
     async fn view_health_analysis_is_included_when_requested() {
-        let conn = setup().await;
-        seed_context(&conn, "a", "\"ok\"", "2026-06-01T00:00:00Z").await;
+        let (_dir, conn, sea_orm_db) = setup().await;
+        seed_context(&sea_orm_db, "a", "\"ok\"", "2026-06-01T00:00:00Z").await;
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = ViewProjectContextTool::call(
             Some(&alice),
@@ -2744,24 +2780,21 @@ mod tests {
         // "Needs_Attention". One healthy + one stale-and-invalid-JSON
         // entry (out of 2 total) lands the health score at 55, inside
         // the needs_attention band (50-70).
-        let conn = setup().await;
-        seed_context(&conn, "healthy", "\"ok\"", "2026-06-01T00:00:00Z").await;
-        {
-            let guard = conn.lock().await;
-            project_context_repository::create_new(
-                &guard,
-                "bad",
-                "not valid json",
-                Some("d"),
-                "alice",
-                "2026-01-01T00:00:00Z",
-            )
-            .unwrap();
-        }
+        let (_dir, conn, sea_orm_db) = setup().await;
+        seed_context(&sea_orm_db, "healthy", "\"ok\"", "2026-06-01T00:00:00Z").await;
+        project_context_repository::create_new(
+            &sea_orm_db,
+            "bad",
+            "not valid json",
+            Some("d"),
+            "alice",
+            "2026-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = ViewProjectContextTool::call(
             Some(&alice),
@@ -2801,11 +2834,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_worker_can_create_a_new_key() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = CreateProjectContextTool::call(
             Some(&alice),
@@ -2823,12 +2855,11 @@ mod tests {
 
     #[tokio::test]
     async fn creating_an_existing_key_is_a_conflict_not_an_overwrite() {
-        let conn = setup().await;
-        seed_context(&conn, "dup", "\"v1\"", "2026-06-01T00:00:00Z").await;
+        let (_dir, conn, sea_orm_db) = setup().await;
+        seed_context(&sea_orm_db, "dup", "\"v1\"", "2026-06-01T00:00:00Z").await;
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = CreateProjectContextTool::call(
             Some(&alice),
@@ -2843,11 +2874,10 @@ mod tests {
 
     #[tokio::test]
     async fn an_invalid_charset_key_is_invalid() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = CreateProjectContextTool::call(
             Some(&alice),
@@ -2862,11 +2892,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_config_namespaced_key_is_rejected_for_everyone_including_admin() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         let op = write_operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = CreateProjectContextTool::call(
             Some(&op),
@@ -2881,11 +2910,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_viewer_tier_operator_cannot_create_a_key() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         let viewer = viewer_operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let denied = CreateProjectContextTool::REQUIRED
             .check(Some(&viewer), &conexus_auth::NoPolicyOverrides);
@@ -2909,12 +2937,11 @@ mod tests {
         // never actually reachable, not a bug. wake_notify::deliver's
         // own test module exercises the broadcast behavior directly
         // against a non-namespace-restricted caller instead.
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         let alice = worker();
         let registry = WaiterRegistry::new();
         let (_sender, mut receiver) = registry.register("alice");
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = CreateProjectContextTool::call(
             Some(&alice),
@@ -2946,11 +2973,10 @@ mod tests {
 
     #[tokio::test]
     async fn single_update_creates_a_new_key_when_it_does_not_exist() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = UpdateProjectContextTool::call(
             Some(&alice),
@@ -2968,23 +2994,20 @@ mod tests {
 
     #[tokio::test]
     async fn single_update_without_description_preserves_the_existing_one() {
-        let conn = setup().await;
-        {
-            let guard = conn.lock().await;
-            project_context_repository::create_new(
-                &guard,
-                "k",
-                "\"v1\"",
-                Some("original description"),
-                "alice",
-                "2026-06-01T00:00:00Z",
-            )
-            .unwrap();
-        }
+        let (_dir, conn, sea_orm_db) = setup().await;
+        project_context_repository::create_new(
+            &sea_orm_db,
+            "k",
+            "\"v1\"",
+            Some("original description"),
+            "alice",
+            "2026-06-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = UpdateProjectContextTool::call(
             Some(&alice),
@@ -2995,8 +3018,8 @@ mod tests {
         )
         .await;
         assert!(matches!(result, ToolResult::Ok { .. }));
-        let guard = conn.lock().await;
-        let row = project_context_repository::get(&guard, "k")
+        let row = project_context_repository::get(&sea_orm_db, "k")
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(row.value, "\"v2\"");
@@ -3005,15 +3028,14 @@ mod tests {
 
     #[tokio::test]
     async fn single_update_denies_a_foreign_key_for_a_non_admin() {
-        let conn = setup().await;
-        seed_context(&conn, "k", "\"v1\"", "2026-06-01T00:00:00Z").await;
+        let (_dir, conn, sea_orm_db) = setup().await;
+        seed_context(&sea_orm_db, "k", "\"v1\"", "2026-06-01T00:00:00Z").await;
         let bob = Principal {
             agent_id: Some("bob".to_string()),
             ..worker()
         };
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = UpdateProjectContextTool::call(
             Some(&bob),
@@ -3034,11 +3056,10 @@ mod tests {
 
     #[tokio::test]
     async fn update_tools_bulk_arm_dispatches_on_updates_presence_even_though_schema_omits_it() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = UpdateProjectContextTool::call(
             Some(&alice),
@@ -3065,11 +3086,10 @@ mod tests {
         // batch is not aborted. Contrast with
         // `bulk_tools_own_strict_validation_rejects_the_whole_batch_
         // upfront` below.
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = UpdateProjectContextTool::call(
             Some(&alice),
@@ -3099,23 +3119,20 @@ mod tests {
 
     #[tokio::test]
     async fn bulk_update_authorizes_every_key_up_front_aborting_the_whole_batch_on_denial() {
-        let conn = setup().await;
-        {
-            let guard = conn.lock().await;
-            project_context_repository::create_new(
-                &guard,
-                "owned-by-bob",
-                "\"v\"",
-                Some("d"),
-                "bob",
-                "2026-06-01T00:00:00Z",
-            )
-            .unwrap();
-        }
+        let (_dir, conn, sea_orm_db) = setup().await;
+        project_context_repository::create_new(
+            &sea_orm_db,
+            "owned-by-bob",
+            "\"v\"",
+            Some("d"),
+            "bob",
+            "2026-06-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = UpdateProjectContextTool::call(
             Some(&alice),
@@ -3131,10 +3148,12 @@ mod tests {
         assert!(matches!(result, ToolResult::PermissionDenied { .. }));
         // Zero writes landed -- the whole batch aborted, including the
         // key that would otherwise have been perfectly fine.
-        let guard = conn.lock().await;
-        assert!(project_context_repository::get(&guard, "alice-owned-new")
-            .unwrap()
-            .is_none());
+        assert!(
+            project_context_repository::get(&sea_orm_db, "alice-owned-new")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -3144,12 +3163,11 @@ mod tests {
         // this proves deliver_bulk's dedup logic directly via a
         // non-namespaced pseudo-key is not reachable through THIS
         // tool either, matching the sibling test's documented finding.
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         let alice = worker();
         let registry = WaiterRegistry::new();
         let (_sender, mut receiver) = registry.register("alice");
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = UpdateProjectContextTool::call(
             Some(&alice),
@@ -3176,11 +3194,10 @@ mod tests {
         // direction: THIS standalone tool validates every item's shape
         // BEFORE any write, so a malformed item hard-fails the call
         // instead of just failing that one item.
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = BulkUpdateProjectContextTool::call(
             Some(&alice),
@@ -3196,19 +3213,18 @@ mod tests {
         assert!(matches!(result, ToolResult::Invalid { .. }));
         // Zero writes landed -- the shape check happens before Phase 1
         // authorization even starts.
-        let guard = conn.lock().await;
-        assert!(project_context_repository::get(&guard, "good")
+        assert!(project_context_repository::get(&sea_orm_db, "good")
+            .await
             .unwrap()
             .is_none());
     }
 
     #[tokio::test]
     async fn bulk_tool_happy_path_updates_every_item() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = BulkUpdateProjectContextTool::call(
             Some(&alice),
@@ -3225,12 +3241,13 @@ mod tests {
             panic!("expected Ok, got {result:?}");
         };
         assert_eq!(data.unwrap()["updates_attempted"], 2);
-        let guard = conn.lock().await;
-        let a = project_context_repository::get(&guard, "a")
+        let a = project_context_repository::get(&sea_orm_db, "a")
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(a.value, "\"1\"");
-        let b = project_context_repository::get(&guard, "b")
+        let b = project_context_repository::get(&sea_orm_db, "b")
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(b.description.as_deref(), Some("desc-b"));
@@ -3238,23 +3255,20 @@ mod tests {
 
     #[tokio::test]
     async fn bulk_tool_an_explicit_null_description_clears_an_existing_one() {
-        let conn = setup().await;
-        {
-            let guard = conn.lock().await;
-            project_context_repository::create_new(
-                &guard,
-                "k",
-                "\"v1\"",
-                Some("original"),
-                "alice",
-                "2026-06-01T00:00:00Z",
-            )
-            .unwrap();
-        }
+        let (_dir, conn, sea_orm_db) = setup().await;
+        project_context_repository::create_new(
+            &sea_orm_db,
+            "k",
+            "\"v1\"",
+            Some("original"),
+            "alice",
+            "2026-06-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = BulkUpdateProjectContextTool::call(
             Some(&alice),
@@ -3267,8 +3281,8 @@ mod tests {
         )
         .await;
         assert!(matches!(result, ToolResult::Ok { .. }));
-        let guard = conn.lock().await;
-        let row = project_context_repository::get(&guard, "k")
+        let row = project_context_repository::get(&sea_orm_db, "k")
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(row.description, None);
@@ -3284,23 +3298,20 @@ mod tests {
     /// BL-R22-1's comment at this tool's `description_provided` site).
     #[tokio::test]
     async fn bulk_tool_value_only_update_preserves_existing_description() {
-        let conn = setup().await;
-        {
-            let guard = conn.lock().await;
-            project_context_repository::create_new(
-                &guard,
-                "r22_bulk",
-                "\"v1\"",
-                Some("original bulk description"),
-                "alice",
-                "2026-06-01T00:00:00Z",
-            )
-            .unwrap();
-        }
+        let (_dir, conn, sea_orm_db) = setup().await;
+        project_context_repository::create_new(
+            &sea_orm_db,
+            "r22_bulk",
+            "\"v1\"",
+            Some("original bulk description"),
+            "alice",
+            "2026-06-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = BulkUpdateProjectContextTool::call(
             Some(&alice),
@@ -3313,8 +3324,8 @@ mod tests {
         )
         .await;
         assert!(matches!(result, ToolResult::Ok { .. }));
-        let guard = conn.lock().await;
-        let row = project_context_repository::get(&guard, "r22_bulk")
+        let row = project_context_repository::get(&sea_orm_db, "r22_bulk")
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(row.value, "\"v2\"");
@@ -3332,11 +3343,10 @@ mod tests {
     /// CREATE case, it doesn't remove it.
     #[tokio::test]
     async fn bulk_tool_create_without_description_gets_placeholder_default() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = BulkUpdateProjectContextTool::call(
             Some(&alice),
@@ -3349,8 +3359,8 @@ mod tests {
         )
         .await;
         assert!(matches!(result, ToolResult::Ok { .. }));
-        let guard = conn.lock().await;
-        let row = project_context_repository::get(&guard, "r22_bulk_create")
+        let row = project_context_repository::get(&sea_orm_db, "r22_bulk_create")
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(row.description.as_deref(), Some("Bulk update operation 1"));
@@ -3361,11 +3371,10 @@ mod tests {
         // Phase 2 applies each authorized item independently -- with
         // both items passing Phase 1 authorization (new, non-config_*
         // keys), both must land, including a non-string JSON value.
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = BulkUpdateProjectContextTool::call(
             Some(&alice),
@@ -3379,22 +3388,22 @@ mod tests {
         )
         .await;
         assert!(matches!(result, ToolResult::Ok { .. }));
-        let guard = conn.lock().await;
-        assert!(project_context_repository::get(&guard, "x")
+        assert!(project_context_repository::get(&sea_orm_db, "x")
+            .await
             .unwrap()
             .is_some());
-        assert!(project_context_repository::get(&guard, "y")
+        assert!(project_context_repository::get(&sea_orm_db, "y")
+            .await
             .unwrap()
             .is_some());
     }
 
     #[tokio::test]
     async fn bulk_tool_empty_updates_array_is_invalid() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = BulkUpdateProjectContextTool::call(
             Some(&alice),
@@ -3428,12 +3437,11 @@ mod tests {
 
     #[tokio::test]
     async fn deletes_a_single_owned_key() {
-        let conn = setup().await;
-        seed_context(&conn, "k", "\"v\"", "2026-06-01T00:00:00Z").await;
+        let (_dir, conn, sea_orm_db) = setup().await;
+        seed_context(&sea_orm_db, "k", "\"v\"", "2026-06-01T00:00:00Z").await;
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = DeleteProjectContextTool::call(
             Some(&alice),
@@ -3447,21 +3455,20 @@ mod tests {
             panic!("expected Ok, got {result:?}");
         };
         assert_eq!(data.unwrap()["deleted_count"], 1);
-        let guard = conn.lock().await;
-        assert!(project_context_repository::get(&guard, "k")
+        assert!(project_context_repository::get(&sea_orm_db, "k")
+            .await
             .unwrap()
             .is_none());
     }
 
     #[tokio::test]
     async fn deletes_multiple_keys_via_context_keys_array() {
-        let conn = setup().await;
-        seed_context(&conn, "a", "\"1\"", "2026-06-01T00:00:00Z").await;
-        seed_context(&conn, "b", "\"2\"", "2026-06-01T00:00:00Z").await;
+        let (_dir, conn, sea_orm_db) = setup().await;
+        seed_context(&sea_orm_db, "a", "\"1\"", "2026-06-01T00:00:00Z").await;
+        seed_context(&sea_orm_db, "b", "\"2\"", "2026-06-01T00:00:00Z").await;
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = DeleteProjectContextTool::call(
             Some(&alice),
@@ -3479,11 +3486,10 @@ mod tests {
 
     #[tokio::test]
     async fn no_keys_specified_is_invalid() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = DeleteProjectContextTool::call(
             Some(&alice),
@@ -3498,11 +3504,10 @@ mod tests {
 
     #[tokio::test]
     async fn deleting_a_nonexistent_key_is_not_found() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = DeleteProjectContextTool::call(
             Some(&alice),
@@ -3517,11 +3522,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_config_namespaced_delete_is_rejected_before_the_critical_key_guard() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         let op = write_operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = DeleteProjectContextTool::call(
             Some(&op),
@@ -3543,12 +3547,17 @@ mod tests {
 
     #[tokio::test]
     async fn a_critical_key_without_force_delete_is_refused() {
-        let conn = setup().await;
-        seed_context(&conn, "server_startup", "\"v\"", "2026-06-01T00:00:00Z").await;
+        let (_dir, conn, sea_orm_db) = setup().await;
+        seed_context(
+            &sea_orm_db,
+            "server_startup",
+            "\"v\"",
+            "2026-06-01T00:00:00Z",
+        )
+        .await;
         let admin = admin_agent();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = DeleteProjectContextTool::call(
             Some(&admin),
@@ -3559,20 +3568,27 @@ mod tests {
         )
         .await;
         assert!(matches!(result, ToolResult::Invalid { .. }));
-        let guard = conn.lock().await;
-        assert!(project_context_repository::get(&guard, "server_startup")
-            .unwrap()
-            .is_some());
+        assert!(
+            project_context_repository::get(&sea_orm_db, "server_startup")
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]
     async fn a_critical_key_with_force_delete_succeeds() {
-        let conn = setup().await;
-        seed_context(&conn, "server_startup", "\"v\"", "2026-06-01T00:00:00Z").await;
+        let (_dir, conn, sea_orm_db) = setup().await;
+        seed_context(
+            &sea_orm_db,
+            "server_startup",
+            "\"v\"",
+            "2026-06-01T00:00:00Z",
+        )
+        .await;
         let admin = admin_agent();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = DeleteProjectContextTool::call(
             Some(&admin),
@@ -3595,15 +3611,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_non_owner_worker_is_denied_before_any_deletion() {
-        let conn = setup().await;
-        seed_context(&conn, "k", "\"v\"", "2026-06-01T00:00:00Z").await;
+        let (_dir, conn, sea_orm_db) = setup().await;
+        seed_context(&sea_orm_db, "k", "\"v\"", "2026-06-01T00:00:00Z").await;
         let bob = Principal {
             agent_id: Some("bob".to_string()),
             ..worker()
         };
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = DeleteProjectContextTool::call(
             Some(&bob),
@@ -3614,32 +3629,35 @@ mod tests {
         )
         .await;
         assert!(matches!(result, ToolResult::PermissionDenied { .. }));
-        let guard = conn.lock().await;
-        assert!(project_context_repository::get(&guard, "k")
+        assert!(project_context_repository::get(&sea_orm_db, "k")
+            .await
             .unwrap()
             .is_some());
     }
 
     #[tokio::test]
     async fn a_multi_key_delete_aborts_entirely_if_any_key_fails_authorization() {
-        let conn = setup().await;
-        seed_context(&conn, "owned-by-alice", "\"v\"", "2026-06-01T00:00:00Z").await;
-        {
-            let guard = conn.lock().await;
-            project_context_repository::create_new(
-                &guard,
-                "owned-by-bob",
-                "\"v\"",
-                Some("d"),
-                "bob",
-                "2026-06-01T00:00:00Z",
-            )
-            .unwrap();
-        }
+        let (_dir, conn, sea_orm_db) = setup().await;
+        seed_context(
+            &sea_orm_db,
+            "owned-by-alice",
+            "\"v\"",
+            "2026-06-01T00:00:00Z",
+        )
+        .await;
+        project_context_repository::create_new(
+            &sea_orm_db,
+            "owned-by-bob",
+            "\"v\"",
+            Some("d"),
+            "bob",
+            "2026-06-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = DeleteProjectContextTool::call(
             Some(&alice),
@@ -3650,16 +3668,18 @@ mod tests {
         )
         .await;
         assert!(matches!(result, ToolResult::PermissionDenied { .. }));
-        let guard = conn.lock().await;
-        assert!(project_context_repository::get(&guard, "owned-by-alice")
-            .unwrap()
-            .is_some());
+        assert!(
+            project_context_repository::get(&sea_orm_db, "owned-by-alice")
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]
     async fn delete_purges_the_rag_chunk_for_the_deleted_key() {
-        let conn = setup().await;
-        seed_context(&conn, "k", "\"v\"", "2026-06-01T00:00:00Z").await;
+        let (_dir, conn, sea_orm_db) = setup().await;
+        seed_context(&sea_orm_db, "k", "\"v\"", "2026-06-01T00:00:00Z").await;
         {
             let guard = conn.lock().await;
             let chunks = [conexus_db::rag_repository::NewChunk {
@@ -3679,7 +3699,6 @@ mod tests {
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = DeleteProjectContextTool::call(
             Some(&alice),
@@ -3713,13 +3732,12 @@ mod tests {
 
     #[tokio::test]
     async fn backup_writes_a_json_file_with_the_auto_generated_name() {
-        let conn = setup().await;
-        seed_context(&conn, "a", "\"one\"", "2026-06-01T00:00:00Z").await;
+        let (_dir, conn, sea_orm_db) = setup().await;
+        seed_context(&sea_orm_db, "a", "\"one\"", "2026-06-01T00:00:00Z").await;
         let admin = admin_agent();
         let tmp = tempfile::tempdir().unwrap();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx_with_project_dir(&registry, &file_map, tmp.path(), &sea_orm_db);
         let result = BackupProjectContextTool::call(
             Some(&admin),
@@ -3747,12 +3765,11 @@ mod tests {
 
     #[tokio::test]
     async fn backup_uses_a_caller_supplied_name() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         let admin = admin_agent();
         let tmp = tempfile::tempdir().unwrap();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx_with_project_dir(&registry, &file_map, tmp.path(), &sea_orm_db);
         let result = BackupProjectContextTool::call(
             Some(&admin),
@@ -3778,12 +3795,11 @@ mod tests {
         // JSON-schema validation, so this check in the tool body is
         // the ONLY thing standing between a caller and a path-
         // traversal-shaped backup_name (see BACKUP_NAME_RE's doc).
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         let admin = admin_agent();
         let tmp = tempfile::tempdir().unwrap();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx_with_project_dir(&registry, &file_map, tmp.path(), &sea_orm_db);
         for bad_name in ["../../etc/passwd", "a/b", "with spaces", ""] {
             let result = BackupProjectContextTool::call(
@@ -3803,13 +3819,12 @@ mod tests {
 
     #[tokio::test]
     async fn backup_includes_health_report_by_default() {
-        let conn = setup().await;
-        seed_context(&conn, "a", "\"ok\"", "2026-06-01T00:00:00Z").await;
+        let (_dir, conn, sea_orm_db) = setup().await;
+        seed_context(&sea_orm_db, "a", "\"ok\"", "2026-06-01T00:00:00Z").await;
         let admin = admin_agent();
         let tmp = tempfile::tempdir().unwrap();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx_with_project_dir(&registry, &file_map, tmp.path(), &sea_orm_db);
         let result = BackupProjectContextTool::call(
             Some(&admin),
@@ -3828,12 +3843,11 @@ mod tests {
 
     #[tokio::test]
     async fn backup_omits_health_report_when_disabled() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         let admin = admin_agent();
         let tmp = tempfile::tempdir().unwrap();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx_with_project_dir(&registry, &file_map, tmp.path(), &sea_orm_db);
         let result = BackupProjectContextTool::call(
             Some(&admin),
@@ -3852,22 +3866,21 @@ mod tests {
 
     #[tokio::test]
     async fn backup_denies_a_worker_without_system_config_write() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         let alice = worker();
         let denied = BackupProjectContextTool::REQUIRED
             .check(Some(&alice), &conexus_auth::NoPolicyOverrides);
         assert!(denied.is_err());
-        let _ = conn;
+        let _ = (conn, sea_orm_db);
     }
 
     #[tokio::test]
     async fn backup_writes_a_durable_audit_row() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         let admin = admin_agent();
         let tmp = tempfile::tempdir().unwrap();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let c = ctx_with_project_dir(&registry, &file_map, tmp.path(), &sea_orm_db);
         let result = BackupProjectContextTool::call(
             Some(&admin),
