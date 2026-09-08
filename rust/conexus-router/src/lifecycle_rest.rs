@@ -1700,26 +1700,22 @@ mod handler_tests {
         drop(held);
 
         let resp = task.await.unwrap();
-        // Capability is left intact; only membership is stripped. The
-        // Python original expects the SAME uniform 404 a genuine
-        // non-member sees (its R7-F1 closed existence oracle) -- but
-        // this crate's `revalidate_capability_and_membership` maps
-        // `DeniedMembership` to a 403 unconditionally, a deliberate,
-        // ALREADY-established and already-tested divergence for this
-        // specific mid-flight-revalidation case (see perm_gates.rs's
-        // own `revalidate_after_catches_a_membership_revocation_that_
-        // lands_during_a_real_concurrent_await`, which asserts the
-        // identical 403). The oracle-closing 404 still applies at
-        // ENTRY time for a caller who was NEVER a member -- see this
-        // same test module's `rename_project_handler_never_touches_
-        // the_lock...` sibling and `project_rename.rs`'s own
-        // `precheck_closes_the_oracle_on_a_hidden_name_collision` --
-        // just not for a caller whose membership is revoked AFTER they
-        // already legitimately held it, which discloses nothing new
-        // about the project's existence. This test's real assertion is
-        // that the request is denied and the rename never lands, not
-        // the exact status code Python happened to pick.
-        assert_eq!(resp.status(), 403, "{:?}", json_body(resp).await);
+        // Capability is left intact; only membership is stripped. Verified
+        // against the real Python source
+        // (`agent_mcp/router/admin_api.py::_revalidate_capability_and_
+        // membership_or_403`): it composes `revalidate_capability_or_403`
+        // with `_deny_cross_tenant_project_read` -- the SAME function used
+        // at entry time -- which returns the uniform 404 `unknown_project`
+        // envelope whenever the caller's resolved role is `None`, with NO
+        // structural distinction between "never a member" (entry time) and
+        // "membership revoked mid-flight" (this test). An earlier version
+        // of this test (and `perm_gates.rs`'s own
+        // `revalidate_after_catches_a_membership_revocation_that_lands_
+        // during_a_real_concurrent_await`) wrongly asserted a deliberate
+        // 403-for-mid-flight-revocation divergence that does not exist in
+        // Python -- both were corrected to 404 once the real source was
+        // read directly rather than assumed.
+        assert_eq!(resp.status(), 404, "{:?}", json_body(resp).await);
         assert!(
             state
                 .registry
@@ -2160,5 +2156,39 @@ exit 0
             "{:?}",
             json_body(rename_resp).await
         );
+    }
+
+    /// PF-R20-1 (test_sec_r20_json_recursion_depth.py, Site 1: `POST
+    /// /api/router/projects`): Python's `json.loads` raises an
+    /// uncaught `RecursionError` (a `RuntimeError`, not caught by the
+    /// `except json.JSONDecodeError` guard) on a body nested past the
+    /// interpreter's recursion limit -- a bare 500. In Rust the
+    /// concern is worse in kind (a native stack overflow would abort
+    /// the WHOLE PROCESS, not just fail one request -- see
+    /// `json_sanitize.rs`'s own module doc), but this handler already
+    /// routes its body through `perm_gates::read_body_and_revalidate`
+    /// -> `json_sanitize::decode_untrusted_body`, whose pre-parse
+    /// raw-byte nesting-depth scan rejects a body this deep BEFORE
+    /// `serde_json` ever sees it. Verified here end-to-end through the
+    /// real handler (not just `json_sanitize`'s own unit tests) with
+    /// the identical ~10k-deep repro shape the Python finding used.
+    #[tokio::test]
+    async fn create_project_handler_denies_deep_json_with_a_clean_400_not_a_crash() {
+        let (_dir, state) = test_state();
+        let uid = seed_real_sysadmin(&state, "root").await;
+        let identity = identity_for(&uid, true, HashSet::new());
+
+        const DEEP_DEPTH: usize = 10_000;
+        let mut deep_body = "[".repeat(DEEP_DEPTH);
+        deep_body.push_str(&"]".repeat(DEEP_DEPTH));
+
+        let resp = create_project_handler(
+            State(state.clone()),
+            Extension(identity),
+            HeaderMap::new(),
+            Bytes::from(deep_body),
+        )
+        .await;
+        assert_eq!(resp.status(), 400, "{:?}", json_body(resp).await);
     }
 }

@@ -514,6 +514,29 @@ mod tests {
         assert_eq!(resp.status, 404);
     }
 
+    /// R3-F1 regression guard: a non-sysadmin delegate WITH a
+    /// resolved role on the project still gets the roster -- the
+    /// scoping guard must not over-reject a legitimate member.
+    #[test]
+    fn a_member_delegate_can_list_the_roster() {
+        let dir = TempDir::new().unwrap();
+        let registry = registry_with(&dir, "proj-a");
+        let mut c = conn();
+        let alice = seed_user(&mut c, "alice");
+        identity::grant_project_membership(&c, "proj-a", Some(&alice), None, "viewer").unwrap();
+        let resp =
+            decide_list_project_memberships(&c, &registry, false, Some(&alice), "proj-a").unwrap();
+        let crate::mcp_handler::HandlerBody::Json(body) = resp.body else {
+            panic!("expected JSON");
+        };
+        assert_eq!(resp.status, 200);
+        assert!(body["memberships"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["user_id"] == alice));
+    }
+
     // -- decide_add_project_membership -----------------------------------
 
     #[test]
@@ -537,6 +560,53 @@ mod tests {
             panic!("expected Added, got {outcome:?}");
         };
         assert_eq!(payload["role"], "operator");
+    }
+
+    /// PF-R7-1 (test_sec_r7_type_confusion.py): a structured JSON
+    /// value (`dict`/`list`) in `user_id`/`group_id` must be a clean
+    /// 400 `validation_error`, not an uncaught SQLite bind panic.
+    #[test]
+    fn rejects_a_structured_user_id() {
+        let dir = TempDir::new().unwrap();
+        let registry = registry_with(&dir, "proj-a");
+        let c = conn();
+        let outcome = decide_add_project_membership(
+            &c,
+            &registry,
+            true,
+            "admin",
+            None,
+            None,
+            "proj-a",
+            &serde_json::json!({"user_id": {"nested": "obj"}}),
+        )
+        .unwrap();
+        let AddProjectMembershipOutcome::Rejected(resp) = outcome else {
+            panic!("expected Rejected, got {outcome:?}");
+        };
+        assert_eq!(resp.status, 400);
+    }
+
+    #[test]
+    fn rejects_a_structured_group_id() {
+        let dir = TempDir::new().unwrap();
+        let registry = registry_with(&dir, "proj-a");
+        let c = conn();
+        let outcome = decide_add_project_membership(
+            &c,
+            &registry,
+            true,
+            "admin",
+            None,
+            None,
+            "proj-a",
+            &serde_json::json!({"group_id": ["list", "item"]}),
+        )
+        .unwrap();
+        let AddProjectMembershipOutcome::Rejected(resp) = outcome else {
+            panic!("expected Rejected, got {outcome:?}");
+        };
+        assert_eq!(resp.status, 400);
     }
 
     #[test]
@@ -566,6 +636,50 @@ mod tests {
             panic!("expected Rejected");
         };
         assert_eq!(resp.status, 404);
+    }
+
+    /// R7-F1 (test_sec_r7_membership_write_oracle.py): the existence-
+    /// oracle half of the fix -- an EXISTING project a non-member
+    /// delegate has zero membership on must produce the SAME 404
+    /// `not_found` shape as a genuinely nonexistent one (no 403-vs-404
+    /// differential that would confirm the project is real).
+    #[test]
+    fn a_non_member_on_an_existing_hidden_project_gets_the_same_404_as_nonexistent() {
+        let dir = TempDir::new().unwrap();
+        let registry = registry_with(&dir, "proj-hidden");
+        let c = conn();
+        let hidden = decide_add_project_membership(
+            &c,
+            &registry,
+            false,
+            "bob",
+            Some("bob"),
+            None,
+            "proj-hidden",
+            &serde_json::json!({"user_id": "alice"}),
+        )
+        .unwrap();
+        let empty_registry = ProjectRegistry::new(dir.path().join("empty.local.json"));
+        let nonexistent = decide_add_project_membership(
+            &c,
+            &empty_registry,
+            false,
+            "bob",
+            Some("bob"),
+            None,
+            "no-such-slug-xyz",
+            &serde_json::json!({"user_id": "alice"}),
+        )
+        .unwrap();
+        let (
+            AddProjectMembershipOutcome::Rejected(hidden_resp),
+            AddProjectMembershipOutcome::Rejected(nonexistent_resp),
+        ) = (hidden, nonexistent)
+        else {
+            panic!("expected both Rejected");
+        };
+        assert_eq!(hidden_resp.status, 404);
+        assert_eq!(hidden_resp.status, nonexistent_resp.status);
     }
 
     #[test]
@@ -642,6 +756,42 @@ mod tests {
             panic!("expected Changed, got {outcome:?}");
         };
         assert_eq!(payload["role"], "operator");
+    }
+
+    /// R7-F1 sibling for `decide_change_project_membership_role`: a
+    /// non-member's uniform 404 for an EXISTING (hidden) project, and
+    /// no `system.projects.manage` role-rank/name leak in the body.
+    #[test]
+    fn change_role_a_non_member_gets_the_uniform_404_for_an_existing_hidden_project() {
+        let dir = TempDir::new().unwrap();
+        let registry = registry_with(&dir, "proj-hidden");
+        let mut c = conn();
+        let victim = seed_user(&mut c, "victim");
+        identity::grant_project_membership(&c, "proj-hidden", Some(&victim), None, "operator")
+            .unwrap();
+        let outcome = decide_change_project_membership_role(
+            &c,
+            &registry,
+            false,
+            "bob",
+            Some("bob"),
+            None,
+            "proj-hidden",
+            &format!("u:{victim}"),
+            &serde_json::json!({"role": "viewer"}),
+        )
+        .unwrap();
+        let ChangeProjectMembershipRoleOutcome::Rejected(resp) = outcome else {
+            panic!("expected Rejected");
+        };
+        assert_eq!(resp.status, 404);
+        assert_eq!(
+            identity::project_membership_role(&c, "proj-hidden", Some(&victim), None)
+                .unwrap()
+                .as_deref(),
+            Some("operator"),
+            "the unauthorized change must be a no-op"
+        );
     }
 
     #[test]
@@ -814,6 +964,40 @@ mod tests {
             identity::project_membership_role(&c, "proj-a", Some(&alice), None)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// R7-F1 sibling for `decide_delete_project_membership`: same
+    /// uniform 404 for a non-member on an existing-hidden project, and
+    /// the target membership must survive the rejected delete.
+    #[test]
+    fn delete_a_non_member_gets_the_uniform_404_for_an_existing_hidden_project() {
+        let dir = TempDir::new().unwrap();
+        let registry = registry_with(&dir, "proj-hidden");
+        let mut c = conn();
+        let victim = seed_user(&mut c, "victim");
+        identity::grant_project_membership(&c, "proj-hidden", Some(&victim), None, "operator")
+            .unwrap();
+        let outcome = decide_delete_project_membership(
+            &c,
+            &registry,
+            false,
+            "bob",
+            Some("bob"),
+            None,
+            "proj-hidden",
+            &format!("u:{victim}"),
+        )
+        .unwrap();
+        let DeleteProjectMembershipOutcome::Rejected(resp) = outcome else {
+            panic!("expected Rejected");
+        };
+        assert_eq!(resp.status, 404);
+        assert!(
+            identity::project_membership_role(&c, "proj-hidden", Some(&victim), None)
+                .unwrap()
+                .is_some(),
+            "the unauthorized delete must be a no-op"
         );
     }
 
