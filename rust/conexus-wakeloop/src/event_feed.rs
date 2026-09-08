@@ -37,6 +37,25 @@
 //! This is a design decision made explicit here, not a silent gap --
 //! revisit it ONLY if a future change reintroduces a payload-carrying
 //! wake channel.
+//!
+//! ## Phase G async-plumbing prerequisite (this is a prerequisite PR,
+//! not a repository conversion)
+//!
+//! [`assemble_event_feed`] is `async fn` and takes a `&sea_orm::
+//! DatabaseConnection` alongside its legacy `conn: &AsyncMutex<
+//! Connection>`, but does not read from it yet -- NOTHING in this
+//! function's body has been converted to sea-orm in this PR. Every
+//! internal collector (`collect_events_with_cap`,
+//! `collect_unassigned_task_events_for`, `collect_agent_profile_
+//! events_for`, `collect_pending_pokes_for`,
+//! `collect_scheduled_directive_events_for`) still reads from the
+//! SAME legacy rusqlite connection it always has, locked once at the
+//! top of the function body. This PR only settles the async plumbing
+//! (see the module-level comment near `AsyncMutex`'s Phase D1/D2/D3
+//! precedent in `conexus_auth::tool` for the `!Send`-future hazard
+//! this pattern avoids) so a future batch PR can flip each collector
+//! call from legacy to sea-orm one at a time without touching this
+//! function's signature again.
 
 use conexus_core::ToolResult;
 use conexus_db::agent_repository::{AgentField, AgentRepository, FieldValue};
@@ -46,6 +65,7 @@ use conexus_db::{
 };
 use rusqlite::Connection;
 use serde_json::{json, Value};
+use tokio::sync::Mutex as AsyncMutex;
 
 /// Per-poll cap on the message backlog the event feed drains at once.
 /// Matches `MessageQueryFilters::limit`'s clamp ceiling. When more than
@@ -619,15 +639,34 @@ pub struct AssembledFeed {
 /// `wait_for_events` call whose queue happened to be empty), but
 /// `events.extend(...)` treats both identically; an empty `Vec` here
 /// covers both cases with no behavioral difference.
-pub fn assemble_event_feed(
-    conn: &Connection,
+///
+/// `conn: &AsyncMutex<Connection>`, not a bare `&Connection` -- this
+/// function is `async fn`, and embedding a `!Sync` `&Connection` in an
+/// async fn's own generated future would make every CALLER's future
+/// `!Send` across the `.await` point (the exact hazard `conexus_auth::
+/// tool::ToolCallContext`'s own doc explains, already hit and fixed 3
+/// times elsewhere in this migration). Locked ONCE at the top of the
+/// body; every internal collector below still receives the same
+/// `&Connection` it always has, just borrowed from the guard instead
+/// of a bare parameter.
+///
+/// `sea_orm_db` is unused in this PR -- see this module's own doc
+/// comment for why: no collector has been converted to sea-orm yet,
+/// this signature only settles the async plumbing a future batch PR
+/// will build on.
+#[allow(clippy::too_many_arguments)]
+pub async fn assemble_event_feed(
+    conn: &AsyncMutex<Connection>,
     agent_id: &str,
     cursor: Option<&str>,
     now_iso: &str,
     drain_queue: Vec<Value>,
     fire_scheduled: bool,
     get_env: impl Fn(&str) -> Option<String>,
+    _sea_orm_db: &sea_orm::DatabaseConnection,
 ) -> rusqlite::Result<AssembledFeed> {
+    let guard = conn.lock().await;
+    let conn = &*guard;
     let collected = collect_events_with_cap(conn, agent_id, cursor, now_iso, get_env)?;
     let mut events = collected.events;
     let msg_cap_ts = collected.msg_cap_ts;
@@ -881,6 +920,15 @@ mod tests {
 
     fn no_env(_: &str) -> Option<String> {
         None
+    }
+
+    /// A throwaway sea-orm connection for `assemble_event_feed`'s tests
+    /// -- nothing in this PR reads from or writes to it (see this
+    /// module's own doc comment), so `sqlite::memory:` is fine here
+    /// even though it's never backed by the same file as the rusqlite
+    /// `Connection` under test.
+    async fn test_sea_orm_db() -> sea_orm::DatabaseConnection {
+        sea_orm::Database::connect("sqlite::memory:").await.unwrap()
     }
 
     fn send_message(conn: &Connection, id: &str, to: &str, ts: &str, message_type: &str) {
@@ -1361,8 +1409,8 @@ mod tests {
 
     // -- assemble_event_feed -------------------------------------------------
 
-    #[test]
-    fn assemble_event_feed_merges_messages_and_unassigned_tasks() {
+    #[tokio::test]
+    async fn assemble_event_feed_merges_messages_and_unassigned_tasks() {
         let conn = test_conn();
         seed_agent(&conn, "alice");
         send_message(&conn, "m1", "alice", "2026-01-01T00:00:01Z", "text");
@@ -1382,6 +1430,8 @@ mod tests {
         };
         task_repository::create(&conn, unassigned).unwrap();
 
+        let conn = AsyncMutex::new(conn);
+        let sea_orm_db = test_sea_orm_db().await;
         let feed = assemble_event_feed(
             &conn,
             "alice",
@@ -1390,7 +1440,9 @@ mod tests {
             Vec::new(),
             false,
             no_env,
+            &sea_orm_db,
         )
+        .await
         .unwrap();
         let types: Vec<_> = feed
             .events
@@ -1402,12 +1454,14 @@ mod tests {
         assert_eq!(feed.next_cursor, "2026-01-01T00:00:02Z");
     }
 
-    #[test]
-    fn assemble_event_feed_includes_the_drain_queue() {
+    #[tokio::test]
+    async fn assemble_event_feed_includes_the_drain_queue() {
         let conn = test_conn();
         seed_agent(&conn, "alice");
         let queued = event("hold_advisory", "2026-01-01T00:00:05Z");
 
+        let conn = AsyncMutex::new(conn);
+        let sea_orm_db = test_sea_orm_db().await;
         let feed = assemble_event_feed(
             &conn,
             "alice",
@@ -1416,13 +1470,15 @@ mod tests {
             vec![queued.clone()],
             false,
             no_env,
+            &sea_orm_db,
         )
+        .await
         .unwrap();
         assert!(feed.events.contains(&queued));
     }
 
-    #[test]
-    fn assemble_event_feed_fires_scheduled_directives_only_when_fire_scheduled_is_true() {
+    #[tokio::test]
+    async fn assemble_event_feed_fires_scheduled_directives_only_when_fire_scheduled_is_true() {
         let conn = test_conn();
         seed_agent(&conn, "alice");
         scheduled_directive_repository::create(
@@ -1439,6 +1495,8 @@ mod tests {
         )
         .unwrap();
 
+        let conn = AsyncMutex::new(conn);
+        let sea_orm_db = test_sea_orm_db().await;
         let not_fired = assemble_event_feed(
             &conn,
             "alice",
@@ -1447,7 +1505,9 @@ mod tests {
             Vec::new(),
             false,
             no_env,
+            &sea_orm_db,
         )
+        .await
         .unwrap();
         assert!(not_fired.events.is_empty());
 
@@ -1459,14 +1519,16 @@ mod tests {
             Vec::new(),
             true,
             no_env,
+            &sea_orm_db,
         )
+        .await
         .unwrap();
         assert_eq!(fired.events.len(), 1);
         assert_eq!(fired.events[0]["data"]["source"], "schedule");
     }
 
-    #[test]
-    fn assemble_event_feed_urgent_pokes_sort_ahead_of_older_normal_events() {
+    #[tokio::test]
+    async fn assemble_event_feed_urgent_pokes_sort_ahead_of_older_normal_events() {
         let conn = test_conn();
         seed_agent(&conn, "alice");
         send_message(&conn, "m1", "alice", "2026-01-01T00:00:01Z", "text");
@@ -1481,6 +1543,8 @@ mod tests {
         )
         .unwrap();
 
+        let conn = AsyncMutex::new(conn);
+        let sea_orm_db = test_sea_orm_db().await;
         let feed = assemble_event_feed(
             &conn,
             "alice",
@@ -1489,13 +1553,15 @@ mod tests {
             Vec::new(),
             true,
             no_env,
+            &sea_orm_db,
         )
+        .await
         .unwrap();
         assert_eq!(feed.events[0]["data"]["source"], "poke");
     }
 
-    #[test]
-    fn assemble_event_feed_clamps_the_merged_cursor_to_the_message_truncation_boundary() {
+    #[tokio::test]
+    async fn assemble_event_feed_clamps_the_merged_cursor_to_the_message_truncation_boundary() {
         // BL-R21-1, end-to-end through `assemble_event_feed` (port of
         // test_sec_r21_event_feed_clamp_propagation.py::
         // test_newer_task_event_does_not_skip_truncated_messages).
@@ -1550,6 +1616,9 @@ mod tests {
         )
         .unwrap();
 
+        let conn = AsyncMutex::new(conn);
+        let sea_orm_db = test_sea_orm_db().await;
+
         // ---- Poll 1: truncated at the cap; the task event held back.
         let poll1 = assemble_event_feed(
             &conn,
@@ -1559,7 +1628,9 @@ mod tests {
             Vec::new(),
             false,
             no_env,
+            &sea_orm_db,
         )
+        .await
         .unwrap();
         let msg_events1 = poll1
             .events
@@ -1599,7 +1670,9 @@ mod tests {
             Vec::new(),
             false,
             no_env,
+            &sea_orm_db,
         )
+        .await
         .unwrap();
         let msg_events2 = poll2
             .events
@@ -1623,10 +1696,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn assemble_event_feed_empty_result_preserves_the_cursor() {
+    #[tokio::test]
+    async fn assemble_event_feed_empty_result_preserves_the_cursor() {
         let conn = test_conn();
         seed_agent(&conn, "alice");
+        let conn = AsyncMutex::new(conn);
+        let sea_orm_db = test_sea_orm_db().await;
         let feed = assemble_event_feed(
             &conn,
             "alice",
@@ -1635,7 +1710,9 @@ mod tests {
             Vec::new(),
             false,
             no_env,
+            &sea_orm_db,
         )
+        .await
         .unwrap();
         assert!(feed.events.is_empty());
         assert_eq!(feed.next_cursor, "2025-06-01T00:00:00Z");

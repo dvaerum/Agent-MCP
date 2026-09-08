@@ -44,6 +44,7 @@ use conexus_db::{message_repository, task_repository};
 use conexus_wakeloop::event_feed::{self, UNASSIGNED_TASK_TERMINAL_STATUSES};
 use rusqlite::Connection;
 use serde_json::json;
+use tokio::sync::Mutex as AsyncMutex;
 
 pub const INBOX_URI_PREFIX: &str = "agent-mcp://inbox/";
 pub const STATUS_URI_PREFIX: &str = "agent-mcp://status/";
@@ -150,11 +151,18 @@ fn resolve_read_scope(uri_agent_id: &str, principal: Option<&Principal>) -> Resu
 /// exposed for testability; the real `resources/read` wiring always
 /// passes `None` (MCP's `resources/read` has no query params, per
 /// Python's own docstring).
-pub fn render_inbox(
-    conn: &Connection,
+///
+/// `conn: &AsyncMutex<Connection>`, not a bare `&Connection` -- forwards
+/// straight into `assemble_event_feed`, which is itself `async fn` and
+/// locks the connection internally; no lock needed at this level (see
+/// `event_feed::assemble_event_feed`'s own doc for why the mutex, not a
+/// bare reference).
+pub async fn render_inbox(
+    conn: &AsyncMutex<Connection>,
     agent_id: &str,
     since: Option<&str>,
     now_iso: &str,
+    sea_orm_db: &sea_orm::DatabaseConnection,
 ) -> rusqlite::Result<String> {
     let assembled = event_feed::assemble_event_feed(
         conn,
@@ -164,7 +172,9 @@ pub fn render_inbox(
         Vec::new(),
         false,
         crate::agent_communication_tools::process_env,
-    )?;
+        sea_orm_db,
+    )
+    .await?;
     Ok(json!({"events": assembled.events, "next_cursor": assembled.next_cursor}).to_string())
 }
 
@@ -191,11 +201,12 @@ pub fn render_status(conn: &Connection, agent_id: &str) -> rusqlite::Result<Stri
 /// then renders. Never carries MCP wire types; the caller maps
 /// [`ReadOutcome`] onto its own JSON-RPC error codes/text (matching
 /// Python's two-distinct-raise-site error contract).
-pub fn read(
-    conn: &Connection,
+pub async fn read(
+    conn: &AsyncMutex<Connection>,
     uri: &str,
     principal: Option<&Principal>,
     now_iso: &str,
+    sea_orm_db: &sea_orm::DatabaseConnection,
 ) -> Result<ReadOutcome, rusqlite::Error> {
     let Some((kind, uri_agent_id)) = match_uri(uri) else {
         return Ok(ReadOutcome::UnknownUri);
@@ -205,10 +216,13 @@ pub fn read(
     }
     let (body, mime_type) = match kind {
         "inbox" => (
-            render_inbox(conn, uri_agent_id, None, now_iso)?,
+            render_inbox(conn, uri_agent_id, None, now_iso, sea_orm_db).await?,
             "application/json",
         ),
-        "status" => (render_status(conn, uri_agent_id)?, "application/json"),
+        "status" => {
+            let guard = conn.lock().await;
+            (render_status(&guard, uri_agent_id)?, "application/json")
+        }
         _ => unreachable!("match_uri only ever returns a kind this match covers"),
     };
     Ok(ReadOutcome::Ok { body, mime_type })
@@ -226,6 +240,13 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
         conn
+    }
+
+    /// A throwaway sea-orm connection -- `read`/`render_inbox` don't
+    /// read from or write to it in this PR (see `event_feed::
+    /// assemble_event_feed`'s own doc), so `sqlite::memory:` is fine.
+    async fn test_sea_orm_db() -> sea_orm::DatabaseConnection {
+        sea_orm::Database::connect("sqlite::memory:").await.unwrap()
     }
 
     fn worker(agent_id: &str) -> Principal {
@@ -273,10 +294,19 @@ mod tests {
 
     // -- match_uri (indirectly via read) -------------------------------
 
-    #[test]
-    fn an_unrecognized_uri_is_unknown() {
-        let conn = test_conn();
-        let outcome = read(&conn, "agent-mcp://bogus/x", None, "2026-01-01T00:00:00Z").unwrap();
+    #[tokio::test]
+    async fn an_unrecognized_uri_is_unknown() {
+        let conn = AsyncMutex::new(test_conn());
+        let sea_orm_db = test_sea_orm_db().await;
+        let outcome = read(
+            &conn,
+            "agent-mcp://bogus/x",
+            None,
+            "2026-01-01T00:00:00Z",
+            &sea_orm_db,
+        )
+        .await
+        .unwrap();
         assert!(matches!(outcome, ReadOutcome::UnknownUri));
     }
 
@@ -410,10 +440,13 @@ mod tests {
 
     // -- render_inbox -----------------------------------------------------
 
-    #[test]
-    fn render_inbox_returns_a_well_formed_empty_envelope_with_no_activity() {
-        let conn = test_conn();
-        let body = render_inbox(&conn, "worker-1", None, "2026-01-01T00:00:00Z").unwrap();
+    #[tokio::test]
+    async fn render_inbox_returns_a_well_formed_empty_envelope_with_no_activity() {
+        let conn = AsyncMutex::new(test_conn());
+        let sea_orm_db = test_sea_orm_db().await;
+        let body = render_inbox(&conn, "worker-1", None, "2026-01-01T00:00:00Z", &sea_orm_db)
+            .await
+            .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert!(parsed["events"].as_array().unwrap().is_empty());
         assert!(parsed["next_cursor"].is_string());
@@ -421,16 +454,19 @@ mod tests {
 
     // -- read (end-to-end) ------------------------------------------------
 
-    #[test]
-    fn read_denies_a_foreign_workers_status_resource() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn read_denies_a_foreign_workers_status_resource() {
+        let conn = AsyncMutex::new(test_conn());
+        let sea_orm_db = test_sea_orm_db().await;
         let p = worker("worker-2");
         let outcome = read(
             &conn,
             "agent-mcp://status/worker-1",
             Some(&p),
             "2026-01-01T00:00:00Z",
+            &sea_orm_db,
         )
+        .await
         .unwrap();
         assert!(matches!(
             outcome,
@@ -438,16 +474,19 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn read_serves_a_workers_own_status_resource() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn read_serves_a_workers_own_status_resource() {
+        let conn = AsyncMutex::new(test_conn());
+        let sea_orm_db = test_sea_orm_db().await;
         let p = worker("worker-1");
         let outcome = read(
             &conn,
             "agent-mcp://status/worker-1",
             Some(&p),
             "2026-01-01T00:00:00Z",
+            &sea_orm_db,
         )
+        .await
         .unwrap();
         match outcome {
             ReadOutcome::Ok { body, mime_type } => {
@@ -458,16 +497,19 @@ mod tests {
         }
     }
 
-    #[test]
-    fn read_serves_an_admins_cross_agent_inbox_read() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn read_serves_an_admins_cross_agent_inbox_read() {
+        let conn = AsyncMutex::new(test_conn());
+        let sea_orm_db = test_sea_orm_db().await;
         let p = admin();
         let outcome = read(
             &conn,
             "agent-mcp://inbox/worker-1",
             Some(&p),
             "2026-01-01T00:00:00Z",
+            &sea_orm_db,
         )
+        .await
         .unwrap();
         assert!(matches!(outcome, ReadOutcome::Ok { .. }));
     }
