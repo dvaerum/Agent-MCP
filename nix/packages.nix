@@ -190,9 +190,9 @@ let
     src = "${src}/agent_mcp/dashboard";
     # Re-set whenever the dashboard's package-lock.json changes
     # upstream (rare). On hash mismatch, nix prints the correct
-    # value; paste it here. Updated 2026-09-02: vis-network dropped
-    # (System page removed).
-    npmDepsHash = "sha256-ULW168sMSy2igETqZAfJ+n4Pgeh/sbh+LCGQoVBglpE=";
+    # value; paste it here. Updated 2026-09-08: next 15.5.23 -> 15.5.25
+    # + npm audit fix (dashboard-npm-audit-critical-rce security fix).
+    npmDepsHash = "sha256-cnLHpnM+NEq8YhwzBotBOUK6BCDLAVge2vOERq/IE40=";
     NEXT_PUBLIC_AUTO_CONNECT = "false";
     NEXT_PUBLIC_DEFAULT_SERVER_HOST = "";
     NEXT_PUBLIC_DEFAULT_SERVER_PORT = "";
