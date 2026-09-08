@@ -768,6 +768,32 @@ mod http_tests {
         (resp.status(), resp.headers().clone())
     }
 
+    /// Same as `post` above, but also collects the response body --
+    /// needed by AC-R17-1's byte-identical-body assertion, which `post`
+    /// alone (status/headers only) can't prove.
+    async fn post_body(
+        router: &Router,
+        path: &str,
+        content_type: &str,
+        body: Vec<u8>,
+    ) -> (StatusCode, String) {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header(header::CONTENT_TYPE, content_type)
+            .body(Body::from(body))
+            .unwrap();
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(peer_addr()));
+        let resp = router.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
     /// A real multipart/form-data body with one field forced into a
     /// FILE part (`filename=` present) -- the exact aiohttp
     /// `FormData.add_field(..., filename=...)` shape
@@ -927,6 +953,120 @@ mod http_tests {
             headers.get(header::SET_COOKIE).is_none(),
             "an SSO/passwordless account must never mint a session"
         );
+    }
+
+    #[tokio::test]
+    async fn login_post_sso_account_body_is_byte_identical_to_a_deleted_account() {
+        // Port of `test_sec_r17_sso_login_enum_oracle.py::test_sso_
+        // login_response_byte_identical_to_unknown_user`. The login
+        // form echoes the submitted username, so bodies for DIFFERENT
+        // usernames legitimately differ -- the real oracle is whether
+        // *the same* submitted username reveals, via status or body,
+        // that it names an SSO account. POST one fixed username while
+        // it's an SSO row, delete the row, then POST the identical
+        // request again: both responses must be byte-identical 401s.
+        let (_dir, state, router) = test_app();
+        {
+            let mut conn = state.conn.lock().await;
+            // A second account keeps the users table non-empty after
+            // the probe row is deleted -- login.rs's own empty-users
+            // gate is out of scope for this router-level test harness
+            // (see `test_app`'s own doc), but keeping the shape
+            // faithful to the real deployment topology costs nothing.
+            identity::create_user(
+                &mut conn,
+                "keep-nonempty",
+                "correct horse battery staple",
+                None,
+                false,
+                true,
+                &[],
+                NOW,
+            )
+            .unwrap();
+            identity::create_sso_user(
+                &mut conn,
+                "probe-user",
+                "sub-probe",
+                None,
+                false,
+                false,
+                NOW,
+            )
+            .unwrap();
+        }
+
+        let body = b"username=probe-user&password=guess".to_vec();
+        let (status_sso, body_sso) = post_body(
+            &router,
+            "/agent-mcp/login",
+            "application/x-www-form-urlencoded",
+            body.clone(),
+        )
+        .await;
+
+        {
+            let conn = state.conn.lock().await;
+            conn.execute("DELETE FROM users WHERE username = 'probe-user'", [])
+                .unwrap();
+        }
+        let (status_missing, body_missing) = post_body(
+            &router,
+            "/agent-mcp/login",
+            "application/x-www-form-urlencoded",
+            body,
+        )
+        .await;
+
+        assert_eq!(status_sso, StatusCode::UNAUTHORIZED);
+        assert_eq!(status_missing, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            body_sso, body_missing,
+            "an SSO account must be byte-identical to a nonexistent username"
+        );
+    }
+
+    #[tokio::test]
+    async fn login_post_sso_account_status_and_copy_match_wrong_password_path() {
+        // Port of `test_sec_r17_sso_login_enum_oracle.py::test_sso_
+        // login_status_matches_wrong_password_path`.
+        let (_dir, state, router) = test_app();
+        {
+            let mut conn = state.conn.lock().await;
+            identity::create_user(
+                &mut conn,
+                "pw-real",
+                "rightpw12345",
+                None,
+                false,
+                true,
+                &[],
+                NOW,
+            )
+            .unwrap();
+            identity::create_sso_user(&mut conn, "sso-user", "sub-sso", None, false, false, NOW)
+                .unwrap();
+        }
+
+        let (status_sso, body_sso) = post_body(
+            &router,
+            "/agent-mcp/login",
+            "application/x-www-form-urlencoded",
+            b"username=sso-user&password=guess".to_vec(),
+        )
+        .await;
+        let (status_badpw, body_badpw) = post_body(
+            &router,
+            "/agent-mcp/login",
+            "application/x-www-form-urlencoded",
+            b"username=pw-real&password=guess".to_vec(),
+        )
+        .await;
+
+        assert_eq!(status_sso, StatusCode::UNAUTHORIZED);
+        assert_eq!(status_badpw, StatusCode::UNAUTHORIZED);
+        assert!(body_sso.contains("Invalid username or password."));
+        assert!(body_badpw.contains("Invalid username or password."));
     }
 
     // -- PF-R21-1 (form tier): invalid-UTF8 body must never 500 ---------

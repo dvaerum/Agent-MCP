@@ -330,6 +330,26 @@ mod tests {
     }
 
     #[test]
+    fn a_foreign_scheme_on_the_same_host_is_rejected() {
+        // Same host, downgraded scheme is still a different origin --
+        // ported from `test_sec_r17_sso_discovery_originpin.py::
+        // test_discovery_foreign_scheme_rejected`.
+        let metadata = metadata_with(
+            ISSUER,
+            "https://idp.example.test/authorize",
+            Some("https://idp.example.test/token"),
+            "http://idp.example.test/jwks",
+        );
+        let issuer = IssuerUrl::new(ISSUER.to_string()).unwrap();
+        assert_eq!(
+            assert_discovery_same_origin(&issuer, &metadata),
+            Err(OidcHttpError::OriginMismatch {
+                endpoint: "jwks_uri"
+            })
+        );
+    }
+
+    #[test]
     fn a_foreign_port_is_rejected_even_with_the_same_host() {
         let metadata = metadata_with(
             ISSUER,

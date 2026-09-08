@@ -48,14 +48,20 @@ pub struct OidcReconcileInput<'a> {
     pub email_verified: bool,
     pub preferred_username: Option<&'a str>,
     pub subject: &'a SsoSubject,
-    /// Flips the sysadmin bit on a freshly JIT-created row --
-    /// `AGENT_MCP_SSO_OIDC_DEFAULT_SYSADMIN`, defaulting off.
+    /// Unconditionally flips the sysadmin bit on EVERY freshly
+    /// JIT-created row, regardless of table emptiness -- per
+    /// `sso.py`'s own `find_or_create_sso_user` docstring, "only the
+    /// proxy-header path passes True today"
+    /// (`AGENT_MCP_SSO_PROXY_DEFAULT_SYSADMIN`). The real OIDC call
+    /// site (`oidc_handlers.rs::oidc_reconcile_sysadmin_flags`) always
+    /// hardcodes this `false` -- OIDC's own bootstrap opt-in only ever
+    /// threads through `bootstrap_sysadmin` below, never this field.
     pub default_is_sysadmin: bool,
     /// Gates the SEPARATE empty-table first-user sysadmin promotion
     /// inside `identity::create_user`'s own `BEGIN IMMEDIATE`
     /// bootstrap cluster (AC-R9-2) -- a fresh OIDC deploy's first IdP
-    /// user is only auto-promoted when the operator opted in via the
-    /// same env var above.
+    /// user is only auto-promoted when the operator opted in via
+    /// `AGENT_MCP_SSO_OIDC_DEFAULT_SYSADMIN`.
     pub bootstrap_sysadmin: bool,
 }
 
@@ -316,6 +322,77 @@ mod tests {
             Some(legacy_key),
             "the victim row must not have been retagged by another claimant"
         );
+    }
+
+    #[test]
+    fn r20f1_bool_str_family_claimant_cannot_take_over_a_legacy_row() {
+        // Same exploit shape as `r20f1_a_differently_typed_claimant_
+        // cannot_take_over_a_legacy_row`, using the bool/str collision
+        // family (`str(True) == "True"`) instead of the int/str one --
+        // ported directly from `test_sec_r20_f1_sso_legacy_fallback_
+        // collision.py::test_ambiguous_bool_str_claimant_does_not_
+        // hijack_legacy_row`.
+        let mut c = conn();
+        let legacy_key = "oidc:https://idp.example.test:True";
+        let victim_id = create_user(
+            &mut c,
+            "victim2",
+            "correct horse battery staple",
+            None,
+            true,
+            true,
+            &[],
+            NOW,
+        )
+        .unwrap();
+        identity::stamp_sso_subject_if_absent(&c, &victim_id, legacy_key).unwrap();
+
+        let sub = SsoSubject::new(ISS, SsoSubjectValue::Bool(true)).unwrap();
+        assert_eq!(sub.legacy_lookup_key(), None);
+        let mut req = input(&sub);
+        req.preferred_username = Some("attacker");
+
+        let row = find_or_create_oidc_user(&mut c, &req, NOW).unwrap();
+
+        assert_ne!(row.user_id, victim_id);
+        assert!(!row.is_sysadmin);
+        let victim_after = identity::get_user_by_id(&c, &victim_id).unwrap().unwrap();
+        assert_eq!(victim_after.sso_subject.as_deref(), Some(legacy_key));
+    }
+
+    #[test]
+    fn r20f1_str_claimant_cannot_take_over_a_numeric_legacy_row() {
+        // Mirror direction: a STR claimant must not hijack a legacy row
+        // whose key content could equally have been minted from a
+        // non-str scalar (a legacy row literally named "1") -- ported
+        // from `test_sec_r20_f1_sso_legacy_fallback_collision.py::
+        // test_str_claimant_does_not_hijack_numeric_legacy_row`.
+        let mut c = conn();
+        let legacy_key = "oidc:https://idp.example.test:1";
+        let victim_id = create_user(
+            &mut c,
+            "numvictim",
+            "correct horse battery staple",
+            None,
+            true,
+            true,
+            &[],
+            NOW,
+        )
+        .unwrap();
+        identity::stamp_sso_subject_if_absent(&c, &victim_id, legacy_key).unwrap();
+
+        let sub = SsoSubject::new(ISS, SsoSubjectValue::Str("1".to_string())).unwrap();
+        assert_eq!(sub.legacy_lookup_key(), None);
+        let mut req = input(&sub);
+        req.preferred_username = Some("strattacker");
+
+        let row = find_or_create_oidc_user(&mut c, &req, NOW).unwrap();
+
+        assert_ne!(row.user_id, victim_id);
+        assert!(!row.is_sysadmin);
+        let victim_after = identity::get_user_by_id(&c, &victim_id).unwrap().unwrap();
+        assert_eq!(victim_after.sso_subject.as_deref(), Some(legacy_key));
     }
 
     #[test]
