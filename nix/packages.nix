@@ -192,7 +192,7 @@ let
     # upstream (rare). On hash mismatch, nix prints the correct
     # value; paste it here. Updated 2026-09-08: next 15.5.23 -> 15.5.25
     # + npm audit fix (dashboard-npm-audit-critical-rce security fix).
-    npmDepsHash = "sha256-cnLHpnM+NEq8YhwzBotBOUK6BCDLAVge2vOERq/IE40=";
+    npmDepsHash = "sha256-EPA1am+uB/3zVzcBV0lmOj62uFLyH9hwoahK/l3o210=";
     NEXT_PUBLIC_AUTO_CONNECT = "false";
     NEXT_PUBLIC_DEFAULT_SERVER_HOST = "";
     NEXT_PUBLIC_DEFAULT_SERVER_PORT = "";
