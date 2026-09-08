@@ -1737,9 +1737,8 @@ impl Tool for PurgeAgentTool {
             // the orphan half applies, but the observable contract is
             // identical: no session row survives referencing a
             // deleted agent).
-            let _ = conexus_db::claude_code_session_repository::delete_by_agent_id(
-                &guard, agent_id,
-            );
+            let _ =
+                conexus_db::claude_code_session_repository::delete_by_agent_id(&guard, agent_id);
 
             // Note: Python also snapshots+signals this agent's open MCP
             // push streams for immediate teardown (AC-R29-1 symmetry
