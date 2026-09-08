@@ -1293,4 +1293,872 @@ mod handler_tests {
         assert_eq!(resp.status(), 409, "{:?}", json_body(resp).await);
         assert!(state.registry.get("old-name").unwrap().is_some());
     }
+
+    // ====================================================================
+    // Genuine end-to-end TOCTOU races, testing the real handlers directly
+    // (test_sec_r3f3_active_conns_toctou.py / test_sec_r7f1_project_
+    // lifecycle_toctou.py / test_sec_r13f1_rename_lock_toctou.py /
+    // test_sec_r36_lifecycle_parity.py / test_sec_r9f5_rename_workspace_
+    // desync.py, the last already covered by project_registry.rs's own
+    // R9-F5 tests -- not duplicated here).
+    //
+    // Synchronization technique: tokio's `Mutex` exposes no `asyncio.
+    // Lock`-style waiter introspection, so unlike the Python originals'
+    // `_wait_until_contended` poll on `lock._waiters`, these tests use
+    // `tokio::task::yield_now()` to give the (default `current_thread`,
+    // single-worker, cooperatively-scheduled) test runtime exactly the
+    // ticks needed to run the spawned task up to its OWN blocking
+    // `mutex.lock_owned().await` -- there are zero other await points
+    // between a handler's entry and that call, so this is deterministic
+    // under `current_thread`, not a timing guess.
+    // ====================================================================
+
+    use conexus_db::{group_capability_repository, group_membership_repository};
+
+    /// Seeds a genuinely non-sysadmin delegate carrying `system.
+    /// projects.manage` via a REAL group-capability grant (mutable --
+    /// these tests revoke it mid-race) plus a real `role`-tier
+    /// `project_membership` row on `project`. Returns `(user_id,
+    /// group_id, GateIdentity)` -- the identity's own `principal.
+    /// capabilities` only matters for the entry-time `require_
+    /// capability` check; every later re-check
+    /// (`project_mutation_precheck`/`revalidated_lock`/`rename_
+    /// precheck`) re-derives fresh from the DB rows this seeds.
+    async fn seed_delegate_with_membership(
+        state: &RouterState,
+        username: &str,
+        project: &str,
+        role: &str,
+    ) -> (String, String, GateIdentity) {
+        let mut conn = state.conn.lock().await;
+        let is_empty: i64 = conn
+            .query_row("SELECT COUNT(*) AS n FROM users", [], |r| r.get(0))
+            .unwrap();
+        if is_empty == 0 {
+            identity::create_user(
+                &mut conn,
+                "__test_first_sysadmin",
+                "ignoredsentinelpassword",
+                None,
+                false,
+                true,
+                &[],
+                NOW_STR,
+            )
+            .unwrap();
+        }
+        let uid = identity::create_user(
+            &mut conn,
+            username,
+            "correct horse battery staple",
+            None,
+            false,
+            true,
+            &[],
+            NOW_STR,
+        )
+        .unwrap();
+        let group = group_membership_repository::create_group(
+            &conn,
+            &format!("g-{username}"),
+            false,
+            NOW_STR,
+        )
+        .unwrap();
+        group_capability_repository::replace(
+            &conn,
+            &group.group_id,
+            [Capability::SystemProjectsManage.as_str()],
+        )
+        .unwrap();
+        group_membership_repository::add_group_member(
+            &conn,
+            &group.group_id,
+            Some(&uid),
+            None,
+            NOW_STR,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO project_membership (project_name, user_id, role) VALUES (?1, ?2, ?3)",
+            (project, &uid, role),
+        )
+        .unwrap();
+        let identity = identity_for(
+            &uid,
+            false,
+            HashSet::from([Capability::SystemProjectsManage]),
+        );
+        (uid, group.group_id, identity)
+    }
+
+    async fn revoke_delegate_capability(state: &RouterState, group_id: &str) {
+        let conn = state.conn.lock().await;
+        group_capability_repository::replace(&conn, group_id, std::iter::empty::<&str>()).unwrap();
+    }
+
+    async fn revoke_delegate_membership(state: &RouterState, project: &str, user_id: &str) {
+        let conn = state.conn.lock().await;
+        conn.execute(
+            "DELETE FROM project_membership WHERE project_name = ?1 AND user_id = ?2",
+            (project, user_id),
+        )
+        .unwrap();
+    }
+
+    /// Give the `current_thread` test runtime enough ticks to run a
+    /// just-spawned task up to its own blocking lock-acquire await --
+    /// see this section's own module doc for why this is deterministic
+    /// here, not a timing guess.
+    async fn let_spawned_task_reach_its_lock_wait() {
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    // -- test_sec_r3f3_active_conns_toctou.py: the active_conns guard
+    // must be re-checked from INSIDE the lock, immediately before the
+    // destructive step -- a connection landing in the outside-check-
+    // passed/destructive-op-not-yet-run window must still get the clean
+    // 409, never let the destructive op run underneath it. -------------
+
+    #[tokio::test]
+    async fn delete_project_handler_toctou_race_active_conns_lands_before_stop_gets_409() {
+        let (dir, state) = test_state();
+        let uid = seed_real_sysadmin(&state, "root").await;
+        register(
+            &state,
+            "racer-del",
+            &dir.path().join("workspaces").join("racer-del"),
+        );
+        let identity = identity_for(&uid, true, HashSet::new());
+
+        let lock = state.runtime.ensure_lock("racer-del", "backend");
+        let held = lock.lock_owned().await;
+
+        let state2 = state.clone();
+        let task = tokio::spawn(async move {
+            delete_project_handler(
+                State(state2),
+                Extension(identity),
+                Path("racer-del".to_string()),
+                Query(HashMap::new()),
+                HeaderMap::new(),
+            )
+            .await
+        });
+        let_spawned_task_reach_its_lock_wait().await;
+
+        // Simulate a connection establishing in the exact window the
+        // OUTSIDE active_conns check cannot see.
+        state
+            .runtime
+            .with_runtime_mut("racer-del", |rt| rt.active_conns = 1);
+        drop(held);
+
+        let resp = task.await.unwrap();
+        assert_eq!(resp.status(), 409, "{:?}", json_body(resp).await);
+        assert!(
+            state.registry.get("racer-del").unwrap().is_some(),
+            "the destructive delete must NOT have run"
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_project_handler_toctou_race_active_conns_lands_before_stop_gets_409() {
+        let (dir, state) = test_state();
+        let uid = seed_real_sysadmin(&state, "root").await;
+        register(
+            &state,
+            "racer-ren",
+            &dir.path().join("workspaces").join("racer-ren"),
+        );
+        let identity = identity_for(&uid, true, HashSet::new());
+
+        let lock = state.runtime.ensure_lock("racer-ren", "backend");
+        let held = lock.lock_owned().await;
+
+        let state2 = state.clone();
+        let task = tokio::spawn(async move {
+            rename_project_handler(
+                State(state2),
+                Extension(identity),
+                Path("racer-ren".to_string()),
+                HeaderMap::new(),
+                Bytes::from_static(br#"{"name": "racer-ren-2"}"#),
+            )
+            .await
+        });
+        let_spawned_task_reach_its_lock_wait().await;
+
+        state
+            .runtime
+            .with_runtime_mut("racer-ren", |rt| rt.active_conns = 3);
+        drop(held);
+
+        let resp = task.await.unwrap();
+        assert_eq!(resp.status(), 409, "{:?}", json_body(resp).await);
+        assert!(state.registry.get("racer-ren").unwrap().is_some());
+        assert!(state.registry.get("racer-ren-2").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn stop_project_handler_toctou_race_active_conns_lands_before_stop_gets_409() {
+        let (dir, state) = test_state();
+        let uid = seed_real_sysadmin(&state, "root").await;
+        register(
+            &state,
+            "racer-stop",
+            &dir.path().join("workspaces").join("racer-stop"),
+        );
+        let identity = identity_for(&uid, true, HashSet::new());
+
+        let lock = state.runtime.ensure_lock("racer-stop", "backend");
+        let held = lock.lock_owned().await;
+
+        let state2 = state.clone();
+        let task = tokio::spawn(async move {
+            stop_project_handler(
+                State(state2),
+                Extension(identity),
+                Path("racer-stop".to_string()),
+                HeaderMap::new(),
+            )
+            .await
+        });
+        let_spawned_task_reach_its_lock_wait().await;
+
+        state
+            .runtime
+            .with_runtime_mut("racer-stop", |rt| rt.active_conns = 1);
+        drop(held);
+
+        let resp = task.await.unwrap();
+        assert_eq!(resp.status(), 409, "{:?}", json_body(resp).await);
+        assert!(state.registry.get("racer-stop").unwrap().is_some());
+    }
+
+    // -- test_sec_r7f1_project_lifecycle_toctou.py Tests E/F: a caller
+    // whose group-delegated capability is revoked WHILE their delete/
+    // stop request is blocked acquiring the per-project ensure_lock
+    // must be re-checked before the destructive op runs. -----------------
+
+    #[tokio::test]
+    async fn delete_project_handler_denies_a_capability_revoked_while_blocked_on_the_lock() {
+        let (dir, state) = test_state();
+        register(
+            &state,
+            "race-delete-project",
+            &dir.path().join("workspaces").join("race-delete-project"),
+        );
+        let (_uid, group_id, identity) =
+            seed_delegate_with_membership(&state, "alice", "race-delete-project", "operator").await;
+
+        let lock = state.runtime.ensure_lock("race-delete-project", "backend");
+        let held = lock.lock_owned().await;
+
+        let state2 = state.clone();
+        let task = tokio::spawn(async move {
+            delete_project_handler(
+                State(state2),
+                Extension(identity),
+                Path("race-delete-project".to_string()),
+                Query(HashMap::new()),
+                HeaderMap::new(),
+            )
+            .await
+        });
+        let_spawned_task_reach_its_lock_wait().await;
+
+        revoke_delegate_capability(&state, &group_id).await;
+        drop(held);
+
+        let resp = task.await.unwrap();
+        assert_eq!(resp.status(), 403, "{:?}", json_body(resp).await);
+        assert!(
+            state.registry.get("race-delete-project").unwrap().is_some(),
+            "project must NOT have been deleted off alice's stale, pre-revocation grant"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_project_handler_denies_a_capability_revoked_while_blocked_on_the_lock() {
+        let (dir, state) = test_state();
+        register(
+            &state,
+            "race-stop-project",
+            &dir.path().join("workspaces").join("race-stop-project"),
+        );
+        let (_uid, group_id, identity) =
+            seed_delegate_with_membership(&state, "alice", "race-stop-project", "operator").await;
+
+        let lock = state.runtime.ensure_lock("race-stop-project", "backend");
+        let held = lock.lock_owned().await;
+
+        let state2 = state.clone();
+        let task = tokio::spawn(async move {
+            stop_project_handler(
+                State(state2),
+                Extension(identity),
+                Path("race-stop-project".to_string()),
+                HeaderMap::new(),
+            )
+            .await
+        });
+        let_spawned_task_reach_its_lock_wait().await;
+
+        revoke_delegate_capability(&state, &group_id).await;
+        drop(held);
+
+        let resp = task.await.unwrap();
+        assert_eq!(resp.status(), 403, "{:?}", json_body(resp).await);
+    }
+
+    // -- test_sec_r13f1_rename_lock_toctou.py: rename's SECOND, wholly
+    // independent yield point -- acquiring the ensure_lock itself --
+    // must be re-checked too, not just the body-read (rename's FIRST
+    // yield point, already covered by the create/rename-shaped tests
+    // elsewhere). Both the capability-only and membership-only
+    // revocation shapes the finding calls out. ---------------------------
+
+    #[tokio::test]
+    async fn rename_project_handler_denies_a_capability_revoked_while_blocked_on_the_lock() {
+        let (dir, state) = test_state();
+        register(
+            &state,
+            "race-rename-lock",
+            &dir.path().join("workspaces").join("race-rename-lock"),
+        );
+        let (_uid, group_id, identity) =
+            seed_delegate_with_membership(&state, "alice", "race-rename-lock", "operator").await;
+
+        let lock = state.runtime.ensure_lock("race-rename-lock", "backend");
+        let held = lock.lock_owned().await;
+
+        let state2 = state.clone();
+        let task = tokio::spawn(async move {
+            rename_project_handler(
+                State(state2),
+                Extension(identity),
+                Path("race-rename-lock".to_string()),
+                HeaderMap::new(),
+                Bytes::from_static(br#"{"name": "renamed-race-lock", "grace_days": 7}"#),
+            )
+            .await
+        });
+        let_spawned_task_reach_its_lock_wait().await;
+
+        revoke_delegate_capability(&state, &group_id).await;
+        drop(held);
+
+        let resp = task.await.unwrap();
+        assert_eq!(resp.status(), 403, "{:?}", json_body(resp).await);
+        assert!(
+            state.registry.get("race-rename-lock").unwrap().is_some(),
+            "project must NOT have been renamed off alice's stale, pre-revocation grant"
+        );
+        assert!(state.registry.get("renamed-race-lock").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn rename_project_handler_denies_a_membership_revoked_while_blocked_on_the_lock() {
+        let (dir, state) = test_state();
+        register(
+            &state,
+            "race-rename-lock-membership",
+            &dir.path()
+                .join("workspaces")
+                .join("race-rename-lock-membership"),
+        );
+        let (uid, _group_id, identity) = seed_delegate_with_membership(
+            &state,
+            "alice",
+            "race-rename-lock-membership",
+            "operator",
+        )
+        .await;
+
+        let lock = state
+            .runtime
+            .ensure_lock("race-rename-lock-membership", "backend");
+        let held = lock.lock_owned().await;
+
+        let state2 = state.clone();
+        let task = tokio::spawn(async move {
+            rename_project_handler(
+                State(state2),
+                Extension(identity),
+                Path("race-rename-lock-membership".to_string()),
+                HeaderMap::new(),
+                Bytes::from_static(br#"{"name": "renamed-race-lock-membership", "grace_days": 7}"#),
+            )
+            .await
+        });
+        let_spawned_task_reach_its_lock_wait().await;
+
+        revoke_delegate_membership(&state, "race-rename-lock-membership", &uid).await;
+        drop(held);
+
+        let resp = task.await.unwrap();
+        // Capability is left intact; only membership is stripped. The
+        // Python original expects the SAME uniform 404 a genuine
+        // non-member sees (its R7-F1 closed existence oracle) -- but
+        // this crate's `revalidate_capability_and_membership` maps
+        // `DeniedMembership` to a 403 unconditionally, a deliberate,
+        // ALREADY-established and already-tested divergence for this
+        // specific mid-flight-revalidation case (see perm_gates.rs's
+        // own `revalidate_after_catches_a_membership_revocation_that_
+        // lands_during_a_real_concurrent_await`, which asserts the
+        // identical 403). The oracle-closing 404 still applies at
+        // ENTRY time for a caller who was NEVER a member -- see this
+        // same test module's `rename_project_handler_never_touches_
+        // the_lock...` sibling and `project_rename.rs`'s own
+        // `precheck_closes_the_oracle_on_a_hidden_name_collision` --
+        // just not for a caller whose membership is revoked AFTER they
+        // already legitimately held it, which discloses nothing new
+        // about the project's existence. This test's real assertion is
+        // that the request is denied and the rename never lands, not
+        // the exact status code Python happened to pick.
+        assert_eq!(resp.status(), 403, "{:?}", json_body(resp).await);
+        assert!(
+            state
+                .registry
+                .get("race-rename-lock-membership")
+                .unwrap()
+                .is_some(),
+            "project must NOT have been renamed off alice's stale, pre-revocation membership"
+        );
+        assert!(state
+            .registry
+            .get("renamed-race-lock-membership")
+            .unwrap()
+            .is_none());
+    }
+
+    // -- test_sec_r36_lifecycle_parity.py (BL-R36-1): stop must pop the
+    // per-name orchestrator state exactly like delete/rename -- no
+    // concurrency needed, a direct handler call proves it. ---------------
+
+    #[tokio::test]
+    async fn stop_project_handler_pops_the_project_orchestrator_state() {
+        let (dir, state) = test_state();
+        let uid = seed_real_sysadmin(&state, "root").await;
+        register(
+            &state,
+            "winddown",
+            &dir.path().join("workspaces").join("winddown"),
+        );
+        state.runtime.with_runtime_mut("winddown", |rt| {
+            rt.last_active
+                .insert("backend".into(), std::time::SystemTime::now())
+        });
+        assert!(state.runtime.snapshot("winddown").is_some());
+
+        let identity = identity_for(&uid, true, HashSet::new());
+        let resp = stop_project_handler(
+            State(state.clone()),
+            Extension(identity),
+            Path("winddown".to_string()),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(resp.status(), 200, "{:?}", json_body(resp).await);
+        assert!(
+            state.runtime.snapshot("winddown").is_none(),
+            "stop must clear the per-name orchestrator state (BL-R36-1)"
+        );
+    }
+
+    // -- test_sec_r35_rename_warmstart_lock.py (BL-R35-1): rename must
+    // pop the OLD-name orchestrator state and purge its runtime dir,
+    // exactly like delete does -- direct handler calls, no concurrency
+    // needed to prove the state mutation itself (the concurrent-warm-
+    // start-doesn't-start-a-backend half of BL-R35-1 is proven at the
+    // `orchestrator::ensure` layer by `ensure_aborts_when_project_
+    // renamed_while_lock_held`, and the lock-is-HELD-across-the-stop
+    // half follows structurally from `revalidated_lock`'s own guard
+    // never dropping until after `finish_rename_project` returns --
+    // see this handler's own SC-R8-1 comment on `drop(_lock_guard)`). --
+
+    #[tokio::test]
+    async fn rename_project_handler_pops_the_old_name_orchestrator_state() {
+        let (dir, state) = test_state();
+        let uid = seed_real_sysadmin(&state, "root").await;
+        register(
+            &state,
+            "ephemeral",
+            &dir.path().join("workspaces").join("ephemeral"),
+        );
+        state.runtime.with_runtime_mut("ephemeral", |rt| {
+            rt.last_active
+                .insert("backend".into(), std::time::SystemTime::now())
+        });
+        assert!(state.runtime.snapshot("ephemeral").is_some());
+
+        let identity = identity_for(&uid, true, HashSet::new());
+        let resp = rename_project_handler(
+            State(state.clone()),
+            Extension(identity),
+            Path("ephemeral".to_string()),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"name": "renamed"}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), 200, "{:?}", json_body(resp).await);
+        assert!(
+            state.runtime.snapshot("ephemeral").is_none(),
+            "rename must clear the OLD-name orchestrator state (BL-R35-1)"
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_project_handler_purges_the_old_name_runtime_dir() {
+        let (dir, state) = test_state();
+        let uid = seed_real_sysadmin(&state, "root").await;
+        register(&state, "runt", &dir.path().join("workspaces").join("runt"));
+        let runtime_dir = state.sock_dir.join("runt");
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        std::fs::write(runtime_dir.join("backend.sock"), b"").unwrap();
+        std::fs::write(runtime_dir.join("forwarding_hmac"), b"k".repeat(32)).unwrap();
+
+        let identity = identity_for(&uid, true, HashSet::new());
+        let resp = rename_project_handler(
+            State(state.clone()),
+            Extension(identity),
+            Path("runt".to_string()),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"name": "grown"}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), 200, "{:?}", json_body(resp).await);
+        assert!(
+            !runtime_dir.exists(),
+            "rename must purge the OLD-name runtime dir (stale socket + HMAC key, BL-R35-1)"
+        );
+    }
+
+    // ====================================================================
+    // Genuine concurrent-REQUEST races that need a real, controllable
+    // `systemctl stop` shell-out to park one request mid-critical-section
+    // while a second lands (test_sec_r36_lifecycle_parity.py's PF-R36-1 /
+    // test_sec_r37_rename_error_mapping.py's PF-R37-1) -- mirrors
+    // `orchestrator::ensure`'s own `write_fake_systemctl_blocking_on_is_
+    // active` idiom, applied to `stop` instead.
+    // ====================================================================
+
+    fn fast_ensure_config(program: &std::path::Path) -> EnsureConfig {
+        EnsureConfig {
+            systemctl_program: program.to_str().unwrap().to_string(),
+            systemctl_mode: crate::orchestrator::primitives::SystemctlMode::User,
+            systemctl_timeout: std::time::Duration::from_secs(5),
+            ensure_failure_cooldown: std::time::Duration::from_millis(200),
+            boot_grace: std::time::Duration::from_millis(150),
+            socket_poll_attempts: 5,
+            max_restart_attempts: 5,
+            giveup_cooldown: std::time::Duration::from_secs(600),
+        }
+    }
+
+    fn test_state_with_ensure_config(
+        ensure_config: EnsureConfig,
+    ) -> (tempfile::TempDir, Arc<RouterState>) {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_router_schema(&conn).unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
+        let state = Arc::new(RouterState::new(
+            conn,
+            registry,
+            RateLimitConfig::resolve_from_process_env(),
+            ensure_config,
+            test_state_config(dir.path()),
+        ));
+        (dir, state)
+    }
+
+    /// A disposable fake `systemctl`: `stop` against a unit whose name
+    /// contains `block_unit_substr` touches `started` then blocks
+    /// (bounded, so a genuine regression fails the test rather than
+    /// hanging the suite) until `release` appears; every OTHER `stop`
+    /// (a different project's unit) and every `is-active` returns
+    /// immediately with the caller-chosen codes.
+    fn write_fake_systemctl_blocking_on_stop(
+        dir: &std::path::Path,
+        block_unit_substr: &str,
+        started: &std::path::Path,
+        release: &std::path::Path,
+        is_active_rc: i32,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let log = dir.join("calls.log");
+        let script_path = dir.join("fake-systemctl-stop-block.sh");
+        let script = format!(
+            r#"#!/bin/sh
+echo "$@" >> "{log}"
+verb=""
+unit=""
+for a in "$@"; do
+  case "$a" in
+    is-active|start|restart|stop) verb="$a" ;;
+    --user) ;;
+    *) unit="$a" ;;
+  esac
+done
+if [ "$verb" = "stop" ]; then
+  case "$unit" in
+    *{block_unit_substr}*)
+      touch "{started}"
+      i=0
+      while [ ! -f "{release}" ] && [ $i -lt 200 ]; do
+        sleep 0.05
+        i=$((i+1))
+      done
+      ;;
+  esac
+  exit 0
+fi
+if [ "$verb" = "is-active" ]; then
+  exit {is_active_rc}
+fi
+exit 0
+"#,
+            log = log.display(),
+            started = started.display(),
+            release = release.display(),
+        );
+        std::fs::write(&script_path, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script_path, perms).unwrap();
+        }
+        (script_path, log)
+    }
+
+    async fn wait_for_marker(path: &std::path::Path, what: &str) {
+        for _ in 0..200 {
+            if path.exists() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("{what} never happened -- marker file {path:?} was never created");
+    }
+
+    // -- test_sec_r36_lifecycle_parity.py (PF-R36-1): two concurrent
+    // renames of the SAME project. The winner renames it away; the
+    // loser, on acquiring the lock next, must re-check existence INSIDE
+    // the lock and return a clean 404 -- never let `_REGISTRY.rename`'s
+    // `UnknownProject` escape as a 500. -----------------------------------
+
+    #[tokio::test]
+    async fn concurrent_rename_of_the_same_project_loser_gets_404_not_500() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = dir.path().join("started");
+        let release = dir.path().join("release");
+        let (program, _log) =
+            write_fake_systemctl_blocking_on_stop(dir.path(), "contended", &started, &release, 3);
+        let (state_dir, state) = test_state_with_ensure_config(fast_ensure_config(&program));
+        let uid = seed_real_sysadmin(&state, "root").await;
+        register(
+            &state,
+            "contended",
+            &state_dir.path().join("workspaces").join("contended"),
+        );
+
+        // Winner: contended -> winner. Parks in its systemctl stop
+        // (holding the ensure_lock).
+        let winner_state = state.clone();
+        let winner_identity = identity_for(&uid, true, HashSet::new());
+        let winner = tokio::spawn(async move {
+            rename_project_handler(
+                State(winner_state),
+                Extension(winner_identity),
+                Path("contended".to_string()),
+                HeaderMap::new(),
+                Bytes::from_static(br#"{"name": "winner"}"#),
+            )
+            .await
+        });
+        wait_for_marker(&started, "winner rename never reached its systemctl stop").await;
+
+        // Loser: contended -> loser. Passes its outside-lock probe
+        // (contended is still registered -- winner is parked BEFORE its
+        // registry.rename), then blocks on the SAME ensure_lock.
+        let loser_state = state.clone();
+        let loser_identity = identity_for(&uid, true, HashSet::new());
+        let loser = tokio::spawn(async move {
+            rename_project_handler(
+                State(loser_state),
+                Extension(loser_identity),
+                Path("contended".to_string()),
+                HeaderMap::new(),
+                Bytes::from_static(br#"{"name": "loser"}"#),
+            )
+            .await
+        });
+        let_spawned_task_reach_its_lock_wait().await;
+
+        std::fs::write(&release, b"go").unwrap();
+        let winner_resp = winner.await.unwrap();
+        assert_eq!(
+            winner_resp.status(),
+            200,
+            "{:?}",
+            json_body(winner_resp).await
+        );
+
+        let loser_resp = loser.await.unwrap();
+        assert_ne!(
+            loser_resp.status(),
+            500,
+            "the losing concurrent rename must not surface a 500"
+        );
+        assert_eq!(
+            loser_resp.status(),
+            404,
+            "{:?}",
+            json_body(loser_resp).await
+        );
+    }
+
+    // -- test_sec_r37_rename_error_mapping.py (PF-R37-1): the registry's
+    // atomic ProjectNameTaken guard is the ONLY backstop for two renames
+    // with DIFFERENT old names racing the SAME new name (`ensure_lock`
+    // keys on old_name, so they never serialize against each other) --
+    // it must map to 409 name_taken, never a 500. -------------------------
+
+    #[tokio::test]
+    async fn concurrent_rename_of_different_projects_to_the_same_new_name_loser_gets_409_not_500() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = dir.path().join("started");
+        let release = dir.path().join("release");
+        // Only the LOSER's unit (losesrc) blocks; the winner's own stop
+        // call runs to completion immediately.
+        let (program, _log) =
+            write_fake_systemctl_blocking_on_stop(dir.path(), "losesrc", &started, &release, 3);
+        let (state_dir, state) = test_state_with_ensure_config(fast_ensure_config(&program));
+        let uid = seed_real_sysadmin(&state, "root").await;
+        register(
+            &state,
+            "winsrc",
+            &state_dir.path().join("ws").join("ws_winsrc"),
+        );
+        register(
+            &state,
+            "losesrc",
+            &state_dir.path().join("ws").join("ws_losesrc"),
+        );
+
+        // Loser: losesrc -> shared. Parks in its systemctl stop.
+        let loser_state = state.clone();
+        let loser_identity = identity_for(&uid, true, HashSet::new());
+        let loser = tokio::spawn(async move {
+            rename_project_handler(
+                State(loser_state),
+                Extension(loser_identity),
+                Path("losesrc".to_string()),
+                HeaderMap::new(),
+                Bytes::from_static(br#"{"name": "shared"}"#),
+            )
+            .await
+        });
+        wait_for_marker(&started, "loser rename never reached its systemctl stop").await;
+
+        // Winner: winsrc -> shared. Its own stop call doesn't block, so
+        // it runs to completion, claiming "shared" as a real project.
+        let winner_identity = identity_for(&uid, true, HashSet::new());
+        let winner_resp = rename_project_handler(
+            State(state.clone()),
+            Extension(winner_identity),
+            Path("winsrc".to_string()),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"name": "shared"}"#),
+        )
+        .await;
+        assert_eq!(
+            winner_resp.status(),
+            200,
+            "{:?}",
+            json_body(winner_resp).await
+        );
+
+        // Release the loser; its registry.rename() now hits the
+        // already-taken name.
+        std::fs::write(&release, b"go").unwrap();
+        let loser_resp = loser.await.unwrap();
+        assert_ne!(
+            loser_resp.status(),
+            500,
+            "the losing concurrent rename must not surface a 500"
+        );
+        assert_eq!(
+            loser_resp.status(),
+            409,
+            "{:?}",
+            json_body(loser_resp).await
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_racing_a_create_of_the_same_new_name_gets_409_not_500() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = dir.path().join("started");
+        let release = dir.path().join("release");
+        let (program, _log) =
+            write_fake_systemctl_blocking_on_stop(dir.path(), "mover", &started, &release, 3);
+        let (state_dir, state) = test_state_with_ensure_config(fast_ensure_config(&program));
+        let uid = seed_real_sysadmin(&state, "root").await;
+        register(
+            &state,
+            "mover",
+            &state_dir.path().join("ws").join("ws_mover"),
+        );
+
+        // Rename mover -> fresh. Parks in its systemctl stop.
+        let rename_state = state.clone();
+        let rename_identity = identity_for(&uid, true, HashSet::new());
+        let rename_task = tokio::spawn(async move {
+            rename_project_handler(
+                State(rename_state),
+                Extension(rename_identity),
+                Path("mover".to_string()),
+                HeaderMap::new(),
+                Bytes::from_static(br#"{"name": "fresh"}"#),
+            )
+            .await
+        });
+        wait_for_marker(&started, "rename never reached its systemctl stop").await;
+
+        // Create "fresh" as a real project while the rename is parked.
+        let create_identity = identity_for(&uid, true, HashSet::new());
+        let create_resp = create_project_handler(
+            State(state.clone()),
+            Extension(create_identity),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"name": "fresh"}"#),
+        )
+        .await;
+        assert_eq!(
+            create_resp.status(),
+            201,
+            "{:?}",
+            json_body(create_resp).await
+        );
+
+        std::fs::write(&release, b"go").unwrap();
+        let rename_resp = rename_task.await.unwrap();
+        assert_ne!(
+            rename_resp.status(),
+            500,
+            "a rename racing a create of the same new name must not 500"
+        );
+        assert_eq!(
+            rename_resp.status(),
+            409,
+            "{:?}",
+            json_body(rename_resp).await
+        );
+    }
 }

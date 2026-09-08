@@ -1550,6 +1550,63 @@ mod tests {
     }
 
     #[test]
+    fn rename_project_membership_project_rekeys_a_group_grant_too() {
+        // AZ-R13-1 (test_sec_r13_project_rename_membership.py, exploit
+        // 1): a GROUP-conferred grant must follow the rename exactly
+        // like a user grant -- the UPDATE is keyed on project_name
+        // alone, but confirm it directly since the Python regression
+        // was specifically about group rows being missed by an
+        // earlier, narrower fix attempt.
+        let c = conn();
+        c.execute(
+            "INSERT INTO groups (group_id, name, is_sysadmin, created_at) \
+             VALUES ('g-admins', 'Proj Admins', 0, ?1)",
+            [NOW],
+        )
+        .unwrap();
+        grant_project_membership(&c, "old-name", None, Some("g-admins"), "viewer").unwrap();
+        rename_project_membership_project(&c, "old-name", "new-name").unwrap();
+        assert_eq!(
+            project_membership_role(&c, "new-name", None, Some("g-admins")).unwrap(),
+            Some("viewer".to_string()),
+            "the group grant must follow the rename"
+        );
+        assert!(
+            project_membership_role(&c, "old-name", None, Some("g-admins"))
+                .unwrap()
+                .is_none(),
+            "nothing may be left orphaned under the old name"
+        );
+    }
+
+    #[test]
+    fn rename_project_membership_project_leaves_an_unrelated_project_untouched() {
+        // test_sec_r13_project_rename_membership.py's
+        // `test_rename_leaves_unrelated_projects_membership_untouched`:
+        // renaming one project's membership rows must not touch a
+        // different project's rows, even for the SAME user.
+        let mut c = conn();
+        let uid = create_user(
+            &mut c,
+            "carol",
+            "correct horse battery staple",
+            None,
+            false,
+            true,
+            &[],
+            NOW,
+        )
+        .unwrap();
+        add_project_membership(&c, &uid, "moving").unwrap();
+        add_project_membership(&c, &uid, "bystander").unwrap();
+        rename_project_membership_project(&c, "moving", "moved").unwrap();
+        assert_eq!(
+            membership_projects_for(&c, &uid),
+            vec!["bystander".to_string(), "moved".to_string()]
+        );
+    }
+
+    #[test]
     fn remove_project_membership_by_project_drops_every_matching_row() {
         let mut c = conn();
         let uid = create_user(
