@@ -98,7 +98,7 @@ impl Tool for ViewFileMetadataTool {
         arguments: &'a Value,
         conn: &'a AsyncMutex<Connection>,
         _now: &'a str,
-        _ctx: &'a conexus_auth::ToolCallContext<'a>,
+        ctx: &'a conexus_auth::ToolCallContext<'a>,
     ) -> conexus_auth::BoxFuture<'a, ToolResult> {
         Box::pin(async move {
             let Some(filepath_arg) = str_arg(arguments, "filepath").filter(|s| !s.is_empty())
@@ -112,6 +112,7 @@ impl Tool for ViewFileMetadataTool {
 
             let guard = conn.lock().await;
             let wd = crate::file_management_tools::working_directory_for(&guard, agent_id);
+            drop(guard);
             let Some(normalized) = normalize_filepath(&wd, &filepath_arg) else {
                 return ToolResult::Invalid {
                     field: Some("filepath".to_string()),
@@ -119,7 +120,7 @@ impl Tool for ViewFileMetadataTool {
                 };
             };
 
-            match file_metadata_repository::get(&guard, &normalized) {
+            match file_metadata_repository::get(ctx.sea_orm_db, &normalized).await {
                 Ok(Some(row)) => {
                     let metadata_parsed: Value = serde_json::from_str(&row.metadata)
                         .unwrap_or_else(|_| {
@@ -199,7 +200,7 @@ impl Tool for UpdateFileMetadataTool {
         arguments: &'a Value,
         conn: &'a AsyncMutex<Connection>,
         now: &'a str,
-        _ctx: &'a conexus_auth::ToolCallContext<'a>,
+        ctx: &'a conexus_auth::ToolCallContext<'a>,
     ) -> conexus_auth::BoxFuture<'a, ToolResult> {
         Box::pin(async move {
             let Some(filepath_arg) = str_arg(arguments, "filepath").filter(|s| !s.is_empty())
@@ -233,13 +234,19 @@ impl Tool for UpdateFileMetadataTool {
 
             let metadata_json = metadata_to_set.to_string();
 
+            // `file_metadata_repository` is sea-orm-backed (Phase G);
+            // `agent_action_repository` below is not yet -- `guard`
+            // (the legacy connection) stays alive across both calls
+            // since the audit-log write still needs it.
             match file_metadata_repository::upsert(
-                &guard,
+                ctx.sea_orm_db,
                 &normalized,
                 &metadata_json,
                 requesting_admin_id,
                 now,
-            ) {
+            )
+            .await
+            {
                 Ok(()) => {
                     let _ = agent_action_repository::log_agent_action(
                         &guard,
@@ -274,14 +281,6 @@ impl Tool for UpdateFileMetadataTool {
 
 #[cfg(test)]
 mod tests {
-    // Phase G (sea-orm migration infra): a throwaway in-memory
-    // sea-orm connection for ToolCallContext::sea_orm_db -- no test in
-    // this file queries through it yet, it only needs to exist so
-    // off_wire's now-mandatory last argument has something to point
-    // at.
-    async fn test_sea_orm_db() -> sea_orm::DatabaseConnection {
-        sea_orm::Database::connect("sqlite::memory:").await.unwrap()
-    }
 
     use super::*;
     use conexus_auth::ToolCallContext;
@@ -321,8 +320,19 @@ mod tests {
         }
     }
 
-    async fn setup() -> AsyncMutex<Connection> {
-        let conn = Connection::open_in_memory().unwrap();
+    /// Phase G: `file_metadata_repository`'s calls now genuinely query
+    /// through `ctx.sea_orm_db` -- an unrelated `:memory:` connection
+    /// (SQLite's `:memory:` databases are never shared across separate
+    /// connections) would silently see an empty, schema-less database.
+    /// Both connection types must point at the SAME real temp file.
+    async fn setup() -> (
+        tempfile::TempDir,
+        AsyncMutex<Connection>,
+        sea_orm::DatabaseConnection,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let conn = Connection::open(&path).unwrap();
         init_schema(&conn).unwrap();
         AgentRepository::create(
             &conn,
@@ -338,16 +348,18 @@ mod tests {
             },
         )
         .unwrap();
-        AsyncMutex::new(conn)
+        let sea_orm_db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        (dir, AsyncMutex::new(conn), sea_orm_db)
     }
 
     #[tokio::test]
     async fn view_reports_no_metadata_recorded_yet() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         let principal = worker_principal("alice");
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -382,11 +394,10 @@ mod tests {
 
     #[tokio::test]
     async fn an_operator_updates_metadata_and_it_is_readable_back() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         let operator = operator_principal();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -428,11 +439,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_malformed_path_is_invalid_not_a_500() {
-        let conn = setup().await;
+        let (_dir, conn, sea_orm_db) = setup().await;
         let principal = worker_principal("alice");
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
