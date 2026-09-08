@@ -1341,9 +1341,7 @@ pub async fn context_data(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     let limit = crate::read_limits::clamp_section_limit(params.get("limit").map(String::as_str));
-    let guard = shared.conn.lock().await;
-    let rows = conexus_db::project_context_repository::list_recent(&guard, limit);
-    drop(guard);
+    let rows = conexus_db::project_context_repository::list_recent(&shared.sea_orm_db, limit).await;
     match rows {
         Ok(rows) => {
             let data: Vec<_> = rows.iter().map(context_row_to_json).collect();
@@ -1717,8 +1715,10 @@ pub async fn all_data(
     };
     let tasks_data: Vec<Value> = tasks.iter().map(task_row_to_json).collect();
 
-    let context_rows = conexus_db::project_context_repository::list_recent(&guard, section_limit)
-        .unwrap_or_default();
+    let context_rows =
+        conexus_db::project_context_repository::list_recent(&shared.sea_orm_db, section_limit)
+            .await
+            .unwrap_or_default();
     let context_data: Vec<Value> = context_rows.iter().map(context_row_to_json).collect();
 
     // "last 100" cap, further narrowed by a smaller `?limit` -- matches
@@ -3854,14 +3854,32 @@ mod tests {
 
     use std::collections::HashMap;
 
+    /// A real temp-file-backed connection, not `:memory:` --
+    /// `test_shared_state` below opens a SEPARATE sea-orm connection
+    /// to the SAME file (via `rusqlite::Connection::path`), so
+    /// sea-orm-backed repositories (Phase G, e.g.
+    /// `project_context_repository`) and this rusqlite connection
+    /// observe the same data; two independent `:memory:` connections
+    /// never do (this exact bug has bitten every prior PR in this
+    /// migration). The tempdir is deliberately leaked via `keep()`
+    /// (never cleaned up) rather than threaded through every one of
+    /// this file's ~37 call sites -- safe for a throwaway per-test
+    /// file the OS reclaims on its own.
     fn test_conn() -> rusqlite::Connection {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap().keep();
+        let conn = rusqlite::Connection::open(dir.join("test.db")).unwrap();
         conexus_db::schema::init_schema(&conn).unwrap();
         conn
     }
 
     async fn test_shared_state(conn: rusqlite::Connection) -> Arc<SharedState> {
-        let sea_orm_db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
+        let path = conn
+            .path()
+            .expect("test_conn opens a real file, not :memory:")
+            .to_string();
+        let sea_orm_db = sea_orm::Database::connect(format!("sqlite://{path}"))
+            .await
+            .unwrap();
         Arc::new(SharedState {
             conn: tokio::sync::Mutex::new(conn),
             forwarding_hmac_key: None,
@@ -4530,8 +4548,8 @@ mod tests {
         let text = body_text(resp).await;
         assert_eq!(status, StatusCode::OK, "update failed: {text}");
 
-        let guard = shared.conn.lock().await;
-        let row = conexus_db::project_context_repository::get(&guard, "r22_rest")
+        let row = conexus_db::project_context_repository::get(&shared.sea_orm_db, "r22_rest")
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(row.value, "{\"v\":2}");

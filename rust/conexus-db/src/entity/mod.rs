@@ -24,4 +24,5 @@ pub mod agent_action;
 pub mod claude_code_session;
 pub mod file_metadata;
 pub mod group_capability;
+pub mod project_context;
 pub mod task_comment;

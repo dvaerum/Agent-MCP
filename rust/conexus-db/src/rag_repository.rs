@@ -801,11 +801,29 @@ mod tests {
         );
     }
 
-    #[test]
-    fn fetch_recent_context_filters_by_time_window_descending() {
-        let conn = test_conn_without_vec();
+    /// `fetch_recent_context` reads `project_context` via rusqlite
+    /// directly (it stays outside this migration's scope), but
+    /// seeding through `project_context_repository::upsert` is
+    /// sea-orm-backed (Phase G) -- a real temp file shared between
+    /// both connection types (never `:memory:` for either side) is
+    /// required for the rusqlite read to see the sea-orm writes.
+    async fn test_conn_without_vec_shared_file(
+    ) -> (tempfile::TempDir, Connection, sea_orm::DatabaseConnection) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn).unwrap();
+        let sea_orm_db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        (dir, conn, sea_orm_db)
+    }
+
+    #[tokio::test]
+    async fn fetch_recent_context_filters_by_time_window_descending() {
+        let (_dir, conn, sea_orm_db) = test_conn_without_vec_shared_file().await;
         crate::project_context_repository::upsert(
-            &conn,
+            &sea_orm_db,
             "old",
             "v",
             None,
@@ -813,9 +831,10 @@ mod tests {
             "alice",
             "2026-01-01T00:00:00Z",
         )
+        .await
         .unwrap();
         crate::project_context_repository::upsert(
-            &conn,
+            &sea_orm_db,
             "mid",
             "v",
             None,
@@ -823,9 +842,10 @@ mod tests {
             "alice",
             "2026-01-02T00:00:00Z",
         )
+        .await
         .unwrap();
         crate::project_context_repository::upsert(
-            &conn,
+            &sea_orm_db,
             "new",
             "v",
             None,
@@ -833,6 +853,7 @@ mod tests {
             "alice",
             "2026-01-03T00:00:00Z",
         )
+        .await
         .unwrap();
 
         let rows = fetch_recent_context(&conn, "2026-01-01T12:00:00Z", None).unwrap();
@@ -844,12 +865,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn fetch_recent_context_limit_none_means_unbounded() {
-        let conn = test_conn_without_vec();
+    #[tokio::test]
+    async fn fetch_recent_context_limit_none_means_unbounded() {
+        let (_dir, conn, sea_orm_db) = test_conn_without_vec_shared_file().await;
         for i in 0..10 {
             crate::project_context_repository::upsert(
-                &conn,
+                &sea_orm_db,
                 &format!("k{i}"),
                 "v",
                 None,
@@ -857,6 +878,7 @@ mod tests {
                 "alice",
                 &format!("2026-01-01T00:00:{i:02}Z"),
             )
+            .await
             .unwrap();
         }
 
