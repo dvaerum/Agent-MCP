@@ -21,6 +21,19 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 # on) for generate_task_id -- we only need N random bytes to hex-encode,
 # not a full PRNG/distribution library.
 getrandom = "0.4"
+# Phase G (see the plan's own "Full sea-orm migration" section): the
+# `entity/` module's `Model`/`ActiveModel` structs are real production
+# types other crates will construct once repository rewrites land
+# (PR 2+) -- kept a real dependency, not dev-only, even though THIS PR
+# only defines Entities and doesn't yet rewrite a repository to use
+# them. `macros` (default) for `DeriveEntityModel`; `sqlx-sqlite` +
+# `runtime-tokio-rustls` matches this workspace's existing TLS/runtime
+# choice (`conexus-tools`'s `reqwest` also uses rustls).
+sea-orm = { version = "2", default-features = false, features = [
+    "macros",
+    "sqlx-sqlite",
+    "runtime-tokio-rustls",
+] }
 
 [dev-dependencies]
 # Only needed to register the real sqlite-vec extension for THIS
@@ -29,6 +42,13 @@ getrandom = "0.4"
 # `rag_embeddings` exists in sqlite_master, a plain SQL query), so
 # this stays a dev-dependency, not a real one.
 conexus-vec = { path = "../conexus-vec" }
+# Phase G entity round-trip tests need a real async runtime to drive
+# sea-orm's `DatabaseConnection` -- dev-only for now; conexus-db's
+# production code stays 100% sync until a repository is actually
+# rewritten onto sea-orm (PR 2+), matching this crate's own "never
+# introduce a dependency before a real caller needs it" discipline.
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tempfile = "3"
 
 [[bin]]
 name = "conexus-db-differential"
