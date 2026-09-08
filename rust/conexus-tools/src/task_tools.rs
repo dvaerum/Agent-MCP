@@ -5501,6 +5501,306 @@ mod update_task_tests {
         assert_eq!(row.priority, "high");
     }
 
+    /// BL-R12-1 (ported from `tests/router/test_sec_r12_dashboard_task_
+    /// invariants.py::test_dashboard_cannot_resurrect_completed_task`):
+    /// `update_task` -- the tool `POST /api/update-task-dashboard` is a
+    /// thin adapter over -- must refuse to resurrect a `completed` task
+    /// back to `in_progress` via an explicit `status`, matching the
+    /// terminal-sink guard `update_task_status` enforces. When no
+    /// explicit `status` is given, `final_status` is threaded through
+    /// as the PRIOR status, so `is_status_transition_allowed` denies
+    /// the same-status transition on a terminal source either way --
+    /// this test pins the explicit-status half of that guard.
+    #[tokio::test]
+    async fn resurrecting_a_completed_task_via_explicit_status_is_denied() {
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "t1", "completed", None);
+        }
+        let result = call(
+            serde_json::json!({"task_id": "t1", "status": "in_progress"}),
+            &conn,
+        )
+        .await;
+        assert!(
+            matches!(result, ToolResult::Conflict { .. }),
+            "resurrecting a completed task must be refused, got {result:?}"
+        );
+        let guard = conn.lock().await;
+        let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+        assert_eq!(row.status, "completed", "resurrection must not land");
+    }
+
+    /// BL-R12-1 (ported from `test_sec_r12_dashboard_task_invariants.py::
+    /// test_dashboard_rejects_bogus_status_enum`): an arbitrary status
+    /// string is rejected before ever reaching a DB write. Already
+    /// pinned for the sibling `update_task_status` tool
+    /// (`rejects_an_invalid_status`, above); this closes the same gap
+    /// for `update_task`, the tool the REST dashboard route actually
+    /// calls.
+    #[tokio::test]
+    async fn rejects_an_invalid_status_value() {
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "t1", "pending", None);
+        }
+        let result = call(
+            serde_json::json!({"task_id": "t1", "status": "totally-bogus-status"}),
+            &conn,
+        )
+        .await;
+        assert!(
+            matches!(result, ToolResult::Invalid { field, .. } if field.as_deref() == Some("status"))
+        );
+        let guard = conn.lock().await;
+        let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+        assert_eq!(row.status, "pending", "a bogus status must never be stored");
+    }
+
+    /// BL-R12-1 (ported from `test_sec_r12_dashboard_task_invariants.py::
+    /// test_dashboard_completion_clears_current_task_pointer`):
+    /// completing a task via `update_task` must clear the assignee's
+    /// `agents.current_task` pointer -- the stale-pointer bug that leaks
+    /// into `/api/all-data`.
+    #[tokio::test]
+    async fn completing_a_task_clears_the_assignees_current_task_pointer() {
+        let conn = test_conn();
+        seed_agent(&conn, "bob").await;
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "t1", "pending", Some("bob"));
+            AgentRepository::reconcile_current_task_on_reassign(
+                &guard,
+                "t1",
+                None,
+                Some("bob"),
+                NOW,
+            )
+            .unwrap();
+        }
+        let result = call(
+            serde_json::json!({"task_id": "t1", "status": "completed"}),
+            &conn,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        let guard = conn.lock().await;
+        let agent = AgentRepository::get_by_id(&guard, "bob").unwrap().unwrap();
+        assert_eq!(
+            agent.current_task, None,
+            "completing the assignee's current task must clear the pointer"
+        );
+    }
+
+    /// Regression sibling of the above two: a legal `pending ->
+    /// in_progress` transition via `update_task` still lands.
+    #[tokio::test]
+    async fn legal_status_transition_still_succeeds() {
+        let conn = test_conn();
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "t1", "pending", None);
+        }
+        let result = call(
+            serde_json::json!({"task_id": "t1", "status": "in_progress"}),
+            &conn,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        let guard = conn.lock().await;
+        let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+        assert_eq!(row.status, "in_progress");
+    }
+
+    /// BL-R13-1 (ported from `tests/router/test_sec_r13_rest_task_
+    /// assignability.py::test_dashboard_reassign_to_nonexistent_agent_
+    /// rejected`): reassigning via `update_task` (the dashboard's
+    /// reassign path) must honour the same `_agent_assignable`
+    /// invariant `create_task` enforces -- a nonexistent agent is
+    /// rejected, not silently pinned.
+    #[tokio::test]
+    async fn reassigning_to_a_nonexistent_agent_is_rejected() {
+        let conn = test_conn();
+        seed_agent(&conn, "alice").await;
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "t1", "pending", Some("alice"));
+        }
+        let result = call(
+            serde_json::json!({"task_id": "t1", "assigned_to": "ghost-does-not-exist"}),
+            &conn,
+        )
+        .await;
+        assert!(
+            matches!(result, ToolResult::Invalid { ref field, .. } if field.as_deref() == Some("assigned_to")),
+            "reassigning to a nonexistent agent must be rejected, got {result:?}"
+        );
+        let guard = conn.lock().await;
+        let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+        assert_eq!(
+            row.assigned_to.as_deref(),
+            Some("alice"),
+            "assignment must be unchanged"
+        );
+    }
+
+    /// BL-R13-1 (ported from `test_sec_r13_rest_task_assignability.py::
+    /// test_dashboard_reassign_to_terminated_agent_rejected`): reassigning
+    /// to a TERMINATED (but existent) agent must also be rejected --
+    /// `_agent_assignable`'s liveness half, not just existence.
+    #[tokio::test]
+    async fn reassigning_to_a_terminated_agent_is_rejected() {
+        let conn = test_conn();
+        seed_agent(&conn, "alice").await;
+        seed_agent(&conn, "zombie").await;
+        {
+            let guard = conn.lock().await;
+            AgentRepository::terminate(&guard, "zombie", NOW).unwrap();
+            seed_task(&guard, "t1", "pending", Some("alice"));
+        }
+        let result = call(
+            serde_json::json!({"task_id": "t1", "assigned_to": "zombie"}),
+            &conn,
+        )
+        .await;
+        assert!(
+            matches!(result, ToolResult::Invalid { ref field, .. } if field.as_deref() == Some("assigned_to")),
+            "reassigning to a terminated agent must be rejected, got {result:?}"
+        );
+        let guard = conn.lock().await;
+        let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+        assert_eq!(
+            row.assigned_to.as_deref(),
+            Some("alice"),
+            "assignment must be unchanged"
+        );
+    }
+
+    /// BL-R16-1 (ported from `tests/router/test_sec_r16_clear_assignment_
+    /// parity.py::test_reassign_to_real_agent_does_not_fire_unassigned`):
+    /// reassigning to a REAL agent must NOT fire the broadcast
+    /// unassigned-pool fanout -- only a CLEAR that lands a non-terminal
+    /// task back to 'unassigned' does. Uses a bystander agent the
+    /// broadcast fanout (not the targeted wake) would reach.
+    #[tokio::test]
+    async fn reassigning_to_a_real_agent_does_not_fire_the_unassigned_fanout() {
+        let conn = test_conn();
+        seed_agent(&conn, "alice").await;
+        seed_agent(&conn, "bob").await;
+        seed_agent(&conn, "bystander").await;
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "t1", "pending", Some("alice"));
+        }
+        let registry = WaiterRegistry::new();
+        let (_tx_bystander, mut rx_bystander) = registry.register("bystander");
+        let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let ctx = conexus_auth::ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+        );
+        let result = UpdateTaskTool::call(
+            Some(&admin("alice")),
+            &serde_json::json!({"task_id": "t1", "assigned_to": "bob"}),
+            &conn,
+            NOW,
+            &ctx,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        let guard = conn.lock().await;
+        assert_eq!(
+            task_repository::get_by_id(&guard, "t1")
+                .unwrap()
+                .unwrap()
+                .status,
+            "pending",
+            "reassigning to a live agent must NOT flip status to unassigned"
+        );
+        drop(guard);
+        assert!(
+            rx_bystander.try_recv().is_err(),
+            "a bystander must not be woken by a spurious unassigned-pool fanout on reassign"
+        );
+    }
+
+    /// BL-R16-1 (ported from `test_sec_r16_clear_assignment_parity.py::
+    /// test_clear_assignment_transitions_status_to_unassigned`,
+    /// parametrized over `[None, "", "unassigned"]`): every clear
+    /// spelling -- a JSON `null`, an empty string, and the literal
+    /// `"unassigned"` -- must transition a non-terminal task's status
+    /// to `unassigned`. The literal-`"unassigned"` case is already
+    /// covered by `clearing_assignment_sets_status_unassigned_and_
+    /// clears_current_task`; this closes the `null`/`""` spellings the
+    /// dashboard's own wire normalization (`assigned_to: null` /
+    /// `""`) actually sends.
+    #[tokio::test]
+    async fn clearing_with_null_and_empty_string_also_transitions_to_unassigned() {
+        for clear_value in [serde_json::Value::Null, serde_json::json!("")] {
+            let conn = test_conn();
+            seed_agent(&conn, "alice").await;
+            {
+                let guard = conn.lock().await;
+                seed_task(&guard, "t1", "pending", Some("alice"));
+            }
+            let result = call(
+                serde_json::json!({"task_id": "t1", "assigned_to": clear_value}),
+                &conn,
+            )
+            .await;
+            assert!(matches!(result, ToolResult::Ok { .. }), "{clear_value:?}");
+            let guard = conn.lock().await;
+            let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+            assert_eq!(row.assigned_to, None, "{clear_value:?}");
+            assert_eq!(row.status, "unassigned", "{clear_value:?}");
+        }
+    }
+
+    /// BL-R18-1 (ported from `tests/router/test_sec_r18_reassign_
+    /// terminal_sink.py::test_reassign_terminal_task_rejected`): the
+    /// terminal-sink invariant must hold on the ASSIGN axis too --
+    /// reassigning a TERMINAL task to a live agent via `update_task`
+    /// (the dashboard's reassign path) must be REJECTED, not just the
+    /// bulk `reassign` op's sibling guard (`reassign_op_on_a_terminal_
+    /// task_is_denied`, BL-R25-1, in `bulk_task_operations_tests`).
+    /// With no explicit `status` given, `final_status` threads through
+    /// as the PRIOR (terminal) status, so `is_status_transition_
+    /// allowed`'s same-status-on-terminal-source check denies this the
+    /// same way it denies resurrection.
+    #[tokio::test]
+    async fn reassigning_a_terminal_task_to_a_live_agent_is_denied() {
+        let conn = test_conn();
+        seed_agent(&conn, "alice").await;
+        seed_agent(&conn, "bob").await;
+        {
+            let guard = conn.lock().await;
+            seed_task(&guard, "t1", "completed", Some("alice"));
+        }
+        let result = call(
+            serde_json::json!({"task_id": "t1", "assigned_to": "bob"}),
+            &conn,
+        )
+        .await;
+        assert!(
+            matches!(result, ToolResult::Conflict { .. }),
+            "reassigning a terminal task to a live agent must be rejected, got {result:?}"
+        );
+        let guard = conn.lock().await;
+        let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+        assert_eq!(
+            row.status, "completed",
+            "rejected reassign must keep terminal status"
+        );
+        assert_eq!(
+            row.assigned_to.as_deref(),
+            Some("alice"),
+            "rejected reassign must leave the assignment unchanged"
+        );
+    }
+
     #[tokio::test]
     async fn appends_a_note() {
         let conn = test_conn();
