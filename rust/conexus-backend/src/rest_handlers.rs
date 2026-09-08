@@ -1742,7 +1742,8 @@ pub async fn all_data(
         .collect();
 
     let file_metadata_rows =
-        conexus_db::file_metadata_repository::list_bounded(&guard, section_limit)
+        conexus_db::file_metadata_repository::list_bounded(&shared.sea_orm_db, section_limit)
+            .await
             .unwrap_or_default();
     let file_metadata_data: Vec<Value> = file_metadata_rows
         .iter()

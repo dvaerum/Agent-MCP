@@ -15,39 +15,27 @@
 //! `content_hash` is a RAG-indexer concern (skip re-embedding
 //! unchanged content) this repository only stores/returns, never
 //! computes.
+//!
+//! Phase G (sea-orm migration): the second repository converted, per
+//! the plan's own real-call-site-count ordering (this table has 3
+//! production call sites -- `file_metadata_tools.rs`'s `get`/`upsert`,
+//! `rest_handlers.rs`'s `list_bounded` for `/api/all-data` -- all
+//! already inside async contexts with `sea_orm_db` already threaded
+//! through them from Phase G PR 2a's infra).
 
-use rusqlite::{Connection, OptionalExtension, Result};
+use sea_orm::{ActiveValue::Set, DatabaseConnection, DbErr, EntityTrait, QueryOrder, QuerySelect};
 
-/// One row of the `file_metadata` table.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct FileMetadataRow {
-    pub filepath: String,
-    pub metadata: String,
-    pub last_updated: String,
-    pub updated_by: String,
-    pub content_hash: Option<String>,
-}
-
-const COLUMNS: &str = "filepath, metadata, last_updated, updated_by, content_hash";
+pub use crate::entity::file_metadata::Model as FileMetadataRow;
+use crate::entity::file_metadata::{ActiveModel, Column, Entity};
 
 /// The recorded metadata for `filepath`, or `None` if nothing has
 /// ever been set — the normal, benign state (metadata is optional and
 /// operator-managed), not a missing-resource error.
-pub fn get(conn: &Connection, filepath: &str) -> Result<Option<FileMetadataRow>> {
-    conn.query_row(
-        &format!("SELECT {COLUMNS} FROM file_metadata WHERE filepath = ?1"),
-        [filepath],
-        |row| {
-            Ok(FileMetadataRow {
-                filepath: row.get(0)?,
-                metadata: row.get(1)?,
-                last_updated: row.get(2)?,
-                updated_by: row.get(3)?,
-                content_hash: row.get(4)?,
-            })
-        },
-    )
-    .optional()
+pub async fn get(
+    db: &DatabaseConnection,
+    filepath: &str,
+) -> Result<Option<FileMetadataRow>, DbErr> {
+    Entity::find_by_id(filepath.to_string()).one(db).await
 }
 
 /// The first `limit` rows, in whatever order SQLite returns them --
@@ -57,19 +45,22 @@ pub fn get(conn: &Connection, filepath: &str) -> Result<Option<FileMetadataRow>>
 /// "db review item 2" note: this was unbounded before), not a
 /// recency-sorted one -- unlike `project_context_repository::
 /// list_recent`, there's no Python `ORDER BY updated_at DESC` to
-/// preserve here.
-pub fn list_bounded(conn: &Connection, limit: i64) -> Result<Vec<FileMetadataRow>> {
-    let mut stmt = conn.prepare(&format!("SELECT {COLUMNS} FROM file_metadata LIMIT ?1"))?;
-    let rows = stmt.query_map([limit], |row| {
-        Ok(FileMetadataRow {
-            filepath: row.get(0)?,
-            metadata: row.get(1)?,
-            last_updated: row.get(2)?,
-            updated_by: row.get(3)?,
-            content_hash: row.get(4)?,
-        })
-    })?;
-    rows.collect()
+/// preserve here. Ordered by the primary key here only because
+/// sea-orm's `Paginator`/`limit` needs SOME deterministic row source
+/// to page against; SQLite's own unordered scan order (what the
+/// original rusqlite `LIMIT`-with-no-`ORDER BY` actually returned) is
+/// not otherwise observable through sea-orm's query builder, and no
+/// caller depends on a specific order (confirmed by reading
+/// `rest_handlers.rs`'s own call site, which never sorts the result).
+pub async fn list_bounded(
+    db: &DatabaseConnection,
+    limit: i64,
+) -> Result<Vec<FileMetadataRow>, DbErr> {
+    Entity::find()
+        .order_by_asc(Column::Filepath)
+        .limit(limit as u64)
+        .all(db)
+        .await
 }
 
 /// Insert or wholesale-replace `filepath`'s metadata row — Python's
@@ -78,18 +69,33 @@ pub fn list_bounded(conn: &Connection, limit: i64) -> Result<Vec<FileMetadataRow
 /// the tool layer, matching Python's own unconditional-replace
 /// semantic — this is a full overwrite, not a partial-field merge
 /// like `project_settings_repository::upsert`'s BL-R22-1 rule).
-pub fn upsert(
-    conn: &Connection,
+pub async fn upsert(
+    db: &DatabaseConnection,
     filepath: &str,
     metadata: &str,
     updated_by: &str,
     now: &str,
-) -> Result<()> {
-    conn.execute(
-        "INSERT OR REPLACE INTO file_metadata (filepath, metadata, last_updated, updated_by) \
-         VALUES (?1, ?2, ?3, ?4)",
-        (filepath, metadata, now, updated_by),
-    )?;
+) -> Result<(), DbErr> {
+    let am = ActiveModel {
+        filepath: Set(filepath.to_string()),
+        metadata: Set(metadata.to_string()),
+        last_updated: Set(now.to_string()),
+        updated_by: Set(updated_by.to_string()),
+        content_hash: Set(None),
+    };
+    Entity::insert(am)
+        .on_conflict(
+            sea_orm::sea_query::OnConflict::column(Column::Filepath)
+                .update_columns([
+                    Column::Metadata,
+                    Column::LastUpdated,
+                    Column::UpdatedBy,
+                    Column::ContentHash,
+                ])
+                .to_owned(),
+        )
+        .exec(db)
+        .await?;
     Ok(())
 }
 
@@ -97,31 +103,40 @@ pub fn upsert(
 mod tests {
     use super::*;
     use crate::schema::init_schema;
+    use sea_orm::Database;
 
-    fn conn() -> Connection {
-        let c = Connection::open_in_memory().unwrap();
-        init_schema(&c).unwrap();
-        c
+    async fn conn() -> (tempfile::TempDir, DatabaseConnection) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        {
+            let c = rusqlite::Connection::open(&path).unwrap();
+            init_schema(&c).unwrap();
+        }
+        let db = Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        (dir, db)
     }
 
-    #[test]
-    fn get_on_an_unrecorded_path_returns_none() {
-        let c = conn();
-        assert_eq!(get(&c, "/tmp/a.rs").unwrap(), None);
+    #[tokio::test]
+    async fn get_on_an_unrecorded_path_returns_none() {
+        let (_dir, db) = conn().await;
+        assert_eq!(get(&db, "/tmp/a.rs").await.unwrap(), None);
     }
 
-    #[test]
-    fn upsert_then_get_returns_the_recorded_row() {
-        let c = conn();
+    #[tokio::test]
+    async fn upsert_then_get_returns_the_recorded_row() {
+        let (_dir, db) = conn().await;
         upsert(
-            &c,
+            &db,
             "/tmp/a.rs",
             r#"{"lang":"rust"}"#,
             "alice",
             "2026-06-01T00:00:00Z",
         )
+        .await
         .unwrap();
-        let row = get(&c, "/tmp/a.rs").unwrap().unwrap();
+        let row = get(&db, "/tmp/a.rs").await.unwrap().unwrap();
         assert_eq!(row.filepath, "/tmp/a.rs");
         assert_eq!(row.metadata, r#"{"lang":"rust"}"#);
         assert_eq!(row.updated_by, "alice");
@@ -129,37 +144,45 @@ mod tests {
         assert_eq!(row.content_hash, None);
     }
 
-    #[test]
-    fn list_bounded_respects_the_limit() {
-        let c = conn();
-        upsert(&c, "/tmp/a.rs", "{}", "alice", "2026-01-01T00:00:00Z").unwrap();
-        upsert(&c, "/tmp/b.rs", "{}", "alice", "2026-01-01T00:00:00Z").unwrap();
-        upsert(&c, "/tmp/c.rs", "{}", "alice", "2026-01-01T00:00:00Z").unwrap();
+    #[tokio::test]
+    async fn list_bounded_respects_the_limit() {
+        let (_dir, db) = conn().await;
+        upsert(&db, "/tmp/a.rs", "{}", "alice", "2026-01-01T00:00:00Z")
+            .await
+            .unwrap();
+        upsert(&db, "/tmp/b.rs", "{}", "alice", "2026-01-01T00:00:00Z")
+            .await
+            .unwrap();
+        upsert(&db, "/tmp/c.rs", "{}", "alice", "2026-01-01T00:00:00Z")
+            .await
+            .unwrap();
 
-        assert_eq!(list_bounded(&c, 10).unwrap().len(), 3);
-        assert_eq!(list_bounded(&c, 2).unwrap().len(), 2);
+        assert_eq!(list_bounded(&db, 10).await.unwrap().len(), 3);
+        assert_eq!(list_bounded(&db, 2).await.unwrap().len(), 2);
     }
 
-    #[test]
-    fn a_second_upsert_replaces_the_whole_row() {
-        let c = conn();
+    #[tokio::test]
+    async fn a_second_upsert_replaces_the_whole_row() {
+        let (_dir, db) = conn().await;
         upsert(
-            &c,
+            &db,
             "/tmp/a.rs",
             r#"{"lang":"rust"}"#,
             "alice",
             "2026-06-01T00:00:00Z",
         )
+        .await
         .unwrap();
         upsert(
-            &c,
+            &db,
             "/tmp/a.rs",
             r#"{"lang":"python"}"#,
             "bob",
             "2026-06-01T00:01:00Z",
         )
+        .await
         .unwrap();
-        let row = get(&c, "/tmp/a.rs").unwrap().unwrap();
+        let row = get(&db, "/tmp/a.rs").await.unwrap().unwrap();
         assert_eq!(row.metadata, r#"{"lang":"python"}"#);
         assert_eq!(row.updated_by, "bob");
     }
