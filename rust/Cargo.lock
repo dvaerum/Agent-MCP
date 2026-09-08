@@ -572,6 +572,7 @@ dependencies = [
  "conexus-core",
  "conexus-db",
  "rusqlite",
+ "sea-orm",
  "serde",
  "serde_json",
  "tokio",

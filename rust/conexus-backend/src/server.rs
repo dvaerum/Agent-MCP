@@ -673,10 +673,14 @@ impl ServerHandler for ConexusServer {
     ) -> Result<ReadResourceResponse, McpError> {
         let principal = principal_from_context(&context);
         let now = chrono::Utc::now().to_rfc3339();
-        let outcome = {
-            let guard = self.shared.conn.lock().await;
-            conexus_tools::resources::read(&guard, &request.uri, principal.as_ref(), &now)
-        }
+        let outcome = conexus_tools::resources::read(
+            &self.shared.conn,
+            &request.uri,
+            principal.as_ref(),
+            &now,
+            &self.shared.sea_orm_db,
+        )
+        .await
         .map_err(|_| {
             McpError::internal_error(format!("failed to read resource {:?}", request.uri), None)
         })?;

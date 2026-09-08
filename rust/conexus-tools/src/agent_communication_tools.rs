@@ -259,18 +259,17 @@ pub async fn wait_for_events_entry(
     // Fast path -- combine DB backlog with anything already queued for
     // us between register() and here.
     let drained = drain(&mut receiver);
-    let fast_feed = {
-        let guard = conn.lock().await;
-        event_feed::assemble_event_feed(
-            &guard,
-            &agent_id,
-            since.as_deref(),
-            now_iso,
-            drained,
-            true,
-            process_env,
-        )
-    };
+    let fast_feed = event_feed::assemble_event_feed(
+        conn,
+        &agent_id,
+        since.as_deref(),
+        now_iso,
+        drained,
+        true,
+        process_env,
+        ctx.sea_orm_db,
+    )
+    .await;
     if let Ok(assembled) = fast_feed {
         if !assembled.events.is_empty() {
             hold_ladder::reset(&agent_id); // a real event resets the ladder
@@ -511,18 +510,17 @@ pub async fn wait_for_events_slow_path(
         // A schedule is due now -> fire it and return.
         if let Some(due) = &soonest_due {
             if due.as_str() <= now_iso_str.as_str() {
-                let assembled = {
-                    let guard = conn.lock().await;
-                    event_feed::assemble_event_feed(
-                        &guard,
-                        &agent_id,
-                        since.as_deref(),
-                        &now_iso_str,
-                        Vec::new(),
-                        true,
-                        process_env,
-                    )
-                };
+                let assembled = event_feed::assemble_event_feed(
+                    conn,
+                    &agent_id,
+                    since.as_deref(),
+                    &now_iso_str,
+                    Vec::new(),
+                    true,
+                    process_env,
+                    ctx.sea_orm_db,
+                )
+                .await;
                 if let Ok(assembled) = assembled {
                     if !assembled.events.is_empty() {
                         hold_ladder::reset(&agent_id);
@@ -613,18 +611,17 @@ pub async fn wait_for_events_slow_path(
             }
             Ok(StreamSlice::Item(WakeSignal::Wake)) => {
                 let now_iso_str = now_iso();
-                let assembled = {
-                    let guard = conn.lock().await;
-                    event_feed::assemble_event_feed(
-                        &guard,
-                        &agent_id,
-                        since.as_deref(),
-                        &now_iso_str,
-                        Vec::new(),
-                        true,
-                        process_env,
-                    )
-                };
+                let assembled = event_feed::assemble_event_feed(
+                    conn,
+                    &agent_id,
+                    since.as_deref(),
+                    &now_iso_str,
+                    Vec::new(),
+                    true,
+                    process_env,
+                    ctx.sea_orm_db,
+                )
+                .await;
                 if let Ok(assembled) = assembled {
                     if !assembled.events.is_empty() {
                         hold_ladder::reset(&agent_id);
@@ -806,7 +803,7 @@ impl conexus_auth::Tool for FetchEventsSinceTool {
         arguments: &'a Value,
         conn: &'a AsyncMutex<Connection>,
         now: &'a str,
-        _ctx: &'a ToolCallContext<'a>,
+        ctx: &'a ToolCallContext<'a>,
     ) -> conexus_auth::BoxFuture<'a, ToolResult> {
         Box::pin(async move {
             let principal =
@@ -837,18 +834,17 @@ impl conexus_auth::Tool for FetchEventsSinceTool {
                 }
             };
 
-            let assembled = {
-                let guard = conn.lock().await;
-                event_feed::assemble_event_feed(
-                    &guard,
-                    agent_id,
-                    cursor.as_deref(),
-                    now,
-                    Vec::new(),
-                    true,
-                    process_env,
-                )
-            };
+            let assembled = event_feed::assemble_event_feed(
+                conn,
+                agent_id,
+                cursor.as_deref(),
+                now,
+                Vec::new(),
+                true,
+                process_env,
+                ctx.sea_orm_db,
+            )
+            .await;
             let Ok(assembled) = assembled else {
                 return ToolResult::Failed {
                     message: "fetch_events_since: event assembly failed".to_string(),
