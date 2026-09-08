@@ -479,9 +479,10 @@ mod subject_backfill_tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    fn test_shared() -> Arc<SharedState> {
+    async fn test_shared() -> Arc<SharedState> {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
+        let sea_orm_db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
         Arc::new(SharedState {
             conn: tokio::sync::Mutex::new(conn),
             forwarding_hmac_key: None,
@@ -490,6 +491,7 @@ mod subject_backfill_tests {
             project_dir: std::env::temp_dir(),
             operator_events: crate::operator_events::OperatorEventsHub::new(),
             delivery_transport: crate::delivery_transport::DeliveryTransportHub::new(),
+            sea_orm_db,
         })
     }
 
@@ -523,7 +525,7 @@ mod subject_backfill_tests {
 
     #[tokio::test]
     async fn model_unconfigured_is_a_no_op() {
-        let shared = test_shared();
+        let shared = test_shared().await;
         {
             let conn = shared.conn.lock().await;
             seed_root(&conn, "m1", "admin", "hello there");
@@ -534,7 +536,7 @@ mod subject_backfill_tests {
 
     #[tokio::test]
     async fn nothing_to_backfill_is_a_no_op() {
-        let shared = test_shared();
+        let shared = test_shared().await;
         let titled = backfill_null_subjects(
             &shared,
             env(&[("AGENT_MCP_SUBJECT_MODEL", "qwen2.5:3b-instruct")]),
@@ -551,7 +553,7 @@ mod subject_backfill_tests {
         // endpoint -- every suggest_subject call must degrade to None
         // rather than propagate an error, matching Python's own
         // per-row `continue` on a dead model.
-        let shared = test_shared();
+        let shared = test_shared().await;
         {
             let conn = shared.conn.lock().await;
             seed_root(&conn, "m1", "admin", "hello there");
@@ -596,7 +598,7 @@ mod subject_backfill_tests {
             let _ = socket.shutdown().await;
         });
 
-        let shared = test_shared();
+        let shared = test_shared().await;
         {
             let conn = shared.conn.lock().await;
             conexus_db::agent_repository::AgentRepository::create(
@@ -651,9 +653,10 @@ mod claude_session_monitor_tests {
     use conexus_wakeloop::waiter_registry::WaiterRegistry;
     use std::sync::Arc;
 
-    fn test_shared(project_dir: std::path::PathBuf) -> Arc<SharedState> {
+    async fn test_shared(project_dir: std::path::PathBuf) -> Arc<SharedState> {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
+        let sea_orm_db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
         Arc::new(SharedState {
             conn: tokio::sync::Mutex::new(conn),
             forwarding_hmac_key: None,
@@ -662,6 +665,7 @@ mod claude_session_monitor_tests {
             project_dir,
             operator_events: crate::operator_events::OperatorEventsHub::new(),
             delivery_transport: crate::delivery_transport::DeliveryTransportHub::new(),
+            sea_orm_db,
         })
     }
 
@@ -681,7 +685,7 @@ mod claude_session_monitor_tests {
     #[tokio::test]
     async fn no_registry_file_is_a_silent_no_op() {
         let dir = scratch_dir("missing");
-        let shared = test_shared(dir.clone());
+        let shared = test_shared(dir.clone()).await;
         let mut state = MonitorState::default();
         check_registry_changes(&shared, &mut state).await;
         let conn = shared.conn.lock().await;
@@ -697,7 +701,7 @@ mod claude_session_monitor_tests {
     async fn malformed_json_is_a_silent_no_op() {
         let dir = scratch_dir("malformed");
         write_registry(&dir, "not json");
-        let shared = test_shared(dir.clone());
+        let shared = test_shared(dir.clone()).await;
         let mut state = MonitorState::default();
         check_registry_changes(&shared, &mut state).await;
         let conn = shared.conn.lock().await;
@@ -716,7 +720,7 @@ mod claude_session_monitor_tests {
             &dir,
             r#"{"sessions": {"s1": {"pid": 111, "parent_pid": 222, "working_directory": "/repo"}}}"#,
         );
-        let shared = test_shared(dir.clone());
+        let shared = test_shared(dir.clone()).await;
         let mut state = MonitorState::default();
         check_registry_changes(&shared, &mut state).await;
 
@@ -748,7 +752,7 @@ mod claude_session_monitor_tests {
     async fn an_unchanged_mtime_skips_the_second_read_entirely() {
         let dir = scratch_dir("unchanged");
         write_registry(&dir, r#"{"sessions": {"s1": {"pid": 1, "parent_pid": 2}}}"#);
-        let shared = test_shared(dir.clone());
+        let shared = test_shared(dir.clone()).await;
         let mut state = MonitorState::default();
         check_registry_changes(&shared, &mut state).await;
         assert_eq!(state.known_sessions.len(), 1);
@@ -768,7 +772,7 @@ mod claude_session_monitor_tests {
             &dir,
             r#"{"sessions": {"s1": {"pid": 1, "parent_pid": 2, "last_activity": "2026-01-01T00:00:00Z"}}}"#,
         );
-        let shared = test_shared(dir.clone());
+        let shared = test_shared(dir.clone()).await;
         let mut state = MonitorState::default();
         check_registry_changes(&shared, &mut state).await;
 
@@ -804,7 +808,7 @@ mod claude_session_monitor_tests {
     async fn a_session_dropped_from_the_registry_is_marked_inactive() {
         let dir = scratch_dir("drop");
         write_registry(&dir, r#"{"sessions": {"s1": {"pid": 1, "parent_pid": 2}}}"#);
-        let shared = test_shared(dir.clone());
+        let shared = test_shared(dir.clone()).await;
         let mut state = MonitorState::default();
         check_registry_changes(&shared, &mut state).await;
 

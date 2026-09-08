@@ -2358,8 +2358,22 @@ mod tests {
     fn ctx<'a>(
         registry: &'a WaiterRegistry,
         file_map: &'a FileMap,
+        sea_orm_db: &'a sea_orm::DatabaseConnection,
     ) -> conexus_auth::ToolCallContext<'a> {
-        conexus_auth::ToolCallContext::off_wire(registry, file_map, std::path::Path::new("/tmp"))
+        conexus_auth::ToolCallContext::off_wire(
+            registry,
+            file_map,
+            std::path::Path::new("/tmp"),
+            sea_orm_db,
+        )
+    }
+
+    // Phase G (sea-orm migration infra): a throwaway in-memory sea-orm
+    // connection for ToolCallContext::sea_orm_db -- no test in this
+    // file queries through it yet, it only needs to exist so ctx()'s
+    // now-mandatory last argument has something to point at.
+    async fn test_sea_orm_db() -> sea_orm::DatabaseConnection {
+        sea_orm::Database::connect("sqlite::memory:").await.unwrap()
     }
 
     async fn seed(conn: &AsyncMutex<Connection>, agent_id: &str, action_type: &str, ts: &str) {
@@ -2384,7 +2398,8 @@ mod tests {
         let op = operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = ViewAuditLogTool::call(
             Some(&op),
             &serde_json::json!({}),
@@ -2412,7 +2427,8 @@ mod tests {
         let op = operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = ViewAuditLogTool::call(
             Some(&op),
             &serde_json::json!({"agent_id": "alice", "action": "deleted_task"}),
@@ -2448,7 +2464,8 @@ mod tests {
         let op = operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = ViewAuditLogTool::call(
             Some(&op),
             &serde_json::json!({}),
@@ -2541,7 +2558,8 @@ mod tests {
         let op = confirmed_operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = GetAgentTokensTool::call(
             Some(&op),
             &serde_json::json!({}),
@@ -2565,7 +2583,8 @@ mod tests {
         let op = confirmed_operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = GetAgentTokensTool::call(
             Some(&op),
             &serde_json::json!({"include_sensitive_data": true}),
@@ -2591,7 +2610,8 @@ mod tests {
         let op = cap_only_non_confirmed();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = GetAgentTokensTool::call(
             Some(&op),
             &serde_json::json!({"include_sensitive_data": true}),
@@ -2615,7 +2635,8 @@ mod tests {
         let op = confirmed_operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = GetAgentTokensTool::call(
             Some(&op),
             &serde_json::json!({"limit": 2}),
@@ -2649,7 +2670,8 @@ mod tests {
         let op = confirmed_operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = GetAgentTokensTool::call(
             Some(&op),
             // include_terminated must ALSO be true -- Python's own
@@ -2695,7 +2717,8 @@ mod tests {
         let op = confirmed_operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = GetAgentTokensTool::call(
             Some(&op),
             &serde_json::json!({}),
@@ -2749,7 +2772,8 @@ mod tests {
         let op = operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = ViewStatusTool::call(
             Some(&op),
             &serde_json::json!({}),
@@ -2784,7 +2808,8 @@ mod tests {
         let op = operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = ViewStatusTool::call(
             Some(&op),
             &serde_json::json!({}),
@@ -2806,7 +2831,8 @@ mod tests {
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
         file_map.claim("/tmp/a.txt", "alice", "editing", "2026-06-01T00:00:00Z");
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = ViewStatusTool::call(
             Some(&op),
             &serde_json::json!({}),
@@ -2855,7 +2881,8 @@ mod tests {
         let op = confirmed_operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = RegisterAgentTool::call(
             Some(&op),
             &serde_json::json!({"name": "alice"}),
@@ -2889,7 +2916,8 @@ mod tests {
         let op = confirmed_operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = RegisterAgentTool::call(
             Some(&op),
             &serde_json::json!({"name": "boss", "role": "manager"}),
@@ -2913,7 +2941,8 @@ mod tests {
         let op = confirmed_operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = RegisterAgentTool::call(
             Some(&op),
             &serde_json::json!({"name": "alice", "role": "superadmin"}),
@@ -2931,7 +2960,8 @@ mod tests {
         let op = confirmed_operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = RegisterAgentTool::call(
             Some(&op),
             &serde_json::json!({"name": "deleted-alice]"}),
@@ -2949,7 +2979,8 @@ mod tests {
         let op = confirmed_operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = RegisterAgentTool::call(
             Some(&op),
             &serde_json::json!({"name": "admin-bob"}),
@@ -2968,7 +2999,8 @@ mod tests {
         let op = confirmed_operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = RegisterAgentTool::call(
             Some(&op),
             &serde_json::json!({"name": "alice"}),
@@ -2986,7 +3018,8 @@ mod tests {
         let op = confirmed_operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = RegisterAgentTool::call(
             Some(&op),
             &serde_json::json!({
@@ -3017,7 +3050,8 @@ mod tests {
         let op = confirmed_operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = RegisterAgentTool::call(
             Some(&op),
             &serde_json::json!({"name": "alice"}),
@@ -3069,7 +3103,8 @@ mod tests {
         let op = operator_with(&[Capability::AgentsRotateToken]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = RotateAgentTokenTool::call(
             Some(&op),
             &serde_json::json!({"agent_id": "alice"}),
@@ -3097,7 +3132,8 @@ mod tests {
         let op = operator_with(&[Capability::AgentsRotateToken]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = RotateAgentTokenTool::call(
             Some(&op),
             &serde_json::json!({"agent_id": "ghost"}),
@@ -3125,7 +3161,8 @@ mod tests {
         let op = operator_with(&[Capability::AgentsRotateToken]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = RotateAgentTokenTool::call(
             Some(&op),
             &serde_json::json!({"agent_id": "alice"}),
@@ -3144,7 +3181,8 @@ mod tests {
         let op = operator_with(&[Capability::AgentsRotateToken]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = RotateAgentTokenTool::call(
             Some(&op),
             &serde_json::json!({"agent_id": "alice"}),
@@ -3190,7 +3228,8 @@ mod tests {
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = RestoreAgentTool::call(
             Some(&op),
             &serde_json::json!({"agent_id": "alice"}),
@@ -3215,7 +3254,8 @@ mod tests {
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = RestoreAgentTool::call(
             Some(&op),
             &serde_json::json!({"agent_id": "alice"}),
@@ -3265,7 +3305,8 @@ mod tests {
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = RestoreAgentTool::call(
             Some(&op),
             &serde_json::json!({"agent_id": "alice"}),
@@ -3290,7 +3331,8 @@ mod tests {
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = RestoreAgentTool::call(
             Some(&op),
             &serde_json::json!({"agent_id": "ghost"}),
@@ -3316,7 +3358,8 @@ mod tests {
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = EditAgentTool::call(
             Some(&op),
             &serde_json::json!({"agent_id": "alice", "color": "#123456"}),
@@ -3343,7 +3386,8 @@ mod tests {
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = EditAgentTool::call(
             Some(&op),
             &serde_json::json!({"agent_id": "alice"}),
@@ -3362,7 +3406,8 @@ mod tests {
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = EditAgentTool::call(
             Some(&op),
             &serde_json::json!({"agent_id": "alice", "agent_role": "overlord"}),
@@ -3394,7 +3439,8 @@ mod tests {
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = EditAgentTool::call(
             Some(&op),
             &serde_json::json!({"agent_id": "alice", "aoe_session_id": ""}),
@@ -3419,7 +3465,8 @@ mod tests {
         let registry = WaiterRegistry::new();
         let (_sender, mut receiver) = registry.register("alice");
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = EditAgentTool::call(
             Some(&op),
             &serde_json::json!({"agent_id": "alice", "auto_event_loop": false}),
@@ -3438,7 +3485,8 @@ mod tests {
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = EditAgentTool::call(
             Some(&op),
             &serde_json::json!({"agent_id": "ghost", "color": "#000000"}),
@@ -3472,7 +3520,8 @@ mod tests {
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = EditAgentTool::call(
             Some(&op),
             &serde_json::json!({"agent_id": "alice", "working_directory": "/tmp/new-wd"}),
@@ -3500,7 +3549,8 @@ mod tests {
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = EditAgentTool::call(
             Some(&op),
             &serde_json::json!({"agent_id": "bob", "color": "#abcdef"}),
@@ -3574,7 +3624,8 @@ mod tests {
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = TerminateAgentTool::call(
             Some(&op),
             &serde_json::json!({"agent_id": "alice"}),
@@ -3598,7 +3649,8 @@ mod tests {
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = TerminateAgentTool::call(
             Some(&op),
             &serde_json::json!({"agent_id": "ghost"}),
@@ -3628,7 +3680,8 @@ mod tests {
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = TerminateAgentTool::call(
             Some(&op),
             &serde_json::json!({"agent_id": "alice"}),
@@ -3664,7 +3717,8 @@ mod tests {
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = TerminateAgentTool::call(
             Some(&op),
             &serde_json::json!({"agent_id": "alice"}),
@@ -3704,7 +3758,8 @@ mod tests {
         let registry = WaiterRegistry::new();
         let (_sender, mut receiver) = registry.register("bob");
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = TerminateAgentTool::call(
             Some(&op),
             &serde_json::json!({"agent_id": "alice"}),
@@ -3724,7 +3779,8 @@ mod tests {
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = TerminateAgentTool::call(
             Some(&op),
             &serde_json::json!({"agent_id": "alice"}),
@@ -3787,7 +3843,8 @@ mod tests {
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = PurgeAgentTool::call(
             Some(&op),
             &serde_json::json!({"agent_id": "ghost"}),
@@ -3806,7 +3863,8 @@ mod tests {
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = PurgeAgentTool::call(
             Some(&op),
             &serde_json::json!({"agent_id": "alice"}),
@@ -3835,7 +3893,8 @@ mod tests {
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = PurgeAgentTool::call(
             Some(&op),
             &serde_json::json!({"agent_id": "alice"}),
@@ -3863,7 +3922,8 @@ mod tests {
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = PurgeAgentTool::call(
             Some(&op),
             &serde_json::json!({"agent_id": "alice"}),
@@ -3922,7 +3982,8 @@ mod tests {
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = PurgeAgentTool::call(
             Some(&op),
             &serde_json::json!({"agent_id": "alice"}),
@@ -3967,7 +4028,8 @@ mod tests {
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = PurgeAgentTool::call(
             Some(&op),
             &serde_json::json!({"agent_id": "alice"}),
@@ -4021,7 +4083,8 @@ mod tests {
         let registry = WaiterRegistry::new();
         let (_sender, mut receiver) = registry.register("bob");
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = PurgeAgentTool::call(
             Some(&op),
             &serde_json::json!({"agent_id": "alice"}),
@@ -4058,7 +4121,8 @@ mod tests {
         let registry = WaiterRegistry::new();
         let (_sender, mut receiver) = registry.register("bob");
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = PurgeAgentTool::call(
             Some(&op),
             &serde_json::json!({"agent_id": "alice"}),
@@ -4095,7 +4159,8 @@ mod tests {
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = PurgeAgentTool::call(
             Some(&op),
             &serde_json::json!({"agent_id": "alice"}),
@@ -4135,7 +4200,8 @@ mod tests {
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = PurgeAgentTool::call(
             Some(&op),
             &serde_json::json!({"agent_id": "alice"}),
@@ -4167,7 +4233,8 @@ mod tests {
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let first = PurgeAgentTool::call(
             Some(&op),
             &serde_json::json!({"agent_id": "alice"}),
@@ -4196,7 +4263,8 @@ mod tests {
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let first = PurgeAgentTool::call(
             Some(&op),
             &serde_json::json!({"agent_id": "alice"}),

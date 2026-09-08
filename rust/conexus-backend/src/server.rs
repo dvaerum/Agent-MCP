@@ -85,6 +85,12 @@ pub struct SharedState {
     /// one is worker-bearer-authed and keyed by `agent_id`, never
     /// reached from the operator dashboard's own doors.
     pub delivery_transport: crate::delivery_transport::DeliveryTransportHub,
+    /// Phase G (sea-orm migration): the sea-orm connection repositories
+    /// converted onto sea-orm use, opened ONCE at boot alongside `conn`
+    /// above against the SAME underlying SQLite file -- see
+    /// `conexus_auth::tool::ToolCallContext::sea_orm_db`'s own doc for
+    /// why both connection types coexist during the migration.
+    pub sea_orm_db: sea_orm::DatabaseConnection,
 }
 
 /// [`ProgressSink`] backed by a real MCP [`Peer`]/[`ProgressToken`]
@@ -371,6 +377,7 @@ pub(crate) async fn dispatch_rest_tool(
         waiter_registry: &shared.waiter_registry,
         file_map: &shared.file_map,
         project_dir: &shared.project_dir,
+        sea_orm_db: &shared.sea_orm_db,
     };
     let policy_source = SnapshotPolicySource::resolve(&shared.conn, &descriptor.required).await;
     let result = conexus_auth::dispatch(
@@ -526,6 +533,7 @@ impl ServerHandler for ConexusServer {
             waiter_registry: &self.shared.waiter_registry,
             file_map: &self.shared.file_map,
             project_dir: &self.shared.project_dir,
+            sea_orm_db: &self.shared.sea_orm_db,
         };
 
         // `dispatch`/`Tool::call` now lock `shared.conn` themselves

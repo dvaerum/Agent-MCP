@@ -120,9 +120,10 @@ pub async fn require_rest_identity(
 mod tests {
     use super::*;
 
-    fn test_shared_state(forwarding_hmac_key: Option<Vec<u8>>) -> Arc<SharedState> {
+    async fn test_shared_state(forwarding_hmac_key: Option<Vec<u8>>) -> Arc<SharedState> {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conexus_db::schema::init_schema(&conn).unwrap();
+        let sea_orm_db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
         Arc::new(SharedState {
             conn: tokio::sync::Mutex::new(conn),
             forwarding_hmac_key,
@@ -131,6 +132,7 @@ mod tests {
             project_dir: std::env::temp_dir(),
             operator_events: crate::operator_events::OperatorEventsHub::new(),
             delivery_transport: crate::delivery_transport::DeliveryTransportHub::new(),
+            sea_orm_db,
         })
     }
 
@@ -201,7 +203,7 @@ mod tests {
 
     #[tokio::test]
     async fn unauthenticated_status_request_is_rejected_with_401() {
-        let shared = test_shared_state(Some(b"gate-test-key-bytes".to_vec()));
+        let shared = test_shared_state(Some(b"gate-test-key-bytes".to_vec())).await;
         let (_dir, socket_path) = spawn_test_app(shared).await;
         assert_eq!(
             request_status(&socket_path, "GET", "/status", None).await,
@@ -211,7 +213,7 @@ mod tests {
 
     #[tokio::test]
     async fn unauthenticated_context_data_request_is_rejected_with_401() {
-        let shared = test_shared_state(Some(b"gate-test-key-bytes".to_vec()));
+        let shared = test_shared_state(Some(b"gate-test-key-bytes".to_vec())).await;
         let (_dir, socket_path) = spawn_test_app(shared).await;
         assert_eq!(
             request_status(&socket_path, "GET", "/context-data", None).await,
@@ -221,7 +223,7 @@ mod tests {
 
     #[tokio::test]
     async fn unauthenticated_create_sample_memories_is_rejected_and_writes_nothing() {
-        let shared = test_shared_state(Some(b"gate-test-key-bytes".to_vec()));
+        let shared = test_shared_state(Some(b"gate-test-key-bytes".to_vec())).await;
         let (_dir, socket_path) = spawn_test_app(shared.clone()).await;
         assert_eq!(
             request_status(&socket_path, "POST", "/create-sample-memories", None).await,
@@ -241,7 +243,7 @@ mod tests {
     #[tokio::test]
     async fn signed_forwarding_operator_admits_status_with_200() {
         let key = b"gate-test-key-bytes".to_vec();
-        let shared = test_shared_state(Some(key.clone()));
+        let shared = test_shared_state(Some(key.clone())).await;
         let (_dir, socket_path) = spawn_test_app(shared).await;
         let now = chrono::Utc::now().timestamp() as u64;
         let header = conexus_auth::forwarding_header::sign(
@@ -265,7 +267,7 @@ mod tests {
 
     #[tokio::test]
     async fn authenticated_operator_bearer_can_create_sample_memories() {
-        let shared = test_shared_state(None);
+        let shared = test_shared_state(None).await;
         {
             let guard = shared.conn.lock().await;
             guard

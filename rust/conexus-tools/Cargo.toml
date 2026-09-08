@@ -69,3 +69,15 @@ tokio = { version = "1", features = [
 # writes a real file to disk -- an isolated real tempdir per test,
 # same crate `conexus-backend` already uses for its own boot tests.
 tempfile = "3"
+# Every test in this crate builds a ToolCallContext, which now carries
+# a `sea_orm_db: &sea_orm::DatabaseConnection` field (Phase G) -- a
+# throwaway in-memory connection per test, dev-only since no
+# production code in THIS crate names the sea_orm crate directly
+# (conexus_auth::ToolCallContext re-exports the field's type; only
+# spelling that type out in a test helper's own signature needs the
+# dependency edge). Matches conexus-db's own sea-orm entry exactly.
+sea-orm = { version = "2", default-features = false, features = [
+    "macros",
+    "sqlx-sqlite",
+    "runtime-tokio-rustls",
+] }

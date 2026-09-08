@@ -456,8 +456,20 @@ mod tests {
         .unwrap();
     }
 
-    fn ctx<'a>(registry: &'a WaiterRegistry, file_map: &'a FileMap) -> ToolCallContext<'a> {
-        ToolCallContext::off_wire(registry, file_map, std::path::Path::new("/tmp"))
+    fn ctx<'a>(
+        registry: &'a WaiterRegistry,
+        file_map: &'a FileMap,
+        sea_orm_db: &'a sea_orm::DatabaseConnection,
+    ) -> ToolCallContext<'a> {
+        ToolCallContext::off_wire(registry, file_map, std::path::Path::new("/tmp"), sea_orm_db)
+    }
+
+    // Phase G (sea-orm migration infra): a throwaway in-memory sea-orm
+    // connection for ToolCallContext::sea_orm_db -- no test in this
+    // file queries through it yet, it only needs to exist so ctx()'s
+    // now-mandatory last argument has something to point at.
+    async fn test_sea_orm_db() -> sea_orm::DatabaseConnection {
+        sea_orm::Database::connect("sqlite::memory:").await.unwrap()
     }
 
     #[tokio::test]
@@ -470,7 +482,8 @@ mod tests {
         let alice = worker("alice", &[Capability::TasksCreate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = AddTaskCommentTool::call(
             Some(&alice),
             &serde_json::json!({"task_id": "t1", "text": "hello"}),
@@ -488,7 +501,8 @@ mod tests {
         let alice = worker("alice", &[]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = AddTaskCommentTool::call(
             Some(&alice),
             &serde_json::json!({"task_id": "ghost", "text": "hi"}),
@@ -510,7 +524,8 @@ mod tests {
         let alice = worker("alice", &[]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = AddTaskCommentTool::call(
             Some(&alice),
             &serde_json::json!({"task_id": "t1", "text": "hi"}),
@@ -544,7 +559,8 @@ mod tests {
         let alice = worker("alice", &[]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = AddTaskCommentTool::call(
             Some(&alice),
             &serde_json::json!({"task_id": "t1", "text": "cross-agent note"}),
@@ -594,7 +610,8 @@ mod tests {
         let alice = worker("alice", &[]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = AddTaskCommentTool::call(
             Some(&alice),
             &serde_json::json!({"task_id": "t1", "text": "cross-agent injection attempt"}),
@@ -636,7 +653,8 @@ mod tests {
         let alice = worker("alice", &[]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = AddTaskCommentTool::call(
             Some(&alice),
             &serde_json::json!({"task_id": "t1", "text": "hi"}),
@@ -658,7 +676,8 @@ mod tests {
         let alice = worker("alice", &[]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let add = AddTaskCommentTool::call(
             Some(&alice),
             &serde_json::json!({"task_id": "t1", "text": "v1"}),
@@ -693,7 +712,8 @@ mod tests {
         let bob = worker("bob", &[]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let add = AddTaskCommentTool::call(
             Some(&alice),
             &serde_json::json!({"task_id": "t1", "text": "v1"}),
@@ -743,7 +763,8 @@ mod tests {
         let op = operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let add = AddTaskCommentTool::call(
             Some(&alice),
             &serde_json::json!({"task_id": "t1", "text": "v1"}),
@@ -773,7 +794,8 @@ mod tests {
         let alice = worker("alice", &[]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = EditTaskCommentTool::call(
             Some(&alice),
             &serde_json::json!({"note_id": "not-a-number", "text": "x"}),

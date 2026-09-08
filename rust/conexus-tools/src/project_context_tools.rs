@@ -2348,8 +2348,12 @@ mod tests {
         AsyncMutex::new(conn)
     }
 
-    fn ctx<'a>(registry: &'a WaiterRegistry, file_map: &'a FileMap) -> ToolCallContext<'a> {
-        ToolCallContext::off_wire(registry, file_map, std::path::Path::new("/tmp"))
+    fn ctx<'a>(
+        registry: &'a WaiterRegistry,
+        file_map: &'a FileMap,
+        sea_orm_db: &'a sea_orm::DatabaseConnection,
+    ) -> ToolCallContext<'a> {
+        ToolCallContext::off_wire(registry, file_map, std::path::Path::new("/tmp"), sea_orm_db)
     }
 
     /// For `BackupProjectContextTool` tests only -- a real isolated
@@ -2359,8 +2363,18 @@ mod tests {
         registry: &'a WaiterRegistry,
         file_map: &'a FileMap,
         project_dir: &'a std::path::Path,
+        sea_orm_db: &'a sea_orm::DatabaseConnection,
     ) -> ToolCallContext<'a> {
-        ToolCallContext::off_wire(registry, file_map, project_dir)
+        ToolCallContext::off_wire(registry, file_map, project_dir, sea_orm_db)
+    }
+
+    // Phase G (sea-orm migration infra): a throwaway in-memory sea-orm
+    // connection for ToolCallContext::sea_orm_db -- no test in this
+    // file queries through it yet, it only needs to exist so ctx()'s/
+    // ctx_with_project_dir()'s now-mandatory last argument has
+    // something to point at.
+    async fn test_sea_orm_db() -> sea_orm::DatabaseConnection {
+        sea_orm::Database::connect("sqlite::memory:").await.unwrap()
     }
 
     #[tokio::test]
@@ -2369,7 +2383,8 @@ mod tests {
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = ValidateContextConsistencyTool::call(
             Some(&alice),
             &Value::Null,
@@ -2403,7 +2418,8 @@ mod tests {
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = ValidateContextConsistencyTool::call(
             Some(&alice),
             &Value::Null,
@@ -2424,7 +2440,8 @@ mod tests {
         let conn = setup().await;
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let denied =
             ValidateContextConsistencyTool::REQUIRED.check(None, &conexus_auth::NoPolicyOverrides);
         assert!(denied.is_err());
@@ -2459,7 +2476,8 @@ mod tests {
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = ViewProjectContextTool::call(
             Some(&alice),
             &serde_json::json!({}),
@@ -2482,7 +2500,8 @@ mod tests {
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = ViewProjectContextTool::call(
             Some(&alice),
             &serde_json::json!({"context_key": "a"}),
@@ -2520,7 +2539,8 @@ mod tests {
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = ViewProjectContextTool::call(
             Some(&alice),
             &serde_json::json!({"search_query": "matching"}),
@@ -2543,7 +2563,8 @@ mod tests {
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = ViewProjectContextTool::call(
             Some(&alice),
             &serde_json::json!({"show_stale_entries": true}),
@@ -2568,7 +2589,8 @@ mod tests {
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = ViewProjectContextTool::call(
             Some(&alice),
             &serde_json::json!({"sort_by": "key"}),
@@ -2593,7 +2615,8 @@ mod tests {
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = ViewProjectContextTool::call(
             Some(&alice),
             &serde_json::json!({"sort_by": "last_updated"}),
@@ -2626,7 +2649,8 @@ mod tests {
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = ViewProjectContextTool::call(
             Some(&alice),
             &serde_json::json!({"max_results": 1}),
@@ -2659,7 +2683,8 @@ mod tests {
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = ViewProjectContextTool::call(
             Some(&alice),
             &serde_json::json!({}),
@@ -2684,7 +2709,8 @@ mod tests {
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = ViewProjectContextTool::call(
             Some(&alice),
             &serde_json::json!({"show_health_analysis": true}),
@@ -2735,7 +2761,8 @@ mod tests {
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = ViewProjectContextTool::call(
             Some(&alice),
             &serde_json::json!({"show_health_analysis": true}),
@@ -2778,7 +2805,8 @@ mod tests {
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = CreateProjectContextTool::call(
             Some(&alice),
             &serde_json::json!({"context_key": "a.new.key", "context_value": "hello"}),
@@ -2800,7 +2828,8 @@ mod tests {
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = CreateProjectContextTool::call(
             Some(&alice),
             &serde_json::json!({"context_key": "dup", "context_value": "v2"}),
@@ -2818,7 +2847,8 @@ mod tests {
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = CreateProjectContextTool::call(
             Some(&alice),
             &serde_json::json!({"context_key": "has spaces", "context_value": "v"}),
@@ -2836,7 +2866,8 @@ mod tests {
         let op = write_operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = CreateProjectContextTool::call(
             Some(&op),
             &serde_json::json!({"context_key": "config_x", "context_value": "v"}),
@@ -2854,7 +2885,8 @@ mod tests {
         let viewer = viewer_operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let denied = CreateProjectContextTool::REQUIRED
             .check(Some(&viewer), &conexus_auth::NoPolicyOverrides);
         assert!(denied.is_err());
@@ -2882,7 +2914,8 @@ mod tests {
         let registry = WaiterRegistry::new();
         let (_sender, mut receiver) = registry.register("alice");
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = CreateProjectContextTool::call(
             Some(&alice),
             &serde_json::json!({
@@ -2917,7 +2950,8 @@ mod tests {
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = UpdateProjectContextTool::call(
             Some(&alice),
             &serde_json::json!({"context_key": "fresh.key", "context_value": "v1"}),
@@ -2950,7 +2984,8 @@ mod tests {
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = UpdateProjectContextTool::call(
             Some(&alice),
             &serde_json::json!({"context_key": "k", "context_value": "v2"}),
@@ -2978,7 +3013,8 @@ mod tests {
         };
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = UpdateProjectContextTool::call(
             Some(&bob),
             &serde_json::json!({"context_key": "k", "context_value": "v2"}),
@@ -3002,7 +3038,8 @@ mod tests {
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = UpdateProjectContextTool::call(
             Some(&alice),
             &serde_json::json!({"updates": [
@@ -3032,7 +3069,8 @@ mod tests {
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = UpdateProjectContextTool::call(
             Some(&alice),
             &serde_json::json!({"updates": [
@@ -3077,7 +3115,8 @@ mod tests {
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = UpdateProjectContextTool::call(
             Some(&alice),
             &serde_json::json!({"updates": [
@@ -3110,7 +3149,8 @@ mod tests {
         let registry = WaiterRegistry::new();
         let (_sender, mut receiver) = registry.register("alice");
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = UpdateProjectContextTool::call(
             Some(&alice),
             &serde_json::json!({"updates": [
@@ -3140,7 +3180,8 @@ mod tests {
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = BulkUpdateProjectContextTool::call(
             Some(&alice),
             &serde_json::json!({"updates": [
@@ -3167,7 +3208,8 @@ mod tests {
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = BulkUpdateProjectContextTool::call(
             Some(&alice),
             &serde_json::json!({"updates": [
@@ -3212,7 +3254,8 @@ mod tests {
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = BulkUpdateProjectContextTool::call(
             Some(&alice),
             &serde_json::json!({"updates": [
@@ -3257,7 +3300,8 @@ mod tests {
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = BulkUpdateProjectContextTool::call(
             Some(&alice),
             &serde_json::json!({"updates": [
@@ -3292,7 +3336,8 @@ mod tests {
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = BulkUpdateProjectContextTool::call(
             Some(&alice),
             &serde_json::json!({"updates": [
@@ -3320,7 +3365,8 @@ mod tests {
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = BulkUpdateProjectContextTool::call(
             Some(&alice),
             &serde_json::json!({"updates": [
@@ -3348,7 +3394,8 @@ mod tests {
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = BulkUpdateProjectContextTool::call(
             Some(&alice),
             &serde_json::json!({"updates": []}),
@@ -3386,7 +3433,8 @@ mod tests {
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = DeleteProjectContextTool::call(
             Some(&alice),
             &serde_json::json!({"context_key": "k"}),
@@ -3413,7 +3461,8 @@ mod tests {
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = DeleteProjectContextTool::call(
             Some(&alice),
             &serde_json::json!({"context_keys": ["a", "b"]}),
@@ -3434,7 +3483,8 @@ mod tests {
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = DeleteProjectContextTool::call(
             Some(&alice),
             &serde_json::json!({}),
@@ -3452,7 +3502,8 @@ mod tests {
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = DeleteProjectContextTool::call(
             Some(&alice),
             &serde_json::json!({"context_key": "ghost"}),
@@ -3470,7 +3521,8 @@ mod tests {
         let op = write_operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = DeleteProjectContextTool::call(
             Some(&op),
             &serde_json::json!({"context_key": "config_server_startup"}),
@@ -3496,7 +3548,8 @@ mod tests {
         let admin = admin_agent();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = DeleteProjectContextTool::call(
             Some(&admin),
             &serde_json::json!({"context_key": "server_startup"}),
@@ -3519,7 +3572,8 @@ mod tests {
         let admin = admin_agent();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = DeleteProjectContextTool::call(
             Some(&admin),
             &serde_json::json!({"context_key": "server_startup", "force_delete": true}),
@@ -3549,7 +3603,8 @@ mod tests {
         };
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = DeleteProjectContextTool::call(
             Some(&bob),
             &serde_json::json!({"context_key": "k"}),
@@ -3584,7 +3639,8 @@ mod tests {
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = DeleteProjectContextTool::call(
             Some(&alice),
             &serde_json::json!({"context_keys": ["owned-by-alice", "owned-by-bob"]}),
@@ -3623,7 +3679,8 @@ mod tests {
         let alice = worker();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = DeleteProjectContextTool::call(
             Some(&alice),
             &serde_json::json!({"context_key": "k"}),
@@ -3662,7 +3719,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx_with_project_dir(&registry, &file_map, tmp.path());
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx_with_project_dir(&registry, &file_map, tmp.path(), &sea_orm_db);
         let result = BackupProjectContextTool::call(
             Some(&admin),
             &serde_json::json!({}),
@@ -3694,7 +3752,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx_with_project_dir(&registry, &file_map, tmp.path());
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx_with_project_dir(&registry, &file_map, tmp.path(), &sea_orm_db);
         let result = BackupProjectContextTool::call(
             Some(&admin),
             &serde_json::json!({"backup_name": "before-migration.v2"}),
@@ -3724,7 +3783,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx_with_project_dir(&registry, &file_map, tmp.path());
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx_with_project_dir(&registry, &file_map, tmp.path(), &sea_orm_db);
         for bad_name in ["../../etc/passwd", "a/b", "with spaces", ""] {
             let result = BackupProjectContextTool::call(
                 Some(&admin),
@@ -3749,7 +3809,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx_with_project_dir(&registry, &file_map, tmp.path());
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx_with_project_dir(&registry, &file_map, tmp.path(), &sea_orm_db);
         let result = BackupProjectContextTool::call(
             Some(&admin),
             &serde_json::json!({}),
@@ -3772,7 +3833,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx_with_project_dir(&registry, &file_map, tmp.path());
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx_with_project_dir(&registry, &file_map, tmp.path(), &sea_orm_db);
         let result = BackupProjectContextTool::call(
             Some(&admin),
             &serde_json::json!({"include_health_report": false}),
@@ -3805,7 +3867,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx_with_project_dir(&registry, &file_map, tmp.path());
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx_with_project_dir(&registry, &file_map, tmp.path(), &sea_orm_db);
         let result = BackupProjectContextTool::call(
             Some(&admin),
             &serde_json::json!({"backup_name": "audited"}),

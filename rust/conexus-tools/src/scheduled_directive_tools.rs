@@ -973,8 +973,20 @@ mod tests {
         .unwrap();
     }
 
-    fn ctx<'a>(registry: &'a WaiterRegistry, file_map: &'a FileMap) -> ToolCallContext<'a> {
-        ToolCallContext::off_wire(registry, file_map, std::path::Path::new("/tmp"))
+    fn ctx<'a>(
+        registry: &'a WaiterRegistry,
+        file_map: &'a FileMap,
+        sea_orm_db: &'a sea_orm::DatabaseConnection,
+    ) -> ToolCallContext<'a> {
+        ToolCallContext::off_wire(registry, file_map, std::path::Path::new("/tmp"), sea_orm_db)
+    }
+
+    // Phase G (sea-orm migration infra): a throwaway in-memory sea-orm
+    // connection for ToolCallContext::sea_orm_db -- no test in this
+    // file queries through it yet, it only needs to exist so ctx()'s
+    // now-mandatory last argument has something to point at.
+    async fn test_sea_orm_db() -> sea_orm::DatabaseConnection {
+        sea_orm::Database::connect("sqlite::memory:").await.unwrap()
     }
 
     #[tokio::test]
@@ -987,7 +999,8 @@ mod tests {
         let alice = worker("alice");
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = CreateScheduledDirectiveTool::call(
             Some(&alice),
             &serde_json::json!({"prompt": "check CI", "interval_seconds": 300}),
@@ -1014,7 +1027,8 @@ mod tests {
         let alice = worker("alice");
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = CreateScheduledDirectiveTool::call(
             Some(&alice),
             &serde_json::json!({"prompt": "x", "interval_seconds": 5}),
@@ -1061,7 +1075,8 @@ mod tests {
         let alice = worker("alice");
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         for interval in [
             serde_json::json!(86_400_000_000_000_000_i64), // finite, exceeds the 10-year bound
             // A 23-digit literal doesn't even fit serde_json's own
@@ -1099,7 +1114,8 @@ mod tests {
         let alice = worker("alice");
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let count = serde_json::from_str::<serde_json::Value>("99999999999999999999999").unwrap();
         let result = CreateScheduledDirectiveTool::call(
             Some(&alice),
@@ -1140,7 +1156,8 @@ mod tests {
         let alice = worker("alice");
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = CreateScheduledDirectiveTool::call(
             Some(&alice),
             &serde_json::json!({"prompt": "x", "interval_seconds": 300, "agent_id": "bob"}),
@@ -1164,7 +1181,8 @@ mod tests {
         let mgr = manager("mgr");
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
 
         let ok = CreateScheduledDirectiveTool::call(
             Some(&mgr),
@@ -1197,7 +1215,8 @@ mod tests {
         let op = operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = CreateScheduledDirectiveTool::call(
             Some(&op),
             &serde_json::json!({"prompt": "x", "interval_seconds": 300, "agent_id": "worker-1"}),
@@ -1225,7 +1244,8 @@ mod tests {
         let alice = worker("alice");
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let first = CreateScheduledDirectiveTool::call(
             Some(&alice),
             &serde_json::json!({"prompt": "one", "interval_seconds": 300}),
@@ -1256,7 +1276,8 @@ mod tests {
         let alice = worker("alice");
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         CreateScheduledDirectiveTool::call(
             Some(&alice),
             &serde_json::json!({"prompt": "x", "interval_seconds": 300}),
@@ -1285,7 +1306,8 @@ mod tests {
         let bob = worker("bob");
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = ListScheduledDirectivesTool::call(
             Some(&bob),
             &serde_json::json!({"agent_id": "alice"}),
@@ -1307,7 +1329,8 @@ mod tests {
         let alice = worker("alice");
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let created = CreateScheduledDirectiveTool::call(
             Some(&alice),
             &serde_json::json!({"prompt": "x", "interval_seconds": 300}),
@@ -1363,7 +1386,8 @@ mod tests {
         let bob = worker("bob");
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let created = CreateScheduledDirectiveTool::call(
             Some(&alice),
             &serde_json::json!({"prompt": "x", "interval_seconds": 300}),
@@ -1410,7 +1434,8 @@ mod tests {
         let alice = worker("alice");
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let created = CreateScheduledDirectiveTool::call(
             Some(&alice),
             &serde_json::json!({"prompt": "x", "interval_seconds": 300}),
@@ -1449,7 +1474,8 @@ mod tests {
         let alice = worker("alice");
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = CreateScheduledDirectiveTool::call(
             Some(&alice),
             &serde_json::json!({
@@ -1477,7 +1503,8 @@ mod tests {
         let alice = worker("alice");
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = CreateScheduledDirectiveTool::call(
             Some(&alice),
             &serde_json::json!({"prompt": "x", "interval_seconds": 300, "until": "not-a-date"}),
@@ -1516,7 +1543,8 @@ mod tests {
         let alice = worker("alice");
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
 
         let mut stored: Vec<String> = Vec::new();
         for until in [
@@ -1571,7 +1599,8 @@ mod tests {
         let alice = worker("alice");
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let created = CreateScheduledDirectiveTool::call(
             Some(&bob),
             &serde_json::json!({"prompt": "a", "interval_seconds": 60}),
@@ -1623,7 +1652,8 @@ mod tests {
         let alice = worker("alice");
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let c = ctx(&registry, &file_map);
+        let sea_orm_db = test_sea_orm_db().await;
+        let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = CreateScheduledDirectiveTool::call(
             Some(&alice),
             &serde_json::json!({"prompt": "x", "interval_seconds": 300, "run_now": true}),

@@ -29,8 +29,19 @@ tokio = { version = "1", features = ["sync"] }
 # "auth -> wakeloop -> tools" edge conexus-wakeloop's own doc already
 # anticipated).
 conexus-wakeloop = { path = "../conexus-wakeloop" }
+# ToolCallContext::sea_orm_db (Phase G) -- threaded the same explicit
+# way as waiter_registry/file_map/project_dir. Matches conexus-db's
+# own sea-orm entry exactly (same version/features): `macros` for
+# `DeriveEntityModel`, `sqlx-sqlite` + `runtime-tokio-rustls` for this
+# workspace's existing TLS/runtime choice.
+sea-orm = { version = "2", default-features = false, features = [
+    "macros",
+    "sqlx-sqlite",
+    "runtime-tokio-rustls",
+] }
 
 [dev-dependencies]
 # Tests need a runtime to actually DRIVE an async Tool::call/dispatch,
-# beyond the bare Mutex type already in [dependencies].
+# beyond the bare Mutex type already in [dependencies]. `rt` alone
+# covers `#[tokio::test]`; nothing here needs a multi-threaded runtime.
 tokio = { version = "1", features = ["rt", "macros"] }

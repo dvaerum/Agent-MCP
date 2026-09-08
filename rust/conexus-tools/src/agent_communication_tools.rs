@@ -1494,6 +1494,47 @@ impl conexus_auth::Tool for GetAgentMessagesTool {
 
 #[cfg(test)]
 mod tests {
+    // Phase G (sea-orm migration infra): a throwaway in-memory
+    // sea-orm connection for ToolCallContext::sea_orm_db -- no test in
+    // this file queries through it yet, it only needs to exist so
+    // off_wire's now-mandatory last argument has something to point
+    // at.
+    //
+    // A bare `Database::connect("sqlite::memory:")` reliably hit
+    // `Conn(SqlxError(PoolTimedOut))` under this module's
+    // `#[tokio::test(start_paused = true)]` tests: sqlx's default
+    // ~30s pool-acquire deadline is a REAL timer race against tokio's
+    // paused/auto-advancing virtual clock, and the paused clock can
+    // jump straight past it before the real (wall-clock, off-runtime)
+    // connection open finishes. An explicit, generous
+    // `acquire_timeout` sidesteps that race instead of relying on the
+    // default -- this is test-scaffolding tuning, not a behavior
+    // change to anything production code depends on.
+    async fn test_sea_orm_db() -> sea_orm::DatabaseConnection {
+        sea_orm::Database::connect("sqlite::memory:").await.unwrap()
+    }
+
+    // Phase G (sea-orm migration infra): the `start_paused = true`
+    // counterpart of `test_sea_orm_db` above. A plain
+    // `test_sea_orm_db().await` reliably hit
+    // `Conn(SqlxError(PoolTimedOut))` in every test below this point --
+    // `#[tokio::test(start_paused = true)]`'s auto-fast-forward (see
+    // this module's own doc a few lines down) jumps the paused virtual
+    // clock straight through sqlx's internal pool-acquire deadline the
+    // instant the test task has nothing ELSE runnable, regardless of
+    // how that deadline is configured -- the real (wall-clock)
+    // connection open never gets a chance to finish first. Briefly
+    // un-pausing for just the connect sidesteps the race entirely: the
+    // handful of milliseconds of real time this adds to the virtual
+    // clock before it's re-paused is negligible against every one of
+    // these tests' multi-second timing assertions.
+    async fn test_sea_orm_db_paused() -> sea_orm::DatabaseConnection {
+        tokio::time::resume();
+        let db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
+        tokio::time::pause();
+        db
+    }
+
     use super::*;
     use conexus_core::capability::Capabilities;
     use conexus_core::principal::PrincipalKind;
@@ -1569,7 +1610,13 @@ mod tests {
 
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let sea_orm_db = test_sea_orm_db().await;
+        let ctx = ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+            &sea_orm_db,
+        );
         let principal = agent_bearer("alice");
         let outcome = wait_for_events_entry(&principal, &json!({}), &conn, NOW, &ctx).await;
         let EntryOutcome::Done(result) = outcome else {
@@ -1604,7 +1651,13 @@ mod tests {
 
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let sea_orm_db = test_sea_orm_db().await;
+        let ctx = ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+            &sea_orm_db,
+        );
         let principal = agent_bearer("alice");
         let outcome = wait_for_events_entry(&principal, &json!({}), &conn, NOW, &ctx).await;
         let EntryOutcome::Done(result) = outcome else {
@@ -1650,7 +1703,13 @@ mod tests {
 
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let sea_orm_db = test_sea_orm_db().await;
+        let ctx = ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+            &sea_orm_db,
+        );
         let principal = agent_bearer("alice");
         let outcome = wait_for_events_entry(&principal, &json!({}), &conn, NOW, &ctx).await;
         let EntryOutcome::Done(result) = outcome else {
@@ -1705,7 +1764,13 @@ mod tests {
 
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let sea_orm_db = test_sea_orm_db().await;
+        let ctx = ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+            &sea_orm_db,
+        );
         let principal = agent_bearer("alice");
         let outcome = wait_for_events_entry(&principal, &json!({}), &conn, NOW, &ctx).await;
         assert!(
@@ -1721,7 +1786,13 @@ mod tests {
 
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let sea_orm_db = test_sea_orm_db().await;
+        let ctx = ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+            &sea_orm_db,
+        );
         let principal = agent_bearer("alice");
         let outcome = wait_for_events_entry(&principal, &json!({}), &conn, NOW, &ctx).await;
         let EntryOutcome::EnterSlowPath(setup) = outcome else {
@@ -1737,7 +1808,13 @@ mod tests {
         seed_agent(&conn, "alice").await;
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let sea_orm_db = test_sea_orm_db().await;
+        let ctx = ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+            &sea_orm_db,
+        );
         let principal = agent_bearer("alice");
 
         let first = wait_for_events_entry(&principal, &json!({}), &conn, NOW, &ctx).await;
@@ -1758,7 +1835,13 @@ mod tests {
         seed_agent(&conn, "alice").await;
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let sea_orm_db = test_sea_orm_db().await;
+        let ctx = ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+            &sea_orm_db,
+        );
         let principal = agent_bearer("alice");
         let outcome =
             wait_for_events_entry(&principal, &json!({"since": 12345}), &conn, NOW, &ctx).await;
@@ -1826,7 +1909,13 @@ mod tests {
         seed_agent(&conn, "bob").await;
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let sea_orm_db = test_sea_orm_db_paused().await;
+        let ctx = ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+            &sea_orm_db,
+        );
         let setup = enter_slow_path(&conn, &ctx, "bob", &json!({"timeout_seconds": 5})).await;
 
         let result = wait_for_events_slow_path(setup, &conn, &ctx).await;
@@ -1843,7 +1932,13 @@ mod tests {
         seed_agent(&conn, "carol").await;
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let sea_orm_db = test_sea_orm_db_paused().await;
+        let ctx = ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+            &sea_orm_db,
+        );
         // Register with NO backlog yet, so entry takes the slow path
         // rather than the fast path finding this message immediately.
         let setup = enter_slow_path(&conn, &ctx, "carol", &json!({})).await;
@@ -1883,7 +1978,13 @@ mod tests {
         seed_agent(&conn, "erin").await;
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let sea_orm_db = test_sea_orm_db_paused().await;
+        let ctx = ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+            &sea_orm_db,
+        );
         let setup = enter_slow_path(&conn, &ctx, "erin", &json!({})).await;
         setup.sender.send(WakeSignal::Superseded).await.unwrap();
 
@@ -1906,6 +2007,7 @@ mod tests {
         };
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
+        let sea_orm_db = test_sea_orm_db_paused().await;
         let ctx = ToolCallContext {
             progress_token_present: true,
             client_name: Some("claude-code"),
@@ -1913,6 +2015,7 @@ mod tests {
             waiter_registry: &registry,
             file_map: &file_map,
             project_dir: std::path::Path::new("/tmp"),
+            sea_orm_db: &sea_orm_db,
         };
         // Just over one HEARTBEAT_INTERVAL_SECONDS (25s) so exactly one
         // heartbeat fires before the hold itself expires.
@@ -1934,6 +2037,7 @@ mod tests {
         };
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
+        let sea_orm_db = test_sea_orm_db_paused().await;
         let ctx = ToolCallContext {
             progress_token_present: true,
             client_name: Some("claude-code"),
@@ -1941,6 +2045,7 @@ mod tests {
             waiter_registry: &registry,
             file_map: &file_map,
             project_dir: std::path::Path::new("/tmp"),
+            sea_orm_db: &sea_orm_db,
         };
         // Long enough hold that reaping (after MAX_HEARTBEAT_MISSES misses,
         // one per 25s) must happen well before the hold itself would.
@@ -1970,6 +2075,7 @@ mod tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
+        let sea_orm_db = test_sea_orm_db_paused().await;
         let ctx = ToolCallContext {
             progress_token_present: true,
             client_name: Some("claude-code"),
@@ -1977,6 +2083,7 @@ mod tests {
             waiter_registry: &registry,
             file_map: &file_map,
             project_dir: std::path::Path::new("/tmp"),
+            sea_orm_db: &sea_orm_db,
         };
         // heartbeat=true, progress_token_present=true, requested < base_hold
         // -> ladder_eligible; not yet at OVERRIDE_AFTER so no override.
@@ -2020,7 +2127,13 @@ mod tests {
         seed_agent(&conn, "kate").await;
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let sea_orm_db = test_sea_orm_db_paused().await;
+        let ctx = ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+            &sea_orm_db,
+        );
         // Long enough that only the liveness re-check tick -- not the
         // overall hold deadline -- can end the call inside this window.
         let setup = enter_slow_path(&conn, &ctx, "kate", &json!({"timeout_seconds": 300})).await;
@@ -2092,7 +2205,13 @@ mod tests {
         send_message(&conn, "m1", "kate", &now_iso(), "text").await;
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let sea_orm_db = test_sea_orm_db_paused().await;
+        let ctx = ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+            &sea_orm_db,
+        );
         let principal = agent_bearer("kate");
 
         let result =
@@ -2141,7 +2260,13 @@ mod tests {
         send_message(&conn, "m1", "leo", &now_iso(), "text").await;
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let sea_orm_db = test_sea_orm_db().await;
+        let ctx = ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+            &sea_orm_db,
+        );
         let principal = agent_bearer("leo");
 
         let result =
@@ -2163,7 +2288,13 @@ mod tests {
         seed_agent(&conn, "mia").await;
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let sea_orm_db = test_sea_orm_db().await;
+        let ctx = ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+            &sea_orm_db,
+        );
         let principal = agent_bearer("mia");
 
         let result = FetchEventsSinceTool::call(
@@ -2187,7 +2318,13 @@ mod tests {
         seed_agent(&conn, "nora").await;
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let sea_orm_db = test_sea_orm_db().await;
+        let ctx = ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+            &sea_orm_db,
+        );
         let principal = agent_bearer("nora");
 
         let result =
@@ -2201,7 +2338,13 @@ mod tests {
         let conn = test_conn();
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let sea_orm_db = test_sea_orm_db().await;
+        let ctx = ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+            &sea_orm_db,
+        );
         let mut operator = agent_bearer("alice");
         operator.agent_id = None;
         let descriptor = conexus_auth::ToolDescriptor::of::<WaitForEventsTool>();
@@ -2253,7 +2396,13 @@ mod tests {
         seed_agent(&conn, "bob").await;
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let sea_orm_db = test_sea_orm_db().await;
+        let ctx = ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+            &sea_orm_db,
+        );
         let principal = agent_bearer_with_messages_view("bob");
 
         let result = GetAgentMessagesTool::call(
@@ -2274,7 +2423,13 @@ mod tests {
         seed_agent(&conn, "bob").await;
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let sea_orm_db = test_sea_orm_db().await;
+        let ctx = ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+            &sea_orm_db,
+        );
         let principal = agent_bearer_with_messages_view("bob");
 
         let result =
@@ -2314,7 +2469,13 @@ mod tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let sea_orm_db = test_sea_orm_db().await;
+        let ctx = ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+            &sea_orm_db,
+        );
         let principal = agent_bearer_with_messages_view("bob");
 
         let result =
@@ -2367,7 +2528,13 @@ mod tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let sea_orm_db = test_sea_orm_db().await;
+        let ctx = ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+            &sea_orm_db,
+        );
         let principal = agent_bearer_with_messages_view("bob");
 
         let _ = GetAgentMessagesTool::call(
@@ -2440,7 +2607,13 @@ mod tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let sea_orm_db = test_sea_orm_db().await;
+        let ctx = ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+            &sea_orm_db,
+        );
         let principal = agent_bearer_with_messages_view("bob");
 
         let result = GetAgentMessagesTool::call(
@@ -2504,7 +2677,13 @@ mod tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let sea_orm_db = test_sea_orm_db().await;
+        let ctx = ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+            &sea_orm_db,
+        );
         let principal = agent_bearer_with_messages_view("bob");
 
         let result =
@@ -2563,7 +2742,13 @@ mod tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let sea_orm_db = test_sea_orm_db().await;
+        let ctx = ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+            &sea_orm_db,
+        );
         // alice fetches her OWN sent messages -- the read flag belongs
         // to bob's (the recipient's) inbox view and must never be
         // flipped by the sender's own fetch.
@@ -2598,7 +2783,13 @@ mod tests {
         seed_agent(&conn, "bob").await;
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let sea_orm_db = test_sea_orm_db().await;
+        let ctx = ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+            &sea_orm_db,
+        );
         let principal = agent_bearer("bob"); // no messages.view capability
         let descriptor = conexus_auth::ToolDescriptor::of::<GetAgentMessagesTool>();
 
@@ -2624,7 +2815,13 @@ mod tests {
         seed_agent(&conn, "alice").await;
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let sea_orm_db = test_sea_orm_db().await;
+        let ctx = ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+            &sea_orm_db,
+        );
         let principal = agent_bearer("alice");
 
         let result = SendAgentMessageTool::call(
@@ -2647,7 +2844,13 @@ mod tests {
         seed_agent(&conn, "alice").await;
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let sea_orm_db = test_sea_orm_db().await;
+        let ctx = ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+            &sea_orm_db,
+        );
         let principal = agent_bearer("alice");
 
         let result = SendAgentMessageTool::call(
@@ -2671,7 +2874,13 @@ mod tests {
         seed_agent(&conn, "bob").await;
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let sea_orm_db = test_sea_orm_db().await;
+        let ctx = ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+            &sea_orm_db,
+        );
         let principal = agent_bearer("alice");
         let (_sender, mut receiver) = registry.register("bob");
 
@@ -2733,7 +2942,13 @@ mod tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let sea_orm_db = test_sea_orm_db().await;
+        let ctx = ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+            &sea_orm_db,
+        );
         let principal = agent_bearer("alice");
 
         let result = SendAgentMessageTool::call(
@@ -2754,7 +2969,13 @@ mod tests {
         let conn = test_conn();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let sea_orm_db = test_sea_orm_db().await;
+        let ctx = ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+            &sea_orm_db,
+        );
         // Admin sender bypasses the active-recipient check, reaching the
         // repository's own unknown-recipient rejection.
         let mut admin = agent_bearer("admin");
@@ -2789,7 +3010,13 @@ mod tests {
         seed_agent(&conn, "alice").await;
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let sea_orm_db = test_sea_orm_db().await;
+        let ctx = ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+            &sea_orm_db,
+        );
         let mut admin = agent_bearer("admin");
         admin.capabilities = Capabilities::from_iter([]);
 
@@ -2840,7 +3067,13 @@ mod tests {
         seed_agent(&conn, "bob").await;
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let sea_orm_db = test_sea_orm_db().await;
+        let ctx = ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+            &sea_orm_db,
+        );
         let principal = agent_bearer("alice");
 
         let result = SendAgentMessageTool::call(
@@ -2866,7 +3099,13 @@ mod tests {
         seed_agent(&conn, "bob").await;
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let sea_orm_db = test_sea_orm_db().await;
+        let ctx = ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+            &sea_orm_db,
+        );
         let principal = agent_bearer("alice");
 
         let root = SendAgentMessageTool::call(
@@ -2924,7 +3163,13 @@ mod tests {
         let conn = test_conn();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let sea_orm_db = test_sea_orm_db().await;
+        let ctx = ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+            &sea_orm_db,
+        );
         let worker = agent_bearer("alice");
         let descriptor = conexus_auth::ToolDescriptor::of::<BroadcastAdminMessageTool>();
 
@@ -2947,7 +3192,13 @@ mod tests {
         let conn = test_conn();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let sea_orm_db = test_sea_orm_db().await;
+        let ctx = ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+            &sea_orm_db,
+        );
         let operator = operator_principal();
 
         let result =
@@ -2963,7 +3214,13 @@ mod tests {
         let conn = test_conn();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let sea_orm_db = test_sea_orm_db().await;
+        let ctx = ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+            &sea_orm_db,
+        );
         let operator = operator_principal();
 
         let result = BroadcastAdminMessageTool::call(
@@ -3005,7 +3262,13 @@ mod tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let ctx = ToolCallContext::off_wire(&registry, &file_map, std::path::Path::new("/tmp"));
+        let sea_orm_db = test_sea_orm_db().await;
+        let ctx = ToolCallContext::off_wire(
+            &registry,
+            &file_map,
+            std::path::Path::new("/tmp"),
+            &sea_orm_db,
+        );
         let operator = operator_principal();
         let (_a_sender, mut a_receiver) = registry.register("alice");
         let (_b_sender, mut b_receiver) = registry.register("bob");

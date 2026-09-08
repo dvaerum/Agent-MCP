@@ -2708,6 +2708,14 @@ impl Tool for DeleteTaskTool {
 
 #[cfg(test)]
 mod tests {
+    // Phase G (sea-orm migration infra): no test in THIS particular
+    // module (`mod tests`, the file's first `#[cfg(test)]` block)
+    // builds a ToolCallContext directly -- every real off_wire call
+    // site lives in one of this file's several sibling test modules
+    // below (`view_search_tests`/`create_task_tests`/etc.), each of
+    // which carries its own `test_sea_orm_db()` copy (`use super::*;`
+    // doesn't reach across sibling `#[cfg(test)] mod` blocks).
+
     use super::*;
     use conexus_db::schema::init_schema;
     use conexus_db::task_repository::{self, NewTask};
@@ -3773,6 +3781,18 @@ impl Tool for BulkTaskOperationsTool {
 
 #[cfg(test)]
 mod view_search_tests {
+    // Phase G (sea-orm migration infra): a throwaway in-memory
+    // sea-orm connection for ToolCallContext::sea_orm_db -- no test in
+    // this module queries through it yet, it only needs to exist so
+    // off_wire's now-mandatory last argument has something to point
+    // at. Each sibling test module here (not nested under `mod
+    // tests` -- each is its own top-level `#[cfg(test)] mod` block)
+    // needs its own copy since `use super::*;` only reaches the
+    // file's top-level items, not another sibling test module's.
+    async fn test_sea_orm_db() -> sea_orm::DatabaseConnection {
+        sea_orm::Database::connect("sqlite::memory:").await.unwrap()
+    }
+
     use super::*;
     use conexus_core::capability::Capabilities;
     use conexus_core::principal::PrincipalKind;
@@ -3902,10 +3922,12 @@ mod view_search_tests {
         let conn = test_conn();
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
+            &sea_orm_db,
         );
         let result = ViewTasksTool::call(Some(&admin("a")), &Value::Null, &conn, NOW, &ctx).await;
         assert_eq!(
@@ -3927,10 +3949,12 @@ mod view_search_tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
+            &sea_orm_db,
         );
         let result = ViewTasksTool::call(
             Some(&admin("bob")),
@@ -3960,10 +3984,12 @@ mod view_search_tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
+            &sea_orm_db,
         );
         let result =
             ViewTasksTool::call(Some(&worker("alice")), &Value::Null, &conn, NOW, &ctx).await;
@@ -3983,10 +4009,12 @@ mod view_search_tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
+            &sea_orm_db,
         );
         let result = ViewTasksTool::call(
             Some(&worker("alice")),
@@ -4008,10 +4036,12 @@ mod view_search_tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
+            &sea_orm_db,
         );
         let result = ViewTasksTool::call(
             Some(&admin("bob")),
@@ -4035,10 +4065,12 @@ mod view_search_tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
+            &sea_orm_db,
         );
         let result = ViewTasksTool::call(
             Some(&admin("bob")),
@@ -4062,10 +4094,12 @@ mod view_search_tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
+            &sea_orm_db,
         );
         let result = ViewTasksTool::call(
             Some(&admin("bob")),
@@ -4089,10 +4123,12 @@ mod view_search_tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
+            &sea_orm_db,
         );
         let full = ViewTasksTool::call(
             Some(&admin("bob")),
@@ -4134,10 +4170,12 @@ mod view_search_tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
+            &sea_orm_db,
         );
         let result = ViewTasksTool::call(
             Some(&admin("bob")),
@@ -4158,10 +4196,12 @@ mod view_search_tests {
         let conn = test_conn();
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
+            &sea_orm_db,
         );
         let result =
             SearchTasksTool::call(Some(&admin("bob")), &Value::Null, &conn, NOW, &ctx).await;
@@ -4173,10 +4213,12 @@ mod view_search_tests {
         let conn = test_conn();
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
+            &sea_orm_db,
         );
         let result = SearchTasksTool::call(
             Some(&admin("bob")),
@@ -4221,10 +4263,12 @@ mod view_search_tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
+            &sea_orm_db,
         );
         let result = SearchTasksTool::call(
             Some(&admin("bob")),
@@ -4287,10 +4331,12 @@ mod view_search_tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
+            &sea_orm_db,
         );
         let result = SearchTasksTool::call(
             Some(&admin("bob")),
@@ -4313,10 +4359,12 @@ mod view_search_tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
+            &sea_orm_db,
         );
         let result = SearchTasksTool::call(
             Some(&admin("bob")),
@@ -4346,10 +4394,12 @@ mod view_search_tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
+            &sea_orm_db,
         );
         let result = SearchTasksTool::call(
             Some(&worker("alice")),
@@ -4367,6 +4417,18 @@ mod view_search_tests {
 
 #[cfg(test)]
 mod create_task_tests {
+    // Phase G (sea-orm migration infra): a throwaway in-memory
+    // sea-orm connection for ToolCallContext::sea_orm_db -- no test in
+    // this module queries through it yet, it only needs to exist so
+    // off_wire's now-mandatory last argument has something to point
+    // at. Each sibling test module here (not nested under `mod
+    // tests` -- each is its own top-level `#[cfg(test)] mod` block)
+    // needs its own copy since `use super::*;` only reaches the
+    // file's top-level items, not another sibling test module's.
+    async fn test_sea_orm_db() -> sea_orm::DatabaseConnection {
+        sea_orm::Database::connect("sqlite::memory:").await.unwrap()
+    }
+
     use super::*;
     use conexus_core::capability::Capabilities;
     use conexus_core::principal::PrincipalKind;
@@ -4466,10 +4528,12 @@ mod create_task_tests {
         let conn = test_conn();
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
+            &sea_orm_db,
         );
         let result = CreateTaskTool::call(
             Some(&worker("bob")),
@@ -4494,10 +4558,12 @@ mod create_task_tests {
         seed_agent(&conn, "victim").await;
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
+            &sea_orm_db,
         );
         let result = CreateTaskTool::call(
             Some(&worker("bob")),
@@ -4526,10 +4592,12 @@ mod create_task_tests {
         let conn = test_conn();
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
+            &sea_orm_db,
         );
         let result = CreateTaskTool::call(
             Some(&manager("alice")),
@@ -4549,10 +4617,12 @@ mod create_task_tests {
         let conn = test_conn();
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
+            &sea_orm_db,
         );
         let result = CreateTaskTool::call(
             Some(&manager("alice")),
@@ -4572,10 +4642,12 @@ mod create_task_tests {
         let conn = test_conn();
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
+            &sea_orm_db,
         );
         let result = CreateTaskTool::call(
             Some(&manager("alice")),
@@ -4593,10 +4665,12 @@ mod create_task_tests {
         let conn = test_conn();
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
+            &sea_orm_db,
         );
         let result = CreateTaskTool::call(
             Some(&manager("alice")),
@@ -4618,10 +4692,12 @@ mod create_task_tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
+            &sea_orm_db,
         );
         let result = CreateTaskTool::call(
             Some(&manager("alice")),
@@ -4642,10 +4718,12 @@ mod create_task_tests {
         let conn = test_conn();
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
+            &sea_orm_db,
         );
         let result = CreateTaskTool::call(
             Some(&manager("alice")),
@@ -4669,10 +4747,12 @@ mod create_task_tests {
         seed_agent(&conn, "carol").await;
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
+            &sea_orm_db,
         );
         let result = CreateTaskTool::call(
             Some(&manager("alice")),
@@ -4733,10 +4813,12 @@ mod create_task_tests {
         };
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
+            &sea_orm_db,
         );
         CreateTaskTool::call(
             Some(&manager("alice")),
@@ -4770,10 +4852,12 @@ mod create_task_tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
+            &sea_orm_db,
         );
         let result = CreateTaskTool::call(
             Some(&manager("alice")),
@@ -4796,10 +4880,12 @@ mod create_task_tests {
         let conn = test_conn();
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
+            &sea_orm_db,
         );
         let result = CreateTaskTool::call(
             Some(&manager("alice")),
@@ -4829,10 +4915,12 @@ mod create_task_tests {
         let registry = WaiterRegistry::new();
         let (_tx, mut rx) = registry.register("carol");
         let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
+            &sea_orm_db,
         );
         let result = CreateTaskTool::call(
             Some(&manager("alice")),
@@ -4853,10 +4941,12 @@ mod create_task_tests {
         let registry = WaiterRegistry::new();
         let (_tx, mut rx) = registry.register("dave");
         let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
+            &sea_orm_db,
         );
         let result = CreateTaskTool::call(
             Some(&manager("alice")),
@@ -4873,6 +4963,18 @@ mod create_task_tests {
 
 #[cfg(test)]
 mod update_task_status_tests {
+    // Phase G (sea-orm migration infra): a throwaway in-memory
+    // sea-orm connection for ToolCallContext::sea_orm_db -- no test in
+    // this module queries through it yet, it only needs to exist so
+    // off_wire's now-mandatory last argument has something to point
+    // at. Each sibling test module here (not nested under `mod
+    // tests` -- each is its own top-level `#[cfg(test)] mod` block)
+    // needs its own copy since `use super::*;` only reaches the
+    // file's top-level items, not another sibling test module's.
+    async fn test_sea_orm_db() -> sea_orm::DatabaseConnection {
+        sea_orm::Database::connect("sqlite::memory:").await.unwrap()
+    }
+
     use super::*;
     use conexus_core::capability::Capabilities;
     use conexus_core::principal::PrincipalKind;
@@ -4966,10 +5068,12 @@ mod update_task_status_tests {
     async fn call(principal: &Principal, args: Value, conn: &AsyncMutex<Connection>) -> ToolResult {
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
+            &sea_orm_db,
         );
         UpdateTaskStatusTool::call(Some(principal), &args, conn, NOW, &ctx).await
     }
@@ -5193,10 +5297,12 @@ mod update_task_status_tests {
         let registry = WaiterRegistry::new();
         let (_tx, mut rx) = registry.register("bob");
         let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
+            &sea_orm_db,
         );
         let result = UpdateTaskStatusTool::call(
             Some(&worker("bob")),
@@ -5243,10 +5349,12 @@ mod update_task_status_tests {
         let registry = WaiterRegistry::new();
         let (_tx, mut rx_carol) = registry.register("carol");
         let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
+            &sea_orm_db,
         );
         let result = UpdateTaskStatusTool::call(
             Some(&worker("bob")),
@@ -5373,6 +5481,18 @@ mod update_task_status_tests {
 
 #[cfg(test)]
 mod update_task_tests {
+    // Phase G (sea-orm migration infra): a throwaway in-memory
+    // sea-orm connection for ToolCallContext::sea_orm_db -- no test in
+    // this module queries through it yet, it only needs to exist so
+    // off_wire's now-mandatory last argument has something to point
+    // at. Each sibling test module here (not nested under `mod
+    // tests` -- each is its own top-level `#[cfg(test)] mod` block)
+    // needs its own copy since `use super::*;` only reaches the
+    // file's top-level items, not another sibling test module's.
+    async fn test_sea_orm_db() -> sea_orm::DatabaseConnection {
+        sea_orm::Database::connect("sqlite::memory:").await.unwrap()
+    }
+
     use super::*;
     use conexus_core::capability::Capabilities;
     use conexus_core::principal::PrincipalKind;
@@ -5445,10 +5565,12 @@ mod update_task_tests {
     async fn call(args: Value, conn: &AsyncMutex<Connection>) -> ToolResult {
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
+            &sea_orm_db,
         );
         UpdateTaskTool::call(Some(&admin("alice")), &args, conn, NOW, &ctx).await
     }
@@ -5697,10 +5819,12 @@ mod update_task_tests {
         let registry = WaiterRegistry::new();
         let (_tx_bystander, mut rx_bystander) = registry.register("bystander");
         let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
+            &sea_orm_db,
         );
         let result = UpdateTaskTool::call(
             Some(&admin("alice")),
@@ -6019,10 +6143,12 @@ mod update_task_tests {
         let registry = WaiterRegistry::new();
         let (_tx_bystander, mut rx_bystander) = registry.register("bystander");
         let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
+            &sea_orm_db,
         );
         let result = UpdateTaskTool::call(
             Some(&admin("alice")),
@@ -6062,10 +6188,12 @@ mod update_task_tests {
         let registry = WaiterRegistry::new();
         let (_tx_bystander, mut rx_bystander) = registry.register("bystander");
         let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
+            &sea_orm_db,
         );
         let result = UpdateTaskTool::call(
             Some(&admin("alice")),
@@ -6115,10 +6243,12 @@ mod update_task_tests {
         let (_tx_bob, mut rx_bob) = registry.register("bob");
         let (_tx_carol, mut rx_carol) = registry.register("carol");
         let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
+            &sea_orm_db,
         );
         let result = UpdateTaskTool::call(
             Some(&admin("alice")),
@@ -6150,10 +6280,12 @@ mod update_task_tests {
         let registry = WaiterRegistry::new();
         let (_tx_carol, mut rx_carol) = registry.register("carol");
         let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
+            &sea_orm_db,
         );
         let result = UpdateTaskTool::call(
             Some(&admin("alice")),
@@ -6190,10 +6322,12 @@ mod update_task_tests {
         let registry = WaiterRegistry::new();
         let (_tx_bob, mut rx_bob) = registry.register("bob");
         let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
+            &sea_orm_db,
         );
         let result = UpdateTaskTool::call(
             Some(&admin("alice")),
@@ -6210,6 +6344,18 @@ mod update_task_tests {
 
 #[cfg(test)]
 mod delete_task_tests {
+    // Phase G (sea-orm migration infra): a throwaway in-memory
+    // sea-orm connection for ToolCallContext::sea_orm_db -- no test in
+    // this module queries through it yet, it only needs to exist so
+    // off_wire's now-mandatory last argument has something to point
+    // at. Each sibling test module here (not nested under `mod
+    // tests` -- each is its own top-level `#[cfg(test)] mod` block)
+    // needs its own copy since `use super::*;` only reaches the
+    // file's top-level items, not another sibling test module's.
+    async fn test_sea_orm_db() -> sea_orm::DatabaseConnection {
+        sea_orm::Database::connect("sqlite::memory:").await.unwrap()
+    }
+
     use super::*;
     use conexus_db::agent_repository::{AgentRepository, NewAgent};
     use conexus_db::scheduled_directive_repository::NullableUpdate;
@@ -6275,10 +6421,12 @@ mod delete_task_tests {
     async fn call(args: Value, conn: &AsyncMutex<Connection>) -> ToolResult {
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
+            &sea_orm_db,
         );
         DeleteTaskTool::call(None, &args, conn, NOW, &ctx).await
     }
@@ -6664,10 +6812,12 @@ mod delete_task_tests {
         let registry = WaiterRegistry::new();
         let (_tx, mut rx) = registry.register("bob");
         let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
+            &sea_orm_db,
         );
         let result = DeleteTaskTool::call(
             None,
@@ -6684,6 +6834,18 @@ mod delete_task_tests {
 
 #[cfg(test)]
 mod request_assistance_tests {
+    // Phase G (sea-orm migration infra): a throwaway in-memory
+    // sea-orm connection for ToolCallContext::sea_orm_db -- no test in
+    // this module queries through it yet, it only needs to exist so
+    // off_wire's now-mandatory last argument has something to point
+    // at. Each sibling test module here (not nested under `mod
+    // tests` -- each is its own top-level `#[cfg(test)] mod` block)
+    // needs its own copy since `use super::*;` only reaches the
+    // file's top-level items, not another sibling test module's.
+    async fn test_sea_orm_db() -> sea_orm::DatabaseConnection {
+        sea_orm::Database::connect("sqlite::memory:").await.unwrap()
+    }
+
     use super::*;
     use conexus_core::capability::Capabilities;
     use conexus_core::principal::PrincipalKind;
@@ -6753,10 +6915,12 @@ mod request_assistance_tests {
     async fn call(args: Value, principal: &Principal, conn: &AsyncMutex<Connection>) -> ToolResult {
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
+            &sea_orm_db,
         );
         RequestAssistanceTool::call(Some(principal), &args, conn, NOW, &ctx).await
     }
@@ -6894,6 +7058,18 @@ mod request_assistance_tests {
 
 #[cfg(test)]
 mod bulk_task_operations_tests {
+    // Phase G (sea-orm migration infra): a throwaway in-memory
+    // sea-orm connection for ToolCallContext::sea_orm_db -- no test in
+    // this module queries through it yet, it only needs to exist so
+    // off_wire's now-mandatory last argument has something to point
+    // at. Each sibling test module here (not nested under `mod
+    // tests` -- each is its own top-level `#[cfg(test)] mod` block)
+    // needs its own copy since `use super::*;` only reaches the
+    // file's top-level items, not another sibling test module's.
+    async fn test_sea_orm_db() -> sea_orm::DatabaseConnection {
+        sea_orm::Database::connect("sqlite::memory:").await.unwrap()
+    }
+
     use super::*;
     use conexus_core::capability::Capabilities;
     use conexus_core::principal::PrincipalKind;
@@ -6987,10 +7163,12 @@ mod bulk_task_operations_tests {
     async fn call(args: Value, principal: &Principal, conn: &AsyncMutex<Connection>) -> ToolResult {
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
+            &sea_orm_db,
         );
         BulkTaskOperationsTool::call(Some(principal), &args, conn, NOW, &ctx).await
     }
@@ -7677,10 +7855,12 @@ mod bulk_task_operations_tests {
         let registry = WaiterRegistry::new();
         let (_tx, mut rx_carol) = registry.register("carol");
         let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
+            &sea_orm_db,
         );
         let result = BulkTaskOperationsTool::call(
             Some(&worker("bob")),
@@ -7760,10 +7940,12 @@ mod bulk_task_operations_tests {
         let registry = WaiterRegistry::new();
         let (_tx, mut rx) = registry.register("carol");
         let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
+            &sea_orm_db,
         );
         let result = BulkTaskOperationsTool::call(
             Some(&admin("alice")),

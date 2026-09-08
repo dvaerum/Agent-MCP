@@ -44,6 +44,15 @@ impl Tool for TestTool {
 
 #[cfg(test)]
 mod tests {
+    // Phase G (sea-orm migration infra): a throwaway in-memory
+    // sea-orm connection for ToolCallContext::sea_orm_db -- no test in
+    // this file queries through it yet, it only needs to exist so
+    // off_wire's now-mandatory last argument has something to point
+    // at.
+    async fn test_sea_orm_db() -> sea_orm::DatabaseConnection {
+        sea_orm::Database::connect("sqlite::memory:").await.unwrap()
+    }
+
     use super::*;
     use conexus_db::schema::init_schema;
     use conexus_wakeloop::waiter_registry::WaiterRegistry;
@@ -55,10 +64,12 @@ mod tests {
         let conn = AsyncMutex::new(conn);
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
+        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
+            &sea_orm_db,
         );
         let result = TestTool::call(None, &Value::Null, &conn, "2026-06-01T00:00:00Z", &ctx).await;
         assert_eq!(
