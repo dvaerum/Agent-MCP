@@ -1,6 +1,7 @@
 { pkgs
 , src
 , modulePkgs ? null
+, routerImpl ? "python"
 }:
 
 # Eval-only harness for nix/home-manager-module.nix.
@@ -70,6 +71,7 @@ let
           enable = true;
           source = src;
           router = {
+            impl = routerImpl;
             externalUrl = "https://example.invalid";
             defaultWorkspaceParent = "/home/test/.local/share/agent-mcp/projects";
           };
@@ -81,6 +83,19 @@ let
           # interpolation to resolve at eval time.
           conexusRouterPackage = pkgs.hello;
           conexusLauncherPackage = pkgs.hello;
+          # One daemon-agent instance so the `agent-mcp-daemon-agent@`
+          # template unit actually materializes (default `daemonAgents
+          # = []` emits none) -- needed for the router.impl-aware
+          # After/Wants coverage below. `tokenPath` is never read at
+          # eval time (only interpolated into the wrapper's ExecStart
+          # string), so a non-existent path is fine here.
+          daemonAgents = [
+            {
+              project = "demo-proj";
+              agentId = "worker-1";
+              tokenPath = "/home/test/.config/agent-mcp/tokens/demo-proj--worker-1.token";
+            }
+          ];
         } // lib.optionalAttrs (modulePkgs != null) { pkgs = modulePkgs; };
       }
     ];
@@ -117,6 +132,21 @@ in {
     conexus-router = units."conexus-router".Service.RuntimeDirectoryPreserve or null;
     "agent-mcp@" = units."agent-mcp@".Service.RuntimeDirectoryPreserve or null;
     "conexus@" = units."conexus@".Service.RuntimeDirectoryPreserve or null;
+  };
+
+  # `router.impl`-aware daemon-agent unit dependency (live incident,
+  # 2026-09-08): the `agent-mcp-daemon-agent@` template's own `After`/
+  # `Wants` used to hardcode `agent-mcp-router.service` regardless of
+  # `router.impl`, so every daemon-agent activation unconditionally
+  # started the Python router alongside an already-running
+  # `conexus-router` -- a real, recurring crash-loop this test pins a
+  # regression of. Reads back whichever router unit the ONE seeded
+  # daemon-agent instance (`demo-proj--worker-1`) actually depends on.
+  daemonAgentRouterDependency = let
+    unit = units."agent-mcp-daemon-agent@demo-proj--worker-1".Unit;
+  in {
+    after = unit.After;
+    wants = unit.Wants;
   };
 
   # Store paths installed into the profile.

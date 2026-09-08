@@ -1141,8 +1141,19 @@ in {
       value = {
         Unit = {
           Description = "Agent-MCP daemon agent — ${daemonAgentInstanceName a} (event-driven wait_for_events loop)";
-          After = [ "agent-mcp-router.service" ];
-          Wants = [ "agent-mcp-router.service" ];
+          # `router.impl`-aware (Phase F): a daemon-agent instance
+          # talks to whichever router implementation is actually
+          # live, not a hardcoded Python-only dependency. Mirrors
+          # `conexus-router`'s own conditional `Install.WantedBy`
+          # above -- without this, every daemon-agent activation
+          # unconditionally `Wants`ed (and thus started) the Python
+          # router alongside an already-running Rust one, regardless
+          # of `router.impl`, a real recurring bug found while
+          # deploying Phase G (the Python router would restart-crash-
+          # loop on every subsequent switch since it competes for the
+          # same port `conexus-router` already holds).
+          After = [ (if cfg.router.impl == "rust" then "conexus-router.service" else "agent-mcp-router.service") ];
+          Wants = [ (if cfg.router.impl == "rust" then "conexus-router.service" else "agent-mcp-router.service") ];
           # StartLimit* live in [Unit] (per `man systemd.unit`), not
           # in [Service] — putting them in Service makes systemd log
           # "Unknown key ... ignoring" and the rate-limiter never
