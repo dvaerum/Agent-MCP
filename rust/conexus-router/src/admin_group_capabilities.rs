@@ -415,6 +415,84 @@ mod tests {
     }
 
     #[test]
+    fn a_non_sysadmin_can_grant_a_capability_they_themselves_hold() {
+        // test_sec_r4_cap_amplification.py's
+        // `test_delegated_caps_manager_can_grant_held_cap`: the guard
+        // only blocks amplification beyond the caller's own authority
+        // -- granting a cap the caller ALREADY holds must succeed.
+        use conexus_core::capability::Capabilities;
+        use conexus_core::principal::PrincipalKind;
+        let c = conn();
+        let gid = seed_group(&c, "engineers");
+        let principal = Principal {
+            kind: PrincipalKind::OperatorSession,
+            user_id: Some("bob".to_string()),
+            agent_id: None,
+            project_name: None,
+            project_role: None,
+            agent_role: None,
+            can_wake_loop: false,
+            source_token: None,
+            capabilities: Capabilities::Set(HashSet::from([
+                Capability::SystemGroupsCapabilitiesManage,
+            ])),
+        };
+        let outcome = decide_replace_group_capabilities(
+            &c,
+            &gid,
+            false,
+            "bob",
+            Some(&principal),
+            &serde_json::json!({"capabilities": ["system.groups.capabilities.manage"]}),
+        )
+        .unwrap();
+        let ReplaceGroupCapabilitiesOutcome::Replaced(caps) = outcome else {
+            panic!("expected Replaced, got {outcome:?}");
+        };
+        assert_eq!(caps, vec!["system.groups.capabilities.manage"]);
+    }
+
+    #[test]
+    fn a_non_sysadmin_can_strip_a_capability_they_themselves_hold() {
+        // test_sec_r12_revoke_amplification.py's
+        // `test_delegate_can_strip_held_cap_via_shrinking_put`: a
+        // shrinking PUT that removes a cap the CALLER holds is a
+        // revoke within their own authority.
+        use conexus_core::capability::Capabilities;
+        use conexus_core::principal::PrincipalKind;
+        let c = conn();
+        let gid = seed_group(&c, "g-target");
+        group_capability_repository::replace(&c, &gid, ["system.users.manage"]).unwrap();
+        let principal = Principal {
+            kind: PrincipalKind::OperatorSession,
+            user_id: Some("bob".to_string()),
+            agent_id: None,
+            project_name: None,
+            project_role: None,
+            agent_role: None,
+            can_wake_loop: false,
+            source_token: None,
+            capabilities: Capabilities::Set(HashSet::from([
+                Capability::SystemGroupsCapabilitiesManage,
+                Capability::SystemUsersManage,
+            ])),
+        };
+        let outcome = decide_replace_group_capabilities(
+            &c,
+            &gid,
+            false,
+            "bob",
+            Some(&principal),
+            &serde_json::json!({"capabilities": []}),
+        )
+        .unwrap();
+        let ReplaceGroupCapabilitiesOutcome::Replaced(caps) = outcome else {
+            panic!("expected Replaced, got {outcome:?}");
+        };
+        assert!(caps.is_empty());
+    }
+
+    #[test]
     fn duplicate_entries_are_deduped() {
         let c = conn();
         let gid = seed_group(&c, "engineers");

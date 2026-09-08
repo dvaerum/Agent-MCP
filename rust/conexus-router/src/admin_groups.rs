@@ -577,6 +577,33 @@ mod tests {
     }
 
     #[test]
+    fn a_sysadmin_can_delete_a_sysadmin_flagged_group() {
+        // test_sec_r10_delete_group_guard.py's
+        // `test_sysadmin_can_delete_sysadmin_group`: the AZ-R10-1 guard
+        // must not over-reject the legitimate sysadmin path. A second,
+        // unrelated real sysadmin user keeps the R5-F4 global invariant
+        // satisfied so this test isolates the AZ-R10-1 mechanism alone.
+        let mut c = conn();
+        crate::identity::create_user(
+            &mut c,
+            "root",
+            "correct horse battery staple",
+            None,
+            true,
+            true,
+            &[],
+            NOW,
+        )
+        .unwrap();
+        let gid = seed_sysadmin_group(&c);
+        let outcome = decide_delete_group(&mut c, true, "root", &gid).unwrap();
+        assert!(matches!(outcome, DeleteGroupOutcome::Deleted(_)));
+        assert!(group_membership_repository::get_group(&c, &gid)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn refuses_to_delete_the_last_sysadmin_group() {
         let mut c = conn();
         // A real member, not an empty sysadmin-flagged group -- see

@@ -990,6 +990,84 @@ mod tests {
         assert_eq!(resp.status, 409);
     }
 
+    #[test]
+    fn precheck_rejects_renaming_onto_a_visible_registered_project_as_409() {
+        // test_sec_r37_rename_error_mapping.py's
+        // `test_rename_to_existing_project_name_returns_409`: a plain,
+        // non-racing rename onto an already-registered VISIBLE project
+        // name must 409 name_taken, never a 500.
+        let mut c = conn();
+        let dir = tempfile::tempdir().unwrap();
+        let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
+        registry
+            .register("alpha", "/ws/alpha", "python", now_dt())
+            .unwrap();
+        registry
+            .register("beta", "/ws/beta", "python", now_dt())
+            .unwrap();
+        let uid = seed_operator_member(&mut c, "bob", "alpha", "operator");
+        // bob must also see "beta" for the R1-F1 escape hatch to
+        // surface the rich 409 rather than the hidden-collision 404.
+        c.execute(
+            "INSERT INTO project_membership (project_name, user_id, role) VALUES ('beta', ?1, 'operator')",
+            [&uid],
+        )
+        .unwrap();
+        let store = RuntimeStore::default();
+
+        let outcome = rename_precheck(
+            &c,
+            &registry,
+            &store,
+            false,
+            Some(&uid),
+            "alpha",
+            Some(&serde_json::json!("beta")),
+            None,
+            now_dt(),
+        )
+        .unwrap();
+        let RenamePrecheck::Rejected(resp) = outcome else {
+            panic!("expected Rejected");
+        };
+        assert_eq!(resp.status, 409);
+        let HandlerBody::Json(body) = resp.body else {
+            panic!("expected JSON body");
+        };
+        assert_eq!(body["error"], "name_taken");
+    }
+
+    #[test]
+    fn precheck_rejects_an_unknown_old_name_as_404() {
+        // test_sec_r37_rename_error_mapping.py's
+        // `test_rename_unknown_old_name_returns_404`.
+        let c = conn();
+        let dir = tempfile::tempdir().unwrap();
+        let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
+        let store = RuntimeStore::default();
+
+        let outcome = rename_precheck(
+            &c,
+            &registry,
+            &store,
+            true,
+            Some("u1"),
+            "ghostproject",
+            Some(&serde_json::json!("whatever")),
+            None,
+            now_dt(),
+        )
+        .unwrap();
+        let RenamePrecheck::Rejected(resp) = outcome else {
+            panic!("expected Rejected");
+        };
+        assert_eq!(resp.status, 404);
+        let HandlerBody::Json(body) = resp.body else {
+            panic!("expected JSON body");
+        };
+        assert_eq!(body["error"], "not_registered");
+    }
+
     // -- rename_toctou_recheck --------------------------------------------
 
     #[test]
@@ -1038,6 +1116,49 @@ mod tests {
             panic!("expected Rejected");
         };
         assert_eq!(resp.status, 404);
+    }
+
+    #[test]
+    fn toctou_recheck_denies_if_new_name_became_an_active_alias_mid_flight() {
+        // PF-R36-1's alias-collision half (test_sec_r36_lifecycle_
+        // parity.py's `test_rename_revalidates_alias_collision_inside_
+        // lock`): if `new_name` became an active alias of ANOTHER
+        // project between the outside-lock probe and the inside-lock
+        // re-check, the destructive rename must never proceed.
+        let mut c = conn();
+        let dir = tempfile::tempdir().unwrap();
+        let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
+        registry
+            .register("mover", "/ws/mover", "python", now_dt())
+            .unwrap();
+        registry
+            .register("someoneelse", "/ws/someoneelse", "python", now_dt())
+            .unwrap();
+        registry
+            .add_alias("someoneelse", "target", None, Some(30), now_dt())
+            .unwrap();
+        let uid = seed_operator_member(&mut c, "bob", "someoneelse", "operator");
+        let store = RuntimeStore::default();
+
+        let outcome = rename_toctou_recheck(
+            &c,
+            &registry,
+            &store,
+            false,
+            Some(&uid),
+            "mover",
+            "target",
+            now_dt(),
+        )
+        .unwrap();
+        let RenameToctou::Rejected(resp) = outcome else {
+            panic!("expected Rejected, got {outcome:?}");
+        };
+        assert_eq!(resp.status, 409);
+        let HandlerBody::Json(body) = resp.body else {
+            panic!("expected JSON body");
+        };
+        assert_eq!(body["error"], "alias_collision");
     }
 
     // -- finish_rename_project --------------------------------------------

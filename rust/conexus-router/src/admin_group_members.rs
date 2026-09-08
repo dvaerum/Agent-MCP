@@ -310,7 +310,9 @@ pub fn decide_remove_group_member(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use conexus_core::capability::Capability;
     use conexus_db::schema::init_router_schema;
+    use std::collections::HashSet;
 
     fn conn() -> Connection {
         let c = Connection::open_in_memory().unwrap();
@@ -556,6 +558,225 @@ mod tests {
         conexus_db::group_capability_repository::replace(c, gid, caps).unwrap();
     }
 
+    fn principal_with_caps<'a, I: IntoIterator<Item = &'a str>>(
+        user_id: &str,
+        caps: I,
+    ) -> Principal {
+        use conexus_core::capability::Capabilities;
+        use conexus_core::principal::PrincipalKind;
+        let set: HashSet<Capability> = caps
+            .into_iter()
+            .map(|c| c.parse::<Capability>().unwrap())
+            .collect();
+        Principal {
+            kind: PrincipalKind::OperatorSession,
+            user_id: Some(user_id.to_string()),
+            agent_id: None,
+            project_name: None,
+            project_role: None,
+            agent_role: None,
+            can_wake_loop: false,
+            source_token: None,
+            capabilities: Capabilities::Set(set),
+        }
+    }
+
+    fn seed_project_membership(
+        c: &Connection,
+        project_name: &str,
+        user_id: Option<&str>,
+        group_id: Option<&str>,
+        role: &str,
+    ) {
+        crate::identity::grant_project_membership(c, project_name, user_id, group_id, role)
+            .unwrap();
+    }
+
+    // -- AZ-2 (test_sec_r4_cap_amplification.py): join-a-high-cap-group --
+
+    #[test]
+    fn a_delegate_can_join_a_group_whose_resolved_caps_are_all_held() {
+        // test_sec_r4_cap_amplification.py's
+        // `test_delegated_group_manager_can_join_held_cap_group`: the
+        // guard only blocks amplification, not legitimate delegation.
+        let mut c = conn();
+        let gid = seed_group(&c, "g-lowcap");
+        group_capability_replace(&c, &gid, ["system.groups.manage"]);
+        let alice = seed_user(&mut c, "alice");
+        let principal = principal_with_caps("bob", ["system.groups.manage"]);
+        let outcome = decide_add_group_member(
+            &mut c,
+            false,
+            "bob",
+            Some("bob"),
+            Some(&principal),
+            &gid,
+            &serde_json::json!({"user_id": alice}),
+            NOW,
+        )
+        .unwrap();
+        assert!(matches!(outcome, AddGroupMemberOutcome::Added(_)));
+    }
+
+    #[test]
+    fn a_sysadmin_can_add_a_member_to_a_high_cap_group() {
+        // test_sec_r4_cap_amplification.py's
+        // `test_sysadmin_can_add_member_to_high_cap_group`.
+        let mut c = conn();
+        let gid = seed_group(&c, "g-sys-highcap");
+        group_capability_replace(&c, &gid, ["system.users.manage"]);
+        let alice = seed_user(&mut c, "alice");
+        let outcome = decide_add_group_member(
+            &mut c,
+            true,
+            "root",
+            None,
+            None,
+            &gid,
+            &serde_json::json!({"user_id": alice}),
+            NOW,
+        )
+        .unwrap();
+        assert!(matches!(outcome, AddGroupMemberOutcome::Added(_)));
+    }
+
+    // -- AZ-R6-1 (test_sec_r6_groupjoin_membership.py): group-join
+    // project-membership amplification -----------------------------------
+
+    #[test]
+    fn a_delegate_cannot_join_themselves_into_a_project_member_group() {
+        // A non-sysadmin holding only `system.groups.manage` with NO
+        // membership on the victim project must not be able to add
+        // THEMSELVES into a group that is an operator-member of it --
+        // joining confers the project's operator role via the
+        // resolver the data middleware gates on.
+        let mut c = conn();
+        let gid = seed_group(&c, "r6team");
+        seed_project_membership(&c, "r6victim", None, Some(&gid), "operator");
+        let alice = seed_user(&mut c, "alice");
+        let principal = principal_with_caps(&alice, ["system.groups.manage"]);
+        let outcome = decide_add_group_member(
+            &mut c,
+            false,
+            "alice",
+            Some(&alice),
+            Some(&principal),
+            &gid,
+            &serde_json::json!({"user_id": alice}),
+            NOW,
+        )
+        .unwrap();
+        let AddGroupMemberOutcome::Rejected(resp) = outcome else {
+            panic!("expected Rejected, got {outcome:?}");
+        };
+        assert_eq!(resp.status, 403);
+    }
+
+    #[test]
+    fn a_delegate_cannot_add_a_controlled_group_into_a_project_member_group() {
+        // Group-indirection: adding a GROUP (rather than a user)
+        // member into the project-member group must be guarded the
+        // same way -- the nested group (and anyone in it) would
+        // transitively inherit the project's operator role.
+        let mut c = conn();
+        let gid = seed_group(&c, "r6team");
+        seed_project_membership(&c, "r6victim", None, Some(&gid), "operator");
+        let controlled = seed_group(&c, "g-controlled");
+        let alice = seed_user(&mut c, "alice");
+        let principal = principal_with_caps(&alice, ["system.groups.manage"]);
+        let outcome = decide_add_group_member(
+            &mut c,
+            false,
+            "alice",
+            Some(&alice),
+            Some(&principal),
+            &gid,
+            &serde_json::json!({"group_id": controlled}),
+            NOW,
+        )
+        .unwrap();
+        let AddGroupMemberOutcome::Rejected(resp) = outcome else {
+            panic!("expected Rejected, got {outcome:?}");
+        };
+        assert_eq!(resp.status, 403);
+    }
+
+    #[test]
+    fn a_sysadmin_can_add_a_member_to_a_project_member_group() {
+        let mut c = conn();
+        let gid = seed_group(&c, "r6team");
+        seed_project_membership(&c, "r6victim", None, Some(&gid), "operator");
+        let newbie = seed_user(&mut c, "newbie");
+        let outcome = decide_add_group_member(
+            &mut c,
+            true,
+            "root",
+            None,
+            None,
+            &gid,
+            &serde_json::json!({"user_id": newbie}),
+            NOW,
+        )
+        .unwrap();
+        assert!(matches!(outcome, AddGroupMemberOutcome::Added(_)));
+    }
+
+    #[test]
+    fn an_operator_delegate_can_add_a_member_to_a_viewer_member_group() {
+        // Regression: a delegate who holds OPERATOR on the project may
+        // add a member into a group that is only a VIEWER-member of
+        // that project -- conferring viewer is at or below their own
+        // role.
+        let mut c = conn();
+        let alice = seed_user(&mut c, "alice");
+        seed_project_membership(&c, "r6victim", Some(&alice), None, "operator");
+        let gid = seed_group(&c, "r6viewteam");
+        seed_project_membership(&c, "r6victim", None, Some(&gid), "viewer");
+        let newbie = seed_user(&mut c, "newbie2");
+        let principal = principal_with_caps(&alice, ["system.groups.manage"]);
+        let outcome = decide_add_group_member(
+            &mut c,
+            false,
+            "alice",
+            Some(&alice),
+            Some(&principal),
+            &gid,
+            &serde_json::json!({"user_id": newbie}),
+            NOW,
+        )
+        .unwrap();
+        assert!(matches!(outcome, AddGroupMemberOutcome::Added(_)));
+    }
+
+    // -- SD-R6-2: generic error on IntegrityError -------------------------
+
+    #[test]
+    fn a_foreign_key_violation_returns_a_generic_message_not_the_raw_sqlite_error() {
+        let mut c = conn();
+        let gid = seed_group(&c, "r6team");
+        let outcome = decide_add_group_member(
+            &mut c,
+            true,
+            "root",
+            None,
+            None,
+            &gid,
+            &serde_json::json!({"user_id": "no-such-user-id"}),
+            NOW,
+        )
+        .unwrap();
+        let AddGroupMemberOutcome::Rejected(resp) = outcome else {
+            panic!("expected Rejected, got {outcome:?}");
+        };
+        let crate::mcp_handler::HandlerBody::Json(body) = resp.body else {
+            panic!("expected JSON");
+        };
+        let message = body["message"].as_str().unwrap_or_default();
+        assert!(!message.to_uppercase().contains("FOREIGN KEY"));
+        assert!(!message.to_lowercase().contains("constraint"));
+        assert_eq!(message, "could not add member");
+    }
+
     // -- decide_remove_group_member --------------------------------------
 
     #[test]
@@ -619,6 +840,138 @@ mod tests {
             group_membership_repository::group_member_count(&c, &gid).unwrap(),
             1
         );
+    }
+
+    // -- AZ-R12-1 instance 2 (test_sec_r12_revoke_amplification.py):
+    // removing a group member strips authority just as adding one
+    // grants it -- the REMOVE path must run the SAME amplification
+    // guard as ADD. -------------------------------------------------
+
+    #[test]
+    fn a_delegate_cannot_remove_a_member_from_a_cap_conferring_group() {
+        // A delegate holding `system.groups.manage` but NOT
+        // `system.users.manage` must not be able to remove a member
+        // from a group that confers `system.users.manage` --
+        // stripping a cap-conferring membership the delegate could
+        // never grant.
+        let mut c = conn();
+        let gid = seed_group(&c, "g-caps");
+        group_capability_replace(&c, &gid, ["system.users.manage"]);
+        let victim = seed_user(&mut c, "victim");
+        group_membership_repository::add_group_member(&c, &gid, Some(&victim), None, NOW).unwrap();
+        let principal = principal_with_caps("alice", ["system.groups.manage"]);
+        let outcome = decide_remove_group_member(
+            &mut c,
+            false,
+            "alice",
+            Some("alice"),
+            Some(&principal),
+            &gid,
+            &victim,
+        )
+        .unwrap();
+        let RemoveGroupMemberOutcome::Rejected(resp) = outcome else {
+            panic!("expected Rejected, got {outcome:?}");
+        };
+        assert_eq!(resp.status, 403);
+        assert_eq!(
+            group_membership_repository::group_member_count(&c, &gid).unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_delegate_cannot_remove_a_member_from_a_project_role_group() {
+        // The project-role vector: a delegate with NO role on the
+        // victim project may not remove a member from a group that is
+        // an operator-member of it -- stripping the project role the
+        // delegate could never grant.
+        let mut c = conn();
+        let gid = seed_group(&c, "g-proj");
+        seed_project_membership(&c, "proj-r12", None, Some(&gid), "operator");
+        let victim = seed_user(&mut c, "victim");
+        group_membership_repository::add_group_member(&c, &gid, Some(&victim), None, NOW).unwrap();
+        let principal = principal_with_caps("alice", ["system.groups.manage"]);
+        let outcome = decide_remove_group_member(
+            &mut c,
+            false,
+            "alice",
+            Some("alice"),
+            Some(&principal),
+            &gid,
+            &victim,
+        )
+        .unwrap();
+        let RemoveGroupMemberOutcome::Rejected(resp) = outcome else {
+            panic!("expected Rejected, got {outcome:?}");
+        };
+        assert_eq!(resp.status, 403);
+    }
+
+    #[test]
+    fn a_delegate_can_remove_a_member_from_a_group_whose_caps_are_all_held() {
+        // Regression: a delegate may remove a member from a group
+        // whose conferred caps are all caps the delegate ALSO holds --
+        // within their own authority to grant, so within their
+        // authority to revoke.
+        let mut c = conn();
+        // R5-F4 fires on EVERY removal -- seed an unrelated real
+        // sysadmin so the global invariant is genuinely satisfied and
+        // this test isolates the amplification-guard mechanism alone.
+        crate::identity::create_user(
+            &mut c,
+            "root",
+            "correct horse battery staple",
+            None,
+            true,
+            true,
+            &[],
+            NOW,
+        )
+        .unwrap();
+        let gid = seed_group(&c, "g-safe");
+        group_capability_replace(&c, &gid, ["system.users.manage"]);
+        let victim = seed_user(&mut c, "victim");
+        group_membership_repository::add_group_member(&c, &gid, Some(&victim), None, NOW).unwrap();
+        let principal =
+            principal_with_caps("alice", ["system.groups.manage", "system.users.manage"]);
+        let outcome = decide_remove_group_member(
+            &mut c,
+            false,
+            "alice",
+            Some("alice"),
+            Some(&principal),
+            &gid,
+            &victim,
+        )
+        .unwrap();
+        assert!(matches!(outcome, RemoveGroupMemberOutcome::Removed(_)));
+    }
+
+    #[test]
+    fn a_sysadmin_can_remove_a_member_from_a_cap_conferring_group() {
+        let mut c = conn();
+        // See the comment on the sibling test above -- R5-F4 needs an
+        // unrelated real sysadmin seeded for a genuinely satisfied
+        // global invariant.
+        crate::identity::create_user(
+            &mut c,
+            "root",
+            "correct horse battery staple",
+            None,
+            true,
+            true,
+            &[],
+            NOW,
+        )
+        .unwrap();
+        let gid = seed_group(&c, "g-caps");
+        group_capability_replace(&c, &gid, ["system.users.manage"]);
+        let victim = seed_user(&mut c, "victim");
+        group_membership_repository::add_group_member(&c, &gid, Some(&victim), None, NOW).unwrap();
+        let outcome =
+            decide_remove_group_member(&mut c, true, "root", None, None, &gid, &victim).unwrap();
+        assert!(matches!(outcome, RemoveGroupMemberOutcome::Removed(_)));
     }
 
     #[test]

@@ -1237,6 +1237,78 @@ exit 0
         );
     }
 
+    /// BL-R35-1 (test_sec_r35_rename_warmstart_lock.py) -- the RENAME
+    /// sibling of the delete race above: a project RENAMED away while
+    /// `ensure()` is blocked acquiring the SAME per-`(name, role)` lock
+    /// a `rename_project_handler` holds during its own `systemctl stop`
+    /// must abort exactly like a delete, not start a unit for the
+    /// project's OLD name against its already-moved workspace.
+    /// `registry.get(old_name)` naturally returns `None` after a
+    /// successful rename (the row moved to the new key), so the SAME
+    /// BL-R6-1 re-check this module already runs for delete closes the
+    /// rename race too -- this test proves that structural claim
+    /// directly, rather than assuming a delete-shaped re-check covers a
+    /// rename-shaped mutation without checking.
+    #[tokio::test]
+    async fn ensure_aborts_when_project_renamed_while_lock_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_dir = std::sync::Arc::new(dir.path().join("sockets"));
+        let registry = std::sync::Arc::new(registry_with(dir.path(), "victim", "python"));
+        let store = std::sync::Arc::new(RuntimeStore::new());
+        let started = dir.path().join("started");
+        let release = dir.path().join("release");
+        let (program, log) =
+            write_fake_systemctl_blocking_on_is_active(dir.path(), &started, &release, 3, 0);
+        let cfg = std::sync::Arc::new(fast_cfg(&program));
+
+        let ensure_task = {
+            let store = std::sync::Arc::clone(&store);
+            let registry = std::sync::Arc::clone(&registry);
+            let sock_dir = std::sync::Arc::clone(&sock_dir);
+            let cfg = std::sync::Arc::clone(&cfg);
+            tokio::spawn(async move {
+                ensure(&store, &registry, &sock_dir, "victim", "backend", &cfg).await
+            })
+        };
+
+        for _ in 0..100 {
+            if started.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            started.exists(),
+            "fake systemctl's is-active never started -- ensure() did not reach its shell-out"
+        );
+
+        // Stand-in for a concurrent rename_project_handler landing while
+        // ensure() holds the lock: the real registry mutation
+        // `finish_rename_project` performs, moving "victim" to
+        // "renamed" while this call is blocked mid-critical-section.
+        let now: chrono::DateTime<chrono::Utc> = "2026-01-01T00:00:00Z".parse().unwrap();
+        registry.rename("victim", "renamed", 7, now).unwrap();
+        std::fs::write(&release, b"go").unwrap();
+
+        let err = ensure_task
+            .await
+            .expect("ensure() task must not panic")
+            .unwrap_err();
+        assert!(
+            matches!(err, EnsureError::UnknownProject),
+            "expected UnknownProject from the BL-R6-1 re-check on the OLD name, got {err:?}"
+        );
+
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            !calls
+                .lines()
+                .any(|l| l.contains("start") || l.contains("restart")),
+            "must NOT systemctl-start/restart the OLD-name unit for a project renamed away \
+             while ensure() held the lock (BL-R35-1 orphan) -- got calls: {calls:?}"
+        );
+    }
+
     // -- BL-R6-2b: the systemctl shell-out runs off the event loop -------
 
     /// Like [`write_fake_systemctl`], but `start`/`restart` sleeps for

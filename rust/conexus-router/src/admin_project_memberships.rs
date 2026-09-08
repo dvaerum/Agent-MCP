@@ -668,6 +668,66 @@ mod tests {
     }
 
     #[test]
+    fn an_operator_delegate_can_downgrade_another_operator_to_viewer() {
+        // test_sec_r12_revoke_amplification.py's
+        // `test_operator_delegate_can_downgrade_operator_to_viewer`:
+        // an operator-role delegate holds authority over BOTH the old
+        // AND new role here, so the downgrade is within their own
+        // authority -- must succeed, not be over-rejected by the
+        // AZ-R12-1 guard added for the viewer-delegate case above.
+        let dir = TempDir::new().unwrap();
+        let registry = registry_with(&dir, "proj-a");
+        let mut c = conn();
+        let bob = seed_user(&mut c, "bob");
+        identity::grant_project_membership(&c, "proj-a", Some(&bob), None, "operator").unwrap();
+        let alice = seed_user(&mut c, "alice");
+        identity::grant_project_membership(&c, "proj-a", Some(&alice), None, "operator").unwrap();
+        let outcome = decide_change_project_membership_role(
+            &c,
+            &registry,
+            false,
+            "bob",
+            Some(&bob),
+            Some("operator"),
+            "proj-a",
+            &format!("u:{alice}"),
+            &serde_json::json!({"role": "viewer"}),
+        )
+        .unwrap();
+        let ChangeProjectMembershipRoleOutcome::Changed(payload) = outcome else {
+            panic!("expected Changed, got {outcome:?}");
+        };
+        assert_eq!(payload["role"], "viewer");
+    }
+
+    #[test]
+    fn a_sysadmin_can_downgrade_an_operator_membership() {
+        // test_sec_r12_revoke_amplification.py's
+        // `test_sysadmin_can_downgrade_operator_membership`.
+        let dir = TempDir::new().unwrap();
+        let registry = registry_with(&dir, "proj-a");
+        let mut c = conn();
+        let alice = seed_user(&mut c, "alice");
+        identity::grant_project_membership(&c, "proj-a", Some(&alice), None, "operator").unwrap();
+        let outcome = decide_change_project_membership_role(
+            &c,
+            &registry,
+            true,
+            "root",
+            None,
+            None,
+            "proj-a",
+            &format!("u:{alice}"),
+            &serde_json::json!({"role": "viewer"}),
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            ChangeProjectMembershipRoleOutcome::Changed(_)
+        ));
+    }
+
+    #[test]
     fn a_viewer_cannot_downgrade_an_operator() {
         // AZ-R12-1: the STRIPPED role (operator) must also be
         // authorised, not just the new one (viewer).
@@ -770,6 +830,97 @@ mod tests {
             panic!("expected Rejected");
         };
         assert_eq!(resp.status, 404);
+    }
+
+    #[test]
+    fn a_delegate_with_no_role_at_all_gets_the_uniform_404_not_403() {
+        // test_sec_r12_revoke_amplification.py's
+        // `test_delegate_cannot_revoke_project_membership_with_no_role`:
+        // R7-F1 closes the project-existence oracle -- a delegate who
+        // simply isn't a member of a REAL project gets the SAME 404 a
+        // nonexistent project would, not a 403.
+        let dir = TempDir::new().unwrap();
+        let registry = registry_with(&dir, "proj-a");
+        let mut c = conn();
+        let victim = seed_user(&mut c, "victim");
+        identity::grant_project_membership(&c, "proj-a", Some(&victim), None, "operator").unwrap();
+        let outcome = decide_delete_project_membership(
+            &c,
+            &registry,
+            false,
+            "mallory",
+            Some("mallory"),
+            None,
+            "proj-a",
+            &format!("u:{victim}"),
+        )
+        .unwrap();
+        let DeleteProjectMembershipOutcome::Rejected(resp) = outcome else {
+            panic!("expected Rejected, got {outcome:?}");
+        };
+        assert_eq!(resp.status, 404);
+        assert!(
+            identity::project_membership_role(&c, "proj-a", Some(&victim), None)
+                .unwrap()
+                .is_some(),
+            "the revoke must have been blocked"
+        );
+    }
+
+    #[test]
+    fn an_operator_delegate_can_revoke_a_viewers_membership() {
+        // test_sec_r12_revoke_amplification.py's
+        // `test_operator_delegate_can_revoke_viewer_membership`: the
+        // guard only blocks revoking authority BEYOND the caller's own
+        // -- a role at or below their own must still succeed.
+        let dir = TempDir::new().unwrap();
+        let registry = registry_with(&dir, "proj-a");
+        let mut c = conn();
+        let bob = seed_user(&mut c, "bob");
+        identity::grant_project_membership(&c, "proj-a", Some(&bob), None, "operator").unwrap();
+        let victim = seed_user(&mut c, "victim");
+        identity::grant_project_membership(&c, "proj-a", Some(&victim), None, "viewer").unwrap();
+        let outcome = decide_delete_project_membership(
+            &c,
+            &registry,
+            false,
+            "bob",
+            Some(&bob),
+            Some("operator"),
+            "proj-a",
+            &format!("u:{victim}"),
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            DeleteProjectMembershipOutcome::Deleted(_)
+        ));
+    }
+
+    #[test]
+    fn a_sysadmin_can_revoke_any_project_membership() {
+        // test_sec_r12_revoke_amplification.py's
+        // `test_sysadmin_can_revoke_project_membership`.
+        let dir = TempDir::new().unwrap();
+        let registry = registry_with(&dir, "proj-a");
+        let mut c = conn();
+        let victim = seed_user(&mut c, "victim");
+        identity::grant_project_membership(&c, "proj-a", Some(&victim), None, "operator").unwrap();
+        let outcome = decide_delete_project_membership(
+            &c,
+            &registry,
+            true,
+            "root",
+            None,
+            None,
+            "proj-a",
+            &format!("u:{victim}"),
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            DeleteProjectMembershipOutcome::Deleted(_)
+        ));
     }
 
     #[test]
