@@ -21,25 +21,38 @@
 //! are not ported yet — no Rust tool needs them (the 3 tools this
 //! module backs are add/edit/delete only); port when a real caller
 //! needs them, matching this crate's own "add what's needed" discipline.
+//!
+//! Phase G (sea-orm migration): this is the FIRST repository rewritten
+//! onto sea-orm (see the plan's own "Phase G real architectural fork"
+//! note — chosen over the original pub-fn-count-based ordering once
+//! the REAL transitive caller blast radius was checked: this
+//! repository has exactly 3 call sites, all inside `conexus-tools::
+//! task_comments_tools`'s already-async `Tool::call` bodies, with no
+//! further transitive ripple — unlike `group_capability_repository`,
+//! whose real blast radius reaches through `resolve_capabilities`
+//! into ~50+ deliberately-sync `conexus-router` decision functions).
+//! `task_status`'s read of the `tasks` table uses the raw-SQL escape
+//! hatch (a `sea_orm::Statement`, not a `tasks` Entity) since a real
+//! `tasks` Entity is `task_repository`'s own future rewrite's job,
+//! not duplicated here for one column.
 
-use rusqlite::{Connection, OptionalExtension};
+use sea_orm::{
+    ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection, DbErr, EntityTrait,
+    QueryFilter, Statement,
+};
 
-/// One row of the `task_comments` table.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct TaskCommentRow {
-    pub note_id: i64,
-    pub task_id: String,
-    pub author: Option<String>,
-    pub timestamp: String,
-    pub text: String,
-}
+pub use crate::entity::task_comment::Model as TaskCommentRow;
+use crate::entity::task_comment::{ActiveModel, Column, Entity};
 
 /// The literal SQLite trigger names/checks the `task_comments`
 /// terminal-guard triggers' `RAISE(ABORT, ...)` message against —
 /// shared with `task_repository`'s own copy since both match the same
 /// static marker embedded in `schema.rs`'s DDL (SQLite's trigger
-/// grammar only accepts a literal for `RAISE`). Matched by substring,
-/// mirroring Python's `GUARD_MARKER in str(e)` check exactly.
+/// grammar only accepts a literal for `RAISE`). Matched by substring
+/// against the sea-orm/sqlx error's own `Display` text — verified
+/// empirically (a throwaway probe against the real trigger) that the
+/// marker text survives intact through `DbErr::Exec(SqlxError(...))`'s
+/// wrapping, mirroring Python's `GUARD_MARKER in str(e)` check.
 const GUARD_MARKER: &str = "terminal_task_guard";
 
 /// The DB-level terminal-state guard trigger refused a write — the
@@ -65,17 +78,16 @@ impl std::error::Error for TerminalTaskWriteBlocked {}
 #[derive(Debug)]
 pub enum AddCommentError {
     TerminalTaskWriteBlocked(TerminalTaskWriteBlocked),
-    Db(rusqlite::Error),
+    Db(DbErr),
 }
 
-fn classify_insert_error(task_id: &str, e: rusqlite::Error) -> AddCommentError {
-    if let rusqlite::Error::SqliteFailure(_, Some(msg)) = &e {
-        if msg.contains(GUARD_MARKER) {
-            return AddCommentError::TerminalTaskWriteBlocked(TerminalTaskWriteBlocked {
-                task_id: task_id.to_string(),
-                message: msg.clone(),
-            });
-        }
+fn classify_insert_error(task_id: &str, e: DbErr) -> AddCommentError {
+    let msg = e.to_string();
+    if msg.contains(GUARD_MARKER) {
+        return AddCommentError::TerminalTaskWriteBlocked(TerminalTaskWriteBlocked {
+            task_id: task_id.to_string(),
+            message: msg,
+        });
     }
     AddCommentError::Db(e)
 }
@@ -84,45 +96,45 @@ fn classify_insert_error(task_id: &str, e: rusqlite::Error) -> AddCommentError {
 /// Matches Python's `add_comment`'s empty-text/task_id rejection —
 /// callers are expected to validate before reaching this (the tool
 /// layer already does), so this stays dumb CRUD.
-pub fn add_comment(
-    conn: &Connection,
+pub async fn add_comment(
+    db: &DatabaseConnection,
     task_id: &str,
     author: Option<&str>,
     text: &str,
     now: &str,
 ) -> Result<i64, AddCommentError> {
-    conn.execute(
-        "INSERT INTO task_comments (task_id, author, timestamp, text) VALUES (?1, ?2, ?3, ?4)",
-        (task_id, author, now, text),
-    )
-    .map_err(|e| classify_insert_error(task_id, e))?;
-    Ok(conn.last_insert_rowid())
+    let am = ActiveModel {
+        task_id: Set(task_id.to_string()),
+        author: Set(author.map(str::to_string)),
+        timestamp: Set(now.to_string()),
+        text: Set(text.to_string()),
+        ..Default::default()
+    };
+    let inserted = Entity::insert(am)
+        .exec(db)
+        .await
+        .map_err(|e| classify_insert_error(task_id, e))?;
+    Ok(inserted.last_insert_id)
 }
 
-fn get_row(conn: &Connection, note_id: i64) -> rusqlite::Result<Option<TaskCommentRow>> {
-    conn.query_row(
-        "SELECT note_id, task_id, author, timestamp, text FROM task_comments WHERE note_id = ?1",
-        [note_id],
-        |row| {
-            Ok(TaskCommentRow {
-                note_id: row.get(0)?,
-                task_id: row.get(1)?,
-                author: row.get(2)?,
-                timestamp: row.get(3)?,
-                text: row.get(4)?,
-            })
-        },
-    )
-    .optional()
+async fn get_row(db: &DatabaseConnection, note_id: i64) -> Result<Option<TaskCommentRow>, DbErr> {
+    Entity::find_by_id(note_id).one(db).await
 }
 
-fn task_status(conn: &Connection, task_id: &str) -> rusqlite::Result<Option<String>> {
-    conn.query_row(
-        "SELECT status FROM tasks WHERE task_id = ?1",
-        [task_id],
-        |row| row.get(0),
-    )
-    .optional()
+/// Raw-SQL escape hatch (see this module's own doc): reads
+/// `tasks.status` for `task_id` without a `tasks` Entity, which is
+/// `task_repository`'s own future Phase G rewrite to define.
+async fn task_status(db: &DatabaseConnection, task_id: &str) -> Result<Option<String>, DbErr> {
+    let stmt = Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Sqlite,
+        "SELECT status FROM tasks WHERE task_id = ?",
+        [task_id.into()],
+    );
+    let row = db.query_one_raw(stmt).await?;
+    match row {
+        Some(row) => Ok(Some(row.try_get("", "status")?)),
+        None => Ok(None),
+    }
 }
 
 const TERMINAL_STATUSES: &[&str] = &["completed", "cancelled", "failed"];
@@ -138,7 +150,7 @@ pub enum EditCommentError {
         task_id: String,
         status: String,
     },
-    Db(rusqlite::Error),
+    Db(DbErr),
 }
 
 pub type DeleteCommentError = EditCommentError;
@@ -150,21 +162,23 @@ pub type DeleteCommentError = EditCommentError;
 /// let a non-owner distinguish "comment on a terminal task" from
 /// "comment on a live task" from which error comes back, a new PF-1-
 /// shaped oracle).
-pub fn edit_comment(
-    conn: &Connection,
+pub async fn edit_comment(
+    db: &DatabaseConnection,
     note_id: i64,
     requester: &str,
     new_text: &str,
     is_admin: bool,
 ) -> Result<(), EditCommentError> {
-    let row = get_row(conn, note_id).map_err(EditCommentError::Db)?;
+    let row = get_row(db, note_id).await.map_err(EditCommentError::Db)?;
     let Some(row) = row else {
         return Err(EditCommentError::NotFoundOrForbidden);
     };
     if !is_admin && row.author.as_deref() != Some(requester) {
         return Err(EditCommentError::NotFoundOrForbidden);
     }
-    let status = task_status(conn, &row.task_id).map_err(EditCommentError::Db)?;
+    let status = task_status(db, &row.task_id)
+        .await
+        .map_err(EditCommentError::Db)?;
     if let Some(status) = &status {
         if TERMINAL_STATUSES.contains(&status.as_str()) {
             return Err(EditCommentError::Terminal {
@@ -174,23 +188,23 @@ pub fn edit_comment(
             });
         }
     }
-    conn.execute(
-        "UPDATE task_comments SET text = ?1 WHERE note_id = ?2",
-        (new_text, note_id),
-    )
-    .map_err(|e| {
+    let update_result = Entity::update_many()
+        .col_expr(Column::Text, sea_orm::sea_query::Expr::value(new_text))
+        .filter(Column::NoteId.eq(note_id))
+        .exec(db)
+        .await;
+    update_result.map_err(|e| {
         // Defense-in-depth (Python's own comment: "never reachable in
         // normal operation" since the terminality check above already
         // refused this) -- the DB trigger firing here would otherwise
         // surface as an opaque Db error.
-        if let rusqlite::Error::SqliteFailure(_, Some(msg)) = &e {
-            if msg.contains(GUARD_MARKER) {
-                return EditCommentError::Terminal {
-                    note_id,
-                    task_id: row.task_id.clone(),
-                    status: status.clone().unwrap_or_default(),
-                };
-            }
+        let msg = e.to_string();
+        if msg.contains(GUARD_MARKER) {
+            return EditCommentError::Terminal {
+                note_id,
+                task_id: row.task_id.clone(),
+                status: status.clone().unwrap_or_default(),
+            };
         }
         EditCommentError::Db(e)
     })?;
@@ -202,20 +216,22 @@ pub fn edit_comment(
 /// by a DB trigger (matches Python: a future task-delete cascade must
 /// still be able to remove a terminal task's comments) — this
 /// Python-level terminality check is the ONLY guard for this call.
-pub fn delete_comment(
-    conn: &Connection,
+pub async fn delete_comment(
+    db: &DatabaseConnection,
     note_id: i64,
     requester: &str,
     is_admin: bool,
 ) -> Result<(), DeleteCommentError> {
-    let row = get_row(conn, note_id).map_err(EditCommentError::Db)?;
+    let row = get_row(db, note_id).await.map_err(EditCommentError::Db)?;
     let Some(row) = row else {
         return Err(EditCommentError::NotFoundOrForbidden);
     };
     if !is_admin && row.author.as_deref() != Some(requester) {
         return Err(EditCommentError::NotFoundOrForbidden);
     }
-    let status = task_status(conn, &row.task_id).map_err(EditCommentError::Db)?;
+    let status = task_status(db, &row.task_id)
+        .await
+        .map_err(EditCommentError::Db)?;
     if let Some(status) = status {
         if TERMINAL_STATUSES.contains(&status.as_str()) {
             return Err(EditCommentError::Terminal {
@@ -225,7 +241,9 @@ pub fn delete_comment(
             });
         }
     }
-    conn.execute("DELETE FROM task_comments WHERE note_id = ?1", [note_id])
+    Entity::delete_by_id(note_id)
+        .exec(db)
+        .await
         .map_err(EditCommentError::Db)?;
     Ok(())
 }
@@ -234,116 +252,152 @@ pub fn delete_comment(
 mod tests {
     use super::*;
     use crate::schema::init_schema;
+    use sea_orm::Database;
 
-    fn conn_with_task(task_id: &str, status: &str) -> Connection {
-        let c = Connection::open_in_memory().unwrap();
-        init_schema(&c).unwrap();
-        c.execute(
-            "INSERT INTO tasks (task_id, title, created_by, status, priority, created_at, \
-             updated_at) VALUES (?1, 'Task', 'alice', ?2, 'medium', '2026-06-01T00:00:00Z', \
-             '2026-06-01T00:00:00Z')",
-            (task_id, status),
-        )
-        .unwrap();
-        c
+    async fn conn_with_task(
+        task_id: &str,
+        status: &str,
+    ) -> (tempfile::TempDir, DatabaseConnection) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        {
+            let c = rusqlite::Connection::open(&path).unwrap();
+            init_schema(&c).unwrap();
+            c.execute(
+                "INSERT INTO tasks (task_id, title, created_by, status, priority, created_at, \
+                 updated_at) VALUES (?1, 'Task', 'alice', ?2, 'medium', '2026-06-01T00:00:00Z', \
+                 '2026-06-01T00:00:00Z')",
+                (task_id, status),
+            )
+            .unwrap();
+        }
+        let url = format!("sqlite://{}", path.display());
+        let db = Database::connect(&url).await.unwrap();
+        (dir, db)
     }
 
-    #[test]
-    fn add_comment_returns_an_incrementing_note_id() {
-        let c = conn_with_task("t1", "in_progress");
-        let id1 = add_comment(&c, "t1", Some("alice"), "first", "2026-06-01T00:00:00Z").unwrap();
-        let id2 = add_comment(&c, "t1", Some("alice"), "second", "2026-06-01T00:01:00Z").unwrap();
+    async fn set_task_status(db: &DatabaseConnection, task_id: &str, status: &str) {
+        let stmt = Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Sqlite,
+            "UPDATE tasks SET status = ? WHERE task_id = ?",
+            [status.into(), task_id.into()],
+        );
+        db.execute_raw(stmt).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn add_comment_returns_an_incrementing_note_id() {
+        let (_dir, db) = conn_with_task("t1", "in_progress").await;
+        let id1 = add_comment(&db, "t1", Some("alice"), "first", "2026-06-01T00:00:00Z")
+            .await
+            .unwrap();
+        let id2 = add_comment(&db, "t1", Some("alice"), "second", "2026-06-01T00:01:00Z")
+            .await
+            .unwrap();
         assert!(id2 > id1);
     }
 
-    #[test]
-    fn add_comment_on_a_terminal_task_is_blocked_by_the_db_trigger() {
-        let c = conn_with_task("t1", "completed");
-        let err =
-            add_comment(&c, "t1", Some("alice"), "too late", "2026-06-01T00:00:00Z").unwrap_err();
+    #[tokio::test]
+    async fn add_comment_on_a_terminal_task_is_blocked_by_the_db_trigger() {
+        let (_dir, db) = conn_with_task("t1", "completed").await;
+        let err = add_comment(&db, "t1", Some("alice"), "too late", "2026-06-01T00:00:00Z")
+            .await
+            .unwrap_err();
         assert!(matches!(err, AddCommentError::TerminalTaskWriteBlocked(_)));
     }
 
-    #[test]
-    fn the_author_can_edit_their_own_comment() {
-        let c = conn_with_task("t1", "in_progress");
-        let id = add_comment(&c, "t1", Some("alice"), "v1", "2026-06-01T00:00:00Z").unwrap();
-        edit_comment(&c, id, "alice", "v2", false).unwrap();
-        let row = get_row(&c, id).unwrap().unwrap();
+    #[tokio::test]
+    async fn the_author_can_edit_their_own_comment() {
+        let (_dir, db) = conn_with_task("t1", "in_progress").await;
+        let id = add_comment(&db, "t1", Some("alice"), "v1", "2026-06-01T00:00:00Z")
+            .await
+            .unwrap();
+        edit_comment(&db, id, "alice", "v2", false).await.unwrap();
+        let row = get_row(&db, id).await.unwrap().unwrap();
         assert_eq!(row.text, "v2");
     }
 
-    #[test]
-    fn a_non_author_non_admin_edit_is_not_found_or_forbidden() {
-        let c = conn_with_task("t1", "in_progress");
-        let id = add_comment(&c, "t1", Some("alice"), "v1", "2026-06-01T00:00:00Z").unwrap();
-        let err = edit_comment(&c, id, "bob", "v2", false).unwrap_err();
+    #[tokio::test]
+    async fn a_non_author_non_admin_edit_is_not_found_or_forbidden() {
+        let (_dir, db) = conn_with_task("t1", "in_progress").await;
+        let id = add_comment(&db, "t1", Some("alice"), "v1", "2026-06-01T00:00:00Z")
+            .await
+            .unwrap();
+        let err = edit_comment(&db, id, "bob", "v2", false).await.unwrap_err();
         assert!(matches!(err, EditCommentError::NotFoundOrForbidden));
     }
 
-    #[test]
-    fn an_admin_can_edit_someone_elses_comment() {
-        let c = conn_with_task("t1", "in_progress");
-        let id = add_comment(&c, "t1", Some("alice"), "v1", "2026-06-01T00:00:00Z").unwrap();
-        edit_comment(&c, id, "bob", "moderated", true).unwrap();
-        let row = get_row(&c, id).unwrap().unwrap();
+    #[tokio::test]
+    async fn an_admin_can_edit_someone_elses_comment() {
+        let (_dir, db) = conn_with_task("t1", "in_progress").await;
+        let id = add_comment(&db, "t1", Some("alice"), "v1", "2026-06-01T00:00:00Z")
+            .await
+            .unwrap();
+        edit_comment(&db, id, "bob", "moderated", true)
+            .await
+            .unwrap();
+        let row = get_row(&db, id).await.unwrap().unwrap();
         assert_eq!(row.text, "moderated");
     }
 
-    #[test]
-    fn editing_a_nonexistent_comment_is_not_found_or_forbidden() {
-        let c = conn_with_task("t1", "in_progress");
-        let err = edit_comment(&c, 999, "alice", "v2", false).unwrap_err();
+    #[tokio::test]
+    async fn editing_a_nonexistent_comment_is_not_found_or_forbidden() {
+        let (_dir, db) = conn_with_task("t1", "in_progress").await;
+        let err = edit_comment(&db, 999, "alice", "v2", false)
+            .await
+            .unwrap_err();
         assert!(matches!(err, EditCommentError::NotFoundOrForbidden));
     }
 
-    #[test]
-    fn editing_a_comment_on_a_now_terminal_task_is_a_terminal_conflict() {
-        let c = conn_with_task("t1", "in_progress");
-        let id = add_comment(&c, "t1", Some("alice"), "v1", "2026-06-01T00:00:00Z").unwrap();
-        c.execute(
-            "UPDATE tasks SET status = 'completed' WHERE task_id = 't1'",
-            [],
-        )
-        .unwrap();
-        let err = edit_comment(&c, id, "alice", "v2", false).unwrap_err();
+    #[tokio::test]
+    async fn editing_a_comment_on_a_now_terminal_task_is_a_terminal_conflict() {
+        let (_dir, db) = conn_with_task("t1", "in_progress").await;
+        let id = add_comment(&db, "t1", Some("alice"), "v1", "2026-06-01T00:00:00Z")
+            .await
+            .unwrap();
+        set_task_status(&db, "t1", "completed").await;
+        let err = edit_comment(&db, id, "alice", "v2", false)
+            .await
+            .unwrap_err();
         match err {
             EditCommentError::Terminal { status, .. } => assert_eq!(status, "completed"),
             other => panic!("expected Terminal, got {other:?}"),
         }
     }
 
-    #[test]
-    fn the_author_can_delete_their_own_comment() {
-        let c = conn_with_task("t1", "in_progress");
-        let id = add_comment(&c, "t1", Some("alice"), "v1", "2026-06-01T00:00:00Z").unwrap();
-        delete_comment(&c, id, "alice", false).unwrap();
-        assert_eq!(get_row(&c, id).unwrap(), None);
+    #[tokio::test]
+    async fn the_author_can_delete_their_own_comment() {
+        let (_dir, db) = conn_with_task("t1", "in_progress").await;
+        let id = add_comment(&db, "t1", Some("alice"), "v1", "2026-06-01T00:00:00Z")
+            .await
+            .unwrap();
+        delete_comment(&db, id, "alice", false).await.unwrap();
+        assert_eq!(get_row(&db, id).await.unwrap(), None);
     }
 
-    #[test]
-    fn a_non_author_non_admin_delete_is_not_found_or_forbidden_and_leaves_it_intact() {
-        let c = conn_with_task("t1", "in_progress");
-        let id = add_comment(&c, "t1", Some("alice"), "v1", "2026-06-01T00:00:00Z").unwrap();
-        let err = delete_comment(&c, id, "bob", false).unwrap_err();
+    #[tokio::test]
+    async fn a_non_author_non_admin_delete_is_not_found_or_forbidden_and_leaves_it_intact() {
+        let (_dir, db) = conn_with_task("t1", "in_progress").await;
+        let id = add_comment(&db, "t1", Some("alice"), "v1", "2026-06-01T00:00:00Z")
+            .await
+            .unwrap();
+        let err = delete_comment(&db, id, "bob", false).await.unwrap_err();
         assert!(matches!(err, EditCommentError::NotFoundOrForbidden));
-        assert!(get_row(&c, id).unwrap().is_some());
+        assert!(get_row(&db, id).await.unwrap().is_some());
     }
 
-    #[test]
-    fn deleting_a_comment_on_a_terminal_task_is_a_terminal_conflict() {
-        let c = conn_with_task("t1", "in_progress");
-        let id = add_comment(&c, "t1", Some("alice"), "v1", "2026-06-01T00:00:00Z").unwrap();
+    #[tokio::test]
+    async fn deleting_a_comment_on_a_terminal_task_is_a_terminal_conflict() {
+        let (_dir, db) = conn_with_task("t1", "in_progress").await;
+        let id = add_comment(&db, "t1", Some("alice"), "v1", "2026-06-01T00:00:00Z")
+            .await
+            .unwrap();
         // Flip the parent task terminal AFTER the comment exists --
         // add_comment itself would be trigger-blocked on an
         // already-terminal task, and this test only cares about
         // delete_comment's own terminality check.
-        c.execute(
-            "UPDATE tasks SET status = 'completed' WHERE task_id = 't1'",
-            [],
-        )
-        .unwrap();
-        let err = delete_comment(&c, id, "alice", false).unwrap_err();
+        set_task_status(&db, "t1", "completed").await;
+        let err = delete_comment(&db, id, "alice", false).await.unwrap_err();
         assert!(matches!(err, EditCommentError::Terminal { .. }));
     }
 }
