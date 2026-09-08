@@ -1730,14 +1730,24 @@ impl Tool for PurgeAgentTool {
                 (&tombstone, agent_id),
             );
 
-            // Note: Python also deletes any mcp_sessions/
-            // claude_code_sessions rows FK'd to this agent here, and
-            // separately snapshots+signals its open MCP push streams
-            // for immediate teardown (AC-R29-1 symmetry with
-            // terminate_agent). Neither has a Rust equivalent yet --
-            // no session-registry table/mechanism exists in this
-            // workspace (see the plan's "Phase D5 (admin_tools.py)"
-            // decision 2, the same deferral terminate_agent documents).
+            // BL-R4-2: purge must not leave a `claude_code_sessions`
+            // row referencing the deleted agent (matches Python's own
+            // "either an FK failure or an orphaned row" contract --
+            // this crate's schema has no FK on this column, so only
+            // the orphan half applies, but the observable contract is
+            // identical: no session row survives referencing a
+            // deleted agent).
+            let _ = conexus_db::claude_code_session_repository::delete_by_agent_id(
+                &guard, agent_id,
+            );
+
+            // Note: Python also snapshots+signals this agent's open MCP
+            // push streams for immediate teardown (AC-R29-1 symmetry
+            // with terminate_agent) and deletes any `mcp_sessions` rows
+            // FK'd to it. Neither has a Rust equivalent yet -- no MCP
+            // session-registry table/mechanism exists in this workspace
+            // (see the plan's "Phase D5 (admin_tools.py)" decision 2,
+            // the same deferral terminate_agent documents).
 
             let requesting_agent_id = principal.map(Principal::actor_label).unwrap_or("operator");
             // Audit BEFORE the DELETE below, matching Python's own
@@ -4062,6 +4072,86 @@ mod tests {
         assert!(
             receiver.try_recv().is_err(),
             "purging an agent whose only task is terminal must wake nobody"
+        );
+    }
+
+    /// BL-R4-2 (ported from `tests/test_sec_r4_purge_session_cascade.py::
+    /// test_purge_deletes_claude_code_session_rows`): a purge must not
+    /// leave a `claude_code_sessions` row referencing the deleted agent.
+    #[tokio::test]
+    async fn purge_agent_deletes_claude_code_session_rows() {
+        let conn = setup().await;
+        seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
+        {
+            let guard = conn.lock().await;
+            guard
+                .execute(
+                    "INSERT INTO claude_code_sessions \
+                     (session_id, pid, parent_pid, first_detected, last_activity, agent_id, status) \
+                     VALUES ('s1', 1, 2, '2026-06-01T00:00:00Z', '2026-06-01T00:00:00Z', 'alice', 'detected')",
+                    [],
+                )
+                .unwrap();
+        }
+        let op = operator_with(&[Capability::AgentsTerminate]);
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = PurgeAgentTool::call(
+            Some(&op),
+            &serde_json::json!({"agent_id": "alice"}),
+            &conn,
+            "2026-06-01T00:01:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        let guard = conn.lock().await;
+        assert!(
+            conexus_db::claude_code_session_repository::get_by_id(&guard, "s1")
+                .unwrap()
+                .is_none(),
+            "purge must delete the purged agent's claude_code_sessions rows"
+        );
+    }
+
+    /// Regression sibling: only the purged agent's session rows go -- a
+    /// bystander's session must survive.
+    #[tokio::test]
+    async fn purge_agent_leaves_a_bystanders_claude_code_session_intact() {
+        let conn = setup().await;
+        seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
+        seed_agent(&conn, "bob", "tok-b", "2026-06-01T00:00:00Z").await;
+        {
+            let guard = conn.lock().await;
+            guard
+                .execute(
+                    "INSERT INTO claude_code_sessions \
+                     (session_id, pid, parent_pid, first_detected, last_activity, agent_id, status) \
+                     VALUES ('s-bob', 1, 2, '2026-06-01T00:00:00Z', '2026-06-01T00:00:00Z', 'bob', 'detected')",
+                    [],
+                )
+                .unwrap();
+        }
+        let op = operator_with(&[Capability::AgentsTerminate]);
+        let registry = WaiterRegistry::new();
+        let file_map = FileMap::new();
+        let c = ctx(&registry, &file_map);
+        let result = PurgeAgentTool::call(
+            Some(&op),
+            &serde_json::json!({"agent_id": "alice"}),
+            &conn,
+            "2026-06-01T00:01:00Z",
+            &c,
+        )
+        .await;
+        assert!(matches!(result, ToolResult::Ok { .. }));
+        let guard = conn.lock().await;
+        assert!(
+            conexus_db::claude_code_session_repository::get_by_id(&guard, "s-bob")
+                .unwrap()
+                .is_some(),
+            "a bystander agent's session row must survive"
         );
     }
 

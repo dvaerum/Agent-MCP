@@ -2214,6 +2214,90 @@ mod tests {
         assert_eq!(rows[0].assigned_to.as_deref(), Some("bob"));
     }
 
+    /// R15 Sibling 1b (ported from `tests/test_sec_r15_single_root_
+    /// toctou.py`): Python's finding needs a genuine `await` between
+    /// the single-root pre-check and the INSERT (its own
+    /// RAG-placement-validation await) to open a race window. This
+    /// port never wires RAG placement validation into `assign_task`/
+    /// `create_self_task` (Phase D4 decision 4, "mechanical-only" --
+    /// confirmed directly: `AssignTaskTool::call`'s entire body, from
+    /// lock acquisition through the INSERT, contains exactly ONE
+    /// `.await` -- `conn.lock().await` at the very top -- held
+    /// continuously for the rest of the function). Two concurrent
+    /// callers therefore can never interleave at all: the single
+    /// global `AsyncMutex<Connection>` already serializes them
+    /// completely, closing this race structurally rather than by a
+    /// dedicated re-check. Proven here with a REAL concurrent race
+    /// (two tokio tasks racing on the same connection), not assumed
+    /// from reading the code alone.
+    #[tokio::test]
+    async fn concurrent_mode1_root_creates_race_to_exactly_one_root() {
+        let conn = std::sync::Arc::new(test_conn());
+        {
+            let guard = conn.lock().await;
+            seed_agent(&guard, "bob");
+            seed_agent(&guard, "carol");
+        }
+
+        let conn_a = conn.clone();
+        let conn_b = conn.clone();
+        let task_a = tokio::spawn(async move {
+            call_assign(
+                serde_json::json!({
+                    "agent_token": "tok-bob",
+                    "task_title": "root a",
+                    "task_description": "desc",
+                }),
+                &admin("alice"),
+                &conn_a,
+            )
+            .await
+        });
+        let task_b = tokio::spawn(async move {
+            call_assign(
+                serde_json::json!({
+                    "agent_token": "tok-carol",
+                    "task_title": "root b",
+                    "task_description": "desc",
+                }),
+                &admin("alice"),
+                &conn_b,
+            )
+            .await
+        });
+
+        let (result_a, result_b) = tokio::join!(task_a, task_b);
+        let result_a = result_a.unwrap();
+        let result_b = result_b.unwrap();
+
+        let successes = [&result_a, &result_b]
+            .into_iter()
+            .filter(|r| matches!(r, ToolResult::Ok { .. }))
+            .count();
+        let conflicts = [&result_a, &result_b]
+            .into_iter()
+            .filter(|r| matches!(r, ToolResult::Conflict { .. }))
+            .count();
+        assert_eq!(
+            successes, 1,
+            "exactly one concurrent root-create must win: {result_a:?} / {result_b:?}"
+        );
+        assert_eq!(
+            conflicts, 1,
+            "the loser must be denied via the single-root Conflict: {result_a:?} / {result_b:?}"
+        );
+
+        let guard = conn.lock().await;
+        let roots: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE parent_task IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(roots, 1, "at most one root task must exist after the race");
+    }
+
     #[tokio::test]
     async fn mode1_rejects_an_unknown_agent_token() {
         let conn = test_conn();
