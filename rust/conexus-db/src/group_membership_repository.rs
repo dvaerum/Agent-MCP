@@ -23,9 +23,90 @@
 //! "promote a shared primitive once two call sites need it" rule.
 //!
 //! Lives on the ROUTER DB (`router.db`), same as `group_capability_repository`.
+//!
+//! **Phase G (sea-orm migration, router step 4 PR G)**: a real
+//! call-site classification (every production caller of every
+//! function here, traced across `conexus-router` AND `conexus-auth`
+//! before any conversion code was written) found the SAME shape PR C/
+//! PR D already established, only wider: `resolve_user_groups`/
+//! `resolve_user_is_sysadmin`/`resolve_user_project_role` are the hot
+//! path `conexus_auth::capabilities::resolve_capabilities` needs
+//! (called synchronously from `session_gate.rs::evaluate_session_gate`/
+//! `project_gate.rs`'s revalidation functions -- never forced async),
+//! and `admin_groups.rs`'s/`admin_group_members.rs`'s mutating
+//! `decide_*` functions each run their whole check-then-write sequence
+//! inside ONE rusqlite `BEGIN IMMEDIATE` transaction shared with
+//! `admin_users_gate.rs`'s (non-`group_membership_repository`) last-
+//! sysadmin invariant re-check -- the SAME "a transaction-bound caller
+//! gets a sync twin, not a forced conversion to sea-orm's separate
+//! connection pool" precedent PR D's own `get_user_public_by_id_in_
+//! transaction` already established, just via this crate's own
+//! `_sync`-suffix convention instead of `_in_transaction` (no OTHER
+//! sea-orm-converted call happens inside these particular
+//! transactions, so there's no "reads inside an in-flight uncommitted
+//! transaction" distinction to name separately).
+//!
+//! Functions with a genuine caller on BOTH sides keep BOTH forms
+//! (`get_group`/`add_group_member`/`group_member_count`/
+//! `list_groups_with_member_counts` -- the async form serves the
+//! read-only REST decision layer, `admin_group_capabilities.rs`/
+//! `admin_group_members.rs::list_group_members_response`/
+//! `admin_groups.rs::list_groups_response`/`oidc_group_mapping.rs`'s
+//! now-async claim reconciliation; the `_sync` form serves the
+//! transaction-bound `decide_*` functions). Functions whose ONLY real
+//! caller turned out to already be async with no transaction
+//! constraint (`create_group`, `list_group_members`, `ensure_group`,
+//! `is_direct_user_member`, `remove_group_member`,
+//! `user_group_memberships_by_name_prefix`) convert wholesale, no
+//! `_sync` twin kept. `bootstrap_first_operator_as_sysadmin` has NO
+//! real caller at all (a repair-workflow helper ahead of its own
+//! consumer, per its own doc below) and converts wholesale too, for
+//! the same "nothing left to preserve sync-ness for" reason. Every
+//! other function here (`resolve_user_groups`/`resolve_group_ancestors`/
+//! `any_group_is_sysadmin`/`resolve_user_is_sysadmin`/
+//! `group_is_transitively_sysadmin`/`group_has_transitive_user_member`/
+//! `project_roles_for_groups`/`group_resolved_project_roles`/
+//! `resolve_user_project_role`/`would_create_cycle`/
+//! `update_group_fields`/`delete_group`/`remove_group_member_by_id`,
+//! plus the private `ancestors`/`children_of_group` helpers) has ONLY
+//! forced-sync real callers (the hot path above, or one of the
+//! transaction-bound `decide_*`/`amplification_guard`/
+//! `no_sysadmin_would_remain`/`group_resolved_capabilities` functions)
+//! and stays untouched rusqlite, unrenamed -- matching `sessions`'
+//! own precedent of staying 100% rusqlite when nothing async ever
+//! calls it, rather than adding a speculative, uncalled sea-orm form.
+//!
+//! `oidc_group_mapping.rs` was NOT in this PR's originally-handed-in
+//! caller inventory -- found via this PR's own "verify against the
+//! real current files" mandate (`ensure_group`/`is_direct_user_member`/
+//! `add_group_member`/`user_group_memberships_by_name_prefix`/
+//! `remove_group_member`'s only real production caller). Its own only
+//! caller, `oidc_handlers.rs`'s ID-token handler, is already async
+//! with no hot-path-sync constraint (PR D already established this
+//! exact finding for the same handler's `find_or_create_oidc_user`
+//! call) -- restructured to release `state.conn`'s rusqlite guard
+//! before the (independent, non-transactional) group-mapping step and
+//! re-acquire it only for the still-out-of-scope `identity::
+//! create_session` call, the same "drop the lock, then do the
+//! unrelated async work" shape `lifecycle_rest.rs::
+//! create_project_handler` already established for its own post-create
+//! membership grant.
 
 use rusqlite::{Connection, OptionalExtension, Result};
+use sea_orm::{
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection, DbErr,
+    EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Statement,
+};
 use std::collections::{HashMap, HashSet};
+
+use crate::entity::group_membership::{
+    ActiveModel as GroupMembershipActiveModel, Column as GroupMembershipColumn,
+    Entity as GroupMembershipEntity,
+};
+use crate::entity::groups::{
+    ActiveModel as GroupActiveModel, Column as GroupColumn, Entity as GroupEntity,
+};
+use crate::entity::users::{Column as UserColumn, Entity as UserEntity};
 
 /// Project-role ranking -- port of `ROLE_TIER`/`role_rank`. `viewer` <
 /// `operator`; an unrecognized role ranks 0 (below every known role)
@@ -38,10 +119,10 @@ pub fn role_rank(role: &str) -> i32 {
     }
 }
 
-/// Errors from [`add_group_member`] -- port of Python's
-/// `ValueError`/`CycleDetected` pair, collapsed into one closed enum
-/// (this migration's own precedent over Python's exception-subclass
-/// ladder; see `IdentityError`).
+/// Errors from [`add_group_member`]/[`add_group_member_sync`] -- port
+/// of Python's `ValueError`/`CycleDetected` pair, collapsed into one
+/// closed enum (this migration's own precedent over Python's
+/// exception-subclass ladder; see `IdentityError`).
 #[derive(Debug)]
 pub enum GroupMembershipError {
     /// Port of the `ValueError` raised when neither or both of
@@ -54,11 +135,19 @@ pub enum GroupMembershipError {
         member_group_id: String,
     },
     Db(rusqlite::Error),
+    /// The [`add_group_member`] (sea-orm) counterpart of [`Db`].
+    SeaOrm(sea_orm::DbErr),
 }
 
 impl From<rusqlite::Error> for GroupMembershipError {
     fn from(e: rusqlite::Error) -> Self {
         GroupMembershipError::Db(e)
+    }
+}
+
+impl From<sea_orm::DbErr> for GroupMembershipError {
+    fn from(e: sea_orm::DbErr) -> Self {
+        GroupMembershipError::SeaOrm(e)
     }
 }
 
@@ -77,6 +166,7 @@ impl std::fmt::Display for GroupMembershipError {
                 "adding group {member_group_id:?} as a member of {group_id:?} would close a cycle in the membership DAG"
             ),
             GroupMembershipError::Db(e) => write!(f, "database error: {e}"),
+            GroupMembershipError::SeaOrm(e) => write!(f, "database error: {e}"),
         }
     }
 }
@@ -92,6 +182,11 @@ impl std::error::Error for GroupMembershipError {}
 /// `_ancestors_on`: seed with direct `member_user_id` edges, then walk
 /// upward via `member_group_id` level-by-level, batching each level in
 /// one `IN (...)` query (O(depth) round-trips, not one query per row).
+///
+/// Sync-only (see this module's own doc): the one real caller-graph
+/// reaching this function -- `session_gate.rs`/`project_gate.rs`'s
+/// hot revalidation path plus `conexus_auth::capabilities::
+/// resolve_capabilities` -- is entirely synchronous.
 pub fn resolve_user_groups(conn: &Connection, user_id: &str) -> Result<HashSet<String>> {
     let mut stmt =
         conn.prepare("SELECT group_id FROM group_membership WHERE member_user_id = ?1")?;
@@ -138,6 +233,12 @@ fn ancestors(conn: &Connection, seed: HashSet<String>) -> Result<HashSet<String>
 /// `group_id` plus every ancestor group (upward closure) -- the
 /// group-rooted mirror of [`resolve_user_groups`]: what a FRESH member
 /// of `group_id` would resolve into.
+///
+/// Sync-only: its one real caller, `admin_users_gate.rs::
+/// group_resolved_capabilities`, always runs inside `admin_group_
+/// members.rs`'s `amplification_guard`, itself always inside one of
+/// `decide_add_group_member`/`decide_remove_group_member`'s `BEGIN
+/// IMMEDIATE` transactions.
 pub fn resolve_group_ancestors(conn: &Connection, group_id: &str) -> Result<HashSet<String>> {
     ancestors(conn, HashSet::from([group_id.to_string()]))
 }
@@ -157,6 +258,8 @@ fn children_of_group(
 }
 
 /// `true` iff any of `groups` is itself flagged `is_sysadmin = 1`.
+/// Sync-only, internal to [`resolve_user_is_sysadmin`] (same caller
+/// graph).
 pub fn any_group_is_sysadmin(conn: &Connection, groups: &HashSet<String>) -> Result<bool> {
     if groups.is_empty() {
         return Ok(false);
@@ -177,6 +280,8 @@ pub fn any_group_is_sysadmin(conn: &Connection, groups: &HashSet<String>) -> Res
 /// request-scoped reuse hook Python's own docstring documents
 /// (`router/auth_middleware.py` resolves the graph once per request
 /// and threads it through every consumer). `None` self-resolves.
+///
+/// Sync-only: same hot-path caller graph as [`resolve_user_groups`].
 pub fn resolve_user_is_sysadmin(
     conn: &Connection,
     user_id: &str,
@@ -203,6 +308,10 @@ pub fn resolve_user_is_sysadmin(
 
 /// `true` iff a FRESH member of `group_id` would inherit sysadmin --
 /// i.e. `group_id` itself OR any ancestor group is sysadmin-flagged.
+///
+/// Sync-only: its one real caller, `admin_groups.rs::
+/// decide_delete_group`, always runs inside that function's `BEGIN
+/// IMMEDIATE` transaction (the AZ-R10-1 guard).
 pub fn group_is_transitively_sysadmin(conn: &Connection, group_id: &str) -> Result<bool> {
     let ancestors = resolve_group_ancestors(conn, group_id)?;
     any_group_is_sysadmin(conn, &ancestors)
@@ -214,6 +323,11 @@ pub fn group_is_transitively_sysadmin(conn: &Connection, group_id: &str) -> Resu
 /// visited-set, same shape as [`would_create_cycle`], so a
 /// (theoretically impossible post cycle-detection, but defensive)
 /// cycle in the membership DAG can't loop forever.
+///
+/// Sync-only: its one real caller, `admin_users_gate.rs::
+/// no_sysadmin_would_remain`, always runs inside one of six different
+/// `decide_*` functions' `BEGIN IMMEDIATE` transactions (across both
+/// `admin_users_users.rs` and this module's own REST decision layer).
 pub fn group_has_transitive_user_member(conn: &Connection, group_id: &str) -> Result<bool> {
     let mut visited: HashSet<String> = HashSet::new();
     let mut stack: Vec<String> = vec![group_id.to_string()];
@@ -236,6 +350,8 @@ pub fn group_has_transitive_user_member(conn: &Connection, group_id: &str) -> Re
 }
 
 /// Highest role per project across a set of groups (group rows only).
+/// Sync-only, internal to [`group_resolved_project_roles`] (same
+/// caller graph).
 pub fn project_roles_for_groups(
     conn: &Connection,
     groups: &HashSet<String>,
@@ -268,6 +384,10 @@ pub fn project_roles_for_groups(
 
 /// Every project role a FRESH member of `group_id` would inherit --
 /// the highest tier per project across `group_id` and its ancestors.
+///
+/// Sync-only: its one real caller, `admin_group_members.rs::
+/// amplification_guard`, always runs inside `decide_add_group_member`/
+/// `decide_remove_group_member`'s `BEGIN IMMEDIATE` transaction.
 pub fn group_resolved_project_roles(
     conn: &Connection,
     group_id: &str,
@@ -282,6 +402,16 @@ pub fn group_resolved_project_roles(
 ///
 /// `groups`: same reuse hook as [`resolve_user_is_sysadmin`] -- pass an
 /// already-resolved transitive group set to skip the internal walk.
+///
+/// Sync-only: reached from `session_gate.rs`/`project_gate.rs`'s hot
+/// revalidation path, `cookie_forwarding.rs::resolve_cookie_project_
+/// role`, `project_reads.rs::visible_project_names`,
+/// `admin_group_members.rs::amplification_guard` (transaction-bound),
+/// `admin_project_memberships.rs::gate_list_project_memberships`, and
+/// `users_groups_rest.rs::resolve_caller_role_on_project` -- every one
+/// of them either the hot path itself or a caller sharing a rusqlite
+/// `Connection`/`Transaction` for an unrelated reason; none is async
+/// with no sync constraint.
 pub fn resolve_user_project_role(
     conn: &Connection,
     user_id: &str,
@@ -330,6 +460,13 @@ pub fn resolve_user_project_role(
 /// cycle exists iff `parent_group_id` is reachable from
 /// `new_child_group_id` via the existing membership edges (self-loop
 /// is the trivial 1-cycle). Iterative DFS + visited-set.
+///
+/// Sync-only: its one real caller, `admin_group_members.rs::
+/// decide_add_group_member`, always runs inside that function's
+/// `BEGIN IMMEDIATE` transaction. [`add_group_member`] (the async
+/// primary) has its own private async cycle-check kernel rather than
+/// sharing this one, since it takes a `DatabaseConnection`, not a
+/// `Connection`.
 pub fn would_create_cycle(
     conn: &Connection,
     parent_group_id: &str,
@@ -358,13 +495,18 @@ pub fn would_create_cycle(
 }
 
 /// Insert a `group_membership` row after validation -- the canonical
-/// writer. Exactly one of `member_user_id`/`member_group_id` must be
-/// `Some` (the table's own CHECK constraint enforces this at the
-/// storage layer too; this surfaces a clean, typed error instead of a
-/// caller having to translate a raw constraint-violation). For
-/// group-into-group edges, runs cycle detection first -- on
+/// SYNC writer, kept for `admin_group_members.rs::
+/// decide_add_group_member`'s `BEGIN IMMEDIATE` transaction (insert-
+/// time cycle detection + the INSERT must be one atomic unit). See
+/// [`add_group_member`] for the sea-orm async primary
+/// (`oidc_group_mapping.rs::apply_group_mapping`'s caller). Exactly
+/// one of `member_user_id`/`member_group_id` must be `Some` (the
+/// table's own CHECK constraint enforces this at the storage layer
+/// too; this surfaces a clean, typed error instead of a caller having
+/// to translate a raw constraint-violation). For group-into-group
+/// edges, runs cycle detection first -- on
 /// [`GroupMembershipError::CycleDetected`] the table is left untouched.
-pub fn add_group_member(
+pub fn add_group_member_sync(
     conn: &Connection,
     group_id: &str,
     member_user_id: Option<&str>,
@@ -389,6 +531,96 @@ pub fn add_group_member(
     Ok(())
 }
 
+/// `(member_user_id, member_group_id)` edges directly out of
+/// `group_id` -- async counterpart of [`children_of_group`], private
+/// kernel for [`add_group_member`]'s own cycle check.
+async fn children_of_group_async(
+    db: &DatabaseConnection,
+    group_id: &str,
+) -> std::result::Result<Vec<(Option<String>, Option<String>)>, DbErr> {
+    let rows = GroupMembershipEntity::find()
+        .filter(GroupMembershipColumn::GroupId.eq(group_id))
+        .all(db)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|m| (m.member_user_id, m.member_group_id))
+        .collect())
+}
+
+/// Async counterpart of [`would_create_cycle`], private kernel for
+/// [`add_group_member`]. Not `pub`: [`would_create_cycle`] itself has
+/// no real async caller today (see this module's own doc) -- this
+/// exists only so [`add_group_member`]'s async primary preserves the
+/// SAME cycle-detection guarantee [`add_group_member_sync`] gives,
+/// rather than silently allowing a group-into-group edge to close a
+/// cycle when reached through the async path.
+async fn would_create_cycle_async(
+    db: &DatabaseConnection,
+    parent_group_id: &str,
+    new_child_group_id: &str,
+) -> std::result::Result<bool, DbErr> {
+    if parent_group_id == new_child_group_id {
+        return Ok(true);
+    }
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut stack: Vec<String> = vec![new_child_group_id.to_string()];
+    while let Some(current) = stack.pop() {
+        if !visited.insert(current.clone()) {
+            continue;
+        }
+        for (_user, child_group) in children_of_group_async(db, &current).await? {
+            let Some(child) = child_group else { continue };
+            if child == parent_group_id {
+                return Ok(true);
+            }
+            if !visited.contains(&child) {
+                stack.push(child);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Insert a `group_membership` row after validation -- sea-orm async
+/// primary, used by `oidc_group_mapping.rs::apply_group_mapping` (its
+/// only real caller: an OIDC group-claim JIT-provisions a user-into-
+/// group edge). See [`add_group_member_sync`] for the rusqlite twin
+/// the transaction-bound REST decision layer keeps. Same contract as
+/// the sync twin, including insert-time cycle detection for a
+/// group-into-group edge (via [`would_create_cycle_async`]) -- even
+/// though `apply_group_mapping` itself only ever passes
+/// `member_user_id`, for which no cycle can exist.
+pub async fn add_group_member(
+    db: &DatabaseConnection,
+    group_id: &str,
+    member_user_id: Option<&str>,
+    member_group_id: Option<&str>,
+    added_at: &str,
+) -> std::result::Result<(), GroupMembershipError> {
+    if member_user_id.is_none() == member_group_id.is_none() {
+        return Err(GroupMembershipError::InvalidArgs);
+    }
+    if let Some(child) = member_group_id {
+        if would_create_cycle_async(db, group_id, child).await? {
+            return Err(GroupMembershipError::CycleDetected {
+                group_id: group_id.to_string(),
+                member_group_id: child.to_string(),
+            });
+        }
+    }
+    GroupMembershipActiveModel {
+        rowid: sea_orm::ActiveValue::NotSet,
+        group_id: Set(group_id.to_string()),
+        member_user_id: Set(member_user_id.map(str::to_string)),
+        member_group_id: Set(member_group_id.map(str::to_string)),
+        added_at: Set(added_at.to_string()),
+    }
+    .insert(db)
+    .await?;
+    Ok(())
+}
+
 /// Promote the earliest-by-`created_at` user to sysadmin. No-op when
 /// the `users` table is empty, or when any user already has
 /// `is_sysadmin = 1` (idempotent -- never demotes an existing
@@ -400,95 +632,133 @@ pub fn add_group_member(
 /// `bootstrap_first_operator` (which runs inside `create_user`'s own
 /// `BEGIN IMMEDIATE` transaction) -- this one is for an operator who
 /// somehow ended up sysadmin-less on an existing deployment.
-pub fn bootstrap_first_operator_as_sysadmin(conn: &Connection) -> Result<()> {
-    let existing: Option<i64> = conn
-        .query_row(
-            "SELECT 1 FROM users WHERE is_sysadmin = 1 LIMIT 1",
-            [],
-            |r| r.get(0),
-        )
-        .optional()?;
+///
+/// Sea-orm only, no rusqlite twin: this PR's own call-site
+/// classification found NO real caller anywhere (production or test
+/// beyond this module's own) -- ahead of its own consumer, same as
+/// this migration's established "helpers ahead of their first
+/// consumer" precedent, so there is no sync constraint to preserve a
+/// twin for.
+pub async fn bootstrap_first_operator_as_sysadmin(
+    db: &DatabaseConnection,
+) -> std::result::Result<(), DbErr> {
+    let existing = UserEntity::find()
+        .filter(UserColumn::IsSysadmin.eq(true))
+        .limit(1)
+        .one(db)
+        .await?;
     if existing.is_some() {
         return Ok(());
     }
-    let earliest: Option<String> = conn
-        .query_row(
-            "SELECT user_id FROM users ORDER BY created_at ASC, user_id ASC LIMIT 1",
-            [],
-            |r| r.get(0),
-        )
-        .optional()?;
-    let Some(user_id) = earliest else {
+    let earliest = UserEntity::find()
+        .order_by_asc(UserColumn::CreatedAt)
+        .order_by_asc(UserColumn::UserId)
+        .limit(1)
+        .one(db)
+        .await?;
+    let Some(earliest) = earliest else {
         return Ok(());
     };
-    conn.execute(
-        "UPDATE users SET is_sysadmin = 1 WHERE user_id = ?1",
-        [&user_id],
-    )?;
+    let mut am: crate::entity::users::ActiveModel = earliest.into();
+    am.is_sysadmin = Set(true);
+    am.update(db).await?;
     Ok(())
 }
 
-/// Return the `group_id` for `name`, JIT-creating it if missing.
-/// `created_at` uses SQLite's own `datetime('now')` -- a real,
+/// Return the `group_id` for `name`, sea-orm async primary, JIT-
+/// creating it if missing. Used by `oidc_group_mapping.rs::
+/// apply_group_mapping` (its only real caller). `created_at` is
+/// stamped with the current UTC instant in SQLite's own
+/// `datetime('now')` output format (`YYYY-MM-DD HH:MM:SS`) -- a real,
 /// preserved Python inconsistency (every OTHER `created_at` column in
 /// this schema is stamped with the ISO-8601-with-milliseconds format
 /// `identity::_now_iso`/this crate's own callers use; this one alone
-/// uses SQLite's coarser `'YYYY-MM-DD HH:MM:SS'`), ported as-is per
-/// this migration's "re-derive documented behavior, don't smuggle in
-/// a fix" discipline -- not reconciled here.
-pub fn ensure_group(conn: &Connection, name: &str) -> Result<String> {
-    if let Some(group_id) = conn
-        .query_row("SELECT group_id FROM groups WHERE name = ?1", [name], |r| {
-            r.get(0)
-        })
-        .optional()?
+/// uses SQLite's coarser format), ported as-is per this migration's
+/// "re-derive documented behavior, don't smuggle in a fix" discipline.
+/// Computed in Rust rather than via SQLite's own `datetime('now')`
+/// server-side expression: sea-orm's typed `ActiveModel::insert` has
+/// no builder for a raw SQL expression in a column value, and the
+/// observable behavior (a UTC timestamp in that exact format) is
+/// identical either way.
+pub async fn ensure_group(
+    db: &DatabaseConnection,
+    name: &str,
+) -> std::result::Result<String, DbErr> {
+    if let Some(existing) = GroupEntity::find()
+        .filter(GroupColumn::Name.eq(name))
+        .one(db)
+        .await?
     {
-        return Ok(group_id);
+        return Ok(existing.group_id);
     }
     let mut buf = [0u8; 8];
     getrandom::fill(&mut buf).expect("OS RNG must be available to mint a group_id");
     let group_id: String = buf.iter().map(|b| format!("{b:02x}")).collect();
-    conn.execute(
-        "INSERT INTO groups (group_id, name, is_sysadmin, created_at) VALUES (?1, ?2, 0, datetime('now'))",
-        (&group_id, name),
-    )?;
+    // `datetime('now')` stays a raw SQL expression (not a Rust-side
+    // clock read) specifically to preserve the original SQLite-
+    // server-side-clock behavior exactly -- this crate's `chrono`
+    // dependency doesn't even enable the "clock" feature (see its own
+    // Cargo.toml comment: chrono here is for ISO-8601 parsing/
+    // arithmetic/formatting only, every `now` is caller-supplied
+    // elsewhere), so a Rust-side `Utc::now()` isn't available as a
+    // drop-in substitute without widening that dependency for one
+    // rarely-called JIT-create path.
+    let backend = db.get_database_backend();
+    let stmt = Statement::from_sql_and_values(
+        backend,
+        "INSERT INTO groups (group_id, name, is_sysadmin, created_at) VALUES (?, ?, 0, datetime('now'))",
+        [group_id.clone().into(), name.into()],
+    );
+    db.execute_raw(stmt).await?;
     Ok(group_id)
 }
 
 /// `true` iff `user_id` is already a DIRECT member of `group_id`.
-/// Port of `_add_user_to_group_idempotent`'s own pre-check --
-/// `group_membership` has a UNIQUE index on `(group_id,
+/// Sea-orm async primary, used by `oidc_group_mapping.rs::
+/// apply_group_mapping` (its only real caller) as the idempotent-add
+/// pre-check -- `group_membership` has a UNIQUE index on `(group_id,
 /// member_user_id)`, so a repeated [`add_group_member`] call for an
 /// already-existing edge would hit a constraint violation instead of
-/// silently no-op'ing; this lets a caller preserve the "was it newly
-/// added?" idempotent contract the SSO group-mapping reconcile path
-/// needs.
-pub fn is_direct_user_member(conn: &Connection, group_id: &str, user_id: &str) -> Result<bool> {
-    let exists: Option<i64> = conn
-        .query_row(
-            "SELECT 1 FROM group_membership WHERE group_id = ?1 AND member_user_id = ?2",
-            [group_id, user_id],
-            |r| r.get(0),
-        )
-        .optional()?;
-    Ok(exists.is_some())
+/// silently no-op'ing.
+pub async fn is_direct_user_member(
+    db: &DatabaseConnection,
+    group_id: &str,
+    user_id: &str,
+) -> std::result::Result<bool, DbErr> {
+    let count = GroupMembershipEntity::find()
+        .filter(GroupMembershipColumn::GroupId.eq(group_id))
+        .filter(GroupMembershipColumn::MemberUserId.eq(user_id))
+        .count(db)
+        .await?;
+    Ok(count > 0)
 }
 
-/// Delete a user->group edge; `true` iff a row was removed.
-pub fn remove_group_member(conn: &Connection, group_id: &str, user_id: &str) -> Result<bool> {
-    let n = conn.execute(
-        "DELETE FROM group_membership WHERE group_id = ?1 AND member_user_id = ?2",
-        [group_id, user_id],
-    )?;
-    Ok(n > 0)
+/// Delete a user->group edge; `true` iff a row was removed. Sea-orm
+/// async primary, used by `oidc_group_mapping.rs::
+/// reconcile_oidc_group_membership` (its only real caller, the OIDC
+/// de-provisioning path).
+pub async fn remove_group_member(
+    db: &DatabaseConnection,
+    group_id: &str,
+    user_id: &str,
+) -> std::result::Result<bool, DbErr> {
+    let res = GroupMembershipEntity::delete_many()
+        .filter(GroupMembershipColumn::GroupId.eq(group_id))
+        .filter(GroupMembershipColumn::MemberUserId.eq(user_id))
+        .exec(db)
+        .await?;
+    Ok(res.rows_affected > 0)
 }
 
 /// Port of `remove_group_member_handler`'s own `DELETE` -- `member_id`
 /// is an opaque surrogate matched against BOTH `member_user_id` AND
 /// `member_group_id` (the caller doesn't need to know which kind it
 /// is). Deliberately a SEPARATE function from [`remove_group_member`]
-/// above (that one is user-only, used by the SSO reconcile path,
-/// which always knows it's removing a user edge).
+/// above (that one is async/user-only, used by the SSO reconcile
+/// path, which always knows it's removing a user edge). Sync-only:
+/// its one real caller, `admin_group_members.rs::
+/// decide_remove_group_member`, always runs inside that function's
+/// `BEGIN IMMEDIATE` transaction.
 pub fn remove_group_member_by_id(
     conn: &Connection,
     group_id: &str,
@@ -525,24 +795,39 @@ pub enum GroupMemberRow {
 /// renderable label via a `LEFT JOIN` against `users`/`groups` so the
 /// dashboard needs no follow-up fetch. Ordered by the member's own
 /// display label (`COALESCE(username, group_name)`).
-pub fn list_group_members(conn: &Connection, group_id: &str) -> Result<Vec<GroupMemberRow>> {
-    let mut stmt = conn.prepare(
+///
+/// Sea-orm async primary, used by `admin_group_members.rs::
+/// list_group_members_response` (its only real caller, a plain read
+/// with no transaction). Raw SQL via `Statement::from_sql_and_values`
+/// (same "escape hatch" precedent as `identity.rs::find_linkable_
+/// user_by_email`): the LEFT JOIN + either-shape projection has no
+/// sea-query typed-builder equivalent worth building for one query.
+pub async fn list_group_members(
+    db: &DatabaseConnection,
+    group_id: &str,
+) -> std::result::Result<Vec<GroupMemberRow>, DbErr> {
+    let backend = db.get_database_backend();
+    let stmt = Statement::from_sql_and_values(
+        backend,
         "SELECT gm.member_user_id, gm.member_group_id, gm.added_at, \
                 u.username, g.name, g.is_sysadmin \
          FROM group_membership gm \
          LEFT JOIN users u ON gm.member_user_id = u.user_id \
          LEFT JOIN groups g ON gm.member_group_id = g.group_id \
-         WHERE gm.group_id = ?1 \
+         WHERE gm.group_id = ? \
          ORDER BY COALESCE(u.username, g.name)",
-    )?;
-    let rows = stmt.query_map([group_id], |row| {
-        let member_user_id: Option<String> = row.get(0)?;
-        let member_group_id: Option<String> = row.get(1)?;
-        let added_at: String = row.get(2)?;
-        let username: Option<String> = row.get(3)?;
-        let name: Option<String> = row.get(4)?;
-        let is_sysadmin: Option<bool> = row.get(5)?;
-        Ok(if let Some(user_id) = member_user_id {
+        [group_id.into()],
+    );
+    let rows = db.query_all_raw(stmt).await?;
+    let mut out = Vec::new();
+    for row in rows {
+        let member_user_id: Option<String> = row.try_get("", "member_user_id")?;
+        let member_group_id: Option<String> = row.try_get("", "member_group_id")?;
+        let added_at: String = row.try_get("", "added_at")?;
+        let username: Option<String> = row.try_get("", "username")?;
+        let name: Option<String> = row.try_get("", "name")?;
+        let is_sysadmin: Option<bool> = row.try_get("", "is_sysadmin")?;
+        out.push(if let Some(user_id) = member_user_id {
             GroupMemberRow::User {
                 user_id,
                 username: username.unwrap_or_default(),
@@ -555,9 +840,9 @@ pub fn list_group_members(conn: &Connection, group_id: &str) -> Result<Vec<Group
                 is_sysadmin: is_sysadmin.unwrap_or(false),
                 added_at,
             }
-        })
-    })?;
-    rows.collect()
+        });
+    }
+    Ok(out)
 }
 
 /// `{group_name: group_id}` for `user_id`'s DIRECT memberships in
@@ -565,23 +850,31 @@ pub fn list_group_members(conn: &Connection, group_id: &str) -> Result<Vec<Group
 /// `oidc:`-namespaced group reconcile scope. `name_prefix` is treated
 /// literally (the `LIKE` pattern is `name_prefix + '%'` with backslash
 /// as the escape char), matching Python's inline query exactly.
-pub fn user_group_memberships_by_name_prefix(
-    conn: &Connection,
+///
+/// Sea-orm async primary, used by `oidc_group_mapping.rs::
+/// reconcile_oidc_group_membership` (its only real caller). Raw SQL
+/// via `Statement::from_sql_and_values` (same escape-hatch precedent
+/// as [`list_group_members`]): the `LIKE ... ESCAPE '\'` clause has no
+/// sea-query typed-builder equivalent.
+pub async fn user_group_memberships_by_name_prefix(
+    db: &DatabaseConnection,
     user_id: &str,
     name_prefix: &str,
-) -> Result<HashMap<String, String>> {
+) -> std::result::Result<HashMap<String, String>, DbErr> {
     let pattern = format!("{name_prefix}%");
-    let mut stmt = conn.prepare(
+    let backend = db.get_database_backend();
+    let stmt = Statement::from_sql_and_values(
+        backend,
         "SELECT g.group_id, g.name FROM group_membership gm \
          JOIN groups g ON g.group_id = gm.group_id \
-         WHERE gm.member_user_id = ?1 AND g.name LIKE ?2 ESCAPE '\\'",
-    )?;
-    let rows = stmt.query_map([user_id, pattern.as_str()], |r| {
-        Ok((r.get::<_, String>(1)?, r.get::<_, String>(0)?))
-    })?;
+         WHERE gm.member_user_id = ? AND g.name LIKE ? ESCAPE '\\'",
+        [user_id.into(), pattern.into()],
+    );
+    let rows = db.query_all_raw(stmt).await?;
     let mut out = HashMap::new();
     for row in rows {
-        let (name, group_id) = row?;
+        let group_id: String = row.try_get("", "group_id")?;
+        let name: String = row.try_get("", "name")?;
         out.insert(name, group_id);
     }
     Ok(out)
@@ -609,8 +902,19 @@ fn row_to_group(row: &rusqlite::Row) -> rusqlite::Result<GroupRow> {
     })
 }
 
-/// Port of `_group_member_count`.
-pub fn group_member_count(conn: &Connection, group_id: &str) -> Result<i64> {
+fn group_row_from_model(m: crate::entity::groups::Model) -> GroupRow {
+    GroupRow {
+        group_id: m.group_id,
+        name: m.name,
+        is_sysadmin: m.is_sysadmin,
+        created_at: m.created_at,
+    }
+}
+
+/// Port of `_group_member_count`. Sync twin of [`group_member_count`],
+/// kept for `admin_groups.rs::decide_edit_group`'s `BEGIN IMMEDIATE`
+/// transaction.
+pub fn group_member_count_sync(conn: &Connection, group_id: &str) -> Result<i64> {
     conn.query_row(
         "SELECT COUNT(*) FROM group_membership WHERE group_id = ?1",
         [group_id],
@@ -618,27 +922,78 @@ pub fn group_member_count(conn: &Connection, group_id: &str) -> Result<i64> {
     )
 }
 
+/// Sea-orm async primary of [`group_member_count_sync`], used by
+/// [`list_groups_with_member_counts`] (this file's own async twin)
+/// and `admin_group_capabilities.rs`-adjacent read paths.
+pub async fn group_member_count(
+    db: &DatabaseConnection,
+    group_id: &str,
+) -> std::result::Result<i64, DbErr> {
+    let count = GroupMembershipEntity::find()
+        .filter(GroupMembershipColumn::GroupId.eq(group_id))
+        .count(db)
+        .await?;
+    Ok(i64::try_from(count).unwrap_or(i64::MAX))
+}
+
 /// Port of `list_groups_handler`: every group with its denormalised
-/// member count, ordered by name.
-pub fn list_groups_with_member_counts(conn: &Connection) -> Result<Vec<(GroupRow, i64)>> {
+/// member count, ordered by name. Sync twin of
+/// [`list_groups_with_member_counts`] (async) -- kept only for this
+/// module's own existing tests; no real production sync caller
+/// remains once `admin_groups.rs::list_groups_response` (its only
+/// real caller) converts to async in this same PR.
+pub fn list_groups_with_member_counts_sync(conn: &Connection) -> Result<Vec<(GroupRow, i64)>> {
     let mut stmt = conn.prepare(&format!("SELECT {GROUP_COLUMNS} FROM groups ORDER BY name"))?;
     let rows = stmt.query_map([], row_to_group)?;
     let mut out = Vec::new();
     for row in rows {
         let group = row?;
-        let count = group_member_count(conn, &group.group_id)?;
+        let count = group_member_count_sync(conn, &group.group_id)?;
         out.push((group, count));
     }
     Ok(out)
 }
 
-pub fn get_group(conn: &Connection, group_id: &str) -> Result<Option<GroupRow>> {
+/// Sea-orm async primary of [`list_groups_with_member_counts_sync`],
+/// used by `admin_groups.rs::list_groups_response` (its only real
+/// caller).
+pub async fn list_groups_with_member_counts(
+    db: &DatabaseConnection,
+) -> std::result::Result<Vec<(GroupRow, i64)>, DbErr> {
+    let rows = GroupEntity::find()
+        .order_by_asc(GroupColumn::Name)
+        .all(db)
+        .await?;
+    let mut out = Vec::new();
+    for m in rows {
+        let count = group_member_count(db, &m.group_id).await?;
+        out.push((group_row_from_model(m), count));
+    }
+    Ok(out)
+}
+
+/// Sync twin of [`get_group`], kept for `admin_groups.rs::
+/// decide_edit_group`/`decide_delete_group`/`admin_group_members.rs::
+/// decide_add_group_member`'s `BEGIN IMMEDIATE` transactions.
+pub fn get_group_sync(conn: &Connection, group_id: &str) -> Result<Option<GroupRow>> {
     conn.query_row(
         &format!("SELECT {GROUP_COLUMNS} FROM groups WHERE group_id = ?1"),
         [group_id],
         row_to_group,
     )
     .optional()
+}
+
+/// Sea-orm async primary of [`get_group_sync`], used by
+/// `admin_group_capabilities.rs`'s decision functions and
+/// `admin_group_members.rs::list_group_members_response` (plain reads,
+/// no transaction).
+pub async fn get_group(
+    db: &DatabaseConnection,
+    group_id: &str,
+) -> std::result::Result<Option<GroupRow>, DbErr> {
+    let row = GroupEntity::find_by_id(group_id).one(db).await?;
+    Ok(row.map(group_row_from_model))
 }
 
 /// Errors from [`create_group`]/[`update_group_fields`] -- a distinct
@@ -649,6 +1004,8 @@ pub fn get_group(conn: &Connection, group_id: &str) -> Result<Option<GroupRow>> 
 pub enum GroupCrudError {
     NameConflict,
     Db(rusqlite::Error),
+    /// The [`create_group`] (sea-orm async) counterpart of [`Db`].
+    SeaOrm(sea_orm::DbErr),
 }
 
 impl From<rusqlite::Error> for GroupCrudError {
@@ -657,15 +1014,33 @@ impl From<rusqlite::Error> for GroupCrudError {
     }
 }
 
-/// Port of `create_group_handler`'s own raw INSERT -- deliberately
-/// NOT [`ensure_group`] above: that function is an idempotent
-/// get-or-create with a fixed `is_sysadmin=0` and no explicit `now`,
-/// used only by the SSO-group-reconcile path; this one always
-/// INSERTs fresh, accepts an explicit `is_sysadmin`, takes an
-/// explicit `now`, and surfaces a UNIQUE(name) collision as a real
-/// error rather than silently returning the existing row.
-pub fn create_group(
-    conn: &Connection,
+impl From<sea_orm::DbErr> for GroupCrudError {
+    fn from(e: sea_orm::DbErr) -> Self {
+        GroupCrudError::SeaOrm(e)
+    }
+}
+
+fn is_unique_violation(e: &sea_orm::DbErr) -> bool {
+    matches!(
+        e.sql_err(),
+        Some(sea_orm::SqlErr::UniqueConstraintViolation(_))
+    )
+}
+
+/// Sea-orm async primary of [`create_group`] -- port of
+/// `create_group_handler`'s own raw INSERT -- deliberately NOT
+/// [`ensure_group`]: that function is an idempotent get-or-create
+/// with a fixed `is_sysadmin=0` and no explicit `now`, used only by
+/// the SSO-group-reconcile path; this one always INSERTs fresh,
+/// accepts an explicit `is_sysadmin`, takes an explicit `now`, and
+/// surfaces a UNIQUE(name) collision as a real error rather than
+/// silently returning the existing row. No `_sync` twin: this PR's
+/// call-site classification found its ONE real production caller,
+/// `admin_groups.rs::decide_create_group`, opens no transaction of
+/// its own (a single INSERT is already atomic) and converts to async
+/// in this same PR.
+pub async fn create_group(
+    db: &DatabaseConnection,
     name: &str,
     is_sysadmin: bool,
     now: &str,
@@ -673,19 +1048,26 @@ pub fn create_group(
     let mut buf = [0u8; 8];
     getrandom::fill(&mut buf).expect("OS RNG must be available to mint a group_id");
     let group_id: String = buf.iter().map(|b| format!("{b:02x}")).collect();
-    let insert_result = conn.execute(
-        "INSERT INTO groups (group_id, name, is_sysadmin, created_at) VALUES (?1, ?2, ?3, ?4)",
-        (&group_id, name, is_sysadmin, now),
-    );
-    if let Err(e) = insert_result {
-        if matches!(&e, rusqlite::Error::SqliteFailure(err, _) if err.code == rusqlite::ErrorCode::ConstraintViolation)
-        {
+    let am = GroupActiveModel {
+        group_id: Set(group_id.clone()),
+        name: Set(name.to_string()),
+        is_sysadmin: Set(is_sysadmin),
+        created_at: Set(now.to_string()),
+    };
+    if let Err(e) = am.insert(db).await {
+        if is_unique_violation(&e) {
             return Err(GroupCrudError::NameConflict);
         }
-        return Err(GroupCrudError::Db(e));
+        return Err(GroupCrudError::SeaOrm(e));
     }
-    get_group(conn, &group_id)?
-        .ok_or_else(|| GroupCrudError::Db(rusqlite::Error::QueryReturnedNoRows))
+    get_group(db, &group_id)
+        .await
+        .map_err(GroupCrudError::SeaOrm)?
+        .ok_or_else(|| {
+            GroupCrudError::SeaOrm(DbErr::RecordNotFound(
+                "just-inserted group row not found".to_string(),
+            ))
+        })
 }
 
 /// Partial update for [`update_group_fields`] -- `None` means "leave
@@ -706,12 +1088,16 @@ pub struct GroupFieldUpdate<'a> {
 /// Returns `Ok(false)` if `group_id` doesn't exist (caller decides
 /// the 404); a UNIQUE(name) collision surfaces as
 /// `GroupCrudError::NameConflict`.
+///
+/// Sync-only: its one real caller, `admin_groups.rs::
+/// decide_edit_group`, always runs inside that function's `BEGIN
+/// IMMEDIATE` transaction.
 pub fn update_group_fields(
     conn: &Connection,
     group_id: &str,
     update: &GroupFieldUpdate,
 ) -> std::result::Result<bool, GroupCrudError> {
-    if get_group(conn, group_id)?.is_none() {
+    if get_group_sync(conn, group_id)?.is_none() {
         return Ok(false);
     }
     if let Some(name) = update.name {
@@ -740,6 +1126,10 @@ pub fn update_group_fields(
 /// rows where this group is either the parent OR a member cascade via
 /// `ON DELETE CASCADE`, matching Python's own cascade. Returns
 /// `false` if `group_id` doesn't exist (caller decides the 404).
+///
+/// Sync-only: its one real caller, `admin_groups.rs::
+/// decide_delete_group`, always runs inside that function's `BEGIN
+/// IMMEDIATE` transaction.
 pub fn delete_group(conn: &Connection, group_id: &str) -> Result<bool> {
     let n = conn.execute("DELETE FROM groups WHERE group_id = ?1", [group_id])?;
     Ok(n > 0)
@@ -755,6 +1145,24 @@ mod tests {
         conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
         init_router_schema(&conn).unwrap();
         conn
+    }
+
+    /// A file-backed router DB opened as BOTH a `rusqlite::Connection`
+    /// (schema init/seeding + this file's own `_sync` functions) and a
+    /// sea-orm `DatabaseConnection` on the SAME file (this file's own
+    /// async functions) -- an in-memory `:memory:` DB can't be shared
+    /// across two connection handles the way a real file can. Same
+    /// recipe as `identity.rs`'s own `conn_with_sea_orm()`.
+    async fn conn_with_sea_orm() -> (tempfile::TempDir, Connection, DatabaseConnection) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("group_membership_test.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        init_router_schema(&conn).unwrap();
+        let db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        (dir, conn, db)
     }
 
     fn seed_group(conn: &Connection, group_id: &str) {
@@ -795,9 +1203,9 @@ mod tests {
     }
 
     /// Nests `child_group_id` as a member of `parent_group_id` --
-    /// direct table insert, bypassing [`add_group_member`]'s own cycle
-    /// check, for tests that want to set up a graph shape without
-    /// exercising that validation path.
+    /// direct table insert, bypassing [`add_group_member_sync`]'s own
+    /// cycle check, for tests that want to set up a graph shape
+    /// without exercising that validation path.
     fn nest_group_under(conn: &Connection, parent_group_id: &str, child_group_id: &str) {
         conn.execute(
             "INSERT INTO group_membership (group_id, member_group_id, added_at) VALUES (?1, ?2, '2026-01-01T00:00:00Z')",
@@ -1096,20 +1504,20 @@ mod tests {
     }
 
     #[test]
-    fn add_group_member_rejects_neither_field_set() {
+    fn add_group_member_sync_rejects_neither_field_set() {
         let conn = test_conn();
         seed_group(&conn, "engineers");
-        let err =
-            add_group_member(&conn, "engineers", None, None, "2026-01-01T00:00:00Z").unwrap_err();
+        let err = add_group_member_sync(&conn, "engineers", None, None, "2026-01-01T00:00:00Z")
+            .unwrap_err();
         assert!(matches!(err, GroupMembershipError::InvalidArgs));
     }
 
     #[test]
-    fn add_group_member_rejects_both_fields_set() {
+    fn add_group_member_sync_rejects_both_fields_set() {
         let conn = test_conn();
         seed_group(&conn, "engineers");
         seed_user(&conn, "alice");
-        let err = add_group_member(
+        let err = add_group_member_sync(
             &conn,
             "engineers",
             Some("alice"),
@@ -1121,11 +1529,11 @@ mod tests {
     }
 
     #[test]
-    fn add_group_member_inserts_a_user_edge() {
+    fn add_group_member_sync_inserts_a_user_edge() {
         let conn = test_conn();
         seed_group(&conn, "engineers");
         seed_user(&conn, "alice");
-        add_group_member(
+        add_group_member_sync(
             &conn,
             "engineers",
             Some("alice"),
@@ -1140,31 +1548,13 @@ mod tests {
     }
 
     #[test]
-    fn is_direct_user_member_reflects_a_real_edge() {
-        let conn = test_conn();
-        seed_group(&conn, "engineers");
-        seed_user(&conn, "alice");
-        seed_user(&conn, "bob");
-        add_group_member(
-            &conn,
-            "engineers",
-            Some("alice"),
-            None,
-            "2026-01-01T00:00:00Z",
-        )
-        .unwrap();
-        assert!(is_direct_user_member(&conn, "engineers", "alice").unwrap());
-        assert!(!is_direct_user_member(&conn, "engineers", "bob").unwrap());
-    }
-
-    #[test]
-    fn add_group_member_refuses_a_cycle_and_leaves_the_table_untouched() {
+    fn add_group_member_sync_refuses_a_cycle_and_leaves_the_table_untouched() {
         let conn = test_conn();
         seed_group(&conn, "backend");
         seed_group(&conn, "engineers");
         nest_group_under(&conn, "engineers", "backend");
 
-        let err = add_group_member(
+        let err = add_group_member_sync(
             &conn,
             "backend",
             None,
@@ -1182,11 +1572,11 @@ mod tests {
     }
 
     #[test]
-    fn add_group_member_allows_a_non_cyclic_group_edge() {
+    fn add_group_member_sync_allows_a_non_cyclic_group_edge() {
         let conn = test_conn();
         seed_group(&conn, "backend");
         seed_group(&conn, "engineers");
-        add_group_member(
+        add_group_member_sync(
             &conn,
             "engineers",
             None,
@@ -1200,109 +1590,150 @@ mod tests {
         );
     }
 
-    #[test]
-    fn bootstrap_first_operator_as_sysadmin_promotes_the_earliest_user() {
-        let conn = test_conn();
-        conn.execute(
-            "INSERT INTO users (user_id, username, created_at) VALUES ('bob', 'bob', '2026-01-02T00:00:00Z')",
-            [],
+    #[tokio::test]
+    async fn add_group_member_inserts_a_user_edge() {
+        let (_dir, conn, db) = conn_with_sea_orm().await;
+        seed_group(&conn, "engineers");
+        seed_user(&conn, "alice");
+        add_group_member(
+            &db,
+            "engineers",
+            Some("alice"),
+            None,
+            "2026-01-01T00:00:00Z",
         )
+        .await
         .unwrap();
-        conn.execute(
-            "INSERT INTO users (user_id, username, created_at) VALUES ('alice', 'alice', '2026-01-01T00:00:00Z')",
-            [],
-        )
-        .unwrap();
-
-        bootstrap_first_operator_as_sysadmin(&conn).unwrap();
-
-        let alice_admin: bool = conn
-            .query_row(
-                "SELECT is_sysadmin FROM users WHERE user_id = 'alice'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        let bob_admin: bool = conn
-            .query_row(
-                "SELECT is_sysadmin FROM users WHERE user_id = 'bob'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert!(alice_admin, "the earliest-created user must be promoted");
-        assert!(!bob_admin);
-    }
-
-    #[test]
-    fn bootstrap_first_operator_as_sysadmin_is_a_noop_when_a_sysadmin_already_exists() {
-        let conn = test_conn();
-        conn.execute(
-            "INSERT INTO users (user_id, username, created_at, is_sysadmin) VALUES ('bob', 'bob', '2026-01-02T00:00:00Z', 1)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO users (user_id, username, created_at) VALUES ('alice', 'alice', '2026-01-01T00:00:00Z')",
-            [],
-        )
-        .unwrap();
-
-        bootstrap_first_operator_as_sysadmin(&conn).unwrap();
-
-        let alice_admin: bool = conn
-            .query_row(
-                "SELECT is_sysadmin FROM users WHERE user_id = 'alice'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert!(
-            !alice_admin,
-            "an existing sysadmin must never be joined by a second one"
+        assert_eq!(
+            resolve_user_groups(&conn, "alice").unwrap(),
+            HashSet::from(["engineers".to_string()])
         );
     }
 
-    #[test]
-    fn bootstrap_first_operator_as_sysadmin_is_a_noop_on_an_empty_table() {
-        let conn = test_conn();
-        // Must not panic/error when there is nobody to promote.
-        bootstrap_first_operator_as_sysadmin(&conn).unwrap();
+    #[tokio::test]
+    async fn add_group_member_rejects_neither_field_set() {
+        let (_dir, conn, db) = conn_with_sea_orm().await;
+        seed_group(&conn, "engineers");
+        let err = add_group_member(&db, "engineers", None, None, "2026-01-01T00:00:00Z")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, GroupMembershipError::InvalidArgs));
     }
 
-    #[test]
-    fn ensure_group_creates_on_first_call_and_is_idempotent() {
-        let conn = test_conn();
-        let id1 = ensure_group(&conn, "engineers").unwrap();
-        let id2 = ensure_group(&conn, "engineers").unwrap();
-        assert_eq!(id1, id2);
+    #[tokio::test]
+    async fn add_group_member_refuses_a_cycle_and_leaves_the_table_untouched() {
+        let (_dir, conn, db) = conn_with_sea_orm().await;
+        seed_group(&conn, "backend");
+        seed_group(&conn, "engineers");
+        nest_group_under(&conn, "engineers", "backend");
+
+        let err = add_group_member(
+            &db,
+            "backend",
+            None,
+            Some("engineers"),
+            "2026-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, GroupMembershipError::CycleDetected { .. }));
+
         let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM groups", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM group_membership", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 1);
     }
 
-    #[test]
-    fn remove_group_member_deletes_and_reports_whether_a_row_existed() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn add_group_member_allows_a_non_cyclic_group_edge() {
+        let (_dir, conn, db) = conn_with_sea_orm().await;
+        seed_group(&conn, "backend");
         seed_group(&conn, "engineers");
-        add_user_member(&conn, "engineers", "alice");
-
-        assert!(remove_group_member(&conn, "engineers", "alice").unwrap());
-        assert!(!remove_group_member(&conn, "engineers", "alice").unwrap());
-        assert_eq!(resolve_user_groups(&conn, "alice").unwrap(), HashSet::new());
+        add_group_member(
+            &db,
+            "engineers",
+            None,
+            Some("backend"),
+            "2026-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            resolve_group_ancestors(&conn, "backend").unwrap(),
+            HashSet::from(["backend".to_string(), "engineers".to_string()])
+        );
     }
 
     #[test]
-    fn user_group_memberships_by_name_prefix_matches_only_the_prefix() {
+    fn is_direct_user_member_placeholder_seed_only() {
+        // Real coverage lives in the `#[tokio::test]`s below --
+        // `is_direct_user_member` itself is async-only (see this
+        // module's own doc). This test just pins that the seed helper
+        // still produces the row shape the async tests assert against.
         let conn = test_conn();
+        seed_group(&conn, "engineers");
+        seed_user(&conn, "alice");
+        add_user_member(&conn, "engineers", "alice");
+        let is_member: bool = conn
+            .query_row(
+                "SELECT 1 FROM group_membership WHERE group_id = 'engineers' AND member_user_id = 'alice'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap();
+        assert!(is_member);
+    }
+
+    #[tokio::test]
+    async fn is_direct_user_member_reflects_a_real_edge() {
+        let (_dir, conn, db) = conn_with_sea_orm().await;
+        seed_group(&conn, "engineers");
+        seed_user(&conn, "alice");
+        seed_user(&conn, "bob");
+        add_group_member(
+            &db,
+            "engineers",
+            Some("alice"),
+            None,
+            "2026-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        assert!(is_direct_user_member(&db, "engineers", "alice")
+            .await
+            .unwrap());
+        assert!(!is_direct_user_member(&db, "engineers", "bob")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn remove_group_member_deletes_and_reports_whether_a_row_existed() {
+        let (_dir, conn, db) = conn_with_sea_orm().await;
+        seed_group(&conn, "engineers");
+        add_user_member(&conn, "engineers", "alice");
+
+        assert!(remove_group_member(&db, "engineers", "alice")
+            .await
+            .unwrap());
+        assert!(!remove_group_member(&db, "engineers", "alice")
+            .await
+            .unwrap());
+        assert_eq!(resolve_user_groups(&conn, "alice").unwrap(), HashSet::new());
+    }
+
+    #[tokio::test]
+    async fn user_group_memberships_by_name_prefix_matches_only_the_prefix() {
+        let (_dir, conn, db) = conn_with_sea_orm().await;
         seed_group(&conn, "oidc:engineers");
         seed_group(&conn, "oidc:sales");
         seed_group(&conn, "manual:engineers");
         add_user_member(&conn, "oidc:engineers", "alice");
         add_user_member(&conn, "manual:engineers", "alice");
 
-        let matches = user_group_memberships_by_name_prefix(&conn, "alice", "oidc:").unwrap();
+        let matches = user_group_memberships_by_name_prefix(&db, "alice", "oidc:")
+            .await
+            .unwrap();
         assert_eq!(
             matches,
             HashMap::from([("oidc:engineers".to_string(), "oidc:engineers".to_string())])
@@ -1311,69 +1742,193 @@ mod tests {
 
     const NOW: &str = "2026-01-01T00:00:00.000+00:00";
 
-    #[test]
-    fn create_group_inserts_a_fresh_row() {
-        let conn = test_conn();
-        let group = create_group(&conn, "engineers", false, NOW).unwrap();
+    #[tokio::test]
+    async fn create_group_inserts_a_fresh_row() {
+        let (_dir, _conn, db) = conn_with_sea_orm().await;
+        let group = create_group(&db, "engineers", false, NOW).await.unwrap();
         assert_eq!(group.name, "engineers");
         assert!(!group.is_sysadmin);
         assert_eq!(group.created_at, NOW);
     }
 
-    #[test]
-    fn create_group_rejects_a_duplicate_name() {
-        let conn = test_conn();
-        create_group(&conn, "engineers", false, NOW).unwrap();
-        let err = create_group(&conn, "engineers", false, NOW).unwrap_err();
+    #[tokio::test]
+    async fn create_group_rejects_a_duplicate_name() {
+        let (_dir, _conn, db) = conn_with_sea_orm().await;
+        create_group(&db, "engineers", false, NOW).await.unwrap();
+        let err = create_group(&db, "engineers", false, NOW)
+            .await
+            .unwrap_err();
         assert!(matches!(err, GroupCrudError::NameConflict));
     }
 
-    #[test]
-    fn create_group_is_a_separate_contract_from_ensure_group() {
+    #[tokio::test]
+    async fn create_group_is_a_separate_contract_from_ensure_group() {
         // ensure_group is idempotent get-or-create; create_group always
         // inserts fresh and errors on a collision -- confirm they don't
         // silently converge.
-        let conn = test_conn();
-        let via_ensure = ensure_group(&conn, "shared-name").unwrap();
-        let err = create_group(&conn, "shared-name", false, NOW).unwrap_err();
+        let (_dir, _conn, db) = conn_with_sea_orm().await;
+        let via_ensure = ensure_group(&db, "shared-name").await.unwrap();
+        let err = create_group(&db, "shared-name", false, NOW)
+            .await
+            .unwrap_err();
         assert!(matches!(err, GroupCrudError::NameConflict));
-        assert!(get_group(&conn, &via_ensure).unwrap().is_some());
+        assert!(get_group(&db, &via_ensure).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn ensure_group_creates_on_first_call_and_is_idempotent() {
+        let (_dir, conn, db) = conn_with_sea_orm().await;
+        let id1 = ensure_group(&db, "engineers").await.unwrap();
+        let id2 = ensure_group(&db, "engineers").await.unwrap();
+        assert_eq!(id1, id2);
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM groups", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[test]
-    fn get_group_returns_none_for_an_unknown_id() {
+    fn remove_group_member_by_id_matches_a_user_member() {
         let conn = test_conn();
-        assert!(get_group(&conn, "nope").unwrap().is_none());
+        seed_group(&conn, "engineers");
+        add_user_member(&conn, "engineers", "alice");
+        assert!(remove_group_member_by_id(&conn, "engineers", "alice").unwrap());
+        assert_eq!(group_member_count_sync(&conn, "engineers").unwrap(), 0);
+    }
+
+    #[test]
+    fn remove_group_member_by_id_matches_a_nested_group_member() {
+        let conn = test_conn();
+        seed_group(&conn, "parent");
+        seed_group(&conn, "child");
+        add_group_member_sync(&conn, "parent", None, Some("child"), NOW).unwrap();
+        assert!(remove_group_member_by_id(&conn, "parent", "child").unwrap());
+        assert_eq!(group_member_count_sync(&conn, "parent").unwrap(), 0);
+    }
+
+    #[test]
+    fn remove_group_member_by_id_returns_false_when_no_row_matches() {
+        let conn = test_conn();
+        seed_group(&conn, "engineers");
+        assert!(!remove_group_member_by_id(&conn, "engineers", "nobody").unwrap());
+    }
+
+    #[tokio::test]
+    async fn list_group_members_projects_a_user_member() {
+        let (_dir, conn, db) = conn_with_sea_orm().await;
+        let group = create_group(&db, "engineers", false, NOW).await.unwrap();
+        add_user_member(&conn, &group.group_id, "alice");
+        let members = list_group_members(&db, &group.group_id).await.unwrap();
+        assert_eq!(members.len(), 1);
+        assert_eq!(
+            members[0],
+            GroupMemberRow::User {
+                user_id: "alice".to_string(),
+                username: "alice".to_string(),
+                added_at: "2026-01-01T00:00:00Z".to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn list_group_members_projects_a_nested_group_member() {
+        let (_dir, conn, db) = conn_with_sea_orm().await;
+        let parent = create_group(&db, "parent", false, NOW).await.unwrap();
+        let child = create_group(&db, "child", true, NOW).await.unwrap();
+        add_group_member_sync(&conn, &parent.group_id, None, Some(&child.group_id), NOW).unwrap();
+        let members = list_group_members(&db, &parent.group_id).await.unwrap();
+        assert_eq!(members.len(), 1);
+        assert_eq!(
+            members[0],
+            GroupMemberRow::Group {
+                group_id: child.group_id,
+                name: "child".to_string(),
+                is_sysadmin: true,
+                added_at: NOW.to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn list_group_members_orders_by_display_label() {
+        let (_dir, conn, db) = conn_with_sea_orm().await;
+        let group = create_group(&db, "engineers", false, NOW).await.unwrap();
+        add_user_member(&conn, &group.group_id, "zeb");
+        add_user_member(&conn, &group.group_id, "alice");
+        let members = list_group_members(&db, &group.group_id).await.unwrap();
+        let usernames: Vec<&str> = members
+            .iter()
+            .map(|m| match m {
+                GroupMemberRow::User { username, .. } => username.as_str(),
+                GroupMemberRow::Group { .. } => "",
+            })
+            .collect();
+        assert_eq!(usernames, vec!["alice", "zeb"]);
     }
 
     #[test]
     fn group_member_count_reflects_real_membership() {
         let conn = test_conn();
-        let group = create_group(&conn, "engineers", false, NOW).unwrap();
-        assert_eq!(group_member_count(&conn, &group.group_id).unwrap(), 0);
+        seed_group(&conn, "engineers");
+        assert_eq!(group_member_count_sync(&conn, "engineers").unwrap(), 0);
+        add_user_member(&conn, "engineers", "alice");
+        assert_eq!(group_member_count_sync(&conn, "engineers").unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn group_member_count_matches_the_sync_twin() {
+        let (_dir, conn, db) = conn_with_sea_orm().await;
+        let group = create_group(&db, "engineers", false, NOW).await.unwrap();
         add_user_member(&conn, &group.group_id, "alice");
-        assert_eq!(group_member_count(&conn, &group.group_id).unwrap(), 1);
+        assert_eq!(
+            group_member_count(&db, &group.group_id).await.unwrap(),
+            group_member_count_sync(&conn, &group.group_id).unwrap()
+        );
     }
 
     #[test]
-    fn list_groups_with_member_counts_is_ordered_by_name() {
+    fn list_groups_with_member_counts_sync_is_ordered_by_name() {
         let conn = test_conn();
-        create_group(&conn, "zebra", false, NOW).unwrap();
-        let engineers = create_group(&conn, "engineers", false, NOW).unwrap();
+        seed_group(&conn, "zebra");
+        seed_group(&conn, "engineers");
+        add_user_member(&conn, "engineers", "alice");
+        let groups = list_groups_with_member_counts_sync(&conn).unwrap();
+        let names: Vec<&str> = groups.iter().map(|(g, _)| g.name.as_str()).collect();
+        assert_eq!(names, vec!["engineers", "zebra"]);
+        assert_eq!(groups[0].1, 1);
+    }
+
+    #[tokio::test]
+    async fn list_groups_with_member_counts_is_ordered_by_name() {
+        let (_dir, conn, db) = conn_with_sea_orm().await;
+        create_group(&db, "zebra", false, NOW).await.unwrap();
+        let engineers = create_group(&db, "engineers", false, NOW).await.unwrap();
         add_user_member(&conn, &engineers.group_id, "alice");
-        let groups = list_groups_with_member_counts(&conn).unwrap();
+        let groups = list_groups_with_member_counts(&db).await.unwrap();
         let names: Vec<&str> = groups.iter().map(|(g, _)| g.name.as_str()).collect();
         assert_eq!(names, vec!["engineers", "zebra"]);
         assert_eq!(groups[0].1, 1);
     }
 
     #[test]
+    fn get_group_returns_none_for_an_unknown_id() {
+        let conn = test_conn();
+        assert!(get_group_sync(&conn, "nope").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn get_group_async_returns_none_for_an_unknown_id() {
+        let (_dir, _conn, db) = conn_with_sea_orm().await;
+        assert!(get_group(&db, "nope").await.unwrap().is_none());
+    }
+
+    #[test]
     fn update_group_fields_renames_a_group() {
         let conn = test_conn();
-        let group = create_group(&conn, "old-name", false, NOW).unwrap();
+        seed_group(&conn, "old-name");
         let ok = update_group_fields(
             &conn,
-            &group.group_id,
+            "old-name",
             &GroupFieldUpdate {
                 name: Some("new-name"),
                 is_sysadmin: None,
@@ -1382,7 +1937,7 @@ mod tests {
         .unwrap();
         assert!(ok);
         assert_eq!(
-            get_group(&conn, &group.group_id).unwrap().unwrap().name,
+            get_group_sync(&conn, "old-name").unwrap().unwrap().name,
             "new-name"
         );
     }
@@ -1390,10 +1945,10 @@ mod tests {
     #[test]
     fn update_group_fields_flips_is_sysadmin() {
         let conn = test_conn();
-        let group = create_group(&conn, "engineers", false, NOW).unwrap();
+        seed_group(&conn, "engineers");
         update_group_fields(
             &conn,
-            &group.group_id,
+            "engineers",
             &GroupFieldUpdate {
                 name: None,
                 is_sysadmin: Some(true),
@@ -1401,7 +1956,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            get_group(&conn, &group.group_id)
+            get_group_sync(&conn, "engineers")
                 .unwrap()
                 .unwrap()
                 .is_sysadmin
@@ -1411,11 +1966,11 @@ mod tests {
     #[test]
     fn update_group_fields_rejects_a_name_collision() {
         let conn = test_conn();
-        create_group(&conn, "taken", false, NOW).unwrap();
-        let group = create_group(&conn, "other", false, NOW).unwrap();
+        seed_group(&conn, "taken");
+        seed_group(&conn, "other");
         let err = update_group_fields(
             &conn,
-            &group.group_id,
+            "other",
             &GroupFieldUpdate {
                 name: Some("taken"),
                 is_sysadmin: None,
@@ -1443,97 +1998,18 @@ mod tests {
     #[test]
     fn delete_group_removes_the_row_and_reports_whether_one_existed() {
         let conn = test_conn();
-        let group = create_group(&conn, "engineers", false, NOW).unwrap();
-        assert!(delete_group(&conn, &group.group_id).unwrap());
-        assert!(get_group(&conn, &group.group_id).unwrap().is_none());
-        assert!(!delete_group(&conn, &group.group_id).unwrap());
+        seed_group(&conn, "engineers");
+        assert!(delete_group(&conn, "engineers").unwrap());
+        assert!(get_group_sync(&conn, "engineers").unwrap().is_none());
+        assert!(!delete_group(&conn, "engineers").unwrap());
     }
 
     #[test]
     fn delete_group_cascades_to_group_membership_rows() {
         let conn = test_conn();
-        let group = create_group(&conn, "engineers", false, NOW).unwrap();
-        add_user_member(&conn, &group.group_id, "alice");
-        assert!(delete_group(&conn, &group.group_id).unwrap());
-        assert_eq!(group_member_count(&conn, &group.group_id).unwrap(), 0);
-    }
-
-    #[test]
-    fn remove_group_member_by_id_matches_a_user_member() {
-        let conn = test_conn();
-        let group = create_group(&conn, "engineers", false, NOW).unwrap();
-        add_user_member(&conn, &group.group_id, "alice");
-        assert!(remove_group_member_by_id(&conn, &group.group_id, "alice").unwrap());
-        assert_eq!(group_member_count(&conn, &group.group_id).unwrap(), 0);
-    }
-
-    #[test]
-    fn remove_group_member_by_id_matches_a_nested_group_member() {
-        let conn = test_conn();
-        let parent = create_group(&conn, "parent", false, NOW).unwrap();
-        let child = create_group(&conn, "child", false, NOW).unwrap();
-        add_group_member(&conn, &parent.group_id, None, Some(&child.group_id), NOW).unwrap();
-        assert!(remove_group_member_by_id(&conn, &parent.group_id, &child.group_id).unwrap());
-        assert_eq!(group_member_count(&conn, &parent.group_id).unwrap(), 0);
-    }
-
-    #[test]
-    fn remove_group_member_by_id_returns_false_when_no_row_matches() {
-        let conn = test_conn();
-        let group = create_group(&conn, "engineers", false, NOW).unwrap();
-        assert!(!remove_group_member_by_id(&conn, &group.group_id, "nobody").unwrap());
-    }
-
-    #[test]
-    fn list_group_members_projects_a_user_member() {
-        let conn = test_conn();
-        let group = create_group(&conn, "engineers", false, NOW).unwrap();
-        add_user_member(&conn, &group.group_id, "alice");
-        let members = list_group_members(&conn, &group.group_id).unwrap();
-        assert_eq!(members.len(), 1);
-        assert_eq!(
-            members[0],
-            GroupMemberRow::User {
-                user_id: "alice".to_string(),
-                username: "alice".to_string(),
-                added_at: "2026-01-01T00:00:00Z".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn list_group_members_projects_a_nested_group_member() {
-        let conn = test_conn();
-        let parent = create_group(&conn, "parent", false, NOW).unwrap();
-        let child = create_group(&conn, "child", true, NOW).unwrap();
-        add_group_member(&conn, &parent.group_id, None, Some(&child.group_id), NOW).unwrap();
-        let members = list_group_members(&conn, &parent.group_id).unwrap();
-        assert_eq!(members.len(), 1);
-        assert_eq!(
-            members[0],
-            GroupMemberRow::Group {
-                group_id: child.group_id,
-                name: "child".to_string(),
-                is_sysadmin: true,
-                added_at: NOW.to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn list_group_members_orders_by_display_label() {
-        let conn = test_conn();
-        let group = create_group(&conn, "engineers", false, NOW).unwrap();
-        add_user_member(&conn, &group.group_id, "zeb");
-        add_user_member(&conn, &group.group_id, "alice");
-        let members = list_group_members(&conn, &group.group_id).unwrap();
-        let usernames: Vec<&str> = members
-            .iter()
-            .map(|m| match m {
-                GroupMemberRow::User { username, .. } => username.as_str(),
-                GroupMemberRow::Group { .. } => "",
-            })
-            .collect();
-        assert_eq!(usernames, vec!["alice", "zeb"]);
+        seed_group(&conn, "engineers");
+        add_user_member(&conn, "engineers", "alice");
+        assert!(delete_group(&conn, "engineers").unwrap());
+        assert_eq!(group_member_count_sync(&conn, "engineers").unwrap(), 0);
     }
 }

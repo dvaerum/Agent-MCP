@@ -18,6 +18,7 @@
 use conexus_core::principal::Principal;
 use conexus_db::group_membership_repository::{self, GroupMemberRow, GroupMembershipError};
 use rusqlite::{Connection, TransactionBehavior};
+use sea_orm::DatabaseConnection;
 
 use crate::admin_users_gate::{self, AdminUsersError};
 use crate::mcp_handler::HandlerResponse;
@@ -59,15 +60,24 @@ fn member_json(row: &GroupMemberRow) -> serde_json::Value {
     }
 }
 
-/// Port of `list_group_members_handler`.
-pub fn list_group_members_response(
-    conn: &Connection,
+/// Port of `list_group_members_handler`. Async/sea-orm: its only real
+/// caller, `users_groups_rest.rs::list_group_members_handler`, is a
+/// plain read with no transaction requirement -- converted alongside
+/// `group_membership_repository::get_group`/`list_group_members`
+/// (this PR's own call-site classification found no forced-sync
+/// caller for either, once this function moved off the transaction-
+/// bound `decide_*` shape it never actually needed).
+pub async fn list_group_members_response(
+    db: &DatabaseConnection,
     group_id: &str,
-) -> rusqlite::Result<HandlerResponse> {
-    if group_membership_repository::get_group(conn, group_id)?.is_none() {
+) -> Result<HandlerResponse, sea_orm::DbErr> {
+    if group_membership_repository::get_group(db, group_id)
+        .await?
+        .is_none()
+    {
         return Ok(not_found_group(group_id));
     }
-    let members = group_membership_repository::list_group_members(conn, group_id)?;
+    let members = group_membership_repository::list_group_members(db, group_id).await?;
     let json_members: Vec<serde_json::Value> = members.iter().map(member_json).collect();
     Ok(admin_users_gate::success_envelope(
         serde_json::json!({"members": json_members}),
@@ -166,7 +176,7 @@ pub fn decide_add_group_member(
     }
 
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    if group_membership_repository::get_group(&tx, parent_group_id)?.is_none() {
+    if group_membership_repository::get_group_sync(&tx, parent_group_id)?.is_none() {
         return Ok(AddGroupMemberOutcome::Rejected(not_found_group(
             parent_group_id,
         )));
@@ -195,7 +205,7 @@ pub fn decide_add_group_member(
             ));
         }
     }
-    match group_membership_repository::add_group_member(
+    match group_membership_repository::add_group_member_sync(
         &tx,
         parent_group_id,
         member_user_id,
@@ -240,6 +250,9 @@ pub fn decide_add_group_member(
             }
             return Err(e);
         }
+        Err(GroupMembershipError::SeaOrm(_)) => unreachable!(
+            "add_group_member_sync (rusqlite) never returns GroupMembershipError::SeaOrm, only ::Db"
+        ),
     }
     tx.commit()?;
     let mut member = serde_json::Map::new();
@@ -343,10 +356,26 @@ mod tests {
     }
     const NOW: &str = "2026-01-01T00:00:00.000+00:00";
 
+    /// Raw INSERT, standing in for the now-async
+    /// `group_membership_repository::create_group` -- this module's
+    /// own `decide_add_group_member`/`decide_remove_group_member`
+    /// under test stay rusqlite-based (transaction-bound), so seeding
+    /// via a direct INSERT avoids forcing every one of those tests
+    /// onto the async dual-connection fixture just to mint a fixture
+    /// row. Real `create_group` coverage lives in its own crate
+    /// (`group_membership_repository.rs`) and `admin_groups.rs` tests.
+    fn seed_group_with_flag(c: &Connection, name: &str, is_sysadmin: bool) -> String {
+        let group_id = format!("gid-{name}");
+        c.execute(
+            "INSERT INTO groups (group_id, name, is_sysadmin, created_at) VALUES (?1, ?2, ?3, ?4)",
+            (&group_id, name, is_sysadmin, NOW),
+        )
+        .unwrap();
+        group_id
+    }
+
     fn seed_group(c: &Connection, name: &str) -> String {
-        group_membership_repository::create_group(c, name, false, NOW)
-            .unwrap()
-            .group_id
+        seed_group_with_flag(c, name, false)
     }
 
     async fn seed_user(db: &sea_orm::DatabaseConnection, username: &str) -> String {
@@ -371,8 +400,9 @@ mod tests {
         let (_dir, c, db) = conn_with_sea_orm().await;
         let gid = seed_group(&c, "engineers");
         let alice = seed_user(&db, "alice").await;
-        group_membership_repository::add_group_member(&c, &gid, Some(&alice), None, NOW).unwrap();
-        let resp = list_group_members_response(&c, &gid).unwrap();
+        group_membership_repository::add_group_member_sync(&c, &gid, Some(&alice), None, NOW)
+            .unwrap();
+        let resp = list_group_members_response(&db, &gid).await.unwrap();
         let crate::mcp_handler::HandlerBody::Json(body) = resp.body else {
             panic!("expected JSON");
         };
@@ -381,10 +411,10 @@ mod tests {
         assert_eq!(members[0]["username"], "alice");
     }
 
-    #[test]
-    fn rejects_listing_members_of_an_unknown_group() {
-        let c = conn();
-        let resp = list_group_members_response(&c, "nope").unwrap();
+    #[tokio::test]
+    async fn rejects_listing_members_of_an_unknown_group() {
+        let (_dir, _c, db) = conn_with_sea_orm().await;
+        let resp = list_group_members_response(&db, "nope").await.unwrap();
         assert_eq!(resp.status, 404);
     }
 
@@ -408,7 +438,7 @@ mod tests {
         .unwrap();
         assert!(matches!(outcome, AddGroupMemberOutcome::Added(_)));
         assert_eq!(
-            group_membership_repository::group_member_count(&c, &gid).unwrap(),
+            group_membership_repository::group_member_count_sync(&c, &gid).unwrap(),
             1
         );
     }
@@ -481,7 +511,8 @@ mod tests {
         let (_dir, mut c, db) = conn_with_sea_orm().await;
         let gid = seed_group(&c, "engineers");
         let alice = seed_user(&db, "alice").await;
-        group_membership_repository::add_group_member(&c, &gid, Some(&alice), None, NOW).unwrap();
+        group_membership_repository::add_group_member_sync(&c, &gid, Some(&alice), None, NOW)
+            .unwrap();
         let outcome = decide_add_group_member(
             &mut c,
             true,
@@ -504,7 +535,7 @@ mod tests {
         let mut c = conn();
         let parent = seed_group(&c, "parent");
         let child = seed_group(&c, "child");
-        group_membership_repository::add_group_member(&c, &parent, None, Some(&child), NOW)
+        group_membership_repository::add_group_member_sync(&c, &parent, None, Some(&child), NOW)
             .unwrap();
         // child -> parent would close a 2-cycle.
         let outcome = decide_add_group_member(
@@ -527,9 +558,7 @@ mod tests {
     #[tokio::test]
     async fn a_non_sysadmin_cannot_add_a_member_to_a_sysadmin_group() {
         let (_dir, mut c, db) = conn_with_sea_orm().await;
-        let gid = group_membership_repository::create_group(&c, "engineers", true, NOW)
-            .unwrap()
-            .group_id;
+        let gid = seed_group_with_flag(&c, "engineers", true);
         let alice = seed_user(&db, "alice").await;
         let outcome = decide_add_group_member(
             &mut c,
@@ -559,9 +588,7 @@ mod tests {
     #[test]
     fn a_non_sysadmin_cannot_nest_a_group_into_a_sysadmin_group() {
         let mut c = conn();
-        let sysadmin_gid = group_membership_repository::create_group(&c, "real-admins", true, NOW)
-            .unwrap()
-            .group_id;
+        let sysadmin_gid = seed_group_with_flag(&c, "real-admins", true);
         let pawn_gid = seed_group(&c, "pawn-group");
         let outcome = decide_add_group_member(
             &mut c,
@@ -588,12 +615,10 @@ mod tests {
     #[tokio::test]
     async fn a_non_sysadmin_cannot_join_a_group_that_is_transitively_sysadmin() {
         let (_dir, mut c, db) = conn_with_sea_orm().await;
-        let top_gid = group_membership_repository::create_group(&c, "top-admins", true, NOW)
-            .unwrap()
-            .group_id;
+        let top_gid = seed_group_with_flag(&c, "top-admins", true);
         let mid_gid = seed_group(&c, "middle-group");
         // mid ∈ top -- members of mid inherit sysadmin from top.
-        group_membership_repository::add_group_member(&c, &top_gid, None, Some(&mid_gid), NOW)
+        group_membership_repository::add_group_member_sync(&c, &top_gid, None, Some(&mid_gid), NOW)
             .unwrap();
         let alice = seed_user(&db, "alice").await;
         let outcome = decide_add_group_member(
@@ -637,12 +662,27 @@ mod tests {
         assert_eq!(resp.status, 403);
     }
 
+    /// Raw INSERT, standing in for the now-async
+    /// `group_capability_repository::replace` -- pure fixture setup
+    /// here (no test in this module exercises `replace` itself; that
+    /// coverage lives in `group_capability_repository.rs`/
+    /// `admin_group_capabilities.rs`), so a direct INSERT avoids
+    /// forcing every one of this module's own (transaction-bound,
+    /// still-rusqlite) `decide_add_group_member`/
+    /// `decide_remove_group_member` tests onto the async dual-
+    /// connection fixture just to grant a fixture capability.
     fn group_capability_replace<'a, I: IntoIterator<Item = &'a str>>(
         c: &Connection,
         gid: &str,
         caps: I,
     ) {
-        conexus_db::group_capability_repository::replace(c, gid, caps).unwrap();
+        for cap in caps {
+            c.execute(
+                "INSERT INTO group_capability (group_id, capability) VALUES (?1, ?2)",
+                (gid, cap),
+            )
+            .unwrap();
+        }
     }
 
     fn principal_with_caps<'a, I: IntoIterator<Item = &'a str>>(
@@ -888,12 +928,13 @@ mod tests {
         .unwrap();
         let gid = seed_group(&c, "engineers");
         let alice = seed_user(&db, "alice").await;
-        group_membership_repository::add_group_member(&c, &gid, Some(&alice), None, NOW).unwrap();
+        group_membership_repository::add_group_member_sync(&c, &gid, Some(&alice), None, NOW)
+            .unwrap();
         let outcome =
             decide_remove_group_member(&mut c, true, "admin", None, None, &gid, &alice).unwrap();
         assert!(matches!(outcome, RemoveGroupMemberOutcome::Removed(_)));
         assert_eq!(
-            group_membership_repository::group_member_count(&c, &gid).unwrap(),
+            group_membership_repository::group_member_count_sync(&c, &gid).unwrap(),
             0
         );
     }
@@ -913,11 +954,10 @@ mod tests {
     #[tokio::test]
     async fn a_non_sysadmin_cannot_remove_a_member_from_a_sysadmin_group() {
         let (_dir, mut c, db) = conn_with_sea_orm().await;
-        let gid = group_membership_repository::create_group(&c, "engineers", true, NOW)
-            .unwrap()
-            .group_id;
+        let gid = seed_group_with_flag(&c, "engineers", true);
         let alice = seed_user(&db, "alice").await;
-        group_membership_repository::add_group_member(&c, &gid, Some(&alice), None, NOW).unwrap();
+        group_membership_repository::add_group_member_sync(&c, &gid, Some(&alice), None, NOW)
+            .unwrap();
         let outcome =
             decide_remove_group_member(&mut c, false, "bob", None, None, &gid, &alice).unwrap();
         let RemoveGroupMemberOutcome::Rejected(resp) = outcome else {
@@ -926,7 +966,7 @@ mod tests {
         assert_eq!(resp.status, 403);
         // Confirm the rollback actually left the membership intact.
         assert_eq!(
-            group_membership_repository::group_member_count(&c, &gid).unwrap(),
+            group_membership_repository::group_member_count_sync(&c, &gid).unwrap(),
             1
         );
     }
@@ -947,7 +987,8 @@ mod tests {
         let gid = seed_group(&c, "g-caps");
         group_capability_replace(&c, &gid, ["system.users.manage"]);
         let victim = seed_user(&db, "victim").await;
-        group_membership_repository::add_group_member(&c, &gid, Some(&victim), None, NOW).unwrap();
+        group_membership_repository::add_group_member_sync(&c, &gid, Some(&victim), None, NOW)
+            .unwrap();
         let principal = principal_with_caps("alice", ["system.groups.manage"]);
         let outcome = decide_remove_group_member(
             &mut c,
@@ -964,7 +1005,7 @@ mod tests {
         };
         assert_eq!(resp.status, 403);
         assert_eq!(
-            group_membership_repository::group_member_count(&c, &gid).unwrap(),
+            group_membership_repository::group_member_count_sync(&c, &gid).unwrap(),
             1
         );
     }
@@ -979,7 +1020,8 @@ mod tests {
         let gid = seed_group(&c, "g-proj");
         seed_project_membership(&db, "proj-r12", None, Some(&gid), "operator").await;
         let victim = seed_user(&db, "victim").await;
-        group_membership_repository::add_group_member(&c, &gid, Some(&victim), None, NOW).unwrap();
+        group_membership_repository::add_group_member_sync(&c, &gid, Some(&victim), None, NOW)
+            .unwrap();
         let principal = principal_with_caps("alice", ["system.groups.manage"]);
         let outcome = decide_remove_group_member(
             &mut c,
@@ -1022,7 +1064,8 @@ mod tests {
         let gid = seed_group(&c, "g-safe");
         group_capability_replace(&c, &gid, ["system.users.manage"]);
         let victim = seed_user(&db, "victim").await;
-        group_membership_repository::add_group_member(&c, &gid, Some(&victim), None, NOW).unwrap();
+        group_membership_repository::add_group_member_sync(&c, &gid, Some(&victim), None, NOW)
+            .unwrap();
         let principal =
             principal_with_caps("alice", ["system.groups.manage", "system.users.manage"]);
         let outcome = decide_remove_group_member(
@@ -1059,7 +1102,8 @@ mod tests {
         let gid = seed_group(&c, "g-caps");
         group_capability_replace(&c, &gid, ["system.users.manage"]);
         let victim = seed_user(&db, "victim").await;
-        group_membership_repository::add_group_member(&c, &gid, Some(&victim), None, NOW).unwrap();
+        group_membership_repository::add_group_member_sync(&c, &gid, Some(&victim), None, NOW)
+            .unwrap();
         let outcome =
             decide_remove_group_member(&mut c, true, "root", None, None, &gid, &victim).unwrap();
         assert!(matches!(outcome, RemoveGroupMemberOutcome::Removed(_)));
@@ -1068,11 +1112,10 @@ mod tests {
     #[tokio::test]
     async fn refuses_to_drain_the_last_sysadmin_groups_sole_member() {
         let (_dir, mut c, db) = conn_with_sea_orm().await;
-        let gid = group_membership_repository::create_group(&c, "engineers", true, NOW)
-            .unwrap()
-            .group_id;
+        let gid = seed_group_with_flag(&c, "engineers", true);
         let alice = seed_user(&db, "alice").await;
-        group_membership_repository::add_group_member(&c, &gid, Some(&alice), None, NOW).unwrap();
+        group_membership_repository::add_group_member_sync(&c, &gid, Some(&alice), None, NOW)
+            .unwrap();
         // Sysadmin caller bypasses the amplification guard but must
         // still hit the R5-F4 global-invariant check.
         let outcome =
@@ -1082,7 +1125,7 @@ mod tests {
         };
         assert_eq!(resp.status, 409);
         assert_eq!(
-            group_membership_repository::group_member_count(&c, &gid).unwrap(),
+            group_membership_repository::group_member_count_sync(&c, &gid).unwrap(),
             1,
             "the removal must have rolled back"
         );
@@ -1091,11 +1134,10 @@ mod tests {
     #[tokio::test]
     async fn allows_draining_when_another_sysadmin_source_remains() {
         let (_dir, mut c, db) = conn_with_sea_orm().await;
-        let gid = group_membership_repository::create_group(&c, "engineers", true, NOW)
-            .unwrap()
-            .group_id;
+        let gid = seed_group_with_flag(&c, "engineers", true);
         let alice = seed_user(&db, "alice").await;
-        group_membership_repository::add_group_member(&c, &gid, Some(&alice), None, NOW).unwrap();
+        group_membership_repository::add_group_member_sync(&c, &gid, Some(&alice), None, NOW)
+            .unwrap();
         crate::identity::create_user(
             &db,
             "bob",

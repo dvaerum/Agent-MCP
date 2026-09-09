@@ -5,7 +5,11 @@
 //! composing three already-ported pieces: the pure bundle functions
 //! (`agent_role_bundle`/`project_role_bundle`, `conexus-core`), the
 //! group-capability overlay
-//! (`conexus_db::group_capability_repository::fetch`), and transitive
+//! (`conexus_db::group_capability_repository::fetch_sync` -- this
+//! function stays fully synchronous, see its own doc: called from
+//! `session_gate.rs`/`project_gate.rs`'s hot revalidation path, this
+//! migration's own declared highest-risk hot path, never forced
+//! async), and transitive
 //! group resolution (`conexus_db::group_membership_repository::
 //! resolve_user_groups`).
 
@@ -82,7 +86,7 @@ pub fn resolve_capabilities(
             None => group_membership_repository::resolve_user_groups(conn, user_id)?,
         };
         for gid in &group_ids {
-            let granted = group_capability_repository::fetch(conn, gid)?;
+            let granted = group_capability_repository::fetch_sync(conn, gid)?;
             // SEC R2-F3 (see conexus_db::group_capability_repository's
             // module doc): `group_capability` has no `project_name`
             // column, so a resource-tier grant would be global across
@@ -126,6 +130,28 @@ mod tests {
             [group_id],
         )
         .unwrap();
+    }
+
+    /// Raw INSERT, standing in for `group_capability_repository::
+    /// replace` (now sea-orm async-only, per that crate's own module
+    /// doc -- its rusqlite `fetch_sync` twin exists for
+    /// `resolve_capabilities`'s own hot-path READ, but there's no
+    /// equivalent sync WRITE twin since no real caller needs one).
+    /// Pure fixture setup here -- no test in this module exercises
+    /// `replace` itself; that coverage lives in
+    /// `group_capability_repository.rs`.
+    fn seed_group_capabilities<'a, I: IntoIterator<Item = &'a str>>(
+        conn: &Connection,
+        group_id: &str,
+        caps: I,
+    ) {
+        for cap in caps {
+            conn.execute(
+                "INSERT INTO group_capability (group_id, capability) VALUES (?1, ?2)",
+                (group_id, cap),
+            )
+            .unwrap();
+        }
     }
 
     fn add_user_member(conn: &Connection, group_id: &str, user_id: &str) {
@@ -244,7 +270,7 @@ mod tests {
         let conn = router_conn();
         seed_group(&conn, "admins");
         add_user_member(&conn, "admins", "alice");
-        group_capability_repository::replace(&conn, "admins", ["system.view"]).unwrap();
+        seed_group_capabilities(&conn, "admins", ["system.view"]);
 
         let mut input = base_input();
         input.user_id = Some("alice");
@@ -266,8 +292,7 @@ mod tests {
         let conn = router_conn();
         seed_group(&conn, "admins");
         add_user_member(&conn, "admins", "alice");
-        group_capability_repository::replace(&conn, "admins", ["system.view", "memories.create"])
-            .unwrap();
+        seed_group_capabilities(&conn, "admins", ["system.view", "memories.create"]);
 
         let mut input = base_input();
         input.user_id = Some("alice");
@@ -289,8 +314,7 @@ mod tests {
         let conn = router_conn();
         seed_group(&conn, "admins");
         add_user_member(&conn, "admins", "alice");
-        group_capability_repository::replace(&conn, "admins", ["system.view", "*", "bogus"])
-            .unwrap();
+        seed_group_capabilities(&conn, "admins", ["system.view", "*", "bogus"]);
 
         let mut input = base_input();
         input.user_id = Some("alice");
@@ -313,7 +337,7 @@ mod tests {
             [],
         )
         .unwrap();
-        group_capability_repository::replace(&conn, "engineers", ["system.config.write"]).unwrap();
+        seed_group_capabilities(&conn, "engineers", ["system.config.write"]);
 
         let mut input = base_input();
         input.user_id = Some("alice");
@@ -333,7 +357,7 @@ mod tests {
         // find nothing and the group capability below would be
         // missed.
         seed_group(&conn, "admins");
-        group_capability_repository::replace(&conn, "admins", ["system.view"]).unwrap();
+        seed_group_capabilities(&conn, "admins", ["system.view"]);
 
         let mut input = base_input();
         input.user_id = Some("alice");
@@ -352,7 +376,7 @@ mod tests {
         let conn = router_conn();
         seed_group(&conn, "admins");
         add_user_member(&conn, "admins", "alice");
-        group_capability_repository::replace(&conn, "admins", ["system.sso.configure"]).unwrap();
+        seed_group_capabilities(&conn, "admins", ["system.sso.configure"]);
 
         let mut input = base_input();
         input.user_id = Some("alice");

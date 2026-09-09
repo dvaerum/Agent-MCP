@@ -365,19 +365,26 @@ mod tests {
     /// capability check the revalidator runs FIRST always passes and
     /// the membership/rank branch under test is what actually decides
     /// the outcome.
-    fn grant_capability_via_group(c: &Connection, user_id: &str, cap: Capability) {
+    async fn grant_capability_via_group(
+        db: &sea_orm::DatabaseConnection,
+        user_id: &str,
+        cap: Capability,
+    ) {
         let group =
-            conexus_db::group_membership_repository::create_group(c, "g-delegated", false, NOW)
+            conexus_db::group_membership_repository::create_group(db, "g-delegated", false, NOW)
+                .await
                 .unwrap();
-        conexus_db::group_capability_repository::replace(c, &group.group_id, [cap.as_str()])
+        conexus_db::group_capability_repository::replace(db, &group.group_id, [cap.as_str()])
+            .await
             .unwrap();
         conexus_db::group_membership_repository::add_group_member(
-            c,
+            db,
             &group.group_id,
             Some(user_id),
             None,
             NOW,
         )
+        .await
         .unwrap();
     }
 
@@ -405,7 +412,7 @@ mod tests {
         )
         .await
         .unwrap();
-        grant_capability_via_group(&c, &bob, Capability::SystemProjectsManage);
+        grant_capability_via_group(&db, &bob, Capability::SystemProjectsManage).await;
         let lock = AsyncMutex::new(c);
         let store = RuntimeStore::new();
         let spec = RevalidationSpec {
@@ -449,7 +456,7 @@ mod tests {
         )
         .await
         .unwrap();
-        grant_capability_via_group(&c, &bob, Capability::SystemProjectsManage);
+        grant_capability_via_group(&db, &bob, Capability::SystemProjectsManage).await;
         c.execute(
             "INSERT INTO project_membership (project_name, user_id, role) VALUES ('proj-a', ?1, 'viewer')",
             [&bob],

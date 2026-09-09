@@ -78,6 +78,12 @@ impl From<rusqlite::Error> for HandlerResponse {
     }
 }
 
+impl From<sea_orm::DbErr> for HandlerResponse {
+    fn from(e: sea_orm::DbErr) -> Self {
+        internal_error(e)
+    }
+}
+
 fn cookie_header(headers: &HeaderMap) -> Option<&str> {
     headers.get("cookie").and_then(|v| v.to_str().ok())
 }
@@ -273,8 +279,7 @@ pub async fn list_groups_handler(
     if let Err(resp) = require_groups_capability(&state, &identity) {
         return resp.into_response();
     }
-    let conn = state.conn.lock().await;
-    match admin_groups::list_groups_response(&conn) {
+    match admin_groups::list_groups_response(&state.sea_orm_db).await {
         Ok(resp) => resp.into_response(),
         Err(e) => HandlerResponse::from(e).into_response(),
     }
@@ -290,7 +295,6 @@ pub async fn create_group_handler(
     if let Err(resp) = require_groups_capability(&state, &identity) {
         return resp.into_response();
     }
-    let conn = state.conn.lock().await;
     let now_str = Utc::now().to_rfc3339();
     let spec = RevalidationSpec {
         stale_user_id: &identity.user.user_id,
@@ -299,18 +303,23 @@ pub async fn create_group_handler(
         cap: Capability::SystemGroupsManage,
         project: None,
     };
-    let (parsed, principal) = match perm_gates::read_body_and_revalidate(&conn, &body, &spec) {
-        Ok(v) => v,
-        Err(resp) => return resp.into_response(),
+    let (parsed, principal) = {
+        let conn = state.conn.lock().await;
+        match perm_gates::read_body_and_revalidate(&conn, &body, &spec) {
+            Ok(v) => v,
+            Err(resp) => return resp.into_response(),
+        }
     };
     let parsed_value = serde_json::Value::Object(parsed);
     let outcome = match admin_groups::decide_create_group(
-        &conn,
+        &state.sea_orm_db,
         fresh_is_sysadmin(&principal),
         &identity.user.username,
         &parsed_value,
         &now_str,
-    ) {
+    )
+    .await
+    {
         Ok(o) => o,
         Err(e) => return HandlerResponse::from(e).into_response(),
     };
@@ -409,8 +418,7 @@ pub async fn list_group_members_handler(
     if let Err(resp) = require_groups_capability(&state, &identity) {
         return resp.into_response();
     }
-    let conn = state.conn.lock().await;
-    match admin_group_members::list_group_members_response(&conn, &group_id) {
+    match admin_group_members::list_group_members_response(&state.sea_orm_db, &group_id).await {
         Ok(resp) => resp.into_response(),
         Err(e) => HandlerResponse::from(e).into_response(),
     }
@@ -522,8 +530,12 @@ pub async fn list_group_capabilities_handler(
     if let Err(resp) = require_group_caps_capability(&state, &identity) {
         return resp.into_response();
     }
-    let conn = state.conn.lock().await;
-    let outcome = match admin_group_capabilities::decide_list_group_capabilities(&conn, &group_id) {
+    let outcome = match admin_group_capabilities::decide_list_group_capabilities(
+        &state.sea_orm_db,
+        &group_id,
+    )
+    .await
+    {
         Ok(o) => o,
         Err(e) => return HandlerResponse::from(e).into_response(),
     };
@@ -557,7 +569,6 @@ pub async fn replace_group_capabilities_handler(
     if let Err(resp) = require_group_caps_capability(&state, &identity) {
         return resp.into_response();
     }
-    let conn = state.conn.lock().await;
     let now_str = Utc::now().to_rfc3339();
     let spec = RevalidationSpec {
         stale_user_id: &identity.user.user_id,
@@ -566,19 +577,24 @@ pub async fn replace_group_capabilities_handler(
         cap: Capability::SystemGroupsCapabilitiesManage,
         project: None,
     };
-    let (parsed, principal) = match perm_gates::read_body_and_revalidate(&conn, &body, &spec) {
-        Ok(v) => v,
-        Err(resp) => return resp.into_response(),
+    let (parsed, principal) = {
+        let conn = state.conn.lock().await;
+        match perm_gates::read_body_and_revalidate(&conn, &body, &spec) {
+            Ok(v) => v,
+            Err(resp) => return resp.into_response(),
+        }
     };
     let parsed_value = serde_json::Value::Object(parsed);
     let outcome = match admin_group_capabilities::decide_replace_group_capabilities(
-        &conn,
+        &state.sea_orm_db,
         &group_id,
         fresh_is_sysadmin(&principal),
         &identity.user.username,
         Some(&principal),
         &parsed_value,
-    ) {
+    )
+    .await
+    {
         Ok(o) => o,
         Err(e) => return HandlerResponse::from(e).into_response(),
     };
@@ -1105,25 +1121,38 @@ mod tests {
         )
         .await
         .unwrap();
-        let group =
-            group_membership_repository::create_group(&conn, &format!("g-{username}"), false, NOW)
-                .unwrap();
-        group_capability_repository::replace(&conn, &group.group_id, caps.iter().copied()).unwrap();
+        let group = group_membership_repository::create_group(
+            &state.sea_orm_db,
+            &format!("g-{username}"),
+            false,
+            NOW,
+        )
+        .await
+        .unwrap();
+        group_capability_repository::replace(
+            &state.sea_orm_db,
+            &group.group_id,
+            caps.iter().copied(),
+        )
+        .await
+        .unwrap();
         group_membership_repository::add_group_member(
-            &conn,
+            &state.sea_orm_db,
             &group.group_id,
             Some(&uid),
             None,
             NOW,
         )
+        .await
         .unwrap();
         let identity = identity_for(&conn, &state.sea_orm_db, &uid).await;
         (uid, group.group_id, identity)
     }
 
     async fn revoke_capability(state: &RouterState, group_id: &str) {
-        let conn = state.conn.lock().await;
-        group_capability_repository::replace(&conn, group_id, std::iter::empty()).unwrap();
+        group_capability_repository::replace(&state.sea_orm_db, group_id, std::iter::empty())
+            .await
+            .unwrap();
     }
 
     fn json_body(v: serde_json::Value) -> Bytes {
@@ -1518,12 +1547,15 @@ mod tests {
         let (_dir, state) = real_state().await;
         let (_dev_id, group_id, identity) =
             seed_delegate(&state, "dev", &[Capability::SystemGroupsManage.as_str()]).await;
-        let target_group_id = {
-            let conn = state.conn.lock().await;
-            group_membership_repository::create_group(&conn, "target-group", false, NOW)
-                .unwrap()
-                .group_id
-        };
+        let target_group_id = group_membership_repository::create_group(
+            &state.sea_orm_db,
+            "target-group",
+            false,
+            NOW,
+        )
+        .await
+        .unwrap()
+        .group_id;
         revoke_capability(&state, &group_id).await;
 
         let body = json_body(serde_json::json!({"name": "renamed-target-group"}));
@@ -1556,12 +1588,15 @@ mod tests {
             seed_delegate(&state, "dev", &[Capability::SystemGroupsManage.as_str()]).await;
         let (newbie_id, _newbie_group, _newbie_identity) =
             seed_delegate(&state, "newbie", &[]).await;
-        let target_group_id = {
-            let conn = state.conn.lock().await;
-            group_membership_repository::create_group(&conn, "target-group-2", false, NOW)
-                .unwrap()
-                .group_id
-        };
+        let target_group_id = group_membership_repository::create_group(
+            &state.sea_orm_db,
+            "target-group-2",
+            false,
+            NOW,
+        )
+        .await
+        .unwrap()
+        .group_id;
         revoke_capability(&state, &group_id).await;
 
         let body = json_body(serde_json::json!({"user_id": newbie_id}));
@@ -1592,12 +1627,15 @@ mod tests {
             &[Capability::SystemGroupsCapabilitiesManage.as_str()],
         )
         .await;
-        let target_group_id = {
-            let conn = state.conn.lock().await;
-            group_membership_repository::create_group(&conn, "target-group-3", false, NOW)
-                .unwrap()
-                .group_id
-        };
+        let target_group_id = group_membership_repository::create_group(
+            &state.sea_orm_db,
+            "target-group-3",
+            false,
+            NOW,
+        )
+        .await
+        .unwrap()
+        .group_id;
         revoke_capability(&state, &group_id).await;
 
         let body = json_body(serde_json::json!({
@@ -1614,7 +1652,7 @@ mod tests {
         assert_eq!(resp_status(&resp), 403);
 
         let conn = state.conn.lock().await;
-        let caps = group_capability_repository::fetch(&conn, &target_group_id).unwrap();
+        let caps = group_capability_repository::fetch_sync(&conn, &target_group_id).unwrap();
         assert!(
             caps.is_empty(),
             "target group's capabilities must NOT have been replaced off the stale grant"

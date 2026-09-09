@@ -441,32 +441,36 @@ pub async fn handle_oidc_callback(
 
     // Phase G router step 4 PR D: `find_or_create_oidc_user` above is
     // now sea-orm-backed and no longer holds `state.conn`'s rusqlite
-    // guard, so the group-mapping/session-creation rusqlite work below
-    // (still out of scope -- `group_membership`/`sessions`) takes its
-    // OWN, separately-scoped lock rather than sharing one across the
-    // whole handler.
+    // guard. Phase G PR G: the group-mapping step below is ALSO now
+    // sea-orm-backed (`oidc_group_mapping.rs`'s own module doc) --
+    // `sessions` alone (still out of scope) needs the rusqlite guard,
+    // so it takes its own, separately-scoped lock AFTER the group-
+    // mapping calls finish, rather than one shared across the whole
+    // handler.
     let expires =
         (now + chrono::Duration::days(identity::DEFAULT_SESSION_LIFETIME_DAYS)).to_rfc3339();
+    if !cfg.group_mapping.is_empty() {
+        apply_group_mapping(
+            &state.sea_orm_db,
+            &user.user_id,
+            &groups_claim,
+            &cfg.group_mapping,
+            &now_str,
+        )
+        .await;
+        // De-provision (round-9 AC-R9-1): revoke IdP-managed (oidc:)
+        // memberships the current claim no longer justifies. Manual
+        // local grants are out of scope and untouched.
+        reconcile_oidc_group_membership(
+            &state.sea_orm_db,
+            &user.user_id,
+            &groups_claim,
+            &cfg.group_mapping,
+        )
+        .await;
+    }
     let session_id = {
         let conn = state.conn.lock().await;
-        if !cfg.group_mapping.is_empty() {
-            apply_group_mapping(
-                &conn,
-                &user.user_id,
-                &groups_claim,
-                &cfg.group_mapping,
-                &now_str,
-            );
-            // De-provision (round-9 AC-R9-1): revoke IdP-managed (oidc:)
-            // memberships the current claim no longer justifies. Manual
-            // local grants are out of scope and untouched.
-            reconcile_oidc_group_membership(
-                &conn,
-                &user.user_id,
-                &groups_claim,
-                &cfg.group_mapping,
-            );
-        }
         match identity::create_session(&conn, &user.user_id, &now_str, &expires) {
             Ok(s) => s,
             Err(_) => {

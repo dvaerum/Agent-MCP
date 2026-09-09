@@ -291,15 +291,17 @@ mod tests {
         let (_dir, c, db) = conn_with_sea_orm().await;
         let user_id = seed_user(&db, "frank").await;
         let group =
-            conexus_db::group_membership_repository::create_group(&c, "team-a", false, NOW_STR)
+            conexus_db::group_membership_repository::create_group(&db, "team-a", false, NOW_STR)
+                .await
                 .unwrap();
         conexus_db::group_membership_repository::add_group_member(
-            &c,
+            &db,
             &group.group_id,
             Some(&user_id),
             None,
             NOW_STR,
         )
+        .await
         .unwrap();
         identity::grant_project_membership(&db, "proj-a", None, Some(&group.group_id), "operator")
             .await

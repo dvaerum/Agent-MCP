@@ -1404,28 +1404,31 @@ mod handler_tests {
         )
         .await
         .unwrap();
-        let conn = state.conn.lock().await;
         let group = group_membership_repository::create_group(
-            &conn,
+            &state.sea_orm_db,
             &format!("g-{username}"),
             false,
             NOW_STR,
         )
+        .await
         .unwrap();
         group_capability_repository::replace(
-            &conn,
+            &state.sea_orm_db,
             &group.group_id,
             [Capability::SystemProjectsManage.as_str()],
         )
+        .await
         .unwrap();
         group_membership_repository::add_group_member(
-            &conn,
+            &state.sea_orm_db,
             &group.group_id,
             Some(&uid),
             None,
             NOW_STR,
         )
+        .await
         .unwrap();
+        let conn = state.conn.lock().await;
         conn.execute(
             "INSERT INTO project_membership (project_name, user_id, role) VALUES (?1, ?2, ?3)",
             (project, &uid, role),
@@ -1440,8 +1443,13 @@ mod handler_tests {
     }
 
     async fn revoke_delegate_capability(state: &RouterState, group_id: &str) {
-        let conn = state.conn.lock().await;
-        group_capability_repository::replace(&conn, group_id, std::iter::empty::<&str>()).unwrap();
+        group_capability_repository::replace(
+            &state.sea_orm_db,
+            group_id,
+            std::iter::empty::<&str>(),
+        )
+        .await
+        .unwrap();
     }
 
     async fn revoke_delegate_membership(state: &RouterState, project: &str, user_id: &str) {
