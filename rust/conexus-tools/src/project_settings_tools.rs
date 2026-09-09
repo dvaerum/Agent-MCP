@@ -105,13 +105,12 @@ impl conexus_auth::Tool for ViewProjectSettingsTool {
     fn call<'a>(
         principal: Option<&'a Principal>,
         _arguments: &'a Value,
-        conn: &'a AsyncMutex<Connection>,
+        _conn: &'a AsyncMutex<Connection>,
         _now: &'a str,
-        _ctx: &'a conexus_auth::ToolCallContext<'a>,
+        ctx: &'a conexus_auth::ToolCallContext<'a>,
     ) -> conexus_auth::BoxFuture<'a, ToolResult> {
         Box::pin(async move {
-            let conn = conn.lock().await;
-            let rows = match settings_repo::list_all(&conn) {
+            let rows = match settings_repo::list_all(ctx.sea_orm_db).await {
                 Ok(rows) => rows,
                 // Server-side error logging deferred: no logging/tracing
                 // crate exists anywhere in this workspace yet (wire one in
@@ -210,7 +209,6 @@ impl conexus_auth::Tool for UpdateProjectSettingsTool {
         ctx: &'a conexus_auth::ToolCallContext<'a>,
     ) -> conexus_auth::BoxFuture<'a, ToolResult> {
         Box::pin(async move {
-            let conn = conn.lock().await;
             let context_key = match arguments.get("context_key").and_then(Value::as_str) {
                 Some(k) if !k.is_empty() => k,
                 _ => {
@@ -258,23 +256,17 @@ impl conexus_auth::Tool for UpdateProjectSettingsTool {
 
             let requesting_actor = actor_label(principal);
 
-            let tx = match conn.unchecked_transaction() {
-                Ok(tx) => tx,
-                Err(_e) => {
-                    return ToolResult::Failed {
-                        message: "Database error updating project settings".to_string(),
-                    }
-                }
-            };
             let (_, created) = match settings_repo::upsert(
-                &tx,
+                ctx.sea_orm_db,
                 context_key,
                 &value_json_str,
                 description,
                 description_provided,
                 requesting_actor,
                 now,
-            ) {
+            )
+            .await
+            {
                 Ok(result) => result,
                 Err(_e) => {
                     return ToolResult::Failed {
@@ -282,32 +274,32 @@ impl conexus_auth::Tool for UpdateProjectSettingsTool {
                     }
                 }
             };
-            // Audit through the SAME transaction as the settings write --
-            // matches Python's `with unit_of_work() as u:` wrapping both
-            // calls on one cursor.
+            // Phase G: `project_settings_repository` is sea-orm-backed
+            // now, so the audit-log write below is a SEPARATE,
+            // non-atomic write against the legacy connection -- no
+            // longer sharing one transaction with the settings write
+            // itself (previously "matches Python's `with unit_of_work()
+            // as u:` wrapping both calls on one cursor"; this migration
+            // has already accepted the identical tradeoff everywhere
+            // else `agent_action_repository`'s audit write follows a
+            // converted repository's own write, e.g. `conexus_wakeloop::
+            // event_feed`'s `pending_directive_repository`/`scheduled_
+            // directive_repository` conversions -- see those PRs'
+            // commit messages for the precedent). Best-effort as
+            // before: an audit-log failure must not fail the primary
+            // write, which has already durably committed by this
+            // point.
+            let conn = conn.lock().await;
             let audit_details = serde_json::json!({"context_key": context_key, "created": created});
             if let Err(_e) = agent_action_repository::log_agent_action(
-                &tx,
+                &conn,
                 requesting_actor,
                 "updated_setting",
                 None,
                 Some(&audit_details),
                 now,
             ) {
-                // Best-effort: an audit-log failure must not fail the
-                // primary write (matches Python's own try/except around
-                // `log_agent_action_to_db`'s INSERT) -- but it DOES still
-                // fail the whole transaction if left uncommitted, so
-                // explicitly fall through to the same commit either way
-                // rather than returning early, matching Python's
-                // fire-and-forget semantics (the underlying call there
-                // also can't roll back the settings write on audit
-                // failure -- it just logs and continues).
-            }
-            if let Err(_e) = tx.commit() {
-                return ToolResult::Failed {
-                    message: "Database error updating project settings".to_string(),
-                };
+                // Best-effort, see this block's own doc comment above.
             }
 
             // BL-R14-1 parity: classify AND deliver whichever wake(s)
@@ -378,7 +370,6 @@ impl conexus_auth::Tool for DeleteProjectSettingsTool {
         ctx: &'a conexus_auth::ToolCallContext<'a>,
     ) -> conexus_auth::BoxFuture<'a, ToolResult> {
         Box::pin(async move {
-            let conn = conn.lock().await;
             let context_key = match arguments.get("context_key").and_then(Value::as_str) {
                 Some(k) if !k.is_empty() => k,
                 _ => {
@@ -391,15 +382,7 @@ impl conexus_auth::Tool for DeleteProjectSettingsTool {
 
             let requesting_actor = actor_label(principal);
 
-            let tx = match conn.unchecked_transaction() {
-                Ok(tx) => tx,
-                Err(_e) => {
-                    return ToolResult::Failed {
-                        message: "Database error deleting project settings".to_string(),
-                    }
-                }
-            };
-            let deleted = match settings_repo::delete_many(&tx, &[context_key]) {
+            let deleted = match settings_repo::delete_many(ctx.sea_orm_db, &[context_key]).await {
                 Ok(rows) => rows,
                 Err(_e) => {
                     return ToolResult::Failed {
@@ -414,9 +397,14 @@ impl conexus_auth::Tool for DeleteProjectSettingsTool {
                     hint: None,
                 };
             }
+            // Phase G: audit-log write against the legacy connection,
+            // non-atomic with the sea-orm delete above that already
+            // durably committed -- same established tradeoff as the
+            // update tool above (see its own doc comment).
+            let conn = conn.lock().await;
             let audit_details = serde_json::json!({"context_key": context_key});
             if let Err(_e) = agent_action_repository::log_agent_action(
-                &tx,
+                &conn,
                 requesting_actor,
                 "deleted_setting",
                 None,
@@ -424,11 +412,6 @@ impl conexus_auth::Tool for DeleteProjectSettingsTool {
                 now,
             ) {
                 // Best-effort audit, same rationale as the update tool above.
-            }
-            if let Err(_e) = tx.commit() {
-                return ToolResult::Failed {
-                    message: "Database error deleting project settings".to_string(),
-                };
             }
 
             // BL-R14-1: real delivery, not just classification -- same
@@ -452,25 +435,34 @@ impl conexus_auth::Tool for DeleteProjectSettingsTool {
 
 #[cfg(test)]
 mod tests {
-    // Phase G (sea-orm migration infra): a throwaway in-memory
-    // sea-orm connection for ToolCallContext::sea_orm_db -- no test in
-    // this file queries through it yet, it only needs to exist so
-    // off_wire's now-mandatory last argument has something to point
-    // at.
-    async fn test_sea_orm_db() -> sea_orm::DatabaseConnection {
-        sea_orm::Database::connect("sqlite::memory:").await.unwrap()
-    }
-
     use super::*;
     use conexus_auth::Tool;
     use conexus_core::capability::{Capabilities, ProjectRole};
     use conexus_core::principal::PrincipalKind;
     use conexus_db::schema::init_schema;
 
-    fn test_conn() -> AsyncMutex<Connection> {
-        let conn = Connection::open_in_memory().unwrap();
+    /// A single real temp-file-backed DB opened as BOTH a rusqlite
+    /// `Connection` (legacy: `agent_action_repository`'s audit-log
+    /// reads/writes) and a sea-orm `DatabaseConnection`
+    /// (`project_settings_repository`, Phase G) -- needed because a
+    /// setting written through a tool call's sea-orm write must be
+    /// visible to this file's own rusqlite readback assertions in the
+    /// SAME test (an in-memory `:memory:` DB can't be shared across
+    /// two separate connection handles the way a real file can; same
+    /// dual-connection recipe `conexus_wakeloop::event_feed`'s own
+    /// `test_conn_with_sea_orm` uses). The tempdir is deliberately
+    /// leaked via `keep()` (never cleaned up) rather than threaded
+    /// through this file's many call sites -- safe for a throwaway
+    /// per-test file the OS reclaims on its own.
+    async fn test_conn() -> (AsyncMutex<Connection>, sea_orm::DatabaseConnection) {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let path = dir.join("test.db");
+        let conn = Connection::open(&path).unwrap();
         init_schema(&conn).unwrap();
-        AsyncMutex::new(conn)
+        let sea_orm_db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        (AsyncMutex::new(conn), sea_orm_db)
     }
 
     fn operator_principal() -> Principal {
@@ -508,10 +500,9 @@ mod tests {
 
     #[tokio::test]
     async fn view_reports_no_settings_when_store_is_empty() {
-        let conn = test_conn();
+        let (conn, sea_orm_db) = test_conn().await;
         let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -537,10 +528,9 @@ mod tests {
 
     #[tokio::test]
     async fn update_rejects_a_missing_context_key() {
-        let conn = test_conn();
+        let (conn, sea_orm_db) = test_conn().await;
         let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -562,10 +552,9 @@ mod tests {
 
     #[tokio::test]
     async fn update_rejects_a_key_outside_the_config_namespace() {
-        let conn = test_conn();
+        let (conn, sea_orm_db) = test_conn().await;
         let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -587,10 +576,9 @@ mod tests {
 
     #[tokio::test]
     async fn update_rejects_a_missing_context_value() {
-        let conn = test_conn();
+        let (conn, sea_orm_db) = test_conn().await;
         let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -612,10 +600,9 @@ mod tests {
 
     #[tokio::test]
     async fn update_creates_a_new_row_and_reports_created_true() {
-        let conn = test_conn();
+        let (conn, sea_orm_db) = test_conn().await;
         let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -637,7 +624,8 @@ mod tests {
         assert_eq!(data["context_key"], "config_max_agents");
         assert_eq!(data["created"], true);
 
-        let row = settings_repo::get(&*conn.lock().await, "config_max_agents")
+        let row = settings_repo::get(&sea_orm_db, "config_max_agents")
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(row.value, "10");
@@ -645,10 +633,9 @@ mod tests {
 
     #[tokio::test]
     async fn update_on_existing_key_reports_created_false() {
-        let conn = test_conn();
+        let (conn, sea_orm_db) = test_conn().await;
         let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -679,10 +666,9 @@ mod tests {
 
     #[tokio::test]
     async fn update_writes_an_audit_row_in_the_same_transaction() {
-        let conn = test_conn();
+        let (conn, sea_orm_db) = test_conn().await;
         let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -710,10 +696,9 @@ mod tests {
 
     #[tokio::test]
     async fn update_embeds_the_worker_policy_wake_for_a_matching_key() {
-        let conn = test_conn();
+        let (conn, sea_orm_db) = test_conn().await;
         let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -746,7 +731,7 @@ mod tests {
     /// path this test drives here.
     #[tokio::test]
     async fn update_of_the_loop_toggle_actually_wakes_a_live_agents_waiter() {
-        let conn = test_conn();
+        let (conn, sea_orm_db) = test_conn().await;
         {
             let guard = conn.lock().await;
             conexus_db::agent_repository::AgentRepository::create(
@@ -767,7 +752,6 @@ mod tests {
         let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
         let (_tx, mut rx) = registry.register("bob");
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -795,19 +779,20 @@ mod tests {
     /// to default, which is exactly as wake-worthy as an update).
     #[tokio::test]
     async fn delete_of_the_loop_toggle_actually_wakes_a_live_agents_waiter() {
-        let conn = test_conn();
+        let (conn, sea_orm_db) = test_conn().await;
+        settings_repo::upsert(
+            &sea_orm_db,
+            "config_auto_event_loop_global",
+            "false",
+            None,
+            false,
+            "test",
+            NOW,
+        )
+        .await
+        .unwrap();
         {
             let guard = conn.lock().await;
-            settings_repo::upsert(
-                &guard,
-                "config_auto_event_loop_global",
-                "false",
-                None,
-                false,
-                "test",
-                NOW,
-            )
-            .unwrap();
             conexus_db::agent_repository::AgentRepository::create(
                 &guard,
                 conexus_db::agent_repository::NewAgent {
@@ -826,7 +811,6 @@ mod tests {
         let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
         let (_tx, mut rx) = registry.register("bob");
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -852,10 +836,9 @@ mod tests {
 
     #[tokio::test]
     async fn update_embeds_no_wakes_for_an_unrelated_key() {
-        let conn = test_conn();
+        let (conn, sea_orm_db) = test_conn().await;
         let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -878,10 +861,9 @@ mod tests {
 
     #[tokio::test]
     async fn delete_rejects_a_missing_context_key() {
-        let conn = test_conn();
+        let (conn, sea_orm_db) = test_conn().await;
         let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -903,10 +885,9 @@ mod tests {
 
     #[tokio::test]
     async fn delete_reports_not_found_for_a_missing_key() {
-        let conn = test_conn();
+        let (conn, sea_orm_db) = test_conn().await;
         let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -933,10 +914,9 @@ mod tests {
 
     #[tokio::test]
     async fn delete_removes_an_existing_row_and_writes_an_audit_row() {
-        let conn = test_conn();
+        let (conn, sea_orm_db) = test_conn().await;
         let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -969,7 +949,7 @@ mod tests {
             }
         );
         assert_eq!(
-            settings_repo::get(&*conn.lock().await, "config_x").unwrap(),
+            settings_repo::get(&sea_orm_db, "config_x").await.unwrap(),
             None
         );
 

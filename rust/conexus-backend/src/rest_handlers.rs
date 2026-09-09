@@ -1062,8 +1062,7 @@ pub async fn settings_data(
     State(shared): State<Arc<SharedState>>,
     Extension(resolved): Extension<ResolvedRestPrincipal>,
 ) -> Response {
-    let guard = shared.conn.lock().await;
-    let rows = match conexus_db::project_settings_repository::list_all(&guard) {
+    let rows = match conexus_db::project_settings_repository::list_all(&shared.sea_orm_db).await {
         Ok(rows) => rows,
         Err(_) => {
             return (
@@ -1073,7 +1072,6 @@ pub async fn settings_data(
                 .into_response()
         }
     };
-    drop(guard);
     let settings: Vec<_> = rows
         .iter()
         .map(|r| {
@@ -1623,13 +1621,20 @@ pub async fn all_data(
         crate::read_limits::clamp_section_limit(params.get("limit").map(String::as_str));
     let expose_tokens = resolved.confirmed_operator_tier;
 
-    let guard = shared.conn.lock().await;
-
+    // Phase G: `project_settings_repository` is sea-orm-backed now --
+    // read BEFORE locking `shared.conn` below, since this handler's
+    // guard is held across a lot of still-legacy rusqlite work further
+    // down (an `.await` interleaved with a live guard here would
+    // reintroduce the `!Send`-future hazard documented on
+    // `conexus_backend::principal_resolve::resolve_principal`).
     let global_loop_on = conexus_db::project_settings_repository::get_bool(
-        &guard,
+        &shared.sea_orm_db,
         "config_auto_event_loop_global",
         true,
-    );
+    )
+    .await;
+
+    let guard = shared.conn.lock().await;
 
     let active_token_by_agent: std::collections::HashMap<String, String> = if expose_tokens {
         match conexus_db::agent_repository::AgentRepository::list_active(&guard) {
@@ -2190,6 +2195,17 @@ pub async fn create_message(
     let operator_id = resolved.admission.caller_identity();
     let now = chrono::Utc::now().to_rfc3339();
 
+    // Phase G: resolved via sea-orm before `shared.conn` is locked
+    // below (which is then held across a lot of still-legacy rusqlite
+    // work) -- see `conexus_backend::rest_handlers::all_data`'s own
+    // comment on this exact ordering.
+    let allow_worker_to_worker = conexus_db::project_settings_repository::get_bool(
+        &shared.sea_orm_db,
+        "config_allow_worker_to_worker",
+        true,
+    )
+    .await;
+
     let guard = shared.conn.lock().await;
 
     if let Some(denial) = conexus_tools::agent_messaging::check_send_message_permission(
@@ -2198,6 +2214,7 @@ pub async fn create_message(
         recipient_id,
         content,
         message_type,
+        allow_worker_to_worker,
     ) {
         drop(guard);
         let (status, _) = denial.to_http();
@@ -2681,12 +2698,15 @@ pub async fn list_agents_dashboard(
     }
     let limit = crate::read_limits::clamp_section_limit(params.get("limit").map(String::as_str));
 
-    let guard = shared.conn.lock().await;
+    // Phase G: read before locking `shared.conn` (see `all_data`'s own
+    // comment on this exact ordering, above).
     let global_loop_on = conexus_db::project_settings_repository::get_bool(
-        &guard,
+        &shared.sea_orm_db,
         "config_auto_event_loop_global",
         true,
-    );
+    )
+    .await;
+    let guard = shared.conn.lock().await;
     let rows = conexus_db::agent_repository::AgentRepository::list_for_dashboard(
         &guard,
         status_filter,
@@ -3240,14 +3260,14 @@ pub async fn disconnect_all_agents(
     }
     let now = chrono::Utc::now().to_rfc3339();
     let principal = resolved.dispatch_principal.clone();
-    let guard = shared.conn.lock().await;
     let result = conexus_tools::admin_tools::disconnect_all_agents(
-        &guard,
+        &shared.conn,
+        &shared.sea_orm_db,
         &shared.waiter_registry,
         Some(&principal),
         &now,
-    );
-    drop(guard);
+    )
+    .await;
     if let ToolResult::Ok { data, message } = &result {
         let payload = data.clone().unwrap_or(Value::Null);
         return Json(json!({
@@ -3282,14 +3302,14 @@ pub async fn reconnect_all_agents(
     }
     let now = chrono::Utc::now().to_rfc3339();
     let principal = resolved.dispatch_principal.clone();
-    let guard = shared.conn.lock().await;
     let result = conexus_tools::admin_tools::reconnect_all_agents(
-        &guard,
+        &shared.conn,
+        &shared.sea_orm_db,
         &shared.waiter_registry,
         Some(&principal),
         &now,
-    );
-    drop(guard);
+    )
+    .await;
     if let ToolResult::Ok { message, .. } = &result {
         return Json(json!({
             "success": true,
@@ -4484,8 +4504,9 @@ mod tests {
     #[tokio::test]
     async fn settings_data_threads_confirmed_operator_tier_from_resolved_principal() {
         let conn = test_conn();
+        let shared = test_shared_state(conn).await;
         conexus_db::project_settings_repository::upsert(
-            &conn,
+            &shared.sea_orm_db,
             "config_allow_worker_to_worker",
             "true",
             None,
@@ -4493,8 +4514,8 @@ mod tests {
             "operator",
             "2026-01-01T00:00:00Z",
         )
+        .await
         .unwrap();
-        let shared = test_shared_state(conn).await;
         let resolved = resolved_forwarding("op1", conexus_core::capability::ProjectRole::Operator);
         let resp = settings_data(State(shared), Extension(resolved)).await;
         assert_eq!(resp.status(), StatusCode::OK);

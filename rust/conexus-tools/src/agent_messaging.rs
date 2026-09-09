@@ -39,7 +39,6 @@ use conexus_core::principal::{is_operator_tier, Principal, PrincipalKind};
 use conexus_core::tool_result::ToolResult;
 use conexus_db::agent_repository::AgentRepository;
 use conexus_db::message_repository::{self, NewMessage, SendMessageError};
-use conexus_db::project_settings_repository;
 use rusqlite::Connection;
 
 /// Port of `_sender_label`.
@@ -53,11 +52,24 @@ pub fn sender_label(principal: &Principal) -> String {
 
 /// Port of `_can_agents_communicate`. See this module's own doc for
 /// the "both active" re-derivation.
+///
+/// Phase G: `allow_worker_to_worker` is a plain `bool`, not read from
+/// `project_settings` internally any more -- this function's real
+/// (non-test) call site, [`check_send_message_permission`], is itself
+/// called with a live `Connection`/`Transaction` the caller can't hold
+/// across an `.await` (`send_agent_message`'s own doc: "runs on the
+/// CALLER's own transaction"), so the sea-orm read is hoisted all the
+/// way out to the real top-level callers (`request_assistance`/
+/// `send_with_side_effects`), resolved via `ctx.sea_orm_db` BEFORE
+/// their own transaction/guard is taken, and threaded down as a value
+/// -- this function and everything between it and those callers stays
+/// plain synchronous code, unchanged otherwise.
 pub fn can_agents_communicate(
     conn: &Connection,
     sender_id: &str,
     recipient_id: &str,
     is_admin: bool,
+    allow_worker_to_worker: bool,
 ) -> (bool, String) {
     if is_admin {
         return (true, "Admin privileges".to_string());
@@ -76,7 +88,7 @@ pub fn can_agents_communicate(
     if recipient_id.to_lowercase() == "admin" {
         return (true, "Admin agent always contactable".to_string());
     }
-    if !project_settings_repository::get_bool(conn, "config_allow_worker_to_worker", true) {
+    if !allow_worker_to_worker {
         return (
             false,
             "Worker-to-worker messaging disabled by policy".to_string(),
@@ -96,12 +108,18 @@ pub fn can_agents_communicate(
 }
 
 /// Port of `check_send_message_permission`. `None` means permitted.
+///
+/// Phase G: `allow_worker_to_worker` is a plain `bool` -- see
+/// [`can_agents_communicate`]'s own doc comment for why the
+/// `project_settings` read is hoisted all the way out to this
+/// function's real top-level callers instead of read here.
 pub fn check_send_message_permission(
     conn: &Connection,
     principal: &Principal,
     recipient_id: &str,
     message_content: &str,
     message_type: &str,
+    allow_worker_to_worker: bool,
 ) -> Option<ToolResult> {
     let is_admin = is_operator_tier(principal);
     let sender_id = sender_label(principal);
@@ -112,7 +130,7 @@ pub fn check_send_message_permission(
                 reason: "Valid token required".to_string(),
             });
         }
-        if !project_settings_repository::get_bool(conn, "config_allow_worker_to_worker", true) {
+        if !allow_worker_to_worker {
             return Some(ToolResult::PermissionDenied {
                 reason: "Communication denied: direct agent-to-agent messaging is disabled \
                     for workers by the config_allow_worker_to_worker policy (this also \
@@ -140,8 +158,13 @@ pub fn check_send_message_permission(
         });
     }
 
-    let (can_communicate, reason) =
-        can_agents_communicate(conn, &sender_id, recipient_id, is_admin);
+    let (can_communicate, reason) = can_agents_communicate(
+        conn,
+        &sender_id,
+        recipient_id,
+        is_admin,
+        allow_worker_to_worker,
+    );
     if !can_communicate {
         return Some(ToolResult::PermissionDenied {
             reason: format!("Communication denied: {reason}"),
@@ -207,10 +230,14 @@ pub struct SendMessageArgs<'a> {
 /// and the caller's own writes commit or roll back together --
 /// matches Python's own emit-iff-commit framing (a single
 /// `unit_of_work()` covering the whole call).
+///
+/// Phase G: `allow_worker_to_worker` is a plain `bool` -- see
+/// [`can_agents_communicate`]'s own doc comment for why.
 pub fn send_agent_message(
     tx: &Connection,
     principal: &Principal,
     args: SendMessageArgs<'_>,
+    allow_worker_to_worker: bool,
 ) -> Result<SendOutcome, rusqlite::Error> {
     let SendMessageArgs {
         recipient_id,
@@ -222,9 +249,14 @@ pub fn send_agent_message(
         now,
     } = args;
 
-    if let Some(denial) =
-        check_send_message_permission(tx, principal, recipient_id, message_content, message_type)
-    {
+    if let Some(denial) = check_send_message_permission(
+        tx,
+        principal,
+        recipient_id,
+        message_content,
+        message_type,
+        allow_worker_to_worker,
+    ) {
         return Ok(SendOutcome::Denied(denial));
     }
 
@@ -326,14 +358,14 @@ mod tests {
     #[test]
     fn can_agents_communicate_admin_recipient_always_allowed() {
         let conn = test_conn();
-        let (ok, _) = can_agents_communicate(&conn, "bob", "admin", false);
+        let (ok, _) = can_agents_communicate(&conn, "bob", "admin", false, true);
         assert!(ok);
     }
 
     #[test]
     fn can_agents_communicate_self_message_denied() {
         let conn = test_conn();
-        let (ok, reason) = can_agents_communicate(&conn, "bob", "bob", false);
+        let (ok, reason) = can_agents_communicate(&conn, "bob", "bob", false, true);
         assert!(!ok);
         assert!(reason.contains("add_task_comment"));
     }
@@ -342,24 +374,14 @@ mod tests {
     fn can_agents_communicate_admin_prefix_recipient_is_not_the_real_admin() {
         let conn = test_conn();
         // "admin-helper" must NOT match the exact "admin" carve-out.
-        let (ok, _) = can_agents_communicate(&conn, "bob", "admin-helper", false);
+        let (ok, _) = can_agents_communicate(&conn, "bob", "admin-helper", false, true);
         assert!(!ok);
     }
 
     #[test]
     fn can_agents_communicate_worker_to_worker_denied_when_policy_off() {
         let conn = test_conn();
-        project_settings_repository::upsert(
-            &conn,
-            "config_allow_worker_to_worker",
-            "false",
-            None,
-            false,
-            "test",
-            NOW,
-        )
-        .unwrap();
-        let (ok, reason) = can_agents_communicate(&conn, "bob", "carol", false);
+        let (ok, reason) = can_agents_communicate(&conn, "bob", "carol", false, false);
         assert!(!ok);
         assert!(reason.contains("disabled by policy"));
     }
@@ -369,7 +391,7 @@ mod tests {
         let conn = test_conn();
         seed_agent(&conn, "bob");
         seed_agent(&conn, "carol");
-        let (ok, _) = can_agents_communicate(&conn, "bob", "carol", false);
+        let (ok, _) = can_agents_communicate(&conn, "bob", "carol", false, true);
         assert!(ok);
     }
 
@@ -377,7 +399,7 @@ mod tests {
     fn can_agents_communicate_unknown_recipient_denied() {
         let conn = test_conn();
         seed_agent(&conn, "bob");
-        let (ok, reason) = can_agents_communicate(&conn, "bob", "ghost", false);
+        let (ok, reason) = can_agents_communicate(&conn, "bob", "ghost", false, true);
         assert!(!ok);
         assert!(reason.contains("not a currently-active agent"));
     }
@@ -386,7 +408,8 @@ mod tests {
     fn check_send_message_permission_rejects_an_over_long_message() {
         let conn = test_conn();
         let long = "x".repeat(4001);
-        let denial = check_send_message_permission(&conn, &worker("bob"), "admin", &long, "text");
+        let denial =
+            check_send_message_permission(&conn, &worker("bob"), "admin", &long, "text", true);
         assert!(matches!(denial, Some(ToolResult::Invalid { .. })));
     }
 
@@ -399,6 +422,7 @@ mod tests {
             "admin",
             "stop please",
             "stop_command",
+            true,
         );
         assert!(matches!(denial, Some(ToolResult::PermissionDenied { .. })));
     }
@@ -406,7 +430,8 @@ mod tests {
     #[test]
     fn check_send_message_permission_permits_a_worker_messaging_admin() {
         let conn = test_conn();
-        let denial = check_send_message_permission(&conn, &worker("bob"), "admin", "help", "text");
+        let denial =
+            check_send_message_permission(&conn, &worker("bob"), "admin", "help", "text", true);
         assert!(denial.is_none());
     }
 
@@ -425,8 +450,13 @@ mod tests {
     #[test]
     fn send_agent_message_persists_a_row_and_reports_sent() {
         let conn = test_conn();
-        let outcome =
-            send_agent_message(&conn, &worker("bob"), send_args("admin", "help please")).unwrap();
+        let outcome = send_agent_message(
+            &conn,
+            &worker("bob"),
+            send_args("admin", "help please"),
+            true,
+        )
+        .unwrap();
         assert!(matches!(outcome, SendOutcome::Sent { .. }));
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM agent_messages", [], |row| row.get(0))
@@ -437,18 +467,13 @@ mod tests {
     #[test]
     fn send_agent_message_denied_send_writes_no_row() {
         let conn = test_conn();
-        project_settings_repository::upsert(
+        let outcome = send_agent_message(
             &conn,
-            "config_allow_worker_to_worker",
-            "false",
-            None,
+            &worker("bob"),
+            send_args("admin", "help please"),
             false,
-            "test",
-            NOW,
         )
         .unwrap();
-        let outcome =
-            send_agent_message(&conn, &worker("bob"), send_args("admin", "help please")).unwrap();
         assert!(matches!(outcome, SendOutcome::Denied(_)));
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM agent_messages", [], |row| row.get(0))
@@ -460,8 +485,13 @@ mod tests {
     fn send_agent_message_a_reply_stores_null_subject_regardless_of_explicit_subject() {
         let conn = test_conn();
         seed_agent(&conn, "bob");
-        let root_outcome =
-            send_agent_message(&conn, &worker("bob"), send_args("admin", "root message")).unwrap();
+        let root_outcome = send_agent_message(
+            &conn,
+            &worker("bob"),
+            send_args("admin", "root message"),
+            true,
+        )
+        .unwrap();
         let SendOutcome::Sent {
             message_id: root_id,
         } = root_outcome
@@ -476,6 +506,7 @@ mod tests {
                 parent_message_id: Some(&root_id),
                 ..send_args("admin", "a reply")
             },
+            true,
         )
         .unwrap();
         let SendOutcome::Sent {
@@ -501,6 +532,7 @@ mod tests {
                 subject: Some("a real subject"),
                 ..send_args("admin", "hello")
             },
+            true,
         )
         .unwrap();
         let SendOutcome::Sent { message_id } = outcome else {
@@ -529,7 +561,7 @@ mod tests {
             source_token: None,
             capabilities: Capabilities::from_iter([]),
         };
-        let outcome = send_agent_message(&conn, &admin, send_args("ghost", "hi")).unwrap();
+        let outcome = send_agent_message(&conn, &admin, send_args("ghost", "hi"), true).unwrap();
         assert!(matches!(outcome, SendOutcome::RecipientNotFound(id) if id == "ghost"));
     }
 }

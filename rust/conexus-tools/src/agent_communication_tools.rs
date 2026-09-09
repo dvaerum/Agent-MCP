@@ -245,10 +245,11 @@ pub async fn wait_for_events_entry(
     let (sender, mut receiver) = ctx.waiter_registry.register(&agent_id);
 
     // Flag gate: if either toggle is OFF, return stop_listening now.
-    let (enabled, reason) = {
-        let guard = conn.lock().await;
-        event_feed::check_auto_event_loop_flags(&guard, &agent_id)
-    };
+    // Phase G: `check_auto_event_loop_flags` locks `conn` itself now
+    // (its own sea-orm `project_settings` read comes first) -- no
+    // pre-lock needed here any more.
+    let (enabled, reason) =
+        event_feed::check_auto_event_loop_flags(conn, ctx.sea_orm_db, &agent_id).await;
     if !enabled {
         ctx.waiter_registry.unregister(&agent_id, &sender);
         drain(&mut receiver);
@@ -301,10 +302,8 @@ pub async fn wait_for_events_entry(
     // Idle-stop (event-loop wind-down), checked once before the loop.
     // An enabled schedule suppresses idle-stop -- the agent must stay
     // present to receive its fires.
-    let idle_remaining = {
-        let guard = conn.lock().await;
-        event_feed::idle_stop_seconds_remaining(&guard, &agent_id, now_iso)
-    };
+    let idle_remaining =
+        event_feed::idle_stop_seconds_remaining(conn, ctx.sea_orm_db, &agent_id, now_iso).await;
     let has_schedule =
         scheduled_directive_repository::has_active(ctx.sea_orm_db, &agent_id, now_iso)
             .await
@@ -410,25 +409,23 @@ pub async fn wait_for_events_slow_path(
     // this is behaviorally identical to threading that value through
     // SlowPathSetup, without widening it for a value already validated
     // there as either "disabled" or "still positive").
-    let idle_remaining = {
-        let guard = conn.lock().await;
-        event_feed::idle_stop_seconds_remaining(&guard, &agent_id, &now_iso())
-    };
+    let idle_remaining =
+        event_feed::idle_stop_seconds_remaining(conn, ctx.sea_orm_db, &agent_id, &now_iso()).await;
     let idle_deadline: Option<Instant> =
         idle_remaining.map(|secs| poll_start + Duration::from_secs_f64(secs.max(0.0)));
 
-    // Idle backlog reminder.
-    let (reminder_enabled, reminder_interval) = {
-        let guard = conn.lock().await;
-        (
-            project_settings_repository::get_bool(&guard, "config_idle_reminder_enabled", true),
-            project_settings_repository::get_int(
-                &guard,
-                "config_idle_reminder_interval_seconds",
-                3600,
-            ),
-        )
-    };
+    // Idle backlog reminder. Phase G: both reads go through
+    // `ctx.sea_orm_db` -- no `conn` lock needed for this at all any
+    // more.
+    let reminder_enabled =
+        project_settings_repository::get_bool(ctx.sea_orm_db, "config_idle_reminder_enabled", true)
+            .await;
+    let reminder_interval = project_settings_repository::get_int(
+        ctx.sea_orm_db,
+        "config_idle_reminder_interval_seconds",
+        3600,
+    )
+    .await;
     let mut reminder_deadline: Option<Instant> = if reminder_enabled && reminder_interval > 0 {
         let due_in =
             idle_reminder::seconds_until_due(&agent_id, reminder_interval as f64, now_mono());
@@ -445,13 +442,18 @@ pub async fn wait_for_events_slow_path(
 
     let gate_agent_id = agent_id.clone();
     let liveness_conn = conn;
+    let liveness_sea_orm_db = ctx.sea_orm_db;
     let mut gate = RevalidatingStream::new(
         receiver,
         move || {
             let agent_id = gate_agent_id.clone();
             Box::pin(async move {
-                let guard = liveness_conn.lock().await;
-                let (enabled, reason) = event_feed::check_auto_event_loop_flags(&guard, &agent_id);
+                let (enabled, reason) = event_feed::check_auto_event_loop_flags(
+                    liveness_conn,
+                    liveness_sea_orm_db,
+                    &agent_id,
+                )
+                .await;
                 if enabled {
                     Liveness::live()
                 } else {
@@ -914,9 +916,19 @@ async fn send_with_side_effects(
     let message_type = args.message_type.to_string();
     let priority = args.priority.to_string();
 
+    // Phase G: resolved via sea-orm before `conn` is locked below --
+    // see `can_agents_communicate`'s own doc comment (`agent_messaging`
+    // module) for why this read is hoisted all the way out here.
+    let allow_worker_to_worker = project_settings_repository::get_bool(
+        ctx.sea_orm_db,
+        "config_allow_worker_to_worker",
+        true,
+    )
+    .await;
+
     let outcome = {
         let guard = conn.lock().await;
-        crate::agent_messaging::send_agent_message(&guard, principal, args)
+        crate::agent_messaging::send_agent_message(&guard, principal, args, allow_worker_to_worker)
     }?;
 
     if let crate::agent_messaging::SendOutcome::Sent { ref message_id } = outcome {
@@ -1489,18 +1501,21 @@ mod tests {
     // Phase G (sea-orm migration): a real, schema-initialized,
     // temp-file-backed sea-orm connection for ToolCallContext::
     // sea_orm_db -- `scheduled_directive_repository` (has_active/
-    // soonest_due_at/create) is sea-orm-backed now and every
-    // `wait_for_events_entry`/`wait_for_events_slow_path` call in this
-    // file reads through it unconditionally, so a schema-less
-    // `sqlite::memory:` would make every such read a silent `DbErr`
-    // (swallowed by `.unwrap_or(false)`/`.unwrap_or(None)` -- masking
-    // real bugs rather than surfacing them) and would hard-fail any
-    // test that seeds a schedule via `scheduled_directive_repository::
-    // create`. A SEPARATE temp file from `test_conn`'s legacy
-    // connection is fine -- nothing in this module's tests needs the
-    // rusqlite and sea-orm sides to see each other's data (agents/
-    // settings stay on the legacy connection; `scheduled_directive`
-    // reads/writes go exclusively through this one). The returned
+    // soonest_due_at/create) AND `project_settings_repository` are
+    // both sea-orm-backed now, and every `wait_for_events_entry`/
+    // `wait_for_events_slow_path` call in this file reads through this
+    // connection unconditionally, so a schema-less `sqlite::memory:`
+    // would make every such read a silent `DbErr` (swallowed by
+    // `.unwrap_or(false)`/`.unwrap_or(None)`/`project_settings_
+    // repository::get_bool`'s own default-on-any-error contract --
+    // masking real bugs rather than surfacing them) and would
+    // hard-fail any test that seeds a schedule via `scheduled_
+    // directive_repository::create`. A SEPARATE temp file from
+    // `test_conn`'s legacy connection is fine -- nothing in this
+    // module's tests needs the rusqlite and sea-orm sides to see each
+    // other's data (`agents` stays on the legacy connection;
+    // `project_settings`/`scheduled_directive` reads/writes go
+    // exclusively through this one). The returned
     // `TempDir` must be kept alive by the caller for as long as the
     // connection is used.
     //
@@ -1577,6 +1592,22 @@ mod tests {
         tokio::time::resume();
         let mut opts = sea_orm::ConnectOptions::new(format!("sqlite://{}", path.display()));
         opts.acquire_timeout(Duration::from_secs(3600));
+        // sqlx's connection-pool defaults schedule two REAL background
+        // timers (`max_lifetime`/`idle_timeout`, both `Some(30min)` by
+        // default) independent of `acquire_timeout` above -- under
+        // `start_paused = true`, once this connection has been
+        // acquired/released a few times with the runtime otherwise
+        // idle, tokio's auto-advance can jump straight to whichever of
+        // these fires soonest, silently fast-forwarding `Instant::now()`
+        // by up to ~30 minutes mid-test. Found empirically (a NEW,
+        // 100%-reproducible-in-isolation failure once this crate's own
+        // wake-loop preamble gained its first real per-poll sea-orm
+        // awaits, Phase G project_settings_repository conversion):
+        // disabling both removes that source of timer contention
+        // entirely, on top of the `acquire_timeout` fix above (a
+        // DIFFERENT, already-fixed instance of this same class).
+        opts.max_lifetime(None);
+        opts.idle_timeout(None);
         let db = sea_orm::Database::connect(opts).await.unwrap();
         tokio::time::pause();
         (dir, db)
@@ -1682,23 +1713,21 @@ mod tests {
     async fn flag_gate_off_returns_stop_listening_and_unregisters() {
         let conn = test_conn();
         seed_agent(&conn, "alice").await;
-        {
-            let guard = conn.lock().await;
-            conexus_db::project_settings_repository::upsert(
-                &guard,
-                "config_auto_event_loop_global",
-                "false",
-                None,
-                false,
-                "operator",
-                "2026-01-01T00:00:00Z",
-            )
-            .unwrap();
-        }
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
+        conexus_db::project_settings_repository::upsert(
+            &sea_orm_db,
+            "config_auto_event_loop_global",
+            "false",
+            None,
+            false,
+            "operator",
+            "2026-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
 
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -1724,18 +1753,20 @@ mod tests {
     async fn pre_loop_idle_stop_fires_when_window_already_exceeded() {
         let conn = test_conn();
         seed_agent(&conn, "alice").await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
+        conexus_db::project_settings_repository::upsert(
+            &sea_orm_db,
+            "config_event_idle_stop_seconds",
+            "60",
+            None,
+            false,
+            "operator",
+            "2026-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
         {
             let guard = conn.lock().await;
-            conexus_db::project_settings_repository::upsert(
-                &guard,
-                "config_event_idle_stop_seconds",
-                "60",
-                None,
-                false,
-                "operator",
-                "2026-01-01T00:00:00Z",
-            )
-            .unwrap();
             // Seed last_activity_at far enough in the past that the
             // 60s window is already exceeded by NOW.
             AgentRepository::update_field(
@@ -1750,7 +1781,6 @@ mod tests {
 
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -1774,18 +1804,20 @@ mod tests {
     async fn an_active_schedule_suppresses_idle_stop() {
         let conn = test_conn();
         seed_agent(&conn, "alice").await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
+        conexus_db::project_settings_repository::upsert(
+            &sea_orm_db,
+            "config_event_idle_stop_seconds",
+            "60",
+            None,
+            false,
+            "operator",
+            "2026-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
         {
             let guard = conn.lock().await;
-            conexus_db::project_settings_repository::upsert(
-                &guard,
-                "config_event_idle_stop_seconds",
-                "60",
-                None,
-                false,
-                "operator",
-                "2026-01-01T00:00:00Z",
-            )
-            .unwrap();
             AgentRepository::update_field(
                 &guard,
                 "alice",
@@ -1798,7 +1830,6 @@ mod tests {
 
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         scheduled_directive_repository::create(
             &sea_orm_db,
             "sched_1",
@@ -2975,22 +3006,20 @@ mod tests {
         let conn = test_conn();
         seed_agent(&conn, "alice").await;
         seed_agent(&conn, "bob").await;
-        {
-            let guard = conn.lock().await;
-            project_settings_repository::upsert(
-                &guard,
-                "config_allow_worker_to_worker",
-                "false",
-                None,
-                false,
-                "test",
-                NOW,
-            )
-            .unwrap();
-        }
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
+        project_settings_repository::upsert(
+            &sea_orm_db,
+            "config_allow_worker_to_worker",
+            "false",
+            None,
+            false,
+            "test",
+            NOW,
+        )
+        .await
+        .unwrap();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,

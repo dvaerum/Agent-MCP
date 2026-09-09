@@ -132,22 +132,25 @@ impl ProgressSink for PeerProgressSink {
 struct SnapshotPolicySource(std::collections::HashMap<&'static str, bool>);
 
 impl SnapshotPolicySource {
+    /// Phase G: `project_settings_repository` is sea-orm-backed now,
+    /// so this takes `db: &sea_orm::DatabaseConnection` -- it never
+    /// touched the legacy rusqlite `conn` for anything else, so
+    /// there's no lock to acquire here at all any more.
     async fn resolve(
-        conn: &AsyncMutex<rusqlite::Connection>,
+        db: &sea_orm::DatabaseConnection,
         required: &conexus_auth::Requirement,
     ) -> Self {
         let conexus_auth::Requirement::Policy { keys, .. } = required else {
             // Every other Requirement variant never calls
             // `PolicySource::get_bool` at all (see `Requirement::check`) --
-            // no point paying for a lock on a tool that isn't
+            // no point paying for a read on a tool that isn't
             // Policy-gated.
             return SnapshotPolicySource(std::collections::HashMap::new());
         };
-        let guard = conn.lock().await;
         let mut map = std::collections::HashMap::new();
         for key in *keys {
             if let Some(value) =
-                conexus_db::project_settings_repository::get_bool_override(&guard, key)
+                conexus_db::project_settings_repository::get_bool_override(db, key).await
             {
                 map.insert(*key, value);
             }
@@ -379,7 +382,8 @@ pub(crate) async fn dispatch_rest_tool(
         project_dir: &shared.project_dir,
         sea_orm_db: &shared.sea_orm_db,
     };
-    let policy_source = SnapshotPolicySource::resolve(&shared.conn, &descriptor.required).await;
+    let policy_source =
+        SnapshotPolicySource::resolve(&shared.sea_orm_db, &descriptor.required).await;
     let result = conexus_auth::dispatch(
         descriptor,
         principal,
@@ -454,23 +458,23 @@ impl ServerHandler for ConexusServer {
         context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
         let role = conexus_core::principal::catalog_role(principal_from_context(&context).as_ref());
-        let guard = self.shared.conn.lock().await;
-        let tools = conexus_tools::all_tools()
-            .iter()
-            .filter(|descriptor| {
-                let tier = conexus_tools::access::access_tier(descriptor);
-                conexus_tools::access::is_visible_to_role(tier, role, &guard)
-            })
-            .map(|descriptor| {
+        // Phase G: `is_visible_to_role` is sea-orm-backed now (no more
+        // `shared.conn` lock needed for this at all) and `async fn` --
+        // a plain loop instead of `.filter()`'s sync closure, since a
+        // closure can't `.await`.
+        let mut tools = Vec::new();
+        for descriptor in conexus_tools::all_tools().iter() {
+            let tier = conexus_tools::access::access_tier(descriptor);
+            if conexus_tools::access::is_visible_to_role(tier, role, &self.shared.sea_orm_db).await
+            {
                 let schema = descriptor
                     .parsed_schema()
                     .as_object()
                     .cloned()
                     .unwrap_or_default();
-                Tool::new(descriptor.name, descriptor.description, schema)
-            })
-            .collect();
-        drop(guard);
+                tools.push(Tool::new(descriptor.name, descriptor.description, schema));
+            }
+        }
         Ok(ListToolsResult {
             tools,
             ..Default::default()
@@ -542,12 +546,13 @@ impl ServerHandler for ConexusServer {
         // pre-lock here, or a tool needing the connection AND an
         // internal `.await` (Phase D2's `ask_project_rag`) would
         // deadlock against its own already-held guard. The
-        // `SnapshotPolicySource` build below is the ONE exception: it
-        // takes and releases its own short-lived lock BEFORE calling
-        // `dispatch`, specifically so it never overlaps the tool's own
-        // lock (seq: lock+read+unlock, THEN dispatch).
+        // `SnapshotPolicySource` build below no longer touches
+        // `shared.conn` AT ALL (Phase G: `project_settings_repository`
+        // is sea-orm-backed) -- it reads `shared.sea_orm_db` directly,
+        // so there's no lock-ordering concern with `dispatch`'s own
+        // lock to reason about here any more.
         let policy_source =
-            SnapshotPolicySource::resolve(&self.shared.conn, &descriptor.required).await;
+            SnapshotPolicySource::resolve(&self.shared.sea_orm_db, &descriptor.required).await;
         let result = conexus_auth::dispatch(
             descriptor,
             Some(&principal),
@@ -788,20 +793,30 @@ mod tests {
         }
     }
 
-    fn test_conn() -> AsyncMutex<rusqlite::Connection> {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conexus_db::schema::init_schema(&conn).unwrap();
-        AsyncMutex::new(conn)
+    /// A real temp-file-backed sea-orm connection for `SnapshotPolicySource::
+    /// resolve`'s own `project_settings` reads (Phase G: it no longer
+    /// touches `shared.conn`/rusqlite at all).
+    async fn test_db() -> (tempfile::TempDir, sea_orm::DatabaseConnection) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        {
+            let c = rusqlite::Connection::open(&path).unwrap();
+            conexus_db::schema::init_schema(&c).unwrap();
+        }
+        let db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        (dir, db)
     }
 
     #[tokio::test]
     async fn snapshot_policy_source_is_empty_for_a_non_policy_requirement() {
-        let conn = test_conn();
+        let (_dir, db) = test_db().await;
         let required = conexus_auth::Requirement::Cap {
             cap: conexus_core::capability::Capability::TasksView,
             reason: None,
         };
-        let source = SnapshotPolicySource::resolve(&conn, &required).await;
+        let source = SnapshotPolicySource::resolve(&db, &required).await;
         assert_eq!(
             conexus_auth::PolicySource::get_bool(&source, "config_allow_worker_update_own_status"),
             None
@@ -810,25 +825,23 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_policy_source_reads_a_real_project_settings_override() {
-        let conn = test_conn();
-        {
-            let guard = conn.lock().await;
-            conexus_db::project_settings_repository::upsert(
-                &guard,
-                "config_allow_worker_update_own_status",
-                "false",
-                None,
-                false,
-                "operator",
-                "2026-01-01T00:00:00Z",
-            )
-            .unwrap();
-        }
+        let (_dir, db) = test_db().await;
+        conexus_db::project_settings_repository::upsert(
+            &db,
+            "config_allow_worker_update_own_status",
+            "false",
+            None,
+            false,
+            "operator",
+            "2026-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
         let required = conexus_auth::Requirement::Policy {
             keys: &["config_allow_worker_update_own_status"],
             default: true,
         };
-        let source = SnapshotPolicySource::resolve(&conn, &required).await;
+        let source = SnapshotPolicySource::resolve(&db, &required).await;
         assert_eq!(
             conexus_auth::PolicySource::get_bool(&source, "config_allow_worker_update_own_status"),
             Some(false)
@@ -837,12 +850,12 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_policy_source_has_no_override_when_no_row_exists() {
-        let conn = test_conn();
+        let (_dir, db) = test_db().await;
         let required = conexus_auth::Requirement::Policy {
             keys: &["config_allow_worker_update_own_status"],
             default: true,
         };
-        let source = SnapshotPolicySource::resolve(&conn, &required).await;
+        let source = SnapshotPolicySource::resolve(&db, &required).await;
         assert_eq!(
             conexus_auth::PolicySource::get_bool(&source, "config_allow_worker_update_own_status"),
             None

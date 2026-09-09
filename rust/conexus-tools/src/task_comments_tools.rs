@@ -151,7 +151,11 @@ impl Tool for AddTaskCommentTool {
     fn call<'a>(
         principal: Option<&'a Principal>,
         arguments: &'a Value,
-        conn: &'a AsyncMutex<Connection>,
+        // Phase G: no longer touched here -- `project_settings_
+        // repository`'s policy read moved to `ctx.sea_orm_db` and
+        // `add_comment` (task_comments_repository, already sea-orm)
+        // never needed the legacy connection either.
+        _conn: &'a AsyncMutex<Connection>,
         now: &'a str,
         ctx: &'a conexus_auth::ToolCallContext<'a>,
     ) -> conexus_auth::BoxFuture<'a, ToolResult> {
@@ -186,17 +190,16 @@ impl Tool for AddTaskCommentTool {
                     }
                 }
             };
-            let guard = conn.lock().await;
-
             let requester = principal
                 .and_then(|p| p.agent_id.clone().or_else(|| p.user_id.clone()))
                 .unwrap_or_default();
             let can_view_all = principal.is_some_and(|p| p.has_capability(Capability::TasksAssign));
             let include_foreign = project_settings_repository::get_bool(
-                &guard,
+                ctx.sea_orm_db,
                 "config_allow_worker_comment_foreign_tasks",
                 true,
-            );
+            )
+            .await;
 
             if !can_access_task(
                 task.assigned_to.as_deref(),
@@ -242,7 +245,6 @@ impl Tool for AddTaskCommentTool {
             }
 
             let author = principal.and_then(|p| p.agent_id.clone().or_else(|| p.user_id.clone()));
-            drop(guard);
             match task_comments_repository::add_comment(
                 ctx.sea_orm_db,
                 &task_id,
@@ -614,17 +616,18 @@ mod tests {
         {
             let c = conn.lock().await;
             seed_task(&c, "t1", Some("bob"), "bob");
-            project_settings_repository::upsert(
-                &c,
-                "config_allow_worker_comment_foreign_tasks",
-                "false",
-                None,
-                false,
-                "test",
-                "2026-06-01T00:00:00Z",
-            )
-            .unwrap();
         }
+        project_settings_repository::upsert(
+            &sea_orm_db,
+            "config_allow_worker_comment_foreign_tasks",
+            "false",
+            None,
+            false,
+            "test",
+            "2026-06-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
         let alice = worker("alice", &[]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();

@@ -43,12 +43,13 @@ mod message_retention {
 
     pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
-    fn read_retention_days(conn: &Connection) -> i64 {
+    async fn read_retention_days(sea_orm_db: &sea_orm::DatabaseConnection) -> i64 {
         let days = conexus_db::project_settings_repository::get_int(
-            conn,
+            sea_orm_db,
             "config_message_retention_days",
             0,
-        );
+        )
+        .await;
         if days <= 0 {
             return 0;
         }
@@ -59,24 +60,33 @@ mod message_retention {
     /// window. Returns the number of rows deleted; a no-op (`Ok(0)`,
     /// never touching the table) when retention is disabled -- same
     /// contract as Python's `prune_old_messages()`.
-    pub fn prune_old_messages(
-        conn: &Connection,
+    ///
+    /// Phase G: `conn` is `&tokio::sync::Mutex<Connection>`, not a
+    /// bare `&Connection` -- this is `async fn` now (the retention-
+    /// window read goes through sea-orm), and a bare `&Connection`
+    /// parameter would poison this function's returned future's
+    /// `Send`-ness the moment it's referenced anywhere in the body
+    /// (see `conexus_backend::principal_resolve::resolve_principal`'s
+    /// own doc comment for the fully-worked-out rule). The sea-orm
+    /// read happens first, before `conn` is ever locked.
+    pub async fn prune_old_messages(
+        conn: &tokio::sync::Mutex<Connection>,
+        sea_orm_db: &sea_orm::DatabaseConnection,
         now: chrono::DateTime<chrono::Utc>,
     ) -> rusqlite::Result<i64> {
-        let days = read_retention_days(conn);
+        let days = read_retention_days(sea_orm_db).await;
         if days <= 0 {
             return Ok(0);
         }
         let cutoff = (now - chrono::Duration::days(days)).to_rfc3339();
-        conexus_db::message_repository::prune_read_before(conn, &cutoff)
+        let guard = conn.lock().await;
+        conexus_db::message_repository::prune_read_before(&guard, &cutoff)
     }
 
     pub async fn run_periodically(shared: Arc<SharedState>, interval: Duration) {
         loop {
-            let result = {
-                let conn = shared.conn.lock().await;
-                prune_old_messages(&conn, chrono::Utc::now())
-            };
+            let result =
+                prune_old_messages(&shared.conn, &shared.sea_orm_db, chrono::Utc::now()).await;
             match result {
                 Ok(0) => {}
                 Ok(deleted) => {
@@ -379,6 +389,7 @@ mod tests {
     use conexus_db::message_repository::{self, NewMessage};
     use conexus_db::schema::init_schema;
     use rusqlite::Connection;
+    use tokio::sync::Mutex as AsyncMutex;
 
     fn test_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -386,9 +397,28 @@ mod tests {
         conn
     }
 
-    fn set_retention_days(conn: &Connection, days: i64) {
+    /// A real temp-file-backed sea-orm connection for `prune_old_
+    /// messages`'s own `project_settings` reads. A SEPARATE temp file
+    /// from `test_conn`'s `:memory:` rusqlite connection is fine --
+    /// `agent_messages` (rusqlite) and `project_settings` (sea-orm)
+    /// are disjoint tables here, so nothing in these tests needs the
+    /// two sides to observe each other's data.
+    async fn test_sea_orm_db() -> (tempfile::TempDir, sea_orm::DatabaseConnection) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        {
+            let c = Connection::open(&path).unwrap();
+            init_schema(&c).unwrap();
+        }
+        let db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        (dir, db)
+    }
+
+    async fn set_retention_days(db: &sea_orm::DatabaseConnection, days: i64) {
         conexus_db::project_settings_repository::upsert(
-            conn,
+            db,
             "config_message_retention_days",
             &days.to_string(),
             None,
@@ -396,6 +426,7 @@ mod tests {
             "test",
             "2026-01-01T00:00:00Z",
         )
+        .await
         .unwrap();
     }
 
@@ -422,29 +453,37 @@ mod tests {
         .unwrap();
     }
 
-    #[test]
-    fn disabled_by_default_prunes_nothing() {
+    #[tokio::test]
+    async fn disabled_by_default_prunes_nothing() {
         let conn = test_conn();
         seed_message(&conn, "m1", "2020-01-01T00:00:00Z", true);
-        let deleted = prune_old_messages(&conn, chrono::Utc::now()).unwrap();
+        let conn = AsyncMutex::new(conn);
+        let (_dir, sea_orm_db) = test_sea_orm_db().await;
+        let deleted = prune_old_messages(&conn, &sea_orm_db, chrono::Utc::now())
+            .await
+            .unwrap();
         assert_eq!(deleted, 0);
+        let conn = conn.into_inner();
         assert!(message_repository::get_by_id(&conn, "m1")
             .unwrap()
             .is_some());
     }
 
-    #[test]
-    fn prunes_only_read_messages_past_the_configured_window() {
+    #[tokio::test]
+    async fn prunes_only_read_messages_past_the_configured_window() {
         let conn = test_conn();
-        set_retention_days(&conn, 30);
         let now: chrono::DateTime<chrono::Utc> = "2026-06-01T00:00:00Z".parse().unwrap();
         seed_message(&conn, "old-read", "2026-01-01T00:00:00Z", true);
         seed_message(&conn, "old-unread", "2026-01-01T00:00:00Z", false);
         seed_message(&conn, "recent-read", "2026-05-30T00:00:00Z", true);
+        let conn = AsyncMutex::new(conn);
+        let (_dir, sea_orm_db) = test_sea_orm_db().await;
+        set_retention_days(&sea_orm_db, 30).await;
 
-        let deleted = prune_old_messages(&conn, now).unwrap();
+        let deleted = prune_old_messages(&conn, &sea_orm_db, now).await.unwrap();
 
         assert_eq!(deleted, 1);
+        let conn = conn.into_inner();
         assert!(message_repository::get_by_id(&conn, "old-read")
             .unwrap()
             .is_none());
@@ -456,8 +495,8 @@ mod tests {
             .is_some());
     }
 
-    #[test]
-    fn a_huge_retention_value_is_clamped_not_left_to_overflow() {
+    #[tokio::test]
+    async fn a_huge_retention_value_is_clamped_not_left_to_overflow() {
         // Verified this session (Phase F test_sec_r16 port) that
         // chrono::Duration panics well before 1e15 seconds -- this
         // proves the clamp actually engages for an operator typo
@@ -470,11 +509,13 @@ mod tests {
         // `chrono::Utc::now()` and silently stopped pruning once real
         // time passed 10 years past the seeded date.
         let conn = test_conn();
-        set_retention_days(&conn, 999_999_999_999);
         let now: chrono::DateTime<chrono::Utc> = "2026-01-01T00:00:00Z".parse().unwrap();
         seed_message(&conn, "m1", "2000-01-01T00:00:00Z", true);
+        let conn = AsyncMutex::new(conn);
+        let (_dir, sea_orm_db) = test_sea_orm_db().await;
+        set_retention_days(&sea_orm_db, 999_999_999_999).await;
         // Must not panic.
-        let deleted = prune_old_messages(&conn, now).unwrap();
+        let deleted = prune_old_messages(&conn, &sea_orm_db, now).await.unwrap();
         assert_eq!(deleted, 1);
     }
 }

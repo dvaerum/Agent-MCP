@@ -1995,8 +1995,20 @@ pub fn reconnect_agent(
 /// then `notify()` each). `closed_streams` is always `0` -- see
 /// [`disconnect_agent`]'s doc for the documented session_registry gap,
 /// which applies fleet-wide here too.
-pub fn disconnect_all_agents(
-    conn: &Connection,
+///
+/// Phase G: `conn` is `&tokio::sync::Mutex<Connection>`, not a bare
+/// `&Connection` -- this is `async fn` now (the global-flag write
+/// goes through sea-orm), and a bare `&Connection` parameter would
+/// poison this function's returned future's `Send`-ness the moment
+/// it's referenced anywhere in the body (see `conexus_backend::
+/// principal_resolve::resolve_principal`'s own doc comment for the
+/// fully-worked-out rule). The sea-orm write happens first, before
+/// `conn` is ever locked, so the `MutexGuard` used for the legacy
+/// audit-log write + waiter broadcast below never spans a suspension
+/// point at all.
+pub async fn disconnect_all_agents(
+    conn: &tokio::sync::Mutex<Connection>,
+    sea_orm_db: &sea_orm::DatabaseConnection,
     waiter_registry: &conexus_wakeloop::waiter_registry::WaiterRegistry,
     principal: Option<&Principal>,
     now: &str,
@@ -2006,7 +2018,7 @@ pub fn disconnect_all_agents(
     }
 
     if conexus_db::project_settings_repository::upsert(
-        conn,
+        sea_orm_db,
         "config_auto_event_loop_global",
         "false",
         None,
@@ -2014,6 +2026,7 @@ pub fn disconnect_all_agents(
         principal.map(Principal::actor_label).unwrap_or("operator"),
         now,
     )
+    .await
     .is_err()
     {
         return ToolResult::Failed {
@@ -2021,9 +2034,10 @@ pub fn disconnect_all_agents(
         };
     }
 
+    let guard = conn.lock().await;
     let actor_label = principal.map(Principal::actor_label).unwrap_or("operator");
     let _ = agent_action_repository::log_agent_action(
-        conn,
+        &guard,
         actor_label,
         "disconnected_all_agents",
         None,
@@ -2031,7 +2045,7 @@ pub fn disconnect_all_agents(
         now,
     );
 
-    if let Ok(active) = conexus_db::agent_repository::AgentRepository::list_active(conn) {
+    if let Ok(active) = conexus_db::agent_repository::AgentRepository::list_active(&guard) {
         for agent in active {
             waiter_registry.notify(&agent.agent_id);
         }
@@ -2051,8 +2065,12 @@ pub fn disconnect_all_agents(
 /// whole thing). Flips the global toggle back ON; an agent whose OWN
 /// per-agent `auto_event_loop` is still OFF stays paused, matching
 /// Python's documented precedence exactly.
-pub fn reconnect_all_agents(
-    conn: &Connection,
+///
+/// Phase G: same `&tokio::sync::Mutex<Connection>` + `sea_orm_db`
+/// shape as [`disconnect_all_agents`]'s own doc comment explains.
+pub async fn reconnect_all_agents(
+    conn: &tokio::sync::Mutex<Connection>,
+    sea_orm_db: &sea_orm::DatabaseConnection,
     waiter_registry: &conexus_wakeloop::waiter_registry::WaiterRegistry,
     principal: Option<&Principal>,
     now: &str,
@@ -2062,7 +2080,7 @@ pub fn reconnect_all_agents(
     }
 
     if conexus_db::project_settings_repository::upsert(
-        conn,
+        sea_orm_db,
         "config_auto_event_loop_global",
         "true",
         None,
@@ -2070,6 +2088,7 @@ pub fn reconnect_all_agents(
         principal.map(Principal::actor_label).unwrap_or("operator"),
         now,
     )
+    .await
     .is_err()
     {
         return ToolResult::Failed {
@@ -2077,9 +2096,10 @@ pub fn reconnect_all_agents(
         };
     }
 
+    let guard = conn.lock().await;
     let actor_label = principal.map(Principal::actor_label).unwrap_or("operator");
     let _ = agent_action_repository::log_agent_action(
-        conn,
+        &guard,
         actor_label,
         "reconnected_all_agents",
         None,
@@ -2087,7 +2107,7 @@ pub fn reconnect_all_agents(
         now,
     );
 
-    if let Ok(active) = conexus_db::agent_repository::AgentRepository::list_active(conn) {
+    if let Ok(active) = conexus_db::agent_repository::AgentRepository::list_active(&guard) {
         for agent in active {
             waiter_registry.notify(&agent.agent_id);
         }

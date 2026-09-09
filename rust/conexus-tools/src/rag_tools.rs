@@ -87,9 +87,20 @@ fn env_from_process(key: &str) -> Option<String> {
 /// `config_allow_worker_view_foreign_tasks` -- an explicit
 /// `project_settings` row wins; absent/unparseable defaults to `true`
 /// (Python's schema default). This tool reads it directly (it already
-/// holds `conn`) rather than through a generic `PolicySource`.
-fn config_allow_worker_view_foreign_tasks(conn: &Connection) -> bool {
-    project_settings_repository::get(conn, "config_allow_worker_view_foreign_tasks")
+/// holds `sea_orm_db`) rather than through a generic `PolicySource`.
+///
+/// Phase G: `project_settings_repository` is sea-orm-backed now, so
+/// this takes `db: &sea_orm::DatabaseConnection` instead of the
+/// legacy rusqlite `&Connection` -- its one real caller,
+/// [`query_rag_system`], already holds its rusqlite `MutexGuard`
+/// across this call's own `.await` (safe: a `MutexGuard` is `Send`,
+/// unlike a bare `&Connection` parameter -- see that function's own
+/// doc comment), so awaiting this unrelated sea-orm read alongside it
+/// is no different from the OTHER sea-orm awaits it already holds the
+/// guard across.
+async fn config_allow_worker_view_foreign_tasks(db: &sea_orm::DatabaseConnection) -> bool {
+    project_settings_repository::get(db, "config_allow_worker_view_foreign_tasks")
+        .await
         .ok()
         .flatten()
         .and_then(|row| serde_json::from_str::<bool>(&row.value).ok())
@@ -339,7 +350,7 @@ async fn query_rag_system(
     can_view_all_tasks: bool,
 ) -> Result<String, RagQueryError> {
     let conn = conn.lock().await;
-    let include_foreign = config_allow_worker_view_foreign_tasks(&conn);
+    let include_foreign = config_allow_worker_view_foreign_tasks(sea_orm_db).await;
 
     // --- 1. Live context ---
     let last_indexed = rag_repository::get_last_indexed(sea_orm_db, "context")
@@ -575,13 +586,27 @@ impl Tool for AskProjectRagTool {
 
 #[cfg(test)]
 mod tests {
-    // Phase G (sea-orm migration infra): a throwaway in-memory
-    // sea-orm connection for ToolCallContext::sea_orm_db -- no test in
-    // this file queries through it yet, it only needs to exist so
-    // off_wire's now-mandatory last argument has something to point
-    // at.
+    // Phase G (sea-orm migration infra): a real, schema-initialized,
+    // temp-file-backed sea-orm connection for ToolCallContext::
+    // sea_orm_db -- `config_allow_worker_view_foreign_tasks`'s own
+    // tests read AND write through it now (`project_settings` is
+    // sea-orm-backed), so a schema-less `sqlite::memory:` would
+    // hard-fail its `upsert` call (no such table) rather than merely
+    // degrading a read to a default. The tempdir is deliberately
+    // leaked via `keep()` (never cleaned up) rather than threaded
+    // through this file's several call sites -- safe for a throwaway
+    // per-test file the OS reclaims on its own (same precedent as
+    // `conexus_backend::rest_handlers`'s own `test_conn`).
     async fn test_sea_orm_db() -> sea_orm::DatabaseConnection {
-        sea_orm::Database::connect("sqlite::memory:").await.unwrap()
+        let dir = tempfile::tempdir().unwrap().keep();
+        let path = dir.join("test.db");
+        {
+            let c = Connection::open(&path).unwrap();
+            init_schema(&c).unwrap();
+        }
+        sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap()
     }
 
     use super::*;
@@ -908,17 +933,15 @@ mod tests {
 
     #[tokio::test]
     async fn config_defaults_true_when_no_row_is_set() {
-        let conn = test_conn();
-        let guard = conn.lock().await;
-        assert!(config_allow_worker_view_foreign_tasks(&guard));
+        let sea_orm_db = test_sea_orm_db().await;
+        assert!(config_allow_worker_view_foreign_tasks(&sea_orm_db).await);
     }
 
     #[tokio::test]
     async fn config_respects_an_explicit_false_row() {
-        let conn = test_conn();
-        let guard = conn.lock().await;
+        let sea_orm_db = test_sea_orm_db().await;
         project_settings_repository::upsert(
-            &guard,
+            &sea_orm_db,
             "config_allow_worker_view_foreign_tasks",
             "false",
             None,
@@ -926,8 +949,9 @@ mod tests {
             "op1",
             NOW,
         )
+        .await
         .unwrap();
-        assert!(!config_allow_worker_view_foreign_tasks(&guard));
+        assert!(!config_allow_worker_view_foreign_tasks(&sea_orm_db).await);
     }
 
     // ── append_within_budget boundary ─────────────────────────────────

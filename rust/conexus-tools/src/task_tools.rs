@@ -517,16 +517,22 @@ impl Tool for ViewTasksTool {
                 .or_else(|| principal.user_id.clone())
                 .unwrap_or_else(|| "admin".to_string());
 
+            // Phase G: resolved via sea-orm before `conn` is locked
+            // below -- see `conexus_backend::principal_resolve::
+            // resolve_principal`'s own doc comment for why a bare
+            // `&Connection` reference can't coexist with an internal
+            // `.await` inside this function.
+            let allow_worker_view_foreign_tasks = project_settings_repository::get_bool(
+                ctx.sea_orm_db,
+                "config_allow_worker_view_foreign_tasks",
+                true,
+            )
+            .await;
+
             let conn = conn.lock().await;
 
             let mut target_agent_id_for_filter = filter_agent_id.clone();
-            if !is_admin_request
-                && !project_settings_repository::get_bool(
-                    &conn,
-                    "config_allow_worker_view_foreign_tasks",
-                    true,
-                )
-            {
+            if !is_admin_request && !allow_worker_view_foreign_tasks {
                 match &filter_agent_id {
                     None => target_agent_id_for_filter = Some(requesting_agent_id.clone()),
                     Some(fid) if fid != &requesting_agent_id => {
@@ -920,10 +926,11 @@ impl Tool for SearchTasksTool {
 
             let conn = conn.lock().await;
             let allow_foreign = project_settings_repository::get_bool(
-                &conn,
+                ctx.sea_orm_db,
                 "config_allow_worker_view_foreign_tasks",
                 true,
-            );
+            )
+            .await;
             let all_tasks = match task_repository::list_all(ctx.sea_orm_db, None).await {
                 Ok(rows) => rows,
                 Err(_) => {
@@ -3145,6 +3152,19 @@ impl Tool for RequestAssistanceTool {
                 .or_else(|| principal.user_id.clone())
                 .unwrap_or_else(|| "admin".to_string());
 
+            // Phase G: resolved via sea-orm BEFORE the transaction
+            // below is opened -- `send_agent_message` (called on `tx`
+            // further down) can't itself `.await` a sea-orm read while
+            // holding a `rusqlite::Transaction` (not `Send`); see
+            // `conexus_tools::agent_messaging::can_agents_communicate`'s
+            // own doc comment for why this read is hoisted here.
+            let allow_worker_to_worker = project_settings_repository::get_bool(
+                ctx.sea_orm_db,
+                "config_allow_worker_to_worker",
+                true,
+            )
+            .await;
+
             let conn = conn.lock().await;
             let tx = match conn.unchecked_transaction() {
                 Ok(tx) => tx,
@@ -3295,6 +3315,7 @@ impl Tool for RequestAssistanceTool {
                         parent_message_id: None,
                         now,
                     },
+                    allow_worker_to_worker,
                 ),
                 Ok(crate::agent_messaging::SendOutcome::Sent { .. })
             );
@@ -3413,6 +3434,23 @@ impl Tool for BulkTaskOperationsTool {
                 };
             }
 
+            // Phase G: resolved via sea-orm ONCE, before the whole
+            // bulk loop below (the loop can check this same key for
+            // EVERY "update_status" operation in the batch -- all
+            // reading the identical value, so resolving it once here
+            // instead of per-iteration is also a real simplification,
+            // not just Send-hazard avoidance). `conn`'s `tx` (a
+            // `rusqlite::Transaction`, not `Send`) can't itself
+            // `.await` a sea-orm read -- see `conexus_tools::
+            // agent_messaging::can_agents_communicate`'s own doc
+            // comment for the general rule.
+            let allow_worker_update_own_status = project_settings_repository::get_bool(
+                ctx.sea_orm_db,
+                "config_allow_worker_update_own_status",
+                true,
+            )
+            .await;
+
             let conn = conn.lock().await;
             // Scoped in its own block so `tx` (a `rusqlite::Transaction`,
             // not `Send`) is lexically dropped -- not merely logically
@@ -3496,13 +3534,7 @@ impl Tool for BulkTaskOperationsTool {
                                 ));
                                 continue;
                             }
-                            if !is_admin_request
-                                && !project_settings_repository::get_bool(
-                                    &tx,
-                                    "config_allow_worker_update_own_status",
-                                    true,
-                                )
-                            {
+                            if !is_admin_request && !allow_worker_update_own_status {
                                 outcomes.push(bulk_op_error(
                                     i,
                                     "worker status updates disabled by project policy \
@@ -3960,9 +3992,9 @@ mod view_search_tests {
         .unwrap();
     }
 
-    fn disallow_foreign_view(conn: &Connection) {
+    async fn disallow_foreign_view(db: &sea_orm::DatabaseConnection) {
         project_settings_repository::upsert(
-            conn,
+            db,
             "config_allow_worker_view_foreign_tasks",
             "false",
             None,
@@ -3970,6 +4002,7 @@ mod view_search_tests {
             "test",
             NOW,
         )
+        .await
         .unwrap();
     }
 
@@ -4043,13 +4076,13 @@ mod view_search_tests {
             seed(&guard, "mine", Some("alice"), "bob", "pending");
             seed(&guard, "pool", None, "bob", "pending");
             seed(&guard, "foreign", Some("carol"), "bob", "pending");
-            // Foreign-visibility is on by default -- turn it off to
-            // isolate the "own + pool" rule from that separate axis.
-            disallow_foreign_view(&guard);
         }
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
         let sea_orm_db = test_sea_orm_db(dir.path()).await;
+        // Foreign-visibility is on by default -- turn it off to
+        // isolate the "own + pool" rule from that separate axis.
+        disallow_foreign_view(&sea_orm_db).await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -4070,11 +4103,11 @@ mod view_search_tests {
         {
             let guard = conn.lock().await;
             seed(&guard, "t1", Some("carol"), "bob", "pending");
-            disallow_foreign_view(&guard);
         }
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
         let sea_orm_db = test_sea_orm_db(dir.path()).await;
+        disallow_foreign_view(&sea_orm_db).await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -4455,11 +4488,11 @@ mod view_search_tests {
             let guard = conn.lock().await;
             seed(&guard, "mine", Some("alice"), "bob", "pending");
             seed(&guard, "foreign", Some("carol"), "bob", "pending");
-            disallow_foreign_view(&guard);
         }
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
         let sea_orm_db = test_sea_orm_db(dir.path()).await;
+        disallow_foreign_view(&sea_orm_db).await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -7441,17 +7474,19 @@ mod bulk_task_operations_tests {
         {
             let guard = conn.lock().await;
             seed_task(&guard, "t1", "pending", Some("bob"), "alice");
-            project_settings_repository::upsert(
-                &guard,
-                "config_allow_worker_update_own_status",
-                "false",
-                None,
-                false,
-                "test",
-                NOW,
-            )
-            .unwrap();
         }
+        let sea_orm_db = test_sea_orm_db(dir.path()).await;
+        project_settings_repository::upsert(
+            &sea_orm_db,
+            "config_allow_worker_update_own_status",
+            "false",
+            None,
+            false,
+            "test",
+            NOW,
+        )
+        .await
+        .unwrap();
         let result = call(
             serde_json::json!({"operations": [{"type": "update_status", "task_id": "t1", "status": "in_progress"}]}),
             &worker("bob"),
@@ -7483,17 +7518,19 @@ mod bulk_task_operations_tests {
         {
             let guard = conn.lock().await;
             seed_task(&guard, "t1", "pending", Some("admin"), "alice");
-            project_settings_repository::upsert(
-                &guard,
-                "config_allow_worker_update_own_status",
-                "false",
-                None,
-                false,
-                "test",
-                NOW,
-            )
-            .unwrap();
         }
+        let sea_orm_db = test_sea_orm_db(dir.path()).await;
+        project_settings_repository::upsert(
+            &sea_orm_db,
+            "config_allow_worker_update_own_status",
+            "false",
+            None,
+            false,
+            "test",
+            NOW,
+        )
+        .await
+        .unwrap();
         let result = call(
             serde_json::json!({"operations": [{"type": "update_status", "task_id": "t1", "status": "in_progress"}]}),
             &admin("alice"),
