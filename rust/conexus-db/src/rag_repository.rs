@@ -57,9 +57,35 @@
 //! uses to cap watermark advancement below any row that failed to
 //! embed in a cycle — this module doesn't implement that policy
 //! itself, only exposes the read/write primitives it needs.
+//!
+//! ## Phase G (sea-orm migration): reads converted, writes deliberately not
+//! `embeddings_table_exists`/`get_last_indexed`/`get_all_meta`/
+//! `get_chunk_by_id`/`fetch_recent_context`/`search_similar` are
+//! rewritten here onto `sea_orm::DatabaseConnection`, via the
+//! `rag_chunk`/`rag_meta` Entities plus a raw-SQL escape hatch for
+//! `rag_embeddings` (a `vec0` virtual table sea-query's builder has no
+//! `MATCH`/`k =` vocabulary for) and for `sqlite_master` introspection.
+//! `bulk_index_chunks`/`delete_chunks_for`/`purge_source` stay
+//! synchronous on `rusqlite::Connection` — each is called from inside
+//! an already-established rusqlite transaction/connection at its own
+//! real call site (`task_tools::DeleteTaskTool`'s cascade,
+//! `project_context_tools::DeleteProjectContextTool`), so converting
+//! them now would either break that call site's atomicity story or
+//! require restructuring those tools onto sea-orm transactions —
+//! out of scope for this slice. Since the write functions still need
+//! an existence check and the public `embeddings_table_exists` above
+//! changed shape to take a `DatabaseConnection`, they call the private
+//! rusqlite-flavored [`embeddings_table_exists_sync`] instead — same
+//! query, same semantics, just not the public (now-async) name.
 
-use rusqlite::{Connection, OptionalExtension, Result, Row};
+use rusqlite::{Connection, OptionalExtension, Result};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, DatabaseConnection, DbErr, EntityTrait, QueryFilter, QueryOrder,
+    QuerySelect, Statement,
+};
 use std::collections::HashMap;
+
+use crate::entity::{project_context, rag_chunk, rag_meta};
 
 /// One row of the `rag_chunks` table. `metadata` is parsed from its
 /// stored JSON text; malformed JSON degrades to `None` rather than an
@@ -112,7 +138,24 @@ pub struct NewChunk<'a> {
 /// function in this module already uses this same check internally,
 /// so `ask_project_rag` calling it too doesn't introduce a second
 /// notion of "is RAG available", just reuses the one that exists.
-pub fn embeddings_table_exists(conn: &Connection) -> Result<bool> {
+pub async fn embeddings_table_exists(db: &DatabaseConnection) -> Result<bool, DbErr> {
+    // sea-query's builder has no `sqlite_master` introspection
+    // vocabulary — same raw-SQL escape hatch as `search_similar`'s own
+    // `vec0` query below.
+    let stmt = Statement::from_string(
+        sea_orm::DatabaseBackend::Sqlite,
+        "SELECT 1 FROM sqlite_master WHERE type IN ('table', 'virtual') AND name = 'rag_embeddings'",
+    );
+    Ok(db.query_one_raw(stmt).await?.is_some())
+}
+
+/// Sync rusqlite duplicate of [`embeddings_table_exists`] — kept ONLY
+/// for `bulk_index_chunks`/`delete_chunks_for`/`purge_source` below,
+/// which stay on `rusqlite::Connection` (see this module's own doc)
+/// and can no longer call the public async version once its signature
+/// changed to `&sea_orm::DatabaseConnection`. Not `pub`: no external
+/// caller needs a rusqlite-flavored check any more.
+fn embeddings_table_exists_sync(conn: &Connection) -> rusqlite::Result<bool> {
     conn.query_row(
         "SELECT 1 FROM sqlite_master WHERE type IN ('table', 'virtual') AND name = 'rag_embeddings'",
         [],
@@ -122,16 +165,15 @@ pub fn embeddings_table_exists(conn: &Connection) -> Result<bool> {
     .map(|found| found.is_some())
 }
 
-fn row_to_chunk(row: &Row) -> rusqlite::Result<RagChunkRow> {
-    let metadata_raw: Option<String> = row.get(5)?;
-    Ok(RagChunkRow {
-        chunk_id: row.get(0)?,
-        source_type: row.get(1)?,
-        source_ref: row.get(2)?,
-        chunk_text: row.get(3)?,
-        indexed_at: row.get(4)?,
-        metadata: metadata_raw.and_then(|s| serde_json::from_str(&s).ok()),
-    })
+fn chunk_row_from_model(model: rag_chunk::Model) -> RagChunkRow {
+    RagChunkRow {
+        chunk_id: model.chunk_id,
+        source_type: model.source_type,
+        source_ref: model.source_ref,
+        chunk_text: model.chunk_text,
+        indexed_at: model.indexed_at,
+        metadata: model.metadata.and_then(|s| serde_json::from_str(&s).ok()),
+    }
 }
 
 const CHUNK_COLUMNS: &str = "chunk_id, source_type, source_ref, chunk_text, indexed_at, metadata";
@@ -143,6 +185,13 @@ const CHUNK_COLUMNS: &str = "chunk_id, source_type, source_ref, chunk_text, inde
 /// still lands, its embedding silently skipped (the degrade path: a
 /// host without sqlite-vec still gets full-text-searchable rows, just
 /// not vector-searchable ones).
+///
+/// Deliberately NOT converted to sea-orm (Phase G): called from inside
+/// an already-established rusqlite transaction in
+/// `project_context_tools`'s own test helper today, and future real
+/// (indexer) callers are expected to run inside a rusqlite transaction
+/// too — see this module's own doc for why converting now is out of
+/// scope.
 pub fn bulk_index_chunks(
     conn: &Connection,
     source_type: &str,
@@ -150,7 +199,7 @@ pub fn bulk_index_chunks(
     chunks: &[NewChunk],
     now_iso: &str,
 ) -> Result<i64> {
-    let has_embeddings_table = embeddings_table_exists(conn)?;
+    let has_embeddings_table = embeddings_table_exists_sync(conn)?;
     let mut inserted = 0i64;
 
     for chunk in chunks {
@@ -190,8 +239,11 @@ pub fn bulk_index_chunks(
 /// Removes chunk rows + their embeddings for one source. Does NOT
 /// touch the `hash_<type>_<ref>` watermark — see the module doc for
 /// why that distinguishes this from [`purge_source`].
+///
+/// Deliberately NOT converted to sea-orm (Phase G): same reasoning as
+/// [`bulk_index_chunks`] — this module's own doc explains why.
 pub fn delete_chunks_for(conn: &Connection, source_type: &str, source_ref: &str) -> Result<i64> {
-    if embeddings_table_exists(conn)? {
+    if embeddings_table_exists_sync(conn)? {
         conn.execute(
             "DELETE FROM rag_embeddings WHERE rowid IN \
              (SELECT chunk_id FROM rag_chunks WHERE source_type = ?1 AND source_ref = ?2)",
@@ -209,8 +261,15 @@ pub fn delete_chunks_for(conn: &Connection, source_type: &str, source_ref: &str)
 /// watermark, so a future re-add re-indexes instead of being skipped
 /// as "unchanged" against a ghost hash. Returns the chunk rows
 /// deleted.
+///
+/// Deliberately NOT converted to sea-orm (Phase G): called from inside
+/// already-established rusqlite transactions/connections in
+/// `task_tools::DeleteTaskTool`'s cascade and `project_context_tools::
+/// DeleteProjectContextTool` — converting it now would either break
+/// that call site's atomicity story or require restructuring those
+/// tools onto sea-orm transactions; see this module's own doc.
 pub fn purge_source(conn: &Connection, source_type: &str, source_ref: &str) -> Result<i64> {
-    if embeddings_table_exists(conn)? {
+    if embeddings_table_exists_sync(conn)? {
         conn.execute(
             "DELETE FROM rag_embeddings WHERE rowid IN \
              (SELECT chunk_id FROM rag_chunks WHERE source_type = ?1 AND source_ref = ?2)",
@@ -256,41 +315,38 @@ pub fn set_meta(
     Ok(())
 }
 
-pub fn get_last_indexed(conn: &Connection, source_type: &str) -> Result<Option<String>> {
+pub async fn get_last_indexed(
+    db: &DatabaseConnection,
+    source_type: &str,
+) -> Result<Option<String>, DbErr> {
     let key = format!("last_indexed_{source_type}");
-    conn.query_row(
-        "SELECT meta_value FROM rag_meta WHERE meta_key = ?1",
-        [&key],
-        |row| row.get(0),
-    )
-    .optional()
+    let row = rag_meta::Entity::find_by_id(key).one(db).await?;
+    Ok(row.and_then(|m| m.meta_value))
 }
 
 /// Bulk read of every `rag_meta` row — the indexer's per-cycle
 /// prelude. Rows with a `NULL` value are omitted (a `HashMap<String,
 /// String>` has no way to represent one).
-pub fn get_all_meta(conn: &Connection) -> Result<HashMap<String, String>> {
-    let mut stmt = conn.prepare("SELECT meta_key, meta_value FROM rag_meta")?;
-    let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-    })?;
-    let mut map = HashMap::new();
-    for row in rows {
-        let (key, value) = row?;
-        if let Some(value) = value {
-            map.insert(key, value);
-        }
-    }
-    Ok(map)
+pub async fn get_all_meta(db: &DatabaseConnection) -> Result<HashMap<String, String>, DbErr> {
+    let rows = rag_meta::Entity::find().all(db).await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|m| {
+            let rag_meta::Model {
+                meta_key,
+                meta_value,
+            } = m;
+            meta_value.map(|v| (meta_key, v))
+        })
+        .collect())
 }
 
-pub fn get_chunk_by_id(conn: &Connection, chunk_id: i64) -> Result<Option<RagChunkRow>> {
-    conn.query_row(
-        &format!("SELECT {CHUNK_COLUMNS} FROM rag_chunks WHERE chunk_id = ?1"),
-        [chunk_id],
-        row_to_chunk,
-    )
-    .optional()
+pub async fn get_chunk_by_id(
+    db: &DatabaseConnection,
+    chunk_id: i64,
+) -> Result<Option<RagChunkRow>, DbErr> {
+    let row = rag_chunk::Entity::find_by_id(chunk_id).one(db).await?;
+    Ok(row.map(chunk_row_from_model))
 }
 
 /// K-nearest-neighbor search against `rag_embeddings`, joined back to
@@ -302,13 +358,20 @@ pub fn get_chunk_by_id(conn: &Connection, chunk_id: i64) -> Result<Option<RagChu
 /// filtering happens after fetch. To avoid starving `limit` under a
 /// filter, this over-fetches `limit * 4` candidates before filtering
 /// (matches Python's own heuristic multiplier).
-pub fn search_similar(
-    conn: &Connection,
+///
+/// Raw-SQL escape hatch, not a typed sea-orm query: `rag_embeddings`
+/// is a sqlite-vec `vec0` virtual table with no Entity (sea-query's
+/// builder has no vocabulary for `MATCH`/`k =` KNN syntax) — kept as
+/// ONE prepared statement selecting the full `CHUNK_COLUMNS` set plus
+/// `r.distance`, matching how the rusqlite version ran one prepared
+/// statement too.
+pub async fn search_similar(
+    db: &DatabaseConnection,
     query_embedding: &[f32],
     limit: i64,
     source_type_filter: Option<&str>,
-) -> Result<Vec<RagSearchResult>> {
-    if !embeddings_table_exists(conn)? {
+) -> Result<Vec<RagSearchResult>, DbErr> {
+    if !embeddings_table_exists(db).await? {
         return Ok(Vec::new());
     }
 
@@ -319,35 +382,36 @@ pub fn search_similar(
     };
     let query_json = serde_json::to_string(query_embedding).expect("a &[f32] always serializes");
 
-    let mut stmt = conn.prepare(&format!(
+    let sql = format!(
         "SELECT {}, r.distance FROM rag_embeddings r \
          JOIN rag_chunks c ON r.rowid = c.chunk_id \
-         WHERE r.embedding MATCH ?1 AND k = ?2 ORDER BY r.distance",
+         WHERE r.embedding MATCH ? AND k = ? ORDER BY r.distance",
         CHUNK_COLUMNS
             .split(", ")
             .map(|c| format!("c.{c}"))
             .collect::<Vec<_>>()
             .join(", ")
-    ))?;
-
-    let rows = stmt.query_map((&query_json, effective_k), |row| {
-        let metadata_raw: Option<String> = row.get(5)?;
-        Ok((
-            RagChunkRow {
-                chunk_id: row.get(0)?,
-                source_type: row.get(1)?,
-                source_ref: row.get(2)?,
-                chunk_text: row.get(3)?,
-                indexed_at: row.get(4)?,
-                metadata: metadata_raw.and_then(|s| serde_json::from_str(&s).ok()),
-            },
-            row.get::<_, f64>(6)?,
-        ))
-    })?;
+    );
+    let stmt = Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Sqlite,
+        &sql,
+        [query_json.into(), effective_k.into()],
+    );
+    let rows = db.query_all_raw(stmt).await?;
 
     let mut results = Vec::new();
     for row in rows {
-        let (chunk, distance) = row?;
+        let metadata_raw: Option<String> = row.try_get("", "metadata")?;
+        let chunk = RagChunkRow {
+            chunk_id: row.try_get("", "chunk_id")?,
+            source_type: row.try_get("", "source_type")?,
+            source_ref: row.try_get("", "source_ref")?,
+            chunk_text: row.try_get("", "chunk_text")?,
+            indexed_at: row.try_get("", "indexed_at")?,
+            metadata: metadata_raw.and_then(|s| serde_json::from_str(&s).ok()),
+        };
+        let distance: f64 = row.try_get("", "distance")?;
+
         if let Some(filter) = source_type_filter {
             if chunk.source_type != filter {
                 continue;
@@ -364,37 +428,30 @@ pub fn search_similar(
 /// Time-windowed "recently changed" `project_context` entries — reads
 /// `project_context`, not any RAG table. `limit: None` drops the
 /// `LIMIT` clause entirely (an unbounded read), matching a historical
-/// Python call shape.
-pub fn fetch_recent_context(
-    conn: &Connection,
+/// Python call shape. A real sea-orm typed query (the already-merged
+/// `project_context::Entity`, not a raw `Statement`) — unlike
+/// `search_similar`, there's no `vec0`-shaped obstacle here.
+pub async fn fetch_recent_context(
+    db: &DatabaseConnection,
     since: &str,
     limit: Option<i64>,
-) -> Result<Vec<RecentContextEntry>> {
-    fn map_row(row: &Row) -> rusqlite::Result<RecentContextEntry> {
-        Ok(RecentContextEntry {
-            context_key: row.get(0)?,
-            value: row.get(1)?,
-            description: row.get(2)?,
-            updated_at: row.get(3)?,
+) -> Result<Vec<RecentContextEntry>, DbErr> {
+    let mut query = project_context::Entity::find()
+        .filter(project_context::Column::UpdatedAt.gt(since))
+        .order_by_desc(project_context::Column::UpdatedAt);
+    if let Some(l) = limit {
+        query = query.limit(l as u64);
+    }
+    let rows = query.all(db).await?;
+    Ok(rows
+        .into_iter()
+        .map(|m| RecentContextEntry {
+            context_key: m.context_key,
+            value: m.value,
+            description: m.description,
+            updated_at: m.updated_at,
         })
-    }
-
-    const BASE_SQL: &str =
-        "SELECT context_key, value, description, updated_at FROM project_context \
-         WHERE updated_at > ?1 ORDER BY updated_at DESC";
-
-    match limit {
-        Some(l) => {
-            let mut stmt = conn.prepare(&format!("{BASE_SQL} LIMIT ?2"))?;
-            let rows = stmt.query_map((since, l), map_row)?.collect();
-            rows
-        }
-        None => {
-            let mut stmt = conn.prepare(BASE_SQL)?;
-            let rows = stmt.query_map([since], map_row)?.collect();
-            rows
-        }
-    }
+        .collect())
 }
 
 #[cfg(test)]
@@ -421,10 +478,45 @@ mod tests {
         conn
     }
 
-    fn test_conn_without_vec() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
+    /// sea-orm needs a SEPARATE connection pool from rusqlite's, so a
+    /// test seeding through `bulk_index_chunks`/`set_meta` (still
+    /// rusqlite) and then reading through `get_chunk_by_id`/
+    /// `get_last_indexed`/`get_all_meta`/`search_similar` (now
+    /// sea-orm) needs a REAL FILE-BACKED temp DB, not `:memory:` —
+    /// `:memory:` can't be shared across two connection handles. Same
+    /// pattern as `task_repository::test_conn_with_sea_orm`.
+    async fn test_conn_with_vec_and_sea_orm(
+        dimension: u32,
+    ) -> (tempfile::TempDir, Connection, sea_orm::DatabaseConnection) {
+        VEC_REGISTERED.call_once(|| {
+            assert!(
+                conexus_vec::register_sqlite_vec(),
+                "sqlite-vec must be loadable in the test environment"
+            );
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let conn = Connection::open(&path).unwrap();
         init_schema(&conn).unwrap();
-        conn
+        init_rag_embeddings_table(&conn, dimension).unwrap();
+        let db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        (dir, conn, db)
+    }
+
+    /// Same file-backed rationale as [`test_conn_with_vec_and_sea_orm`],
+    /// without the `rag_embeddings` vec0 table.
+    async fn test_conn_without_vec_and_sea_orm(
+    ) -> (tempfile::TempDir, Connection, sea_orm::DatabaseConnection) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn).unwrap();
+        let db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        (dir, conn, db)
     }
 
     fn one_chunk<'a>(text: &'a str, embedding: Option<&'a [f32]>) -> NewChunk<'a> {
@@ -435,9 +527,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn bulk_index_chunks_writes_chunk_and_embedding_rows() {
-        let conn = test_conn_with_vec(3);
+    #[tokio::test]
+    async fn bulk_index_chunks_writes_chunk_and_embedding_rows() {
+        let (_dir, conn, db) = test_conn_with_vec_and_sea_orm(3).await;
         let embedding = [1.0f32, 0.0, 0.0];
         let chunks = vec![one_chunk("hello world", Some(&embedding))];
 
@@ -451,7 +543,7 @@ mod tests {
         .unwrap();
         assert_eq!(inserted, 1);
 
-        let chunk = get_chunk_by_id(&conn, 1).unwrap().unwrap();
+        let chunk = get_chunk_by_id(&db, 1).await.unwrap().unwrap();
         assert_eq!(chunk.source_type, "markdown");
         assert_eq!(chunk.source_ref, "docs/readme.md");
         assert_eq!(chunk.chunk_text, "hello world");
@@ -484,15 +576,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn bulk_index_chunks_writes_chunk_row_even_without_an_embedding() {
-        let conn = test_conn_with_vec(3);
+    #[tokio::test]
+    async fn bulk_index_chunks_writes_chunk_row_even_without_an_embedding() {
+        let (_dir, conn, db) = test_conn_with_vec_and_sea_orm(3).await;
         let chunks = vec![one_chunk("no vector for this one", None)];
 
         let inserted =
             bulk_index_chunks(&conn, "markdown", "a", &chunks, "2026-01-01T00:00:00Z").unwrap();
         assert_eq!(inserted, 1);
-        assert!(get_chunk_by_id(&conn, 1).unwrap().is_some());
+        assert!(get_chunk_by_id(&db, 1).await.unwrap().is_some());
 
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM rag_embeddings", [], |r| r.get(0))
@@ -503,9 +595,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn bulk_index_chunks_degrades_gracefully_without_an_embeddings_table() {
-        let conn = test_conn_without_vec();
+    #[tokio::test]
+    async fn bulk_index_chunks_degrades_gracefully_without_an_embeddings_table() {
+        let (_dir, conn, db) = test_conn_without_vec_and_sea_orm().await;
         let embedding = [1.0f32, 0.0, 0.0];
         let chunks = vec![one_chunk("still indexed as text", Some(&embedding))];
 
@@ -515,7 +607,7 @@ mod tests {
             inserted, 1,
             "the chunk row must still land even with no rag_embeddings table"
         );
-        assert!(get_chunk_by_id(&conn, 1).unwrap().is_some());
+        assert!(get_chunk_by_id(&db, 1).await.unwrap().is_some());
     }
 
     #[test]
@@ -620,28 +712,28 @@ mod tests {
         );
     }
 
-    #[test]
-    fn set_meta_and_get_last_indexed_round_trip() {
-        let conn = test_conn_without_vec();
-        assert_eq!(get_last_indexed(&conn, "markdown").unwrap(), None);
+    #[tokio::test]
+    async fn set_meta_and_get_last_indexed_round_trip() {
+        let (_dir, conn, db) = test_conn_without_vec_and_sea_orm().await;
+        assert_eq!(get_last_indexed(&db, "markdown").await.unwrap(), None);
 
         set_meta(&conn, "markdown", Some("2026-01-01T00:00:00Z"), None).unwrap();
         assert_eq!(
-            get_last_indexed(&conn, "markdown").unwrap().as_deref(),
+            get_last_indexed(&db, "markdown").await.unwrap().as_deref(),
             Some("2026-01-01T00:00:00Z")
         );
 
         // Re-writing (INSERT OR REPLACE) must overwrite, not conflict.
         set_meta(&conn, "markdown", Some("2026-01-02T00:00:00Z"), None).unwrap();
         assert_eq!(
-            get_last_indexed(&conn, "markdown").unwrap().as_deref(),
+            get_last_indexed(&db, "markdown").await.unwrap().as_deref(),
             Some("2026-01-02T00:00:00Z")
         );
     }
 
-    #[test]
-    fn set_meta_writes_source_hashes_independently_of_last_indexed_at() {
-        let conn = test_conn_without_vec();
+    #[tokio::test]
+    async fn set_meta_writes_source_hashes_independently_of_last_indexed_at() {
+        let (_dir, conn, db) = test_conn_without_vec_and_sea_orm().await;
         set_meta(
             &conn,
             "context",
@@ -651,11 +743,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            get_last_indexed(&conn, "context").unwrap(),
+            get_last_indexed(&db, "context").await.unwrap(),
             None,
             "no last_indexed_at was given, so it must stay unwritten"
         );
-        let all = get_all_meta(&conn).unwrap();
+        let all = get_all_meta(&db).await.unwrap();
         assert_eq!(
             all.get("hash_context_key-a").map(String::as_str),
             Some("hash-a")
@@ -666,9 +758,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn get_all_meta_returns_every_row() {
-        let conn = test_conn_without_vec();
+    #[tokio::test]
+    async fn get_all_meta_returns_every_row() {
+        let (_dir, conn, db) = test_conn_without_vec_and_sea_orm().await;
         set_meta(
             &conn,
             "markdown",
@@ -677,7 +769,7 @@ mod tests {
         )
         .unwrap();
 
-        let all = get_all_meta(&conn).unwrap();
+        let all = get_all_meta(&db).await.unwrap();
         assert_eq!(
             all.get("last_indexed_markdown").map(String::as_str),
             Some("2026-01-01T00:00:00Z")
@@ -685,15 +777,15 @@ mod tests {
         assert_eq!(all.get("hash_markdown_a").map(String::as_str), Some("h1"));
     }
 
-    #[test]
-    fn get_chunk_by_id_returns_none_for_unknown_id() {
-        let conn = test_conn_without_vec();
-        assert_eq!(get_chunk_by_id(&conn, 999).unwrap(), None);
+    #[tokio::test]
+    async fn get_chunk_by_id_returns_none_for_unknown_id() {
+        let (_dir, _conn, db) = test_conn_without_vec_and_sea_orm().await;
+        assert_eq!(get_chunk_by_id(&db, 999).await.unwrap(), None);
     }
 
-    #[test]
-    fn search_similar_ranks_by_ascending_distance() {
-        let conn = test_conn_with_vec(3);
+    #[tokio::test]
+    async fn search_similar_ranks_by_ascending_distance() {
+        let (_dir, conn, db) = test_conn_with_vec_and_sea_orm(3).await;
         // Three orthogonal unit vectors.
         bulk_index_chunks(
             &conn,
@@ -720,7 +812,9 @@ mod tests {
         )
         .unwrap();
 
-        let results = search_similar(&conn, &[1.0, 0.0, 0.0], 5, None).unwrap();
+        let results = search_similar(&db, &[1.0, 0.0, 0.0], 5, None)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 3);
         assert_eq!(
             results[0].chunk.source_ref, "x",
@@ -731,9 +825,9 @@ mod tests {
         assert!(results[1].distance <= results[2].distance);
     }
 
-    #[test]
-    fn search_similar_limit_caps_results() {
-        let conn = test_conn_with_vec(3);
+    #[tokio::test]
+    async fn search_similar_limit_caps_results() {
+        let (_dir, conn, db) = test_conn_with_vec_and_sea_orm(3).await;
         for (i, v) in [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
             .iter()
             .enumerate()
@@ -748,13 +842,15 @@ mod tests {
             .unwrap();
         }
 
-        let results = search_similar(&conn, &[1.0, 0.0, 0.0], 1, None).unwrap();
+        let results = search_similar(&db, &[1.0, 0.0, 0.0], 1, None)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 1);
     }
 
-    #[test]
-    fn search_similar_source_type_filter_is_honored() {
-        let conn = test_conn_with_vec(3);
+    #[tokio::test]
+    async fn search_similar_source_type_filter_is_honored() {
+        let (_dir, conn, db) = test_conn_with_vec_and_sea_orm(3).await;
         bulk_index_chunks(
             &conn,
             "markdown",
@@ -772,14 +868,16 @@ mod tests {
         )
         .unwrap();
 
-        let results = search_similar(&conn, &[1.0, 0.0, 0.0], 5, Some("code")).unwrap();
+        let results = search_similar(&db, &[1.0, 0.0, 0.0], 5, Some("code"))
+            .await
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].chunk.source_type, "code");
     }
 
-    #[test]
-    fn search_similar_hydrates_metadata_json() {
-        let conn = test_conn_with_vec(3);
+    #[tokio::test]
+    async fn search_similar_hydrates_metadata_json() {
+        let (_dir, conn, db) = test_conn_with_vec_and_sea_orm(3).await;
         let metadata = serde_json::json!({"title": "hello"});
         let chunk = NewChunk {
             chunk_text: "content",
@@ -788,40 +886,26 @@ mod tests {
         };
         bulk_index_chunks(&conn, "markdown", "a", &[chunk], "2026-01-01T00:00:00Z").unwrap();
 
-        let results = search_similar(&conn, &[1.0, 0.0, 0.0], 5, None).unwrap();
+        let results = search_similar(&db, &[1.0, 0.0, 0.0], 5, None)
+            .await
+            .unwrap();
         assert_eq!(results[0].chunk.metadata, Some(metadata));
     }
 
-    #[test]
-    fn search_similar_returns_empty_not_an_error_without_embeddings_table() {
-        let conn = test_conn_without_vec();
+    #[tokio::test]
+    async fn search_similar_returns_empty_not_an_error_without_embeddings_table() {
+        let (_dir, _conn, db) = test_conn_without_vec_and_sea_orm().await;
         assert_eq!(
-            search_similar(&conn, &[1.0, 0.0, 0.0], 5, None).unwrap(),
+            search_similar(&db, &[1.0, 0.0, 0.0], 5, None)
+                .await
+                .unwrap(),
             Vec::new()
         );
     }
 
-    /// `fetch_recent_context` reads `project_context` via rusqlite
-    /// directly (it stays outside this migration's scope), but
-    /// seeding through `project_context_repository::upsert` is
-    /// sea-orm-backed (Phase G) -- a real temp file shared between
-    /// both connection types (never `:memory:` for either side) is
-    /// required for the rusqlite read to see the sea-orm writes.
-    async fn test_conn_without_vec_shared_file(
-    ) -> (tempfile::TempDir, Connection, sea_orm::DatabaseConnection) {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.db");
-        let conn = Connection::open(&path).unwrap();
-        init_schema(&conn).unwrap();
-        let sea_orm_db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
-            .await
-            .unwrap();
-        (dir, conn, sea_orm_db)
-    }
-
     #[tokio::test]
     async fn fetch_recent_context_filters_by_time_window_descending() {
-        let (_dir, conn, sea_orm_db) = test_conn_without_vec_shared_file().await;
+        let (_dir, _conn, sea_orm_db) = test_conn_without_vec_and_sea_orm().await;
         crate::project_context_repository::upsert(
             &sea_orm_db,
             "old",
@@ -856,7 +940,9 @@ mod tests {
         .await
         .unwrap();
 
-        let rows = fetch_recent_context(&conn, "2026-01-01T12:00:00Z", None).unwrap();
+        let rows = fetch_recent_context(&sea_orm_db, "2026-01-01T12:00:00Z", None)
+            .await
+            .unwrap();
         let keys: Vec<&str> = rows.iter().map(|r| r.context_key.as_str()).collect();
         assert_eq!(
             keys,
@@ -867,7 +953,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_recent_context_limit_none_means_unbounded() {
-        let (_dir, conn, sea_orm_db) = test_conn_without_vec_shared_file().await;
+        let (_dir, _conn, sea_orm_db) = test_conn_without_vec_and_sea_orm().await;
         for i in 0..10 {
             crate::project_context_repository::upsert(
                 &sea_orm_db,
@@ -882,10 +968,14 @@ mod tests {
             .unwrap();
         }
 
-        let rows = fetch_recent_context(&conn, "2025-12-31T23:59:59Z", None).unwrap();
+        let rows = fetch_recent_context(&sea_orm_db, "2025-12-31T23:59:59Z", None)
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 10);
 
-        let limited = fetch_recent_context(&conn, "2025-12-31T23:59:59Z", Some(3)).unwrap();
+        let limited = fetch_recent_context(&sea_orm_db, "2025-12-31T23:59:59Z", Some(3))
+            .await
+            .unwrap();
         assert_eq!(limited.len(), 3);
     }
 }
