@@ -169,8 +169,7 @@ impl Tool for AddTaskCommentTool {
                 };
             };
 
-            let guard = conn.lock().await;
-            let task = match task_repository::get_by_id(&guard, &task_id) {
+            let task = match task_repository::get_by_id(ctx.sea_orm_db, &task_id).await {
                 Ok(Some(t)) => t,
                 Ok(None) => {
                     return ToolResult::NotFound {
@@ -187,6 +186,7 @@ impl Tool for AddTaskCommentTool {
                     }
                 }
             };
+            let guard = conn.lock().await;
 
             let requester = principal
                 .and_then(|p| p.agent_id.clone().or_else(|| p.user_id.clone()))

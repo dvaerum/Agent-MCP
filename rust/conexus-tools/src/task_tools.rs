@@ -1259,7 +1259,7 @@ pub(crate) fn link_child_to_parent(
     let Some(parent_id) = parent_task_id else {
         return Ok(());
     };
-    let parent = match task_repository::get_by_id(conn, parent_id) {
+    let parent = match task_repository::get_by_id_in_transaction(conn, parent_id) {
         Ok(Some(p)) => p,
         Ok(None) => return Ok(()),
         Err(_) => return Err(()),
@@ -1269,7 +1269,7 @@ pub(crate) fn link_child_to_parent(
         return Ok(());
     }
     children.push(child_task_id.to_string());
-    match task_repository::update_fields(
+    match task_repository::update_fields_in_transaction(
         conn,
         parent_id,
         &conexus_db::task_repository::TaskFields {
@@ -1682,143 +1682,127 @@ impl Tool for UpdateTaskStatusTool {
                 .unwrap_or_else(|| "admin".to_string());
 
             let conn = conn.lock().await;
-            let tx = match conn.unchecked_transaction() {
-                Ok(tx) => tx,
-                Err(_) => {
-                    return ToolResult::Failed {
-                        message: "Database error updating tasks".to_string(),
-                    }
-                }
-            };
-
-            let mut results: Vec<SingleTaskResult> = Vec::new();
-            let mut tasks_to_cascade: Vec<String> = Vec::new();
-
-            for task_id in &task_ids_to_process {
-                let edit = TaskEdit {
-                    notes_content: notes_content.as_deref(),
-                    new_title: new_title.as_deref(),
-                    new_description: new_description.as_deref(),
-                    new_priority: new_priority.as_deref(),
-                    new_assigned_to: new_assigned_to.as_deref(),
-                    new_depends_on_tasks: new_depends_on_tasks.as_deref(),
-                    system_transition: false,
-                    validate_dependencies,
-                };
-                let outcome = match update_single_task(
-                    &tx,
-                    task_id,
-                    &new_status,
-                    &requesting_agent_id,
-                    is_admin_request,
-                    &edit,
-                    now,
-                ) {
-                    Ok(o) => o,
+            // Scoped in its own block so `tx` (a `rusqlite::Transaction`,
+            // not `Send`) is lexically dropped -- not merely
+            // logically consumed by `commit()` -- before the `.await`
+            // below; otherwise the compiler keeps its slot live across
+            // the yield point and the whole `Tool::call` future stops
+            // being `Send`.
+            let (results, cascade_results, dependency_updates) = {
+                let tx = match conn.unchecked_transaction() {
+                    Ok(tx) => tx,
                     Err(_) => {
                         return ToolResult::Failed {
                             message: "Database error updating tasks".to_string(),
                         }
                     }
                 };
-                match outcome {
-                    UpdateSingleTaskOutcome::Applied(applied) => {
-                        if cascade_to_children {
-                            tasks_to_cascade.extend(applied.child_tasks.clone());
-                        }
-                        let mut log_details = serde_json::json!({
-                            "status": new_status,
-                            "old_status": applied.old_status,
-                        });
-                        if notes_content.is_some() {
-                            log_details["notes_added"] = serde_json::json!(true);
-                        }
-                        if let Err(_e) = agent_action_repository::log_agent_action(
-                            &tx,
-                            &requesting_agent_id,
-                            "update_task_status",
-                            Some(task_id),
-                            Some(&log_details),
-                            now,
-                        ) {
-                            // Best-effort audit log -- same rationale as
-                            // every other mutating tool in this module.
-                        }
-                        results.push(SingleTaskResult {
-                            task_id: task_id.clone(),
-                            applied: Some(applied),
-                            error: None,
-                        });
-                    }
-                    other => {
-                        let error = outcome_error_message(&other, task_id);
-                        results.push(SingleTaskResult {
-                            task_id: task_id.clone(),
-                            applied: None,
-                            error: Some(error),
-                        });
-                    }
-                }
-            }
 
-            // Phase 2: smart cascade to children -- only for the
-            // blocking terminal states, only when the caller opted in.
-            let mut cascade_results: Vec<SingleTaskResult> = Vec::new();
-            if cascade_to_children
-                && !tasks_to_cascade.is_empty()
-                && matches!(new_status.as_str(), "cancelled" | "failed")
-            {
-                for child_id in &tasks_to_cascade {
-                    let edit =
-                        TaskEdit::status_only(Some("Auto-cascaded from parent task status change"));
-                    match update_single_task(
+                let mut results: Vec<SingleTaskResult> = Vec::new();
+                let mut tasks_to_cascade: Vec<String> = Vec::new();
+
+                for task_id in &task_ids_to_process {
+                    let edit = TaskEdit {
+                        notes_content: notes_content.as_deref(),
+                        new_title: new_title.as_deref(),
+                        new_description: new_description.as_deref(),
+                        new_priority: new_priority.as_deref(),
+                        new_assigned_to: new_assigned_to.as_deref(),
+                        new_depends_on_tasks: new_depends_on_tasks.as_deref(),
+                        system_transition: false,
+                        validate_dependencies,
+                    };
+                    let outcome = match update_single_task(
                         &tx,
-                        child_id,
+                        task_id,
                         &new_status,
                         &requesting_agent_id,
                         is_admin_request,
                         &edit,
                         now,
                     ) {
-                        Ok(UpdateSingleTaskOutcome::Applied(applied)) => {
-                            cascade_results.push(SingleTaskResult {
-                                task_id: child_id.clone(),
-                                applied: Some(applied),
-                                error: None,
-                            });
-                        }
-                        Ok(other) => {
-                            let error = outcome_error_message(&other, child_id);
-                            cascade_results.push(SingleTaskResult {
-                                task_id: child_id.clone(),
-                                applied: None,
-                                error: Some(error),
-                            });
-                        }
+                        Ok(o) => o,
                         Err(_) => {
                             return ToolResult::Failed {
                                 message: "Database error updating tasks".to_string(),
                             }
                         }
+                    };
+                    match outcome {
+                        UpdateSingleTaskOutcome::Applied(applied) => {
+                            if cascade_to_children {
+                                tasks_to_cascade.extend(applied.child_tasks.clone());
+                            }
+                            let mut log_details = serde_json::json!({
+                                "status": new_status,
+                                "old_status": applied.old_status,
+                            });
+                            if notes_content.is_some() {
+                                log_details["notes_added"] = serde_json::json!(true);
+                            }
+                            if let Err(_e) = agent_action_repository::log_agent_action(
+                                &tx,
+                                &requesting_agent_id,
+                                "update_task_status",
+                                Some(task_id),
+                                Some(&log_details),
+                                now,
+                            ) {
+                                // Best-effort audit log -- same rationale as
+                                // every other mutating tool in this module.
+                            }
+                            results.push(SingleTaskResult {
+                                task_id: task_id.clone(),
+                                applied: Some(applied),
+                                error: None,
+                            });
+                        }
+                        other => {
+                            let error = outcome_error_message(&other, task_id);
+                            results.push(SingleTaskResult {
+                                task_id: task_id.clone(),
+                                applied: None,
+                                error: Some(error),
+                            });
+                        }
                     }
                 }
-            }
 
-            // Phase 3: dependency auto-advance -- shared with the
-            // (future, PR 8) bulk path via the same engine function.
-            let mut dependency_updates: Vec<crate::task_mutation_engine::TaskUpdateApplied> =
-                Vec::new();
-            if auto_update_dependencies && new_status == "completed" {
-                for result in &results {
-                    if let Some(applied) = &result.applied {
-                        match advance_dependents_after_completion(
+                // Phase 2: smart cascade to children -- only for the
+                // blocking terminal states, only when the caller opted in.
+                let mut cascade_results: Vec<SingleTaskResult> = Vec::new();
+                if cascade_to_children
+                    && !tasks_to_cascade.is_empty()
+                    && matches!(new_status.as_str(), "cancelled" | "failed")
+                {
+                    for child_id in &tasks_to_cascade {
+                        let edit = TaskEdit::status_only(Some(
+                            "Auto-cascaded from parent task status change",
+                        ));
+                        match update_single_task(
                             &tx,
-                            &applied.task_id,
+                            child_id,
+                            &new_status,
                             &requesting_agent_id,
                             is_admin_request,
+                            &edit,
                             now,
                         ) {
-                            Ok(advanced) => dependency_updates.extend(advanced),
+                            Ok(UpdateSingleTaskOutcome::Applied(applied)) => {
+                                cascade_results.push(SingleTaskResult {
+                                    task_id: child_id.clone(),
+                                    applied: Some(applied),
+                                    error: None,
+                                });
+                            }
+                            Ok(other) => {
+                                let error = outcome_error_message(&other, child_id);
+                                cascade_results.push(SingleTaskResult {
+                                    task_id: child_id.clone(),
+                                    applied: None,
+                                    error: Some(error),
+                                });
+                            }
                             Err(_) => {
                                 return ToolResult::Failed {
                                     message: "Database error updating tasks".to_string(),
@@ -1827,13 +1811,40 @@ impl Tool for UpdateTaskStatusTool {
                         }
                     }
                 }
-            }
 
-            if tx.commit().is_err() {
-                return ToolResult::Failed {
-                    message: "Database error updating tasks".to_string(),
-                };
-            }
+                // Phase 3: dependency auto-advance -- shared with the
+                // (future, PR 8) bulk path via the same engine function.
+                let mut dependency_updates: Vec<crate::task_mutation_engine::TaskUpdateApplied> =
+                    Vec::new();
+                if auto_update_dependencies && new_status == "completed" {
+                    for result in &results {
+                        if let Some(applied) = &result.applied {
+                            match advance_dependents_after_completion(
+                                &tx,
+                                &applied.task_id,
+                                &requesting_agent_id,
+                                is_admin_request,
+                                now,
+                            ) {
+                                Ok(advanced) => dependency_updates.extend(advanced),
+                                Err(_) => {
+                                    return ToolResult::Failed {
+                                        message: "Database error updating tasks".to_string(),
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if tx.commit().is_err() {
+                    return ToolResult::Failed {
+                        message: "Database error updating tasks".to_string(),
+                    };
+                }
+
+                (results, cascade_results, dependency_updates)
+            };
 
             // Post-commit: wake every mutated task's CURRENT assignee.
             let mut mutated_ids: Vec<String> = results
@@ -1846,7 +1857,7 @@ impl Tool for UpdateTaskStatusTool {
             mutated_ids.dedup();
             let mut woken: HashSet<String> = HashSet::new();
             for tid in &mutated_ids {
-                if let Ok(Some(row)) = task_repository::get_by_id(&conn, tid) {
+                if let Ok(Some(row)) = task_repository::get_by_id(ctx.sea_orm_db, tid).await {
                     if let Some(assignee) = row.assigned_to.filter(|a| !a.is_empty()) {
                         if woken.insert(assignee.clone()) {
                             ctx.waiter_registry.notify(&assignee);
@@ -2045,7 +2056,7 @@ impl Tool for UpdateTaskTool {
                 }
             };
 
-            let Some(prior) = (match task_repository::get_by_id(&tx, &task_id) {
+            let Some(prior) = (match task_repository::get_by_id_in_transaction(&tx, &task_id) {
                 Ok(row) => row,
                 Err(_) => {
                     return ToolResult::Failed {
@@ -2174,7 +2185,9 @@ impl Tool for UpdateTaskTool {
                         clear_fields.status = Some("unassigned");
                     }
                 }
-                if let Err(e) = task_repository::update_fields(&tx, &task_id, &clear_fields, now) {
+                if let Err(e) =
+                    task_repository::update_fields_in_transaction(&tx, &task_id, &clear_fields, now)
+                {
                     return match e {
                         conexus_db::task_repository::UpdateTaskError::TerminalTaskWriteBlocked(
                             _,
@@ -2382,7 +2395,7 @@ impl Tool for DeleteTaskTool {
                 }
             };
 
-            let task_data = match task_repository::get_by_id(&tx, &task_id) {
+            let task_data = match task_repository::get_by_id_in_transaction(&tx, &task_id) {
                 Ok(Some(row)) => row,
                 Ok(None) => {
                     return ToolResult::NotFound {
@@ -2436,7 +2449,7 @@ impl Tool for DeleteTaskTool {
                 let dependent_list: Vec<String> = dependent_tasks
                     .iter()
                     .map(|(id, _)| {
-                        let title = task_repository::get_by_id(&tx, id)
+                        let title = task_repository::get_by_id_in_transaction(&tx, id)
                             .ok()
                             .flatten()
                             .map(|t| t.title)
@@ -2484,11 +2497,12 @@ impl Tool for DeleteTaskTool {
 
             // Parent mirror upkeep.
             if let Some(parent_id) = &task_data.parent_task {
-                if let Ok(Some(parent)) = task_repository::get_by_id(&tx, parent_id) {
+                if let Ok(Some(parent)) = task_repository::get_by_id_in_transaction(&tx, parent_id)
+                {
                     let mut children = parent.child_tasks.unwrap_or_default();
                     if let Some(pos) = children.iter().position(|c| c == &task_id) {
                         children.remove(pos);
-                        let _ = task_repository::update_fields(
+                        let _ = task_repository::update_fields_in_transaction(
                             &tx,
                             parent_id,
                             &conexus_db::task_repository::TaskFields {
@@ -2573,7 +2587,7 @@ impl Tool for DeleteTaskTool {
                         .cloned()
                         .collect();
                     if &pruned != dep_dependencies {
-                        let _ = task_repository::update_fields(
+                        let _ = task_repository::update_fields_in_transaction(
                             &tx,
                             dep_id,
                             &conexus_db::task_repository::TaskFields {
@@ -2599,7 +2613,8 @@ impl Tool for DeleteTaskTool {
                 // so a task whose last blocking dependency was deleted
                 // would otherwise never progress on its own.
                 for dep_id in &reeval_candidates {
-                    let Ok(Some(row)) = task_repository::get_by_id(&tx, dep_id) else {
+                    let Ok(Some(row)) = task_repository::get_by_id_in_transaction(&tx, dep_id)
+                    else {
                         continue;
                     };
                     if row.status != "pending" {
@@ -2607,7 +2622,7 @@ impl Tool for DeleteTaskTool {
                     }
                     let remaining = row.depends_on_tasks.unwrap_or_default();
                     let all_completed = remaining.iter().all(|rid| {
-                        task_repository::get_by_id(&tx, rid)
+                        task_repository::get_by_id_in_transaction(&tx, rid)
                             .ok()
                             .flatten()
                             .is_some_and(|r| r.status == "completed")
@@ -3118,7 +3133,7 @@ impl Tool for RequestAssistanceTool {
                 }
             };
 
-            let parent = match task_repository::get_by_id(&tx, &parent_task_id) {
+            let parent = match task_repository::get_by_id_in_transaction(&tx, &parent_task_id) {
                 Ok(Some(row)) => row,
                 Ok(None) => {
                     return ToolResult::NotFound {
@@ -3203,7 +3218,7 @@ impl Tool for RequestAssistanceTool {
                      {child_task_id}"
                 ),
             });
-            if let Err(_e) = task_repository::update_fields(
+            if let Err(_e) = task_repository::update_fields_in_transaction(
                 &tx,
                 &parent_task_id,
                 &conexus_db::task_repository::TaskFields {
@@ -3377,41 +3392,13 @@ impl Tool for BulkTaskOperationsTool {
             }
 
             let conn = conn.lock().await;
-            let tx = match conn.unchecked_transaction() {
-                Ok(tx) => tx,
-                Err(_) => {
-                    return ToolResult::Failed {
-                        message: "Database error in bulk operations".to_string(),
-                    }
-                }
-            };
-
-            let mut outcomes: Vec<BulkOpOutcome> = Vec::new();
-
-            for (i, op) in operations.iter().enumerate() {
-                let Some(op_obj) = op.as_object() else {
-                    outcomes.push(bulk_op_error(
-                        i,
-                        "Invalid operation format (must be object)",
-                    ));
-                    continue;
-                };
-                let op_type = op_obj.get("type").and_then(Value::as_str);
-                let task_id = op_obj.get("task_id").and_then(Value::as_str);
-                let (Some(op_type), Some(task_id)) = (op_type, task_id) else {
-                    outcomes.push(bulk_op_error(
-                        i,
-                        "Missing required fields 'type' and 'task_id'",
-                    ));
-                    continue;
-                };
-
-                let task_data = match task_repository::get_by_id(&tx, task_id) {
-                    Ok(Some(row)) => row,
-                    Ok(None) => {
-                        outcomes.push(bulk_op_error(i, format!("Task '{task_id}' not found")));
-                        continue;
-                    }
+            // Scoped in its own block so `tx` (a `rusqlite::Transaction`,
+            // not `Send`) is lexically dropped -- not merely logically
+            // consumed by `commit()` -- before the `.await` below; see
+            // the identical rationale on `UpdateTaskStatusTool::call`.
+            let (outcomes, mut mutated_task_ids) = {
+                let tx = match conn.unchecked_transaction() {
+                    Ok(tx) => tx,
                     Err(_) => {
                         return ToolResult::Failed {
                             message: "Database error in bulk operations".to_string(),
@@ -3419,74 +3406,110 @@ impl Tool for BulkTaskOperationsTool {
                     }
                 };
 
-                if !can_access_task(
-                    task_data.assigned_to.as_deref(),
-                    Some(task_data.created_by.as_str()),
-                    Some(requesting_agent_id.as_str()),
-                    is_admin_request,
-                    false,
-                    false,
-                    false,
-                ) {
-                    let deny = worker_ownership_deny(
-                        task_id,
-                        task_data.assigned_to.as_deref(),
-                        "modify it",
-                    );
-                    outcomes.push(bulk_op_error(i, deny));
-                    continue;
-                }
+                let mut outcomes: Vec<BulkOpOutcome> = Vec::new();
 
-                match op_type {
-                    "update_status" => {
-                        let Some(new_status) = op_obj.get("status").and_then(Value::as_str) else {
-                            outcomes.push(bulk_op_error(
-                                i,
-                                "Missing 'status' for update_status operation",
-                            ));
-                            continue;
-                        };
-                        if !VALID_TASK_STATUSES.contains(&new_status) {
-                            outcomes
-                                .push(bulk_op_error(i, format!("Invalid status '{new_status}'")));
+                for (i, op) in operations.iter().enumerate() {
+                    let Some(op_obj) = op.as_object() else {
+                        outcomes.push(bulk_op_error(
+                            i,
+                            "Invalid operation format (must be object)",
+                        ));
+                        continue;
+                    };
+                    let op_type = op_obj.get("type").and_then(Value::as_str);
+                    let task_id = op_obj.get("task_id").and_then(Value::as_str);
+                    let (Some(op_type), Some(task_id)) = (op_type, task_id) else {
+                        outcomes.push(bulk_op_error(
+                            i,
+                            "Missing required fields 'type' and 'task_id'",
+                        ));
+                        continue;
+                    };
+
+                    let task_data = match task_repository::get_by_id_in_transaction(&tx, task_id) {
+                        Ok(Some(row)) => row,
+                        Ok(None) => {
+                            outcomes.push(bulk_op_error(i, format!("Task '{task_id}' not found")));
                             continue;
                         }
-                        if !is_admin_request
-                            && !project_settings_repository::get_bool(
-                                &tx,
-                                "config_allow_worker_update_own_status",
-                                true,
-                            )
-                        {
-                            outcomes.push(bulk_op_error(
-                                i,
-                                "worker status updates disabled by project policy \
+                        Err(_) => {
+                            return ToolResult::Failed {
+                                message: "Database error in bulk operations".to_string(),
+                            }
+                        }
+                    };
+
+                    if !can_access_task(
+                        task_data.assigned_to.as_deref(),
+                        Some(task_data.created_by.as_str()),
+                        Some(requesting_agent_id.as_str()),
+                        is_admin_request,
+                        false,
+                        false,
+                        false,
+                    ) {
+                        let deny = worker_ownership_deny(
+                            task_id,
+                            task_data.assigned_to.as_deref(),
+                            "modify it",
+                        );
+                        outcomes.push(bulk_op_error(i, deny));
+                        continue;
+                    }
+
+                    match op_type {
+                        "update_status" => {
+                            let Some(new_status) = op_obj.get("status").and_then(Value::as_str)
+                            else {
+                                outcomes.push(bulk_op_error(
+                                    i,
+                                    "Missing 'status' for update_status operation",
+                                ));
+                                continue;
+                            };
+                            if !VALID_TASK_STATUSES.contains(&new_status) {
+                                outcomes.push(bulk_op_error(
+                                    i,
+                                    format!("Invalid status '{new_status}'"),
+                                ));
+                                continue;
+                            }
+                            if !is_admin_request
+                                && !project_settings_repository::get_bool(
+                                    &tx,
+                                    "config_allow_worker_update_own_status",
+                                    true,
+                                )
+                            {
+                                outcomes.push(bulk_op_error(
+                                    i,
+                                    "worker status updates disabled by project policy \
                                  (config_allow_worker_update_own_status=false). Ask an \
                                  admin to enable it in dashboard Settings.",
-                            ));
-                            continue;
-                        }
-                        if !is_status_transition_allowed(Some(&task_data.status), new_status) {
-                            outcomes.push(bulk_op_error(
-                                i,
-                                format!(
-                                    "Invalid status transition '{}' -> '{new_status}' for \
+                                ));
+                                continue;
+                            }
+                            if !is_status_transition_allowed(Some(&task_data.status), new_status) {
+                                outcomes.push(bulk_op_error(
+                                    i,
+                                    format!(
+                                        "Invalid status transition '{}' -> '{new_status}' for \
                                      task '{task_id}'",
-                                    task_data.status
-                                ),
-                            ));
-                            continue;
-                        }
-                        let notes_content = op_obj.get("notes").and_then(Value::as_str);
-                        let mut notes = task_data.notes.clone().unwrap_or_default();
-                        if let Some(content) = notes_content.filter(|c| !c.is_empty()) {
-                            notes.push(conexus_db::task_repository::TaskNote {
-                                timestamp: now.to_string(),
-                                author: Some(requesting_agent_id.clone()),
-                                content: content.to_string(),
-                            });
-                        }
-                        if let Err(_e) = task_repository::update_fields(
+                                        task_data.status
+                                    ),
+                                ));
+                                continue;
+                            }
+                            let notes_content = op_obj.get("notes").and_then(Value::as_str);
+                            let mut notes = task_data.notes.clone().unwrap_or_default();
+                            if let Some(content) = notes_content.filter(|c| !c.is_empty()) {
+                                notes.push(conexus_db::task_repository::TaskNote {
+                                    timestamp: now.to_string(),
+                                    author: Some(requesting_agent_id.clone()),
+                                    content: content.to_string(),
+                                });
+                            }
+                            if let Err(_e) = task_repository::update_fields_in_transaction(
                             &tx,
                             task_id,
                             &conexus_db::task_repository::TaskFields {
@@ -3503,91 +3526,97 @@ impl Tool for BulkTaskOperationsTool {
                                 message: "Database error in bulk operations".to_string(),
                             };
                         }
-                        if TERMINAL_TASK_STATUSES.contains(&new_status) {
-                            let _ = AgentRepository::clear_current_task_for(&tx, task_id, now);
-                        }
-                        outcomes.push(BulkOpOutcome {
-                            line: format!(
+                            if TERMINAL_TASK_STATUSES.contains(&new_status) {
+                                let _ = AgentRepository::clear_current_task_for(&tx, task_id, now);
+                            }
+                            outcomes.push(BulkOpOutcome {
+                                line: format!(
                                 "Operation {}: Task '{task_id}' status updated to '{new_status}'",
                                 i + 1
                             ),
-                            mutated_task_id: Some(task_id.to_string()),
-                            completed_task_id: (new_status == "completed")
-                                .then(|| task_id.to_string()),
-                        });
-                    }
-                    "update_priority" => {
-                        if !is_admin_request {
-                            outcomes.push(bulk_op_error(
-                                i,
-                                "priority is an operator/manager-only field and cannot be \
+                                mutated_task_id: Some(task_id.to_string()),
+                                completed_task_id: (new_status == "completed")
+                                    .then(|| task_id.to_string()),
+                            });
+                        }
+                        "update_priority" => {
+                            if !is_admin_request {
+                                outcomes.push(bulk_op_error(
+                                    i,
+                                    "priority is an operator/manager-only field and cannot be \
                                  set by a worker; ask a supervisor to reprioritise",
-                            ));
-                            continue;
-                        }
-                        let new_priority = op_obj.get("priority").and_then(Value::as_str);
-                        let Some(new_priority) =
-                            new_priority.filter(|p| matches!(*p, "low" | "medium" | "high"))
-                        else {
-                            outcomes.push(bulk_op_error(
-                                i,
-                                format!("Invalid priority '{}'", new_priority.unwrap_or_default()),
-                            ));
-                            continue;
-                        };
-                        if TERMINAL_TASK_STATUSES.contains(&task_data.status.as_str()) {
-                            outcomes.push(bulk_op_error(
-                                i,
-                                format!(
-                                    "cannot update priority for task '{task_id}' -- its \
-                                     status '{}' is terminal (completed/cancelled/failed)",
-                                    task_data.status
-                                ),
-                            ));
-                            continue;
-                        }
-                        if let Err(_e) = task_repository::update_fields(
-                            &tx,
-                            task_id,
-                            &conexus_db::task_repository::TaskFields {
-                                priority: Some(new_priority),
-                                ..Default::default()
-                            },
-                            now,
-                        ) {
-                            return ToolResult::Failed {
-                                message: "Database error in bulk operations".to_string(),
+                                ));
+                                continue;
+                            }
+                            let new_priority = op_obj.get("priority").and_then(Value::as_str);
+                            let Some(new_priority) =
+                                new_priority.filter(|p| matches!(*p, "low" | "medium" | "high"))
+                            else {
+                                outcomes.push(bulk_op_error(
+                                    i,
+                                    format!(
+                                        "Invalid priority '{}'",
+                                        new_priority.unwrap_or_default()
+                                    ),
+                                ));
+                                continue;
                             };
-                        }
-                        outcomes.push(bulk_op_error(
-                            i,
-                            format!("Task '{task_id}' priority updated to '{new_priority}'"),
-                        ));
-                    }
-                    "add_note" => {
-                        let Some(content) = op_obj.get("content").and_then(Value::as_str) else {
-                            outcomes
-                                .push(bulk_op_error(i, "Missing 'content' for add_note operation"));
-                            continue;
-                        };
-                        if TERMINAL_TASK_STATUSES.contains(&task_data.status.as_str()) {
+                            if TERMINAL_TASK_STATUSES.contains(&task_data.status.as_str()) {
+                                outcomes.push(bulk_op_error(
+                                    i,
+                                    format!(
+                                        "cannot update priority for task '{task_id}' -- its \
+                                     status '{}' is terminal (completed/cancelled/failed)",
+                                        task_data.status
+                                    ),
+                                ));
+                                continue;
+                            }
+                            if let Err(_e) = task_repository::update_fields_in_transaction(
+                                &tx,
+                                task_id,
+                                &conexus_db::task_repository::TaskFields {
+                                    priority: Some(new_priority),
+                                    ..Default::default()
+                                },
+                                now,
+                            ) {
+                                return ToolResult::Failed {
+                                    message: "Database error in bulk operations".to_string(),
+                                };
+                            }
                             outcomes.push(bulk_op_error(
                                 i,
-                                format!(
-                                    "cannot add note to task '{task_id}' -- its status '{}' \
-                                     is terminal (completed/cancelled/failed)",
-                                    task_data.status
-                                ),
+                                format!("Task '{task_id}' priority updated to '{new_priority}'"),
                             ));
-                            continue;
                         }
-                        let mut notes = task_data.notes.clone().unwrap_or_default();
-                        notes.push(conexus_db::task_repository::TaskNote {
-                            timestamp: now.to_string(),
-                            author: Some(requesting_agent_id.clone()),
-                            content: content.to_string(),
-                        });
-                        if let Err(_e) = task_repository::update_fields(
+                        "add_note" => {
+                            let Some(content) = op_obj.get("content").and_then(Value::as_str)
+                            else {
+                                outcomes.push(bulk_op_error(
+                                    i,
+                                    "Missing 'content' for add_note operation",
+                                ));
+                                continue;
+                            };
+                            if TERMINAL_TASK_STATUSES.contains(&task_data.status.as_str()) {
+                                outcomes.push(bulk_op_error(
+                                    i,
+                                    format!(
+                                        "cannot add note to task '{task_id}' -- its status '{}' \
+                                     is terminal (completed/cancelled/failed)",
+                                        task_data.status
+                                    ),
+                                ));
+                                continue;
+                            }
+                            let mut notes = task_data.notes.clone().unwrap_or_default();
+                            notes.push(conexus_db::task_repository::TaskNote {
+                                timestamp: now.to_string(),
+                                author: Some(requesting_agent_id.clone()),
+                                content: content.to_string(),
+                            });
+                            if let Err(_e) = task_repository::update_fields_in_transaction(
                             &tx,
                             task_id,
                             &conexus_db::task_repository::TaskFields {
@@ -3603,40 +3632,41 @@ impl Tool for BulkTaskOperationsTool {
                                 message: "Database error in bulk operations".to_string(),
                             };
                         }
-                        outcomes.push(bulk_op_error(i, format!("Note added to task '{task_id}'")));
-                    }
-                    "reassign" if is_admin_request => {
-                        let Some(new_assigned_to) =
-                            op_obj.get("assigned_to").and_then(Value::as_str)
-                        else {
-                            outcomes.push(bulk_op_error(
-                                i,
-                                "Missing 'assigned_to' for reassign operation",
-                            ));
-                            continue;
-                        };
-                        if TERMINAL_TASK_STATUSES.contains(&task_data.status.as_str()) {
-                            outcomes.push(bulk_op_error(
-                                i,
-                                format!(
-                                    "cannot reassign task '{task_id}' -- its status '{}' is \
+                            outcomes
+                                .push(bulk_op_error(i, format!("Note added to task '{task_id}'")));
+                        }
+                        "reassign" if is_admin_request => {
+                            let Some(new_assigned_to) =
+                                op_obj.get("assigned_to").and_then(Value::as_str)
+                            else {
+                                outcomes.push(bulk_op_error(
+                                    i,
+                                    "Missing 'assigned_to' for reassign operation",
+                                ));
+                                continue;
+                            };
+                            if TERMINAL_TASK_STATUSES.contains(&task_data.status.as_str()) {
+                                outcomes.push(bulk_op_error(
+                                    i,
+                                    format!(
+                                        "cannot reassign task '{task_id}' -- its status '{}' is \
                                      terminal (completed/cancelled/failed)",
-                                    task_data.status
-                                ),
-                            ));
-                            continue;
-                        }
-                        if !agent_assignable(&tx, new_assigned_to) {
-                            outcomes.push(bulk_op_error(
-                                i,
-                                format!(
-                                    "Cannot reassign task '{task_id}' to '{new_assigned_to}': \
+                                        task_data.status
+                                    ),
+                                ));
+                                continue;
+                            }
+                            if !agent_assignable(&tx, new_assigned_to) {
+                                outcomes.push(bulk_op_error(
+                                    i,
+                                    format!(
+                                        "Cannot reassign task '{task_id}' to '{new_assigned_to}': \
                                      agent does not exist or is terminated"
-                                ),
-                            ));
-                            continue;
-                        }
-                        if let Err(_e) = task_repository::update_fields(
+                                    ),
+                                ));
+                                continue;
+                            }
+                            if let Err(_e) = task_repository::update_fields_in_transaction(
                             &tx,
                             task_id,
                             &conexus_db::task_repository::TaskFields {
@@ -3652,109 +3682,112 @@ impl Tool for BulkTaskOperationsTool {
                                 message: "Database error in bulk operations".to_string(),
                             };
                         }
-                        // BUG (BL-R30-1 sibling, found while porting
-                        // test_sec_r30_reassign_current_task.py): this
-                        // call used to be `let _ =`-swallowed, unlike
-                        // every other DB write in this function (see
-                        // the update_fields call right above) -- a
-                        // genuine DB error here was silently dropped,
-                        // reporting a false success while leaving the
-                        // stale current_task pointer unreconciled.
-                        if AgentRepository::reconcile_current_task_on_reassign(
-                            &tx,
-                            task_id,
-                            task_data.assigned_to.as_deref(),
-                            Some(new_assigned_to),
-                            now,
-                        )
-                        .is_err()
-                        {
-                            return ToolResult::Failed {
-                                message: "Database error in bulk operations".to_string(),
-                            };
-                        }
-                        outcomes.push(BulkOpOutcome {
-                            line: format!(
+                            // BUG (BL-R30-1 sibling, found while porting
+                            // test_sec_r30_reassign_current_task.py): this
+                            // call used to be `let _ =`-swallowed, unlike
+                            // every other DB write in this function (see
+                            // the update_fields call right above) -- a
+                            // genuine DB error here was silently dropped,
+                            // reporting a false success while leaving the
+                            // stale current_task pointer unreconciled.
+                            if AgentRepository::reconcile_current_task_on_reassign(
+                                &tx,
+                                task_id,
+                                task_data.assigned_to.as_deref(),
+                                Some(new_assigned_to),
+                                now,
+                            )
+                            .is_err()
+                            {
+                                return ToolResult::Failed {
+                                    message: "Database error in bulk operations".to_string(),
+                                };
+                            }
+                            outcomes.push(BulkOpOutcome {
+                                line: format!(
                                 "Operation {}: Task '{task_id}' reassigned to '{new_assigned_to}'",
                                 i + 1
                             ),
-                            mutated_task_id: Some(task_id.to_string()),
-                            completed_task_id: None,
-                        });
-                    }
-                    "reassign" => {
-                        outcomes.push(bulk_op_error(
-                            i,
-                            "reassigning a task to another agent is an operator/manager-only \
+                                mutated_task_id: Some(task_id.to_string()),
+                                completed_task_id: None,
+                            });
+                        }
+                        "reassign" => {
+                            outcomes.push(bulk_op_error(
+                                i,
+                                "reassigning a task to another agent is an operator/manager-only \
                              action; a worker cannot reassign -- ask a supervisor",
-                        ));
-                    }
-                    other => {
-                        outcomes.push(bulk_op_error(
-                            i,
-                            format!("Unknown operation type '{other}'"),
-                        ));
-                    }
-                }
-            }
-
-            let mut mutated_task_ids: Vec<String> = outcomes
-                .iter()
-                .filter_map(|o| o.mutated_task_id.clone())
-                .collect();
-            let completed_task_ids: Vec<String> = outcomes
-                .iter()
-                .filter_map(|o| o.completed_task_id.clone())
-                .collect();
-
-            for done_id in &completed_task_ids {
-                match advance_dependents_after_completion(
-                    &tx,
-                    done_id,
-                    &requesting_agent_id,
-                    is_admin_request,
-                    now,
-                ) {
-                    Ok(advanced) => {
-                        mutated_task_ids.extend(advanced.into_iter().map(|a| a.task_id));
-                    }
-                    Err(_) => {
-                        return ToolResult::Failed {
-                            message: "Database error in bulk operations".to_string(),
+                            ));
+                        }
+                        other => {
+                            outcomes.push(bulk_op_error(
+                                i,
+                                format!("Unknown operation type '{other}'"),
+                            ));
                         }
                     }
                 }
-            }
 
-            let success_count = outcomes
-                .iter()
-                .filter(|o| !o.line.contains("Error"))
-                .count();
-            if let Err(_e) = agent_action_repository::log_agent_action(
-                &tx,
-                &requesting_agent_id,
-                "bulk_task_operations",
-                None,
-                Some(&serde_json::json!({
-                    "operations_count": operations.len(),
-                    "success_count": success_count,
-                })),
-                now,
-            ) {
-                // Best-effort audit log, same rationale as elsewhere.
-            }
+                let mut mutated_task_ids: Vec<String> = outcomes
+                    .iter()
+                    .filter_map(|o| o.mutated_task_id.clone())
+                    .collect();
+                let completed_task_ids: Vec<String> = outcomes
+                    .iter()
+                    .filter_map(|o| o.completed_task_id.clone())
+                    .collect();
 
-            if tx.commit().is_err() {
-                return ToolResult::Failed {
-                    message: "Database error in bulk operations".to_string(),
-                };
-            }
+                for done_id in &completed_task_ids {
+                    match advance_dependents_after_completion(
+                        &tx,
+                        done_id,
+                        &requesting_agent_id,
+                        is_admin_request,
+                        now,
+                    ) {
+                        Ok(advanced) => {
+                            mutated_task_ids.extend(advanced.into_iter().map(|a| a.task_id));
+                        }
+                        Err(_) => {
+                            return ToolResult::Failed {
+                                message: "Database error in bulk operations".to_string(),
+                            }
+                        }
+                    }
+                }
+
+                let success_count = outcomes
+                    .iter()
+                    .filter(|o| !o.line.contains("Error"))
+                    .count();
+                if let Err(_e) = agent_action_repository::log_agent_action(
+                    &tx,
+                    &requesting_agent_id,
+                    "bulk_task_operations",
+                    None,
+                    Some(&serde_json::json!({
+                        "operations_count": operations.len(),
+                        "success_count": success_count,
+                    })),
+                    now,
+                ) {
+                    // Best-effort audit log, same rationale as elsewhere.
+                }
+
+                if tx.commit().is_err() {
+                    return ToolResult::Failed {
+                        message: "Database error in bulk operations".to_string(),
+                    };
+                }
+
+                (outcomes, mutated_task_ids)
+            };
 
             mutated_task_ids.sort();
             mutated_task_ids.dedup();
             let mut woken: HashSet<String> = HashSet::new();
             for tid in &mutated_task_ids {
-                if let Ok(Some(row)) = task_repository::get_by_id(&conn, tid) {
+                if let Ok(Some(row)) = task_repository::get_by_id(ctx.sea_orm_db, tid).await {
                     if let Some(assignee) = row.assigned_to.filter(|a| !a.is_empty()) {
                         if woken.insert(assignee.clone()) {
                             ctx.waiter_registry.notify(&assignee);
@@ -3851,7 +3884,7 @@ mod view_search_tests {
     // hangs off one shared, idempotently-created root instead of each
     // being its own root (which would collide on the second insert).
     fn ensure_root(conn: &Connection) {
-        if task_repository::get_by_id(conn, "root_anchor")
+        if task_repository::get_by_id_in_transaction(conn, "root_anchor")
             .unwrap()
             .is_some()
         {
@@ -4249,7 +4282,7 @@ mod view_search_tests {
         {
             let guard = conn.lock().await;
             seed(&guard, "old", None, "bob", "pending");
-            task_repository::update_fields(
+            task_repository::update_fields_in_transaction(
                 &guard,
                 "old",
                 &TaskFields {
@@ -4260,7 +4293,7 @@ mod view_search_tests {
             )
             .unwrap();
             seed(&guard, "new", None, "bob", "pending");
-            task_repository::update_fields(
+            task_repository::update_fields_in_transaction(
                 &guard,
                 "new",
                 &TaskFields {
@@ -4745,7 +4778,7 @@ mod create_task_tests {
         .await;
         let task_id = task_id_of(&result);
         let guard = conn.lock().await;
-        let row = task_repository::get_by_id(&guard, &task_id)
+        let row = task_repository::get_by_id_in_transaction(&guard, &task_id)
             .unwrap()
             .unwrap();
         assert_eq!(row.status, "unassigned");
@@ -4774,7 +4807,7 @@ mod create_task_tests {
         .await;
         let task_id = task_id_of(&result);
         let guard = conn.lock().await;
-        let row = task_repository::get_by_id(&guard, &task_id)
+        let row = task_repository::get_by_id_in_transaction(&guard, &task_id)
             .unwrap()
             .unwrap();
         assert_eq!(row.status, "pending");
@@ -4879,7 +4912,7 @@ mod create_task_tests {
         .await;
         let task_id = task_id_of(&result);
         let guard = conn.lock().await;
-        let parent = task_repository::get_by_id(&guard, "root1")
+        let parent = task_repository::get_by_id_in_transaction(&guard, "root1")
             .unwrap()
             .unwrap();
         assert_eq!(parent.child_tasks, Some(vec![task_id]));
@@ -4973,16 +5006,17 @@ mod create_task_tests {
 
 #[cfg(test)]
 mod update_task_status_tests {
-    // Phase G (sea-orm migration infra): a throwaway in-memory
-    // sea-orm connection for ToolCallContext::sea_orm_db -- no test in
-    // this module queries through it yet, it only needs to exist so
-    // off_wire's now-mandatory last argument has something to point
-    // at. Each sibling test module here (not nested under `mod
-    // tests` -- each is its own top-level `#[cfg(test)] mod` block)
-    // needs its own copy since `use super::*;` only reaches the
-    // file's top-level items, not another sibling test module's.
-    async fn test_sea_orm_db() -> sea_orm::DatabaseConnection {
-        sea_orm::Database::connect("sqlite::memory:").await.unwrap()
+    // Phase G (sea-orm migration infra): real-temp-file-backed, not
+    // `:memory:` -- `UpdateTaskStatusTool`'s post-commit wake loop now
+    // reads the mutated tasks' `assigned_to` through `ctx.sea_orm_db`
+    // (`task_repository::get_by_id`), so it must see the SAME rows
+    // `test_conn`'s rusqlite connection seeds/writes; two disconnected
+    // `:memory:` handles don't share state (same fix as
+    // `view_search_tests`'s own `test_sea_orm_db`).
+    async fn test_sea_orm_db(dir: &std::path::Path) -> sea_orm::DatabaseConnection {
+        sea_orm::Database::connect(format!("sqlite://{}", dir.join("test.db").display()))
+            .await
+            .unwrap()
     }
 
     use super::*;
@@ -4996,10 +5030,11 @@ mod update_task_status_tests {
 
     const NOW: &str = "2026-03-01T00:00:00Z";
 
-    fn test_conn() -> AsyncMutex<Connection> {
-        let conn = Connection::open_in_memory().unwrap();
+    fn test_conn() -> (tempfile::TempDir, AsyncMutex<Connection>) {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = Connection::open(dir.path().join("test.db")).unwrap();
         init_schema(&conn).unwrap();
-        AsyncMutex::new(conn)
+        (dir, AsyncMutex::new(conn))
     }
 
     fn worker(agent_id: &str) -> Principal {
@@ -5075,10 +5110,15 @@ mod update_task_status_tests {
         .unwrap();
     }
 
-    async fn call(principal: &Principal, args: Value, conn: &AsyncMutex<Connection>) -> ToolResult {
+    async fn call(
+        principal: &Principal,
+        args: Value,
+        conn: &AsyncMutex<Connection>,
+        dir: &std::path::Path,
+    ) -> ToolResult {
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let sea_orm_db = test_sea_orm_db(dir).await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -5097,15 +5137,27 @@ mod update_task_status_tests {
 
     #[tokio::test]
     async fn requires_task_id_or_task_ids() {
-        let conn = test_conn();
-        let result = call(&admin("a"), serde_json::json!({"status": "pending"}), &conn).await;
+        let (dir, conn) = test_conn();
+        let result = call(
+            &admin("a"),
+            serde_json::json!({"status": "pending"}),
+            &conn,
+            dir.path(),
+        )
+        .await;
         assert!(matches!(result, ToolResult::Invalid { field: None, .. }));
     }
 
     #[tokio::test]
     async fn requires_status() {
-        let conn = test_conn();
-        let result = call(&admin("a"), serde_json::json!({"task_id": "t1"}), &conn).await;
+        let (dir, conn) = test_conn();
+        let result = call(
+            &admin("a"),
+            serde_json::json!({"task_id": "t1"}),
+            &conn,
+            dir.path(),
+        )
+        .await;
         assert!(
             matches!(result, ToolResult::Invalid { field, .. } if field.as_deref() == Some("status"))
         );
@@ -5113,11 +5165,12 @@ mod update_task_status_tests {
 
     #[tokio::test]
     async fn rejects_an_invalid_status() {
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         let result = call(
             &admin("a"),
             serde_json::json!({"task_id": "t1", "status": "urgent"}),
             &conn,
+            dir.path(),
         )
         .await;
         assert!(
@@ -5127,7 +5180,7 @@ mod update_task_status_tests {
 
     #[tokio::test]
     async fn worker_updates_own_task_status() {
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         {
             let guard = conn.lock().await;
             seed_task(&guard, "t1", "pending", Some("bob"), None);
@@ -5136,6 +5189,7 @@ mod update_task_status_tests {
             &worker("bob"),
             serde_json::json!({"task_id": "t1", "status": "in_progress"}),
             &conn,
+            dir.path(),
         )
         .await;
         assert_eq!(
@@ -5143,13 +5197,15 @@ mod update_task_status_tests {
             "Task t1 status updated to in_progress."
         );
         let guard = conn.lock().await;
-        let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+        let row = task_repository::get_by_id_in_transaction(&guard, "t1")
+            .unwrap()
+            .unwrap();
         assert_eq!(row.status, "in_progress");
     }
 
     #[tokio::test]
     async fn worker_on_a_foreign_task_gets_the_phantom_not_found() {
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         {
             let guard = conn.lock().await;
             seed_task(&guard, "t1", "pending", Some("carol"), None);
@@ -5158,6 +5214,7 @@ mod update_task_status_tests {
             &worker("bob"),
             serde_json::json!({"task_id": "t1", "status": "in_progress"}),
             &conn,
+            dir.path(),
         )
         .await;
         assert!(matches!(result, ToolResult::NotFound { .. }));
@@ -5165,7 +5222,7 @@ mod update_task_status_tests {
 
     #[tokio::test]
     async fn worker_on_an_unassigned_task_gets_permission_denied() {
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         {
             let guard = conn.lock().await;
             seed_task(&guard, "t1", "pending", None, None);
@@ -5174,6 +5231,7 @@ mod update_task_status_tests {
             &worker("bob"),
             serde_json::json!({"task_id": "t1", "status": "in_progress"}),
             &conn,
+            dir.path(),
         )
         .await;
         assert!(matches!(result, ToolResult::PermissionDenied { .. }));
@@ -5181,7 +5239,7 @@ mod update_task_status_tests {
 
     #[tokio::test]
     async fn bulk_update_reports_partial_success() {
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         {
             let guard = conn.lock().await;
             seed_task(&guard, "t1", "pending", None, None);
@@ -5191,6 +5249,7 @@ mod update_task_status_tests {
             &admin("a"),
             serde_json::json!({"task_ids": ["t1", "t2"], "status": "in_progress"}),
             &conn,
+            dir.path(),
         )
         .await;
         let msg = message_of(&result);
@@ -5200,7 +5259,7 @@ mod update_task_status_tests {
 
     #[tokio::test]
     async fn cascades_a_failed_status_to_children() {
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         {
             let guard = conn.lock().await;
             seed_task(&guard, "root1", "in_progress", None, None);
@@ -5208,7 +5267,7 @@ mod update_task_status_tests {
             // `seed_task` doesn't maintain the BL-2 child_tasks mirror
             // the real create_task tool writes -- set it explicitly so
             // this test reflects a realistic post-create_task state.
-            task_repository::update_fields(
+            task_repository::update_fields_in_transaction(
                 &guard,
                 "root1",
                 &TaskFields {
@@ -5227,12 +5286,13 @@ mod update_task_status_tests {
                 "cascade_to_children": true
             }),
             &conn,
+            dir.path(),
         )
         .await;
         let msg = message_of(&result);
         assert!(msg.contains("Cascaded to 1 child tasks."));
         let guard = conn.lock().await;
-        let child = task_repository::get_by_id(&guard, "child1")
+        let child = task_repository::get_by_id_in_transaction(&guard, "child1")
             .unwrap()
             .unwrap();
         assert_eq!(child.status, "failed");
@@ -5240,12 +5300,12 @@ mod update_task_status_tests {
 
     #[tokio::test]
     async fn auto_advances_a_now_unblocked_dependent() {
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         {
             let guard = conn.lock().await;
             seed_task(&guard, "root1", "in_progress", None, None);
             seed_task(&guard, "dependent", "pending", None, Some("root1"));
-            task_repository::update_fields(
+            task_repository::update_fields_in_transaction(
                 &guard,
                 "dependent",
                 &TaskFields {
@@ -5260,12 +5320,13 @@ mod update_task_status_tests {
             &admin("a"),
             serde_json::json!({"task_id": "root1", "status": "completed"}),
             &conn,
+            dir.path(),
         )
         .await;
         let msg = message_of(&result);
         assert!(msg.contains("Auto-advanced 1 dependent tasks."));
         let guard = conn.lock().await;
-        let dependent = task_repository::get_by_id(&guard, "dependent")
+        let dependent = task_repository::get_by_id_in_transaction(&guard, "dependent")
             .unwrap()
             .unwrap();
         assert_eq!(dependent.status, "in_progress");
@@ -5273,7 +5334,7 @@ mod update_task_status_tests {
 
     #[tokio::test]
     async fn writes_a_per_task_audit_row() {
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         {
             let guard = conn.lock().await;
             seed_task(&guard, "t1", "pending", None, None);
@@ -5282,6 +5343,7 @@ mod update_task_status_tests {
             &admin("a"),
             serde_json::json!({"task_id": "t1", "status": "in_progress"}),
             &conn,
+            dir.path(),
         )
         .await;
         let guard = conn.lock().await;
@@ -5298,7 +5360,7 @@ mod update_task_status_tests {
 
     #[tokio::test]
     async fn wakes_the_assignees_registered_waiter() {
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         seed_agent(&conn, "bob").await;
         {
             let guard = conn.lock().await;
@@ -5307,7 +5369,7 @@ mod update_task_status_tests {
         let registry = WaiterRegistry::new();
         let (_tx, mut rx) = registry.register("bob");
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let sea_orm_db = test_sea_orm_db(dir.path()).await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -5333,7 +5395,7 @@ mod update_task_status_tests {
         // COMPLETER is a plain worker (not admin) -- the dependent
         // (owned by a DIFFERENT agent) still advances, and that
         // dependent's owner is woken, not the completer.
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         seed_agent(&conn, "carol").await;
         {
             let guard = conn.lock().await;
@@ -5345,7 +5407,7 @@ mod update_task_status_tests {
                 Some("carol"),
                 Some("blocker"),
             );
-            task_repository::update_fields(
+            task_repository::update_fields_in_transaction(
                 &guard,
                 "dependent",
                 &TaskFields {
@@ -5359,7 +5421,7 @@ mod update_task_status_tests {
         let registry = WaiterRegistry::new();
         let (_tx, mut rx_carol) = registry.register("carol");
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let sea_orm_db = test_sea_orm_db(dir.path()).await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -5377,7 +5439,7 @@ mod update_task_status_tests {
         let msg = message_of(&result);
         assert!(msg.contains("Auto-advanced 1 dependent tasks."));
         let guard = conn.lock().await;
-        let dependent = task_repository::get_by_id(&guard, "dependent")
+        let dependent = task_repository::get_by_id_in_transaction(&guard, "dependent")
             .unwrap()
             .unwrap();
         assert_eq!(dependent.status, "in_progress");
@@ -5394,12 +5456,12 @@ mod update_task_status_tests {
         // BL-R29-1 sibling: cascade_to_children is also a system
         // transition -- a worker cancelling their OWN parent task must
         // still cascade to a child owned by a DIFFERENT agent.
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         {
             let guard = conn.lock().await;
             seed_task(&guard, "parent", "in_progress", Some("alice"), None);
             seed_task(&guard, "child", "in_progress", Some("bob"), Some("parent"));
-            task_repository::update_fields(
+            task_repository::update_fields_in_transaction(
                 &guard,
                 "parent",
                 &TaskFields {
@@ -5418,12 +5480,13 @@ mod update_task_status_tests {
                 "cascade_to_children": true
             }),
             &conn,
+            dir.path(),
         )
         .await;
         let msg = message_of(&result);
         assert!(msg.contains("Cascaded to 1 child tasks."));
         let guard = conn.lock().await;
-        let child = task_repository::get_by_id(&guard, "child")
+        let child = task_repository::get_by_id_in_transaction(&guard, "child")
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -5439,7 +5502,7 @@ mod update_task_status_tests {
         // dependency-advance/cascade reconcile ONLY -- a worker still
         // cannot drive another agent's task through the normal
         // (non-system) update_task_status path.
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         {
             let guard = conn.lock().await;
             seed_task(&guard, "t1", "in_progress", Some("alice"), None);
@@ -5448,11 +5511,14 @@ mod update_task_status_tests {
             &worker("bob"),
             serde_json::json!({"task_id": "t1", "status": "completed"}),
             &conn,
+            dir.path(),
         )
         .await;
         assert!(matches!(result, ToolResult::NotFound { .. }));
         let guard = conn.lock().await;
-        let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+        let row = task_repository::get_by_id_in_transaction(&guard, "t1")
+            .unwrap()
+            .unwrap();
         assert_ne!(row.status, "completed");
     }
 
@@ -5461,7 +5527,7 @@ mod update_task_status_tests {
         // test_update_status_reassign_to_terminated_agent_rejected: the
         // update_task_status `assigned_to` field must not reassign to
         // a TERMINATED agent.
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         seed_agent(&conn, "bob").await;
         {
             let guard = conn.lock().await;
@@ -5472,6 +5538,7 @@ mod update_task_status_tests {
             &admin("alice"),
             serde_json::json!({"task_id": "t1", "status": "pending", "assigned_to": "bob"}),
             &conn,
+            dir.path(),
         )
         .await;
         let msg = message_of(&result);
@@ -5480,7 +5547,9 @@ mod update_task_status_tests {
             "expected a terminated-agent rejection; got {msg:?}"
         );
         let guard = conn.lock().await;
-        let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+        let row = task_repository::get_by_id_in_transaction(&guard, "t1")
+            .unwrap()
+            .unwrap();
         assert_ne!(
             row.assigned_to.as_deref(),
             Some("bob"),
@@ -5627,7 +5696,9 @@ mod update_task_tests {
         .await;
         assert_eq!(message_of(&result), "Task updated successfully.");
         let guard = conn.lock().await;
-        let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+        let row = task_repository::get_by_id_in_transaction(&guard, "t1")
+            .unwrap()
+            .unwrap();
         assert_eq!(row.title, "new title");
         assert_eq!(row.description.as_deref(), Some("new description"));
         assert_eq!(row.priority, "high");
@@ -5660,7 +5731,9 @@ mod update_task_tests {
             "resurrecting a completed task must be refused, got {result:?}"
         );
         let guard = conn.lock().await;
-        let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+        let row = task_repository::get_by_id_in_transaction(&guard, "t1")
+            .unwrap()
+            .unwrap();
         assert_eq!(row.status, "completed", "resurrection must not land");
     }
 
@@ -5687,7 +5760,9 @@ mod update_task_tests {
             matches!(result, ToolResult::Invalid { field, .. } if field.as_deref() == Some("status"))
         );
         let guard = conn.lock().await;
-        let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+        let row = task_repository::get_by_id_in_transaction(&guard, "t1")
+            .unwrap()
+            .unwrap();
         assert_eq!(row.status, "pending", "a bogus status must never be stored");
     }
 
@@ -5742,7 +5817,9 @@ mod update_task_tests {
         .await;
         assert!(matches!(result, ToolResult::Ok { .. }));
         let guard = conn.lock().await;
-        let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+        let row = task_repository::get_by_id_in_transaction(&guard, "t1")
+            .unwrap()
+            .unwrap();
         assert_eq!(row.status, "in_progress");
     }
 
@@ -5770,7 +5847,9 @@ mod update_task_tests {
             "reassigning to a nonexistent agent must be rejected, got {result:?}"
         );
         let guard = conn.lock().await;
-        let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+        let row = task_repository::get_by_id_in_transaction(&guard, "t1")
+            .unwrap()
+            .unwrap();
         assert_eq!(
             row.assigned_to.as_deref(),
             Some("alice"),
@@ -5802,7 +5881,9 @@ mod update_task_tests {
             "reassigning to a terminated agent must be rejected, got {result:?}"
         );
         let guard = conn.lock().await;
-        let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+        let row = task_repository::get_by_id_in_transaction(&guard, "t1")
+            .unwrap()
+            .unwrap();
         assert_eq!(
             row.assigned_to.as_deref(),
             Some("alice"),
@@ -5847,7 +5928,7 @@ mod update_task_tests {
         assert!(matches!(result, ToolResult::Ok { .. }));
         let guard = conn.lock().await;
         assert_eq!(
-            task_repository::get_by_id(&guard, "t1")
+            task_repository::get_by_id_in_transaction(&guard, "t1")
                 .unwrap()
                 .unwrap()
                 .status,
@@ -5887,7 +5968,9 @@ mod update_task_tests {
             .await;
             assert!(matches!(result, ToolResult::Ok { .. }), "{clear_value:?}");
             let guard = conn.lock().await;
-            let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+            let row = task_repository::get_by_id_in_transaction(&guard, "t1")
+                .unwrap()
+                .unwrap();
             assert_eq!(row.assigned_to, None, "{clear_value:?}");
             assert_eq!(row.status, "unassigned", "{clear_value:?}");
         }
@@ -5923,7 +6006,9 @@ mod update_task_tests {
             "reassigning a terminal task to a live agent must be rejected, got {result:?}"
         );
         let guard = conn.lock().await;
-        let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+        let row = task_repository::get_by_id_in_transaction(&guard, "t1")
+            .unwrap()
+            .unwrap();
         assert_eq!(
             row.status, "completed",
             "rejected reassign must keep terminal status"
@@ -5948,7 +6033,9 @@ mod update_task_tests {
         )
         .await;
         let guard = conn.lock().await;
-        let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+        let row = task_repository::get_by_id_in_transaction(&guard, "t1")
+            .unwrap()
+            .unwrap();
         let notes = row.notes.unwrap();
         assert_eq!(notes.len(), 1);
         assert_eq!(notes[0].content, "a note");
@@ -5968,7 +6055,9 @@ mod update_task_tests {
         )
         .await;
         let guard = conn.lock().await;
-        let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+        let row = task_repository::get_by_id_in_transaction(&guard, "t1")
+            .unwrap()
+            .unwrap();
         assert_eq!(row.assigned_to.as_deref(), Some("carol"));
         let agent = AgentRepository::get_by_id(&guard, "carol")
             .unwrap()
@@ -6019,7 +6108,9 @@ mod update_task_tests {
         )
         .await;
         let guard = conn.lock().await;
-        let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+        let row = task_repository::get_by_id_in_transaction(&guard, "t1")
+            .unwrap()
+            .unwrap();
         assert_eq!(row.assigned_to.as_deref(), Some("carol"));
         let agent = AgentRepository::get_by_id(&guard, "carol")
             .unwrap()
@@ -6109,7 +6200,9 @@ mod update_task_tests {
         )
         .await;
         let guard = conn.lock().await;
-        let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+        let row = task_repository::get_by_id_in_transaction(&guard, "t1")
+            .unwrap()
+            .unwrap();
         assert_eq!(row.assigned_to, None);
         assert_eq!(row.status, "unassigned");
         let agent = AgentRepository::get_by_id(&guard, "bob").unwrap().unwrap();
@@ -6170,7 +6263,9 @@ mod update_task_tests {
         .await;
         assert!(matches!(result, ToolResult::Ok { .. }));
         let guard = conn.lock().await;
-        let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+        let row = task_repository::get_by_id_in_transaction(&guard, "t1")
+            .unwrap()
+            .unwrap();
         assert_eq!(row.status, "completed");
         assert_eq!(row.assigned_to, None);
         drop(guard);
@@ -6467,7 +6562,9 @@ mod delete_task_tests {
         let result = call(serde_json::json!({"task_id": "t1"}), &conn).await;
         assert!(matches!(result, ToolResult::Ok { .. }));
         let guard = conn.lock().await;
-        assert!(task_repository::get_by_id(&guard, "t1").unwrap().is_none());
+        assert!(task_repository::get_by_id_in_transaction(&guard, "t1")
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -6481,7 +6578,7 @@ mod delete_task_tests {
         let result = call(serde_json::json!({"task_id": "root1"}), &conn).await;
         assert!(matches!(result, ToolResult::Conflict { .. }));
         let guard = conn.lock().await;
-        assert!(task_repository::get_by_id(&guard, "root1")
+        assert!(task_repository::get_by_id_in_transaction(&guard, "root1")
             .unwrap()
             .is_some());
     }
@@ -6541,15 +6638,17 @@ mod delete_task_tests {
         .await;
         assert!(matches!(result, ToolResult::Ok { .. }));
         let guard = conn.lock().await;
-        assert!(task_repository::get_by_id(&guard, "root1")
+        assert!(task_repository::get_by_id_in_transaction(&guard, "root1")
             .unwrap()
             .is_none());
-        assert!(task_repository::get_by_id(&guard, "child1")
+        assert!(task_repository::get_by_id_in_transaction(&guard, "child1")
             .unwrap()
             .is_none());
-        assert!(task_repository::get_by_id(&guard, "grandchild1")
-            .unwrap()
-            .is_none());
+        assert!(
+            task_repository::get_by_id_in_transaction(&guard, "grandchild1")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -6618,11 +6717,11 @@ mod delete_task_tests {
         .await;
         assert!(matches!(result, ToolResult::Ok { .. }));
         let guard = conn.lock().await;
-        assert!(task_repository::get_by_id(&guard, "parent")
+        assert!(task_repository::get_by_id_in_transaction(&guard, "parent")
             .unwrap()
             .is_none());
         assert!(
-            task_repository::get_by_id(&guard, "child")
+            task_repository::get_by_id_in_transaction(&guard, "child")
                 .unwrap()
                 .is_none(),
             "the in-use descendant must be cascade-deleted, not orphaned"
@@ -6642,7 +6741,7 @@ mod delete_task_tests {
             seed_task(&guard, "root1", "pending", None, None, None);
             seed_task(&guard, "keeper", "pending", None, Some("root1"), None);
             seed_task(&guard, "goner", "pending", None, Some("root1"), None);
-            task_repository::update_fields(
+            task_repository::update_fields_in_transaction(
                 &guard,
                 "root1",
                 &TaskFields {
@@ -6663,7 +6762,7 @@ mod delete_task_tests {
         .await;
         assert!(matches!(result, ToolResult::Ok { .. }));
         let guard = conn.lock().await;
-        let parent = task_repository::get_by_id(&guard, "root1")
+        let parent = task_repository::get_by_id_in_transaction(&guard, "root1")
             .unwrap()
             .unwrap();
         assert_eq!(parent.child_tasks, Some(vec!["keeper".to_string()]));
@@ -6697,7 +6796,7 @@ mod delete_task_tests {
         .await;
         assert!(matches!(result, ToolResult::Ok { .. }));
         let guard = conn.lock().await;
-        let outside = task_repository::get_by_id(&guard, "outside")
+        let outside = task_repository::get_by_id_in_transaction(&guard, "outside")
             .unwrap()
             .unwrap();
         assert_eq!(outside.depends_on_tasks, Some(vec![]));
@@ -6733,7 +6832,7 @@ mod delete_task_tests {
         };
         assert!(msg.contains("Auto-advanced task 'dependent' to in_progress"));
         let guard = conn.lock().await;
-        let dependent = task_repository::get_by_id(&guard, "dependent")
+        let dependent = task_repository::get_by_id_in_transaction(&guard, "dependent")
             .unwrap()
             .unwrap();
         assert_eq!(dependent.status, "in_progress");
@@ -6775,9 +6874,13 @@ mod delete_task_tests {
         .await;
         assert!(matches!(result, ToolResult::Ok { .. }));
         let guard = conn.lock().await;
-        assert!(task_repository::get_by_id(&guard, "a").unwrap().is_none());
-        assert!(task_repository::get_by_id(&guard, "b").unwrap().is_none());
-        let outside = task_repository::get_by_id(&guard, "outside")
+        assert!(task_repository::get_by_id_in_transaction(&guard, "a")
+            .unwrap()
+            .is_none());
+        assert!(task_repository::get_by_id_in_transaction(&guard, "b")
+            .unwrap()
+            .is_none());
+        let outside = task_repository::get_by_id_in_transaction(&guard, "outside")
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -7001,10 +7104,12 @@ mod request_assistance_tests {
         .await;
         assert!(matches!(result, ToolResult::Ok { .. }));
         let guard = conn.lock().await;
-        let parent = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+        let parent = task_repository::get_by_id_in_transaction(&guard, "t1")
+            .unwrap()
+            .unwrap();
         let children = parent.child_tasks.unwrap();
         assert_eq!(children.len(), 1);
-        let child = task_repository::get_by_id(&guard, &children[0])
+        let child = task_repository::get_by_id_in_transaction(&guard, &children[0])
             .unwrap()
             .unwrap();
         assert_eq!(child.priority, "high");
@@ -7068,16 +7173,17 @@ mod request_assistance_tests {
 
 #[cfg(test)]
 mod bulk_task_operations_tests {
-    // Phase G (sea-orm migration infra): a throwaway in-memory
-    // sea-orm connection for ToolCallContext::sea_orm_db -- no test in
-    // this module queries through it yet, it only needs to exist so
-    // off_wire's now-mandatory last argument has something to point
-    // at. Each sibling test module here (not nested under `mod
-    // tests` -- each is its own top-level `#[cfg(test)] mod` block)
-    // needs its own copy since `use super::*;` only reaches the
-    // file's top-level items, not another sibling test module's.
-    async fn test_sea_orm_db() -> sea_orm::DatabaseConnection {
-        sea_orm::Database::connect("sqlite::memory:").await.unwrap()
+    // Phase G (sea-orm migration infra): real-temp-file-backed, not
+    // `:memory:` -- `BulkTaskOperationsTool`'s post-commit wake loop
+    // now reads the mutated tasks' `assigned_to` through
+    // `ctx.sea_orm_db` (`task_repository::get_by_id`), so it must see
+    // the SAME rows `test_conn`'s rusqlite connection seeds/writes;
+    // two disconnected `:memory:` handles don't share state (same fix
+    // as `view_search_tests`'s own `test_sea_orm_db`).
+    async fn test_sea_orm_db(dir: &std::path::Path) -> sea_orm::DatabaseConnection {
+        sea_orm::Database::connect(format!("sqlite://{}", dir.join("test.db").display()))
+            .await
+            .unwrap()
     }
 
     use super::*;
@@ -7089,10 +7195,11 @@ mod bulk_task_operations_tests {
 
     const NOW: &str = "2026-05-15T00:00:00Z";
 
-    fn test_conn() -> AsyncMutex<Connection> {
-        let conn = Connection::open_in_memory().unwrap();
+    fn test_conn() -> (tempfile::TempDir, AsyncMutex<Connection>) {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = Connection::open(dir.path().join("test.db")).unwrap();
         init_schema(&conn).unwrap();
-        AsyncMutex::new(conn)
+        (dir, AsyncMutex::new(conn))
     }
 
     fn worker(agent_id: &str) -> Principal {
@@ -7170,10 +7277,15 @@ mod bulk_task_operations_tests {
         .unwrap();
     }
 
-    async fn call(args: Value, principal: &Principal, conn: &AsyncMutex<Connection>) -> ToolResult {
+    async fn call(
+        args: Value,
+        principal: &Principal,
+        conn: &AsyncMutex<Connection>,
+        dir: &std::path::Path,
+    ) -> ToolResult {
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let sea_orm_db = test_sea_orm_db(dir).await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -7192,14 +7304,20 @@ mod bulk_task_operations_tests {
 
     #[tokio::test]
     async fn requires_a_non_empty_operations_array() {
-        let conn = test_conn();
-        let result = call(serde_json::json!({"operations": []}), &admin("a"), &conn).await;
+        let (dir, conn) = test_conn();
+        let result = call(
+            serde_json::json!({"operations": []}),
+            &admin("a"),
+            &conn,
+            dir.path(),
+        )
+        .await;
         assert!(matches!(result, ToolResult::Invalid { .. }));
     }
 
     #[tokio::test]
     async fn update_status_op_succeeds_for_the_owner() {
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         {
             let guard = conn.lock().await;
             seed_task(&guard, "t1", "pending", Some("bob"), "alice");
@@ -7208,6 +7326,7 @@ mod bulk_task_operations_tests {
             serde_json::json!({"operations": [{"type": "update_status", "task_id": "t1", "status": "in_progress"}]}),
             &worker("bob"),
             &conn,
+            dir.path(),
         )
         .await;
         let msg = message_of(&result);
@@ -7234,7 +7353,7 @@ mod bulk_task_operations_tests {
     /// literal Python fix.
     #[tokio::test]
     async fn update_status_op_db_failure_does_not_leak_the_raw_error() {
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         {
             let guard = conn.lock().await;
             seed_task(&guard, "t1", "pending", Some("bob"), "alice");
@@ -7244,6 +7363,7 @@ mod bulk_task_operations_tests {
             serde_json::json!({"operations": [{"type": "update_status", "task_id": "t1", "status": "in_progress"}]}),
             &worker("bob"),
             &conn,
+            dir.path(),
         )
         .await;
         let msg = match &result {
@@ -7263,13 +7383,15 @@ mod bulk_task_operations_tests {
         // The write never landed -- the transaction rolled back on the
         // genuine SQLite error, so the task's status is untouched.
         let guard = conn.lock().await;
-        let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+        let row = task_repository::get_by_id_in_transaction(&guard, "t1")
+            .unwrap()
+            .unwrap();
         assert_eq!(row.status, "pending");
     }
 
     #[tokio::test]
     async fn update_status_on_a_foreign_task_is_reported_as_a_per_op_error() {
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         {
             let guard = conn.lock().await;
             seed_task(&guard, "t1", "pending", Some("carol"), "alice");
@@ -7278,6 +7400,7 @@ mod bulk_task_operations_tests {
             serde_json::json!({"operations": [{"type": "update_status", "task_id": "t1", "status": "in_progress"}]}),
             &worker("bob"),
             &conn,
+            dir.path(),
         )
         .await;
         let msg = message_of(&result);
@@ -7292,7 +7415,7 @@ mod bulk_task_operations_tests {
     /// `@requires_policy` gate.
     #[tokio::test]
     async fn update_status_op_denied_for_a_worker_when_policy_is_off() {
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         {
             let guard = conn.lock().await;
             seed_task(&guard, "t1", "pending", Some("bob"), "alice");
@@ -7311,6 +7434,7 @@ mod bulk_task_operations_tests {
             serde_json::json!({"operations": [{"type": "update_status", "task_id": "t1", "status": "in_progress"}]}),
             &worker("bob"),
             &conn,
+            dir.path(),
         )
         .await;
         let msg = message_of(&result);
@@ -7320,7 +7444,9 @@ mod bulk_task_operations_tests {
         );
         assert!(!msg.contains("status updated to 'in_progress'"), "{msg}");
         let guard = conn.lock().await;
-        let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+        let row = task_repository::get_by_id_in_transaction(&guard, "t1")
+            .unwrap()
+            .unwrap();
         assert_eq!(row.status, "pending");
     }
 
@@ -7331,7 +7457,7 @@ mod bulk_task_operations_tests {
     /// toggle OFF.
     #[tokio::test]
     async fn update_status_op_still_works_for_admin_when_policy_is_off() {
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         {
             let guard = conn.lock().await;
             seed_task(&guard, "t1", "pending", Some("admin"), "alice");
@@ -7350,6 +7476,7 @@ mod bulk_task_operations_tests {
             serde_json::json!({"operations": [{"type": "update_status", "task_id": "t1", "status": "in_progress"}]}),
             &admin("alice"),
             &conn,
+            dir.path(),
         )
         .await;
         let msg = message_of(&result);
@@ -7358,7 +7485,7 @@ mod bulk_task_operations_tests {
 
     #[tokio::test]
     async fn worker_cannot_update_priority() {
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         {
             let guard = conn.lock().await;
             seed_task(&guard, "t1", "pending", Some("bob"), "alice");
@@ -7367,6 +7494,7 @@ mod bulk_task_operations_tests {
             serde_json::json!({"operations": [{"type": "update_priority", "task_id": "t1", "priority": "high"}]}),
             &worker("bob"),
             &conn,
+            dir.path(),
         )
         .await;
         let msg = message_of(&result);
@@ -7375,7 +7503,7 @@ mod bulk_task_operations_tests {
 
     #[tokio::test]
     async fn admin_updates_priority() {
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         {
             let guard = conn.lock().await;
             seed_task(&guard, "t1", "pending", Some("bob"), "alice");
@@ -7384,6 +7512,7 @@ mod bulk_task_operations_tests {
             serde_json::json!({"operations": [{"type": "update_priority", "task_id": "t1", "priority": "high"}]}),
             &admin("alice"),
             &conn,
+            dir.path(),
         )
         .await;
         let msg = message_of(&result);
@@ -7392,7 +7521,7 @@ mod bulk_task_operations_tests {
 
     #[tokio::test]
     async fn add_note_appends_a_note() {
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         {
             let guard = conn.lock().await;
             seed_task(&guard, "t1", "pending", Some("bob"), "alice");
@@ -7401,10 +7530,13 @@ mod bulk_task_operations_tests {
             serde_json::json!({"operations": [{"type": "add_note", "task_id": "t1", "content": "progress"}]}),
             &worker("bob"),
             &conn,
+            dir.path(),
         )
         .await;
         let guard = conn.lock().await;
-        let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+        let row = task_repository::get_by_id_in_transaction(&guard, "t1")
+            .unwrap()
+            .unwrap();
         assert_eq!(row.notes.unwrap()[0].content, "progress");
     }
 
@@ -7416,7 +7548,7 @@ mod bulk_task_operations_tests {
     /// applied.
     #[tokio::test]
     async fn update_priority_on_a_terminal_task_is_a_per_op_error() {
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         {
             let guard = conn.lock().await;
             seed_task(&guard, "t1", "completed", Some("bob"), "alice");
@@ -7425,13 +7557,16 @@ mod bulk_task_operations_tests {
             serde_json::json!({"operations": [{"type": "update_priority", "task_id": "t1", "priority": "high"}]}),
             &admin("alice"),
             &conn,
+            dir.path(),
         )
         .await;
         let msg = message_of(&result);
         assert!(msg.to_lowercase().contains("terminal"), "{msg}");
         assert!(!msg.contains("priority updated to 'high'"), "{msg}");
         let guard = conn.lock().await;
-        let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+        let row = task_repository::get_by_id_in_transaction(&guard, "t1")
+            .unwrap()
+            .unwrap();
         assert_eq!(
             row.priority, "medium",
             "the seeded priority must be unchanged"
@@ -7445,7 +7580,7 @@ mod bulk_task_operations_tests {
     /// silently applied.
     #[tokio::test]
     async fn add_note_on_a_terminal_task_is_a_per_op_error() {
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         {
             let guard = conn.lock().await;
             seed_task(&guard, "t1", "cancelled", Some("bob"), "alice");
@@ -7454,13 +7589,16 @@ mod bulk_task_operations_tests {
             serde_json::json!({"operations": [{"type": "add_note", "task_id": "t1", "content": "should not land"}]}),
             &admin("alice"),
             &conn,
+            dir.path(),
         )
         .await;
         let msg = message_of(&result);
         assert!(msg.to_lowercase().contains("terminal"), "{msg}");
         assert!(!msg.contains("Note added"), "{msg}");
         let guard = conn.lock().await;
-        let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+        let row = task_repository::get_by_id_in_transaction(&guard, "t1")
+            .unwrap()
+            .unwrap();
         assert!(row.notes.unwrap_or_default().is_empty());
     }
 
@@ -7471,7 +7609,7 @@ mod bulk_task_operations_tests {
     /// a later legitimate op in the same call still lands.
     #[tokio::test]
     async fn a_denied_terminal_op_does_not_abort_the_rest_of_the_batch() {
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         {
             let guard = conn.lock().await;
             seed_task(&guard, "terminal", "completed", Some("bob"), "alice");
@@ -7501,23 +7639,26 @@ mod bulk_task_operations_tests {
             ]}),
             &admin("alice"),
             &conn,
+            dir.path(),
         )
         .await;
         let msg = message_of(&result);
         assert!(msg.to_lowercase().contains("terminal"), "{msg}");
         assert!(msg.contains("Note added"), "{msg}");
         let guard = conn.lock().await;
-        let terminal_row = task_repository::get_by_id(&guard, "terminal")
+        let terminal_row = task_repository::get_by_id_in_transaction(&guard, "terminal")
             .unwrap()
             .unwrap();
         assert_eq!(terminal_row.priority, "medium");
-        let live_row = task_repository::get_by_id(&guard, "live").unwrap().unwrap();
+        let live_row = task_repository::get_by_id_in_transaction(&guard, "live")
+            .unwrap()
+            .unwrap();
         assert_eq!(live_row.notes.unwrap()[0].content, "still processed");
     }
 
     #[tokio::test]
     async fn worker_cannot_reassign() {
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         {
             let guard = conn.lock().await;
             seed_agent(&guard, "carol");
@@ -7527,6 +7668,7 @@ mod bulk_task_operations_tests {
             serde_json::json!({"operations": [{"type": "reassign", "task_id": "t1", "assigned_to": "carol"}]}),
             &worker("bob"),
             &conn,
+            dir.path(),
         )
         .await;
         let msg = message_of(&result);
@@ -7539,7 +7681,7 @@ mod bulk_task_operations_tests {
         // reassign op must refuse a TERMINATED target -- the
         // agent_assignable check at the top of this arm already
         // covers this; this pins it as its own regression.
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         {
             let guard = conn.lock().await;
             seed_agent(&guard, "carol");
@@ -7550,6 +7692,7 @@ mod bulk_task_operations_tests {
             serde_json::json!({"operations": [{"type": "reassign", "task_id": "t1", "assigned_to": "carol"}]}),
             &admin("alice"),
             &conn,
+            dir.path(),
         )
         .await;
         let msg = message_of(&result);
@@ -7558,13 +7701,15 @@ mod bulk_task_operations_tests {
             "expected a terminated-agent rejection; got {msg:?}"
         );
         let guard = conn.lock().await;
-        let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+        let row = task_repository::get_by_id_in_transaction(&guard, "t1")
+            .unwrap()
+            .unwrap();
         assert_ne!(row.assigned_to.as_deref(), Some("carol"));
     }
 
     #[tokio::test]
     async fn admin_reassigns_and_reconciles_current_task() {
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         {
             let guard = conn.lock().await;
             seed_agent(&guard, "carol");
@@ -7574,11 +7719,14 @@ mod bulk_task_operations_tests {
             serde_json::json!({"operations": [{"type": "reassign", "task_id": "t1", "assigned_to": "carol"}]}),
             &admin("alice"),
             &conn,
+            dir.path(),
         )
         .await;
         assert!(matches!(result, ToolResult::Ok { .. }));
         let guard = conn.lock().await;
-        let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+        let row = task_repository::get_by_id_in_transaction(&guard, "t1")
+            .unwrap()
+            .unwrap();
         assert_eq!(row.assigned_to.as_deref(), Some("carol"));
         let agent = AgentRepository::get_by_id(&guard, "carol")
             .unwrap()
@@ -7592,7 +7740,7 @@ mod bulk_task_operations_tests {
         // agent's stale current_task pointer, not just set the gainer's
         // (admin_reassigns_and_reconciles_current_task above only
         // exercises the gainer half -- bob was never pinned to t1).
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         {
             let guard = conn.lock().await;
             seed_agent(&guard, "bob");
@@ -7616,6 +7764,7 @@ mod bulk_task_operations_tests {
             serde_json::json!({"operations": [{"type": "reassign", "task_id": "t1", "assigned_to": "carol"}]}),
             &admin("alice"),
             &conn,
+            dir.path(),
         )
         .await;
         assert!(matches!(result, ToolResult::Ok { .. }));
@@ -7644,7 +7793,7 @@ mod bulk_task_operations_tests {
         // surfaced anywhere. A trigger that only rejects writes to
         // `agents.current_task` isolates that one call's failure --
         // the preceding `tasks` UPDATE (assigned_to) still succeeds.
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         {
             let guard = conn.lock().await;
             seed_agent(&guard, "carol");
@@ -7660,6 +7809,7 @@ mod bulk_task_operations_tests {
             serde_json::json!({"operations": [{"type": "reassign", "task_id": "t1", "assigned_to": "carol"}]}),
             &admin("alice"),
             &conn,
+            dir.path(),
         )
         .await;
         assert!(
@@ -7678,7 +7828,7 @@ mod bulk_task_operations_tests {
     /// enforce, R12-F4).
     #[tokio::test]
     async fn reassign_op_on_a_terminal_task_is_denied() {
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         {
             let guard = conn.lock().await;
             seed_agent(&guard, "bob");
@@ -7688,13 +7838,16 @@ mod bulk_task_operations_tests {
             serde_json::json!({"operations": [{"type": "reassign", "task_id": "t1", "assigned_to": "bob"}]}),
             &admin("alice"),
             &conn,
+            dir.path(),
         )
         .await;
         let msg = message_of(&result);
         assert!(msg.to_lowercase().contains("terminal"), "{msg}");
         assert!(!msg.contains("reassigned to 'bob'"), "{msg}");
         let guard = conn.lock().await;
-        let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+        let row = task_repository::get_by_id_in_transaction(&guard, "t1")
+            .unwrap()
+            .unwrap();
         assert_eq!(row.assigned_to.as_deref(), Some("alice"));
         assert_eq!(row.status, "completed");
     }
@@ -7705,7 +7858,7 @@ mod bulk_task_operations_tests {
     /// terminal reassign must not abort the rest of the batch.
     #[tokio::test]
     async fn a_denied_terminal_reassign_does_not_abort_the_rest_of_the_batch() {
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         {
             let guard = conn.lock().await;
             seed_agent(&guard, "bob");
@@ -7736,13 +7889,14 @@ mod bulk_task_operations_tests {
             ]}),
             &admin("alice"),
             &conn,
+            dir.path(),
         )
         .await;
         let msg = message_of(&result);
         assert!(msg.to_lowercase().contains("terminal"), "{msg}");
         assert!(msg.contains("Note added"), "{msg}");
         let guard = conn.lock().await;
-        let terminal_row = task_repository::get_by_id(&guard, "terminal")
+        let terminal_row = task_repository::get_by_id_in_transaction(&guard, "terminal")
             .unwrap()
             .unwrap();
         assert_eq!(terminal_row.assigned_to.as_deref(), Some("alice"));
@@ -7750,7 +7904,7 @@ mod bulk_task_operations_tests {
 
     #[tokio::test]
     async fn refuses_a_terminal_task_status_transition() {
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         {
             let guard = conn.lock().await;
             seed_task(&guard, "t1", "completed", Some("bob"), "alice");
@@ -7759,6 +7913,7 @@ mod bulk_task_operations_tests {
             serde_json::json!({"operations": [{"type": "update_status", "task_id": "t1", "status": "in_progress"}]}),
             &admin("alice"),
             &conn,
+            dir.path(),
         )
         .await;
         let msg = message_of(&result);
@@ -7767,7 +7922,7 @@ mod bulk_task_operations_tests {
 
     #[tokio::test]
     async fn completing_a_task_advances_a_now_unblocked_dependent() {
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         {
             let guard = conn.lock().await;
             seed_task(&guard, "blocker", "in_progress", Some("bob"), "alice");
@@ -7789,7 +7944,7 @@ mod bulk_task_operations_tests {
                 },
             )
             .unwrap();
-            task_repository::update_fields(
+            task_repository::update_fields_in_transaction(
                 &guard,
                 "dependent",
                 &task_repository::TaskFields {
@@ -7807,11 +7962,12 @@ mod bulk_task_operations_tests {
             serde_json::json!({"operations": [{"type": "update_status", "task_id": "blocker", "status": "completed"}]}),
             &admin("alice"),
             &conn,
+            dir.path(),
         )
         .await;
         assert!(matches!(result, ToolResult::Ok { .. }));
         let guard = conn.lock().await;
-        let dependent = task_repository::get_by_id(&guard, "dependent")
+        let dependent = task_repository::get_by_id_in_transaction(&guard, "dependent")
             .unwrap()
             .unwrap();
         assert_eq!(dependent.status, "in_progress");
@@ -7825,7 +7981,7 @@ mod bulk_task_operations_tests {
         // -- a worker (not admin) completing their own task must still
         // advance a dependent owned by a DIFFERENT agent and wake that
         // agent, not the completer.
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         {
             let guard = conn.lock().await;
             seed_agent(&guard, "carol");
@@ -7848,7 +8004,7 @@ mod bulk_task_operations_tests {
                 },
             )
             .unwrap();
-            task_repository::update_fields(
+            task_repository::update_fields_in_transaction(
                 &guard,
                 "dependent",
                 &task_repository::TaskFields {
@@ -7865,7 +8021,7 @@ mod bulk_task_operations_tests {
         let registry = WaiterRegistry::new();
         let (_tx, mut rx_carol) = registry.register("carol");
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let sea_orm_db = test_sea_orm_db(dir.path()).await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -7882,7 +8038,7 @@ mod bulk_task_operations_tests {
         .await;
         assert!(matches!(result, ToolResult::Ok { .. }));
         let guard = conn.lock().await;
-        let dependent = task_repository::get_by_id(&guard, "dependent")
+        let dependent = task_repository::get_by_id_in_transaction(&guard, "dependent")
             .unwrap()
             .unwrap();
         assert_eq!(dependent.status, "in_progress");
@@ -7896,7 +8052,7 @@ mod bulk_task_operations_tests {
 
     #[tokio::test]
     async fn writes_one_aggregate_audit_row() {
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         {
             let guard = conn.lock().await;
             seed_task(&guard, "t1", "pending", Some("bob"), "alice");
@@ -7926,6 +8082,7 @@ mod bulk_task_operations_tests {
             ]}),
             &worker("bob"),
             &conn,
+            dir.path(),
         )
         .await;
         let guard = conn.lock().await;
@@ -7941,7 +8098,7 @@ mod bulk_task_operations_tests {
 
     #[tokio::test]
     async fn wakes_the_reassigned_agents_waiter() {
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         {
             let guard = conn.lock().await;
             seed_agent(&guard, "carol");
@@ -7950,7 +8107,7 @@ mod bulk_task_operations_tests {
         let registry = WaiterRegistry::new();
         let (_tx, mut rx) = registry.register("carol");
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let sea_orm_db = test_sea_orm_db(dir.path()).await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
