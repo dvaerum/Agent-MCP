@@ -323,23 +323,23 @@ pub async fn login_post_handler(
             html_response(StatusCode::UNAUTHORIZED, render_invalid(&username))
         }
         LoginAttemptOutcome::Success(user) => {
-            let session_id = {
-                let conn = state.conn.lock().await;
-                let expires = (now
-                    + chrono::Duration::days(identity::DEFAULT_SESSION_LIFETIME_DAYS))
+            let expires = (now + chrono::Duration::days(identity::DEFAULT_SESSION_LIFETIME_DAYS))
                 .to_rfc3339();
-                match identity::create_session(&conn, &user.user_id, &now_str, &expires) {
-                    Ok(s) => s,
-                    Err(_) => return internal_error(),
-                }
+            let session_id = match identity::create_session(
+                &state.sea_orm_db,
+                &user.user_id,
+                &now_str,
+                &expires,
+            )
+            .await
+            {
+                Ok(s) => s,
+                Err(_) => return internal_error(),
             };
-            // `touch_last_login` (users, sea-orm) runs AFTER the
-            // `conn` mutex guard above is dropped -- `create_session`
-            // (sessions, deliberately still rusqlite) and this write
-            // to a different table/row have no ordering dependency on
-            // each other, so splitting them across the lock boundary
-            // is safe (Phase G router step 4 PR D; sessions itself
-            // stays out of scope, see `identity.rs`'s own module doc).
+            // Both `create_session` and `touch_last_login` now go
+            // through `state.sea_orm_db` (Phase G router step 4 PR
+            // sessions) -- no ordering dependency between them, no
+            // `conn` mutex needed for either.
             if identity::touch_last_login(&state.sea_orm_db, &user.user_id, &now_str)
                 .await
                 .is_err()
@@ -387,8 +387,10 @@ pub async fn logout_post_handler(
         cookie_header.and_then(|h| login::parse_cookie_header(h, login::SESSION_COOKIE_NAME));
 
     if let Some(session_id) = session_id.filter(|s| !s.is_empty()) {
-        let conn = state.conn.lock().await;
-        if identity::delete_session(&conn, &session_id).is_err() {
+        if identity::delete_session(&state.sea_orm_db, &session_id)
+            .await
+            .is_err()
+        {
             return internal_error();
         }
     }
@@ -535,20 +537,18 @@ pub async fn setup_post_handler(
             html_response(StatusCode::BAD_REQUEST, html)
         }
         SetupPostOutcome::Created(user_id) => {
-            let session_id = {
-                let conn = state.conn.lock().await;
-                let expires = (now
-                    + chrono::Duration::days(identity::DEFAULT_SESSION_LIFETIME_DAYS))
+            let expires = (now + chrono::Duration::days(identity::DEFAULT_SESSION_LIFETIME_DAYS))
                 .to_rfc3339();
-                match identity::create_session(&conn, &user_id, &now_str, &expires) {
+            let session_id =
+                match identity::create_session(&state.sea_orm_db, &user_id, &now_str, &expires)
+                    .await
+                {
                     Ok(s) => s,
                     Err(_) => return internal_error(),
-                }
-            };
+                };
             // See `login_post_handler`'s own comment on this same
-            // split: `touch_last_login` (users, sea-orm) runs after
-            // the rusqlite `conn` guard for `create_session`
-            // (sessions, deliberately still rusqlite) is dropped.
+            // shape: both `create_session` and `touch_last_login` now
+            // go through `state.sea_orm_db`.
             if identity::touch_last_login(&state.sea_orm_db, &user_id, &now_str)
                 .await
                 .is_err()

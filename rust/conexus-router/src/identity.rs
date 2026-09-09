@@ -41,11 +41,27 @@
 //! twin's own doc) -- `sso.rs` is called synchronously from
 //! `session_gate.rs::evaluate_session_gate`, this migration's own
 //! declared highest-risk hot path, and forcing it async is explicitly
-//! out of scope for PR D (reserved for whichever PR converts
-//! `sessions`, deliberately last in this sequence). `sessions`/
-//! `groups`/`group_membership` (this same module's OTHER functions)
-//! remain rusqlite::Connection-based; `sessions` last since it's the
-//! highest-risk piece (`session_gate.rs`'s hot path).
+//! out of scope for PR D. `groups`/`group_membership` (in
+//! `conexus_db`, not this module) were rewritten in PR F/G, the same
+//! way. Finally, PR (sessions, deliberately last in this sequence)
+//! rewrote `create_session`/`delete_session`/`prune_expired_sessions`
+//! onto `sea_orm::DatabaseConnection` against
+//! `conexus_db::entity::sessions` -- real call-site tracing found
+//! this genuinely LOW-risk once actually checked (contrary to this
+//! doc's own earlier "highest-risk piece" framing, corrected here):
+//! their only real production callers
+//! (`login_setup_rest.rs`'s login/setup-wizard handlers,
+//! `oidc_handlers.rs`'s callback handler, `logout_post_handler`) are
+//! ALREADY async axum handlers, so all three convert wholesale with
+//! no sync twin needed. [`get_session`] is the one function that
+//! stays rusqlite-only forever -- its single real caller,
+//! [`login::resolve_current_user`](crate::login::resolve_current_user),
+//! must stay synchronous for `session_gate.rs`'s sake, and nothing
+//! else in this crate calls `get_session` at all. This means
+//! `session_gate.rs::evaluate_session_gate` NEVER needed to become
+//! async for this migration to complete -- its one sessions-table
+//! dependency was never on the async-conversion critical path to
+//! begin with.
 //!
 //! **`create_user`/`create_sso_user`'s `BEGIN IMMEDIATE` under
 //! sea-orm**: sea-orm 2.0.2 exposes SQLite's transaction-mode keyword
@@ -90,6 +106,7 @@ use argon2::password_hash::phc::PasswordHash;
 use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 use argon2::{Algorithm, Argon2, Params, Version};
 use conexus_db::entity::project_membership::{ActiveModel, Column, Entity};
+use conexus_db::entity::sessions;
 use conexus_db::entity::users::{
     ActiveModel as UserActiveModel, Column as UserColumn, Entity as UserEntity, Model as UserModel,
 };
@@ -1073,18 +1090,28 @@ pub struct SessionRow {
 /// `expires_at` are both explicit (this crate's own "never read a
 /// hidden wall clock" convention) rather than computed internally
 /// from `lifetime_days` off a live clock read.
-pub fn create_session(
-    conn: &Connection,
+///
+/// sea-orm-backed: every real production call site
+/// (`login_setup_rest.rs`'s login/setup-wizard handlers,
+/// `oidc_handlers.rs`'s callback handler) is already an async axum
+/// handler -- no sync twin is needed, unlike `get_session` below
+/// (whose one real caller, `login::resolve_current_user`, must stay
+/// synchronous for `session_gate.rs`'s sake).
+pub async fn create_session(
+    db: &DatabaseConnection,
     user_id: &str,
     now: &str,
     expires_at: &str,
 ) -> Result<String, IdentityError> {
     let session_id = random_id(16); // 32 hex chars, matches Python's secrets.token_hex(16)
-    conn.execute(
-        "INSERT INTO sessions (session_id, user_id, created_at, expires_at, last_used_at) \
-         VALUES (?1, ?2, ?3, ?4, ?3)",
-        (&session_id, user_id, now, expires_at),
-    )?;
+    let am = sessions::ActiveModel {
+        session_id: Set(session_id.clone()),
+        user_id: Set(user_id.to_string()),
+        created_at: Set(now.to_string()),
+        expires_at: Set(expires_at.to_string()),
+        last_used_at: Set(now.to_string()),
+    };
+    sessions::Entity::insert(am).exec(db).await?;
     Ok(session_id)
 }
 
@@ -1131,8 +1158,17 @@ pub fn get_session(
 }
 
 /// Drop a session row. No-op if missing.
-pub fn delete_session(conn: &Connection, session_id: &str) -> Result<(), IdentityError> {
-    conn.execute("DELETE FROM sessions WHERE session_id = ?1", [session_id])?;
+///
+/// sea-orm-backed: its one real production call site
+/// (`login_setup_rest.rs::logout_post_handler`) is already async; no
+/// sync twin needed (same rationale as [`create_session`]).
+pub async fn delete_session(
+    db: &DatabaseConnection,
+    session_id: &str,
+) -> Result<(), IdentityError> {
+    sessions::Entity::delete_by_id(session_id.to_string())
+        .exec(db)
+        .await?;
     Ok(())
 }
 
@@ -1140,8 +1176,20 @@ pub fn delete_session(conn: &Connection, session_id: &str) -> Result<(), Identit
 /// against `now`). Returns the number of rows deleted. Called
 /// periodically by the router's reaper task (wired in a later PR);
 /// safe to call ad-hoc.
-pub fn prune_expired_sessions(conn: &Connection, now: &str) -> Result<usize, IdentityError> {
-    Ok(conn.execute("DELETE FROM sessions WHERE expires_at <= ?1", [now])?)
+///
+/// sea-orm-backed: has no real caller anywhere in this crate yet (the
+/// "reaper task" this doc comment refers to is still unwired) -- ready
+/// for whichever future PR wires it in, matching the async shape every
+/// other reaper-adjacent primitive in this crate already uses.
+pub async fn prune_expired_sessions(
+    db: &DatabaseConnection,
+    now: &str,
+) -> Result<u64, IdentityError> {
+    let result = sessions::Entity::delete_many()
+        .filter(sessions::Column::ExpiresAt.lte(now))
+        .exec(db)
+        .await?;
+    Ok(result.rows_affected)
 }
 
 /// Grant `user_id` (`operator`-tier, the schema `DEFAULT`) access to
@@ -1962,7 +2010,7 @@ mod tests {
 
         let later = "2026-01-01T00:05:00.000+00:00";
         let expires = "2026-02-01T00:00:00.000+00:00";
-        let sid = create_session(&c, &uid, NOW, expires).unwrap();
+        let sid = create_session(&db, &uid, NOW, expires).await.unwrap();
 
         let fetched = get_session(&c, &sid, later).unwrap().unwrap();
         assert_eq!(fetched.user_id, uid);
@@ -1971,7 +2019,7 @@ mod tests {
             "get_session slides last_used_at to `now`"
         );
 
-        delete_session(&c, &sid).unwrap();
+        delete_session(&db, &sid).await.unwrap();
         assert!(get_session(&c, &sid, later).unwrap().is_none());
     }
 
@@ -1992,7 +2040,7 @@ mod tests {
         .unwrap();
         let expires = "2026-01-01T00:01:00.000+00:00";
         let after_expiry = "2026-01-01T00:02:00.000+00:00";
-        let sid = create_session(&c, &uid, NOW, expires).unwrap();
+        let sid = create_session(&db, &uid, NOW, expires).await.unwrap();
 
         assert!(get_session(&c, &sid, after_expiry).unwrap().is_none());
         // Still physically present -- only the periodic sweep deletes it.
@@ -2021,10 +2069,16 @@ mod tests {
         )
         .await
         .unwrap();
-        let expired = create_session(&c, &uid, NOW, "2026-01-01T00:01:00.000+00:00").unwrap();
-        let live = create_session(&c, &uid, NOW, "2027-01-01T00:00:00.000+00:00").unwrap();
+        let expired = create_session(&db, &uid, NOW, "2026-01-01T00:01:00.000+00:00")
+            .await
+            .unwrap();
+        let live = create_session(&db, &uid, NOW, "2027-01-01T00:00:00.000+00:00")
+            .await
+            .unwrap();
 
-        let removed = prune_expired_sessions(&c, "2026-06-01T00:00:00.000+00:00").unwrap();
+        let removed = prune_expired_sessions(&db, "2026-06-01T00:00:00.000+00:00")
+            .await
+            .unwrap();
         assert_eq!(removed, 1);
         assert!(get_session(&c, &expired, "2026-06-01T00:00:00.000+00:00")
             .unwrap()

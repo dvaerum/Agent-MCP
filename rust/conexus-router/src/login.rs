@@ -749,7 +749,9 @@ mod tests {
     async fn resolve_current_user_returns_the_user_for_a_valid_session_cookie() {
         let (_dir, c, db) = conn_with_sea_orm().await;
         let uid = seed_user(&db).await;
-        let sid = identity::create_session(&c, &uid, NOW, "2026-02-01T00:00:00.000+00:00").unwrap();
+        let sid = identity::create_session(&db, &uid, NOW, "2026-02-01T00:00:00.000+00:00")
+            .await
+            .unwrap();
         let header = format!("other=1; {SESSION_COOKIE_NAME}={sid}");
 
         let user = resolve_current_user(&c, Some(&header), NOW)
@@ -762,7 +764,9 @@ mod tests {
     async fn resolve_current_user_returns_none_for_an_expired_session() {
         let (_dir, c, db) = conn_with_sea_orm().await;
         let uid = seed_user(&db).await;
-        let sid = identity::create_session(&c, &uid, NOW, "2026-01-01T00:01:00.000+00:00").unwrap();
+        let sid = identity::create_session(&db, &uid, NOW, "2026-01-01T00:01:00.000+00:00")
+            .await
+            .unwrap();
         let header = format!("{SESSION_COOKIE_NAME}={sid}");
 
         let later = "2026-01-01T00:02:00.000+00:00";
@@ -775,7 +779,9 @@ mod tests {
     async fn touch_session_slides_last_used_at() {
         let (_dir, c, db) = conn_with_sea_orm().await;
         let uid = seed_user(&db).await;
-        let sid = identity::create_session(&c, &uid, NOW, "2026-02-01T00:00:00.000+00:00").unwrap();
+        let sid = identity::create_session(&db, &uid, NOW, "2026-02-01T00:00:00.000+00:00")
+            .await
+            .unwrap();
         let later = "2026-01-01T00:05:00.000+00:00";
 
         touch_session(&c, &sid, later).unwrap();

@@ -1468,10 +1468,14 @@ mod tests {
         let (victim_id, _victim_group, _victim_identity) =
             seed_delegate(&state, "victim", &[]).await;
 
-        let sid = {
-            let conn = state.conn.lock().await;
-            identity::create_session(&conn, &dev_id, NOW, "2026-02-01T00:00:00.000+00:00").unwrap()
-        };
+        let sid = identity::create_session(
+            &state.sea_orm_db,
+            &dev_id,
+            NOW,
+            "2026-02-01T00:00:00.000+00:00",
+        )
+        .await
+        .unwrap();
         let cookie = format!("{}={}", login::SESSION_COOKIE_NAME, sid);
         let mut headers = HeaderMap::new();
         headers.insert("cookie", cookie.parse().unwrap());
@@ -1479,10 +1483,9 @@ mod tests {
         // Simulate the concurrent logout landing before this paused
         // request resumes -- the session row is genuinely gone by the
         // time the handler's own revalidation reads it.
-        {
-            let conn = state.conn.lock().await;
-            identity::delete_session(&conn, &sid).unwrap();
-        }
+        identity::delete_session(&state.sea_orm_db, &sid)
+            .await
+            .unwrap();
 
         let body = json_body(serde_json::json!({"email": "raced-in@example.test"}));
         let resp = edit_user_handler(
