@@ -453,6 +453,8 @@ dependencies = [
  "conexus-router",
  "rpassword",
  "rusqlite",
+ "sea-orm",
+ "tokio",
 ]
 
 [[package]]

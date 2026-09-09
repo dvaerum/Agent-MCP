@@ -32,7 +32,7 @@
 //!    `NULL`); the username collision-suffix loop only ever engages
 //!    for a genuinely new subject.
 
-use rusqlite::Connection;
+use sea_orm::DatabaseConnection;
 
 use crate::identity::{self, IdentityError, UserRow};
 use crate::sso::sanitise_username;
@@ -65,34 +65,41 @@ pub struct OidcReconcileInput<'a> {
     pub bootstrap_sysadmin: bool,
 }
 
-fn touch_and_reload(conn: &Connection, user_id: &str, now: &str) -> Result<UserRow, IdentityError> {
-    identity::touch_last_login(conn, user_id, now)?;
-    identity::get_user_by_id(conn, user_id)?
-        .ok_or_else(|| IdentityError::Db(rusqlite::Error::QueryReturnedNoRows))
+async fn touch_and_reload(
+    db: &DatabaseConnection,
+    user_id: &str,
+    now: &str,
+) -> Result<UserRow, IdentityError> {
+    identity::touch_last_login(db, user_id, now).await?;
+    identity::get_user_by_id(db, user_id).await?.ok_or_else(|| {
+        IdentityError::SeaOrm(sea_orm::DbErr::RecordNotFound(
+            "user just touched is missing".to_string(),
+        ))
+    })
 }
 
 /// Port of `find_or_create_sso_user`, scoped to the OIDC call site.
-/// See the module doc for the 3-step algorithm.
-pub fn find_or_create_oidc_user(
-    conn: &mut Connection,
-    input: &OidcReconcileInput,
+/// See the module doc for the 3-step algorithm. Fully async (sea-orm)
+/// -- unlike `sso::find_or_create_sso_user`, this function's only
+/// real call site (`oidc_handlers.rs`'s already-async ID-token
+/// handler) has no hot-path-sync constraint, so this converts
+/// wholesale rather than keeping a `_sync` twin.
+pub async fn find_or_create_oidc_user(
+    db: &DatabaseConnection,
+    input: &OidcReconcileInput<'_>,
     now: &str,
 ) -> Result<UserRow, IdentityError> {
     let encoded = input.subject.encode();
 
     // 1. Stable-subject reconciliation (current format, then the
     // R19-F1 legacy fallback + self-heal on a hit).
-    let existing = match identity::find_user_by_sso_subject(conn, &encoded)? {
+    let existing = match identity::find_user_by_sso_subject(db, &encoded).await? {
         Some(row) => Some(row),
         None => match input.subject.legacy_lookup_key() {
-            Some(legacy_key) => match identity::find_user_by_sso_subject(conn, &legacy_key)? {
+            Some(legacy_key) => match identity::find_user_by_sso_subject(db, &legacy_key).await? {
                 Some(legacy_row) => {
-                    identity::upgrade_sso_subject(
-                        conn,
-                        &legacy_row.user_id,
-                        &legacy_key,
-                        &encoded,
-                    )?;
+                    identity::upgrade_sso_subject(db, &legacy_row.user_id, &legacy_key, &encoded)
+                        .await?;
                     Some(legacy_row)
                 }
                 None => None,
@@ -101,15 +108,15 @@ pub fn find_or_create_oidc_user(
         },
     };
     if let Some(existing) = existing {
-        return touch_and_reload(conn, &existing.user_id, now);
+        return touch_and_reload(db, &existing.user_id, now).await;
     }
 
     // 2. Verified-email link to a pre-existing local account.
     if input.email_verified {
         if let Some(email) = input.email {
-            if let Some(linked) = identity::find_linkable_user_by_email(conn, email)? {
-                identity::stamp_sso_subject_if_absent(conn, &linked.user_id, &encoded)?;
-                return touch_and_reload(conn, &linked.user_id, now);
+            if let Some(linked) = identity::find_linkable_user_by_email(db, email).await? {
+                identity::stamp_sso_subject_if_absent(db, &linked.user_id, &encoded).await?;
+                return touch_and_reload(db, &linked.user_id, now).await;
             }
         }
     }
@@ -118,21 +125,25 @@ pub fn find_or_create_oidc_user(
     let base = sanitise_username(input.preferred_username.or(input.email).unwrap_or("user"));
     let mut candidate = base.clone();
     let mut suffix = 2;
-    while identity::get_user_by_username(conn, &candidate)?.is_some() {
+    while identity::get_user_by_username(db, &candidate)
+        .await?
+        .is_some()
+    {
         candidate = format!("{base}-{suffix}");
         suffix += 1;
     }
 
     let user_id = identity::create_sso_user(
-        conn,
+        db,
         &candidate,
         &encoded,
         input.email,
         input.default_is_sysadmin,
         input.bootstrap_sysadmin,
         now,
-    )?;
-    touch_and_reload(conn, &user_id, now)
+    )
+    .await?;
+    touch_and_reload(db, &user_id, now).await
 }
 
 #[cfg(test)]
@@ -141,14 +152,27 @@ mod tests {
     use crate::identity::create_user;
     use crate::sso_subject::SsoSubjectValue;
     use conexus_db::schema::init_router_schema;
+    use rusqlite::Connection;
 
     const NOW: &str = "2026-09-06T00:00:00Z";
     const ISS: &str = "https://idp.example.test";
 
-    fn conn() -> Connection {
-        let c = Connection::open_in_memory().unwrap();
+    /// A file-backed router DB opened as BOTH a `rusqlite::Connection`
+    /// (to seed fixture rows through the still-sync `create_user`) and
+    /// a sea-orm `DatabaseConnection` (to exercise the now-converted
+    /// `find_or_create_oidc_user`) -- an in-memory `:memory:` DB can't
+    /// be shared across two separate connection handles the way a real
+    /// file can.
+    async fn conn_with_sea_orm() -> (tempfile::TempDir, Connection, sea_orm::DatabaseConnection) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oidc_reconcile_test.db");
+        let c = Connection::open(&path).unwrap();
+        c.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
         init_router_schema(&c).unwrap();
-        c
+        let db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        (dir, c, db)
     }
 
     fn subject(sub: &str) -> SsoSubject {
@@ -166,30 +190,36 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_new_subject_jit_creates_a_passwordless_row() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn a_new_subject_jit_creates_a_passwordless_row() {
+        let (_dir, _c, db) = conn_with_sea_orm().await;
         let sub = subject("alice-1");
-        let row = find_or_create_oidc_user(&mut c, &input(&sub), NOW).unwrap();
+        let row = find_or_create_oidc_user(&db, &input(&sub), NOW)
+            .await
+            .unwrap();
         assert_eq!(row.username, "alice");
         assert_eq!(row.sso_subject.as_deref(), Some(sub.encode().as_str()));
         assert!(!row.is_sysadmin);
     }
 
-    #[test]
-    fn a_second_call_with_the_same_subject_reconciles_to_the_same_row() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn a_second_call_with_the_same_subject_reconciles_to_the_same_row() {
+        let (_dir, _c, db) = conn_with_sea_orm().await;
         let sub = subject("alice-1");
-        let first = find_or_create_oidc_user(&mut c, &input(&sub), NOW).unwrap();
-        let second = find_or_create_oidc_user(&mut c, &input(&sub), NOW).unwrap();
+        let first = find_or_create_oidc_user(&db, &input(&sub), NOW)
+            .await
+            .unwrap();
+        let second = find_or_create_oidc_user(&db, &input(&sub), NOW)
+            .await
+            .unwrap();
         assert_eq!(first.user_id, second.user_id);
     }
 
-    #[test]
-    fn a_colliding_preferred_username_gets_a_numeric_suffix() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn a_colliding_preferred_username_gets_a_numeric_suffix() {
+        let (_dir, _c, db) = conn_with_sea_orm().await;
         create_user(
-            &mut c,
+            &db,
             "alice",
             "correct horse battery staple",
             None,
@@ -198,17 +228,20 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
         let sub = subject("alice-1");
-        let row = find_or_create_oidc_user(&mut c, &input(&sub), NOW).unwrap();
+        let row = find_or_create_oidc_user(&db, &input(&sub), NOW)
+            .await
+            .unwrap();
         assert_eq!(row.username, "alice-2");
     }
 
-    #[test]
-    fn a_verified_email_links_to_a_pre_existing_password_user() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn a_verified_email_links_to_a_pre_existing_password_user() {
+        let (_dir, _c, db) = conn_with_sea_orm().await;
         let existing_id = create_user(
-            &mut c,
+            &db,
             "bob",
             "correct horse battery staple",
             Some("bob@example.test"),
@@ -217,6 +250,7 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
 
         let sub = subject("bob-oidc-1");
@@ -225,19 +259,19 @@ mod tests {
         req.email_verified = true;
         req.preferred_username = None;
 
-        let row = find_or_create_oidc_user(&mut c, &req, NOW).unwrap();
+        let row = find_or_create_oidc_user(&db, &req, NOW).await.unwrap();
         assert_eq!(row.user_id, existing_id);
         assert_eq!(row.sso_subject.as_deref(), Some(sub.encode().as_str()));
     }
 
-    #[test]
-    fn an_unverified_email_never_links_to_a_pre_existing_account() {
+    #[tokio::test]
+    async fn an_unverified_email_never_links_to_a_pre_existing_account() {
         // The verification gate closes the account-takeover vector: an
         // IdP-asserted but UNVERIFIED email must not seize a local
         // operator of that address.
-        let mut c = conn();
+        let (_dir, _c, db) = conn_with_sea_orm().await;
         let existing_id = create_user(
-            &mut c,
+            &db,
             "bob",
             "correct horse battery staple",
             Some("bob@example.test"),
@@ -246,6 +280,7 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
 
         let sub = subject("mallory-1");
@@ -254,17 +289,17 @@ mod tests {
         req.email_verified = false;
         req.preferred_username = Some("mallory");
 
-        let row = find_or_create_oidc_user(&mut c, &req, NOW).unwrap();
+        let row = find_or_create_oidc_user(&db, &req, NOW).await.unwrap();
         assert_ne!(row.user_id, existing_id);
         assert_eq!(row.username, "mallory");
     }
 
-    #[test]
-    fn r19f1_a_legacy_untagged_row_reconciles_and_self_heals() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn r19f1_a_legacy_untagged_row_reconciles_and_self_heals() {
+        let (_dir, _c, db) = conn_with_sea_orm().await;
         let legacy_key = "oidc:https://idp.example.test:alice-1";
         let existing_id = create_user(
-            &mut c,
+            &db,
             "alice",
             "correct horse battery staple",
             None,
@@ -273,11 +308,16 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
-        identity::stamp_sso_subject_if_absent(&c, &existing_id, legacy_key).unwrap();
+        identity::stamp_sso_subject_if_absent(&db, &existing_id, legacy_key)
+            .await
+            .unwrap();
 
         let sub = subject("alice-1");
-        let row = find_or_create_oidc_user(&mut c, &input(&sub), NOW).unwrap();
+        let row = find_or_create_oidc_user(&db, &input(&sub), NOW)
+            .await
+            .unwrap();
 
         assert_eq!(row.user_id, existing_id, "must reconcile, not JIT-create");
         assert_eq!(row.sso_subject.as_deref(), Some(sub.encode().as_str()));
@@ -287,15 +327,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn r20f1_a_differently_typed_claimant_cannot_take_over_a_legacy_row() {
+    #[tokio::test]
+    async fn r20f1_a_differently_typed_claimant_cannot_take_over_a_legacy_row() {
         // An int sub is unconditionally ambiguous (SsoSubject::is_ambiguous),
         // so `legacy_lookup_key()` is None and this must NOT reconcile
         // into -- nor retag -- the victim's legacy row.
-        let mut c = conn();
+        let (_dir, _c, db) = conn_with_sea_orm().await;
         let legacy_key = "oidc:https://idp.example.test:1";
         let victim_id = create_user(
-            &mut c,
+            &db,
             "victim",
             "correct horse battery staple",
             None,
@@ -304,19 +344,25 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
-        identity::stamp_sso_subject_if_absent(&c, &victim_id, legacy_key).unwrap();
+        identity::stamp_sso_subject_if_absent(&db, &victim_id, legacy_key)
+            .await
+            .unwrap();
 
         let sub = SsoSubject::new(ISS, SsoSubjectValue::Int(1)).unwrap();
         assert_eq!(sub.legacy_lookup_key(), None);
         let mut req = input(&sub);
         req.preferred_username = Some("mallory");
 
-        let row = find_or_create_oidc_user(&mut c, &req, NOW).unwrap();
+        let row = find_or_create_oidc_user(&db, &req, NOW).await.unwrap();
 
         assert_ne!(row.user_id, victim_id);
         assert!(!row.is_sysadmin);
-        let victim_after = identity::get_user_by_id(&c, &victim_id).unwrap().unwrap();
+        let victim_after = identity::get_user_by_id(&db, &victim_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             victim_after.sso_subject.as_deref(),
             Some(legacy_key),
@@ -324,18 +370,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn r20f1_bool_str_family_claimant_cannot_take_over_a_legacy_row() {
+    #[tokio::test]
+    async fn r20f1_bool_str_family_claimant_cannot_take_over_a_legacy_row() {
         // Same exploit shape as `r20f1_a_differently_typed_claimant_
         // cannot_take_over_a_legacy_row`, using the bool/str collision
         // family (`str(True) == "True"`) instead of the int/str one --
         // ported directly from `test_sec_r20_f1_sso_legacy_fallback_
         // collision.py::test_ambiguous_bool_str_claimant_does_not_
         // hijack_legacy_row`.
-        let mut c = conn();
+        let (_dir, _c, db) = conn_with_sea_orm().await;
         let legacy_key = "oidc:https://idp.example.test:True";
         let victim_id = create_user(
-            &mut c,
+            &db,
             "victim2",
             "correct horse battery staple",
             None,
@@ -344,33 +390,39 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
-        identity::stamp_sso_subject_if_absent(&c, &victim_id, legacy_key).unwrap();
+        identity::stamp_sso_subject_if_absent(&db, &victim_id, legacy_key)
+            .await
+            .unwrap();
 
         let sub = SsoSubject::new(ISS, SsoSubjectValue::Bool(true)).unwrap();
         assert_eq!(sub.legacy_lookup_key(), None);
         let mut req = input(&sub);
         req.preferred_username = Some("attacker");
 
-        let row = find_or_create_oidc_user(&mut c, &req, NOW).unwrap();
+        let row = find_or_create_oidc_user(&db, &req, NOW).await.unwrap();
 
         assert_ne!(row.user_id, victim_id);
         assert!(!row.is_sysadmin);
-        let victim_after = identity::get_user_by_id(&c, &victim_id).unwrap().unwrap();
+        let victim_after = identity::get_user_by_id(&db, &victim_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(victim_after.sso_subject.as_deref(), Some(legacy_key));
     }
 
-    #[test]
-    fn r20f1_str_claimant_cannot_take_over_a_numeric_legacy_row() {
+    #[tokio::test]
+    async fn r20f1_str_claimant_cannot_take_over_a_numeric_legacy_row() {
         // Mirror direction: a STR claimant must not hijack a legacy row
         // whose key content could equally have been minted from a
         // non-str scalar (a legacy row literally named "1") -- ported
         // from `test_sec_r20_f1_sso_legacy_fallback_collision.py::
         // test_str_claimant_does_not_hijack_numeric_legacy_row`.
-        let mut c = conn();
+        let (_dir, _c, db) = conn_with_sea_orm().await;
         let legacy_key = "oidc:https://idp.example.test:1";
         let victim_id = create_user(
-            &mut c,
+            &db,
             "numvictim",
             "correct horse battery staple",
             None,
@@ -379,40 +431,49 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
-        identity::stamp_sso_subject_if_absent(&c, &victim_id, legacy_key).unwrap();
+        identity::stamp_sso_subject_if_absent(&db, &victim_id, legacy_key)
+            .await
+            .unwrap();
 
         let sub = SsoSubject::new(ISS, SsoSubjectValue::Str("1".to_string())).unwrap();
         assert_eq!(sub.legacy_lookup_key(), None);
         let mut req = input(&sub);
         req.preferred_username = Some("strattacker");
 
-        let row = find_or_create_oidc_user(&mut c, &req, NOW).unwrap();
+        let row = find_or_create_oidc_user(&db, &req, NOW).await.unwrap();
 
         assert_ne!(row.user_id, victim_id);
         assert!(!row.is_sysadmin);
-        let victim_after = identity::get_user_by_id(&c, &victim_id).unwrap().unwrap();
+        let victim_after = identity::get_user_by_id(&db, &victim_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(victim_after.sso_subject.as_deref(), Some(legacy_key));
     }
 
-    #[test]
-    fn default_is_sysadmin_flips_the_bit_on_a_jit_created_row() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn default_is_sysadmin_flips_the_bit_on_a_jit_created_row() {
+        let (_dir, _c, db) = conn_with_sea_orm().await;
         let sub = subject("alice-1");
         let mut req = input(&sub);
         req.default_is_sysadmin = true;
-        let row = find_or_create_oidc_user(&mut c, &req, NOW).unwrap();
+        let row = find_or_create_oidc_user(&db, &req, NOW).await.unwrap();
         assert!(row.is_sysadmin);
     }
 
-    #[test]
-    fn a_second_call_touches_last_login_each_time() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn a_second_call_touches_last_login_each_time() {
+        let (_dir, _c, db) = conn_with_sea_orm().await;
         let sub = subject("alice-1");
-        let first = find_or_create_oidc_user(&mut c, &input(&sub), NOW).unwrap();
+        let first = find_or_create_oidc_user(&db, &input(&sub), NOW)
+            .await
+            .unwrap();
         assert!(first.last_login_at.is_some());
-        let second =
-            find_or_create_oidc_user(&mut c, &input(&sub), "2026-09-07T00:00:00Z").unwrap();
+        let second = find_or_create_oidc_user(&db, &input(&sub), "2026-09-07T00:00:00Z")
+            .await
+            .unwrap();
         assert_eq!(
             second.last_login_at.as_deref(),
             Some("2026-09-07T00:00:00Z")

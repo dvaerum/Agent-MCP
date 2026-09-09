@@ -330,6 +330,12 @@ pub fn sanitise_username(raw: &str) -> String {
 /// cookie) works at all; (2) verified-email link to an existing
 /// account; (3) JIT-create with a collision-avoiding username suffix
 /// loop.
+// NOTE: every `identity::` call below is deliberately the `_sync`-
+// suffixed rusqlite twin, not the async sea-orm primary -- this
+// function is called synchronously from `session_gate.rs::
+// evaluate_session_gate` (this migration's own declared highest-risk
+// hot path), and forcing it async is out of scope for Phase G router
+// step 4 PR D (see `identity.rs`'s own module doc).
 pub fn find_or_create_sso_user(
     conn: &mut Connection,
     email: Option<&str>,
@@ -339,17 +345,17 @@ pub fn find_or_create_sso_user(
     default_is_sysadmin: bool,
     now: &str,
 ) -> Result<UserRow, IdentityError> {
-    if let Some(existing) = identity::find_user_by_sso_subject(conn, subject)? {
-        identity::touch_last_login(conn, &existing.user_id, now)?;
-        return identity::get_user_by_id(conn, &existing.user_id)?
+    if let Some(existing) = identity::find_user_by_sso_subject_sync(conn, subject)? {
+        identity::touch_last_login_sync(conn, &existing.user_id, now)?;
+        return identity::get_user_by_id_sync(conn, &existing.user_id)?
             .ok_or_else(|| IdentityError::Db(rusqlite::Error::QueryReturnedNoRows));
     }
     if email_verified {
         if let Some(email) = email {
-            if let Some(existing) = identity::find_linkable_user_by_email(conn, email)? {
-                identity::stamp_sso_subject_if_absent(conn, &existing.user_id, subject)?;
-                identity::touch_last_login(conn, &existing.user_id, now)?;
-                return identity::get_user_by_id(conn, &existing.user_id)?
+            if let Some(existing) = identity::find_linkable_user_by_email_sync(conn, email)? {
+                identity::stamp_sso_subject_if_absent_sync(conn, &existing.user_id, subject)?;
+                identity::touch_last_login_sync(conn, &existing.user_id, now)?;
+                return identity::get_user_by_id_sync(conn, &existing.user_id)?
                     .ok_or_else(|| IdentityError::Db(rusqlite::Error::QueryReturnedNoRows));
             }
         }
@@ -358,12 +364,12 @@ pub fn find_or_create_sso_user(
     let base = sanitise_username(preferred_username.or(email).unwrap_or("user"));
     let mut candidate = base.clone();
     let mut suffix = 2;
-    while identity::get_user_by_username(conn, &candidate)?.is_some() {
+    while identity::get_user_by_username_sync(conn, &candidate)?.is_some() {
         candidate = format!("{base}-{suffix}");
         suffix += 1;
     }
 
-    let user_id = identity::create_sso_user(
+    let user_id = identity::create_sso_user_sync(
         conn,
         &candidate,
         subject,
@@ -372,7 +378,7 @@ pub fn find_or_create_sso_user(
         true,
         now,
     )?;
-    identity::get_user_by_id(conn, &user_id)?
+    identity::get_user_by_id_sync(conn, &user_id)?
         .ok_or_else(|| IdentityError::Db(rusqlite::Error::QueryReturnedNoRows))
 }
 
@@ -402,7 +408,7 @@ pub fn extract_proxy_header_user(
     // auto-sysadmin. JIT-creating a non-sysadmin row here would both
     // violate the flag and make the table non-empty, locking the
     // setup wizard away (it only renders while the table is empty).
-    if !settings.default_is_sysadmin && identity::users_table_is_empty(conn)? {
+    if !settings.default_is_sysadmin && identity::users_table_is_empty_sync(conn)? {
         return Ok(None);
     }
     // The subject MUST be the RAW (un-sanitised) header value:
@@ -436,6 +442,27 @@ mod tests {
         init_router_schema(&c).unwrap();
         c
     }
+
+    /// A file-backed router DB opened as BOTH a `rusqlite::Connection`
+    /// (to exercise this module's own still-sync
+    /// `extract_proxy_header_user`) and a sea-orm `DatabaseConnection`
+    /// (to seed fixture rows through the now-converted
+    /// `identity::create_user`) -- same recipe as `identity.rs`'s own
+    /// `conn_with_sea_orm` test helper, since an in-memory `:memory:`
+    /// DB can't be shared across two separate connection handles the
+    /// way a real file can.
+    async fn conn_with_sea_orm() -> (tempfile::TempDir, Connection, sea_orm::DatabaseConnection) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sso_test.db");
+        let c = Connection::open(&path).unwrap();
+        c.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        init_router_schema(&c).unwrap();
+        let db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        (dir, c, db)
+    }
+
     const NOW: &str = "2026-01-01T00:00:00.000+00:00";
 
     fn env_map(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
@@ -824,16 +851,16 @@ mod tests {
         )
         .unwrap();
         assert!(result.is_none());
-        assert!(identity::users_table_is_empty(&c).unwrap());
+        assert!(identity::users_table_is_empty_sync(&c).unwrap());
     }
 
-    #[test]
-    fn a_second_colliding_display_username_gets_a_numeric_suffix() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn a_second_colliding_display_username_gets_a_numeric_suffix() {
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
         // Pre-seed a real "alice" via the password path so the JIT
         // path's own collision loop must engage.
         identity::create_user(
-            &mut c,
+            &db,
             "alice",
             "correct horse battery staple",
             None,
@@ -842,6 +869,7 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
         let jit_user = extract_proxy_header_user(
             &mut c,

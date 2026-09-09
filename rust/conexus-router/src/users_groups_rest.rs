@@ -125,8 +125,7 @@ pub async fn list_users_handler(
     if let Err(resp) = require_users_capability(&state, &identity) {
         return resp.into_response();
     }
-    let conn = state.conn.lock().await;
-    match admin_users_users::list_users_response(&conn) {
+    match admin_users_users::list_users_response(&state.sea_orm_db).await {
         Ok(resp) => resp.into_response(),
         Err(e) => HandlerResponse::from(e).into_response(),
     }
@@ -142,7 +141,6 @@ pub async fn create_user_handler(
     if let Err(resp) = require_users_capability(&state, &identity) {
         return resp.into_response();
     }
-    let conn = state.conn.lock().await;
     let now = Utc::now();
     let now_str = now.to_rfc3339();
     let spec = RevalidationSpec {
@@ -152,18 +150,23 @@ pub async fn create_user_handler(
         cap: Capability::SystemUsersManage,
         project: None,
     };
-    let (parsed, principal) = match perm_gates::read_body_and_revalidate(&conn, &body, &spec) {
-        Ok(v) => v,
-        Err(resp) => return resp.into_response(),
+    let (parsed, principal) = {
+        let conn = state.conn.lock().await;
+        match perm_gates::read_body_and_revalidate(&conn, &body, &spec) {
+            Ok(v) => v,
+            Err(resp) => return resp.into_response(),
+        }
     };
     let parsed_value = serde_json::Value::Object(parsed);
     let outcome = match admin_users_users::decide_create_user(
-        &conn,
+        &state.sea_orm_db,
         fresh_is_sysadmin(&principal),
         &identity.user.username,
         &parsed_value,
         &now_str,
-    ) {
+    )
+    .await
+    {
         Ok(o) => o,
         Err(e) => return HandlerResponse::from(e).into_response(),
     };
@@ -1015,8 +1018,15 @@ mod tests {
     /// `evaluate_session_gate` performs once at entry, built here
     /// on-demand so a test can snapshot it BEFORE mutating the DB and
     /// still call a handler with that now-stale `Extension`.
-    fn identity_for(conn: &Connection, user_id: &str) -> GateIdentity {
-        let user = identity::get_user_by_id(conn, user_id).unwrap().unwrap();
+    async fn identity_for(
+        conn: &Connection,
+        db: &sea_orm::DatabaseConnection,
+        user_id: &str,
+    ) -> GateIdentity {
+        let user = identity::get_user_by_id(db, user_id)
+            .await
+            .unwrap()
+            .unwrap();
         let groups = group_membership_repository::resolve_user_groups(conn, user_id).ok();
         let is_sysadmin =
             group_membership_repository::resolve_user_is_sysadmin(conn, user_id, groups.as_ref())
@@ -1065,13 +1075,13 @@ mod tests {
         username: &str,
         caps: &[&str],
     ) -> (String, String, GateIdentity) {
-        let mut conn = state.conn.lock().await;
+        let conn = state.conn.lock().await;
         let is_empty: i64 = conn
             .query_row("SELECT COUNT(*) AS n FROM users", [], |r| r.get(0))
             .unwrap();
         if is_empty == 0 {
             identity::create_user(
-                &mut conn,
+                &state.sea_orm_db,
                 "__test_first_sysadmin",
                 "ignoredsentinelpassword",
                 None,
@@ -1080,10 +1090,11 @@ mod tests {
                 &[],
                 NOW,
             )
+            .await
             .unwrap();
         }
         let uid = identity::create_user(
-            &mut conn,
+            &state.sea_orm_db,
             username,
             "correct horse battery staple",
             None,
@@ -1092,6 +1103,7 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
         let group =
             group_membership_repository::create_group(&conn, &format!("g-{username}"), false, NOW)
@@ -1105,7 +1117,7 @@ mod tests {
             NOW,
         )
         .unwrap();
-        let identity = identity_for(&conn, &uid);
+        let identity = identity_for(&conn, &state.sea_orm_db, &uid).await;
         (uid, group.group_id, identity)
     }
 
@@ -1222,9 +1234,9 @@ mod tests {
             .register("alpha", "/ws/alpha", "python", chrono::Utc::now())
             .unwrap();
         let identity = {
-            let mut conn = state.conn.lock().await;
+            let conn = state.conn.lock().await;
             let uid = identity::create_user(
-                &mut conn,
+                &state.sea_orm_db,
                 "root",
                 "correct horse battery staple",
                 None,
@@ -1233,8 +1245,9 @@ mod tests {
                 &[],
                 NOW,
             )
+            .await
             .unwrap();
-            identity_for(&conn, &uid)
+            identity_for(&conn, &state.sea_orm_db, &uid).await
         };
         let resp = list_project_memberships_handler(
             State(state.clone()),
@@ -1368,9 +1381,9 @@ mod tests {
         .await;
         assert_eq!(resp_status(&resp), 403);
 
-        let conn = state.conn.lock().await;
         assert!(
-            identity::get_user_by_username(&conn, "raced-in-user")
+            identity::get_user_by_username(&state.sea_orm_db, "raced-in-user")
+                .await
                 .unwrap()
                 .is_none(),
             "user must NOT have been created off the stale, pre-revocation grant"
@@ -1404,8 +1417,8 @@ mod tests {
         .await;
         assert_eq!(resp_status(&resp), 403);
 
-        let conn = state.conn.lock().await;
-        let victim = identity::get_user_by_id(&conn, &victim_id)
+        let victim = identity::get_user_by_id(&state.sea_orm_db, &victim_id)
+            .await
             .unwrap()
             .unwrap();
         assert!(
@@ -1453,8 +1466,8 @@ mod tests {
         .await;
         assert_eq!(resp_status(&resp), 403);
 
-        let conn = state.conn.lock().await;
-        let victim = identity::get_user_by_id(&conn, &victim_id)
+        let victim = identity::get_user_by_id(&state.sea_orm_db, &victim_id)
+            .await
             .unwrap()
             .unwrap();
         assert_ne!(
@@ -1965,8 +1978,8 @@ mod tests {
         .await;
         assert_eq!(resp_status(&resp), 200, "{:?}", resp.into_body());
 
-        let conn = state.conn.lock().await;
-        let victim = identity::get_user_by_id(&conn, &victim_id)
+        let victim = identity::get_user_by_id(&state.sea_orm_db, &victim_id)
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(victim.email.as_deref(), Some("still-valid@example.test"));

@@ -495,6 +495,26 @@ mod tests {
         init_router_schema(&c).unwrap();
         c
     }
+
+    /// A file-backed router DB opened as BOTH a `rusqlite::Connection`
+    /// (to exercise this file's still-sync `is_last_sysadmin`/
+    /// `no_sysadmin_would_remain`) and a sea-orm `DatabaseConnection`
+    /// (to seed fixture rows through the now-converted
+    /// `identity::create_user`) -- same recipe as `identity.rs`'s own
+    /// tests, since an in-memory `:memory:` DB can't be shared across
+    /// two separate connection handles the way a real file can.
+    async fn conn_with_sea_orm() -> (tempfile::TempDir, Connection, sea_orm::DatabaseConnection) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("admin_users_gate_test.db");
+        let c = Connection::open(&path).unwrap();
+        c.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        init_router_schema(&c).unwrap();
+        let db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        (dir, c, db)
+    }
+
     const NOW_STR: &str = "2026-01-01T00:00:00.000+00:00";
 
     // -- envelopes ----------------------------------------------------
@@ -585,11 +605,11 @@ mod tests {
 
     // -- last-sysadmin invariant ------------------------------------------
 
-    #[test]
-    fn is_last_sysadmin_true_when_no_other_direct_sysadmin_exists() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn is_last_sysadmin_true_when_no_other_direct_sysadmin_exists() {
+        let (_dir, c, db) = conn_with_sea_orm().await;
         let uid = identity::create_user(
-            &mut c,
+            &db,
             "alice",
             "correct horse battery staple",
             None,
@@ -598,15 +618,16 @@ mod tests {
             &[],
             NOW_STR,
         )
+        .await
         .unwrap();
         assert!(is_last_sysadmin(&c, &uid).unwrap());
     }
 
-    #[test]
-    fn is_last_sysadmin_false_when_another_direct_sysadmin_exists() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn is_last_sysadmin_false_when_another_direct_sysadmin_exists() {
+        let (_dir, c, db) = conn_with_sea_orm().await;
         let alice = identity::create_user(
-            &mut c,
+            &db,
             "alice",
             "correct horse battery staple",
             None,
@@ -615,6 +636,7 @@ mod tests {
             &[],
             NOW_STR,
         )
+        .await
         .unwrap();
         c.execute("INSERT INTO users (user_id, username, created_at, is_sysadmin) VALUES ('bob', 'bob', ?1, 1)", [NOW_STR]).unwrap();
         assert!(!is_last_sysadmin(&c, &alice).unwrap());
@@ -626,11 +648,11 @@ mod tests {
         assert!(no_sysadmin_would_remain(&c).unwrap());
     }
 
-    #[test]
-    fn no_sysadmin_would_remain_false_with_a_direct_sysadmin() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn no_sysadmin_would_remain_false_with_a_direct_sysadmin() {
+        let (_dir, c, db) = conn_with_sea_orm().await;
         identity::create_user(
-            &mut c,
+            &db,
             "alice",
             "correct horse battery staple",
             None,
@@ -639,6 +661,7 @@ mod tests {
             &[],
             NOW_STR,
         )
+        .await
         .unwrap();
         assert!(!no_sysadmin_would_remain(&c).unwrap());
     }

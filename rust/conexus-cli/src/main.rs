@@ -59,7 +59,23 @@ enum RouterCommand {
     },
 }
 
-fn main() -> anyhow::Result<()> {
+// `#[tokio::main]`, matching `conexus-router`'s/`conexus-backend`'s own
+// binary-entry-point convention (both `#[tokio::main] async fn main()`)
+// rather than a scoped `tokio::runtime::Runtime::new()?.block_on(...)`
+// wrapped only around the one now-async call site
+// (`create_operator::run`, which needs a `sea_orm::DatabaseConnection`
+// now that `identity::create_user` is sea-orm-backed) -- this crate is
+// small enough (two leaf subcommands) that matching the workspace's
+// established idiom costs nothing, and `backup::run` (still fully
+// sync, plain rusqlite file I/O) runs unchanged inside the async `main`
+// with no `.await` needed. `flavor = "current_thread"` (not
+// conexus-router's/conexus-backend's own default multi-thread
+// runtime): a one-shot CLI command has no concurrent connections to
+// schedule across worker threads, so a single-threaded runtime is the
+// right-sized choice here (matches the crate's own `tokio = { features
+// = ["rt", "macros"] }`, not `rt-multi-thread`).
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Backup {
@@ -74,6 +90,6 @@ fn main() -> anyhow::Result<()> {
                     email,
                     password_stdin,
                 },
-        } => create_operator::run(&username, email.as_deref(), password_stdin),
+        } => create_operator::run(&username, email.as_deref(), password_stdin).await,
     }
 }

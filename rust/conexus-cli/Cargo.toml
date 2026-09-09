@@ -21,6 +21,23 @@ clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# `router create-operator` needs an async runtime now that
+# `identity::create_user` is sea-orm-backed (Phase G router step 4
+# PR D) -- `rt`+`macros` only (a single-threaded runtime, via
+# `#[tokio::main(flavor = "current_thread")]` in main.rs), not
+# conexus-router's/conexus-backend's own `rt-multi-thread`: this is a
+# one-shot CLI command, not a long-lived server with concurrent
+# connections to schedule across worker threads.
+tokio = { version = "1", features = ["rt", "macros"] }
+# Opens a `sea_orm::DatabaseConnection` onto the SAME router.db file
+# the rusqlite `Connection` above already targets, for the one
+# `identity::create_user` call -- same version/features as
+# conexus-router's own sea-orm entry (see that crate's Cargo.toml).
+sea-orm = { version = "2", default-features = false, features = [
+    "macros",
+    "sqlx-sqlite",
+    "runtime-tokio-rustls",
+] }
 # Interactive password prompt (hidden input, matching Python's
 # `click.prompt(hide_input=True)`/getpass) -- no existing workspace
 # precedent, same "genuinely new, no fork to resolve" shape as this

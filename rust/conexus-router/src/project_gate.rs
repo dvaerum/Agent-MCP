@@ -646,14 +646,34 @@ mod tests {
         c
     }
 
+    /// A file-backed router DB opened as BOTH a `rusqlite::Connection`
+    /// (this file's own gate/finish-split functions and the direct
+    /// `project_membership` SQL fixtures below are still fully sync)
+    /// and a sea-orm `DatabaseConnection` (the now-converted
+    /// `identity::create_user`/`create_sso_user` seed calls) -- same
+    /// dual-connection recipe `identity.rs`'s own tests use, since an
+    /// in-memory `:memory:` DB can't be shared across two separate
+    /// connection handles the way a real file can.
+    async fn conn_with_sea_orm() -> (tempfile::TempDir, Connection, sea_orm::DatabaseConnection) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("project_gate_test.db");
+        let c = Connection::open(&path).unwrap();
+        c.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        init_router_schema(&c).unwrap();
+        let db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        (dir, c, db)
+    }
+
     fn now_dt() -> DateTime<Utc> {
         "2026-01-01T00:00:00Z".parse().unwrap()
     }
     const NOW_STR: &str = "2026-01-01T00:00:00.000+00:00";
 
-    fn seed_user(c: &mut Connection, username: &str) -> String {
+    async fn seed_user(db: &sea_orm::DatabaseConnection, username: &str) -> String {
         crate::identity::create_user(
-            c,
+            db,
             username,
             "correct horse battery staple",
             None,
@@ -662,6 +682,7 @@ mod tests {
             &[],
             NOW_STR,
         )
+        .await
         .unwrap()
     }
 
@@ -714,10 +735,10 @@ mod tests {
         assert_eq!(outcome, CrossTenantOutcome::NotFound);
     }
 
-    #[test]
-    fn a_member_admits_with_no_min_role() {
-        let mut c = conn();
-        let uid = seed_user(&mut c, "alice");
+    #[tokio::test]
+    async fn a_member_admits_with_no_min_role() {
+        let (_dir, c, db) = conn_with_sea_orm().await;
+        let uid = seed_user(&db, "alice").await;
         c.execute(
             "INSERT INTO project_membership (project_name, user_id, role) VALUES ('proj-a', ?1, 'viewer')",
             [&uid],
@@ -731,10 +752,10 @@ mod tests {
         assert_eq!(outcome, CrossTenantOutcome::Admit);
     }
 
-    #[test]
-    fn a_viewer_is_forbidden_when_min_role_requires_operator() {
-        let mut c = conn();
-        let uid = seed_user(&mut c, "alice");
+    #[tokio::test]
+    async fn a_viewer_is_forbidden_when_min_role_requires_operator() {
+        let (_dir, c, db) = conn_with_sea_orm().await;
+        let uid = seed_user(&db, "alice").await;
         c.execute(
             "INSERT INTO project_membership (project_name, user_id, role) VALUES ('proj-a', ?1, 'viewer')",
             [&uid],
@@ -762,10 +783,10 @@ mod tests {
 
     // -- revalidate_capability_and_membership ----------------------------
 
-    #[test]
-    fn revalidate_denies_when_the_session_cookie_no_longer_resolves() {
-        let mut c = conn();
-        let uid = seed_user(&mut c, "alice");
+    #[tokio::test]
+    async fn revalidate_denies_when_the_session_cookie_no_longer_resolves() {
+        let (_dir, c, db) = conn_with_sea_orm().await;
+        let uid = seed_user(&db, "alice").await;
         let cookie = format!("{}=nonexistent-session-id", login::SESSION_COOKIE_NAME);
         let outcome = revalidate_capability_and_membership(
             &c,
@@ -780,10 +801,10 @@ mod tests {
         assert!(matches!(outcome, RevalidateOutcome::DeniedSessionInvalid));
     }
 
-    #[test]
-    fn revalidate_allows_a_sysadmin_with_a_live_session() {
-        let mut c = conn();
-        let uid = seed_user(&mut c, "alice"); // first user -> sysadmin
+    #[tokio::test]
+    async fn revalidate_allows_a_sysadmin_with_a_live_session() {
+        let (_dir, c, db) = conn_with_sea_orm().await;
+        let uid = seed_user(&db, "alice").await; // first user -> sysadmin
         let sid =
             crate::identity::create_session(&c, &uid, NOW_STR, "2026-02-01T00:00:00.000+00:00")
                 .unwrap();
@@ -801,17 +822,17 @@ mod tests {
         assert!(matches!(outcome, RevalidateOutcome::Allow(_)));
     }
 
-    #[test]
-    fn revalidate_denies_membership_for_a_capable_non_member() {
+    #[tokio::test]
+    async fn revalidate_denies_membership_for_a_capable_non_member() {
         // A capability grant with no matching membership row --
         // system.projects.manage is a system-tier cap, so a
         // non-sysadmin non-member could still legitimately carry it
         // via a group grant; the membership half must independently
         // deny.
-        let mut c = conn();
-        seed_user(&mut c, "alice"); // sysadmin, irrelevant here
+        let (_dir, c, db) = conn_with_sea_orm().await;
+        seed_user(&db, "alice").await; // sysadmin, irrelevant here
         let bob = crate::identity::create_user(
-            &mut c,
+            &db,
             "bob",
             "correct horse battery staple",
             None,
@@ -820,6 +841,7 @@ mod tests {
             &[],
             NOW_STR,
         )
+        .await
         .unwrap();
         let outcome = revalidate_capability_and_membership(
             &c,
@@ -838,10 +860,10 @@ mod tests {
 
     // -- revalidate_capability (project-less) -----------------------------
 
-    #[test]
-    fn revalidate_capability_denies_when_the_session_cookie_no_longer_resolves() {
-        let mut c = conn();
-        let uid = seed_user(&mut c, "alice");
+    #[tokio::test]
+    async fn revalidate_capability_denies_when_the_session_cookie_no_longer_resolves() {
+        let (_dir, c, db) = conn_with_sea_orm().await;
+        let uid = seed_user(&db, "alice").await;
         let cookie = format!("{}=nonexistent-session-id", login::SESSION_COOKIE_NAME);
         let outcome = revalidate_capability(
             &c,
@@ -857,10 +879,10 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn revalidate_capability_allows_a_sysadmin_with_a_live_session() {
-        let mut c = conn();
-        let uid = seed_user(&mut c, "alice"); // first user -> sysadmin
+    #[tokio::test]
+    async fn revalidate_capability_allows_a_sysadmin_with_a_live_session() {
+        let (_dir, c, db) = conn_with_sea_orm().await;
+        let uid = seed_user(&db, "alice").await; // first user -> sysadmin
         let sid =
             crate::identity::create_session(&c, &uid, NOW_STR, "2026-02-01T00:00:00.000+00:00")
                 .unwrap();
@@ -876,12 +898,12 @@ mod tests {
         assert!(matches!(outcome, RevalidateCapabilityOutcome::Allow(_)));
     }
 
-    #[test]
-    fn revalidate_capability_denies_a_non_sysadmin_lacking_the_capability() {
-        let mut c = conn();
-        seed_user(&mut c, "alice"); // sysadmin, irrelevant here
+    #[tokio::test]
+    async fn revalidate_capability_denies_a_non_sysadmin_lacking_the_capability() {
+        let (_dir, c, db) = conn_with_sea_orm().await;
+        seed_user(&db, "alice").await; // sysadmin, irrelevant here
         let bob = crate::identity::create_user(
-            &mut c,
+            &db,
             "bob",
             "correct horse battery staple",
             None,
@@ -890,6 +912,7 @@ mod tests {
             &[],
             NOW_STR,
         )
+        .await
         .unwrap();
         let outcome =
             revalidate_capability(&c, &bob, None, NOW_STR, Capability::SystemUsersManage).unwrap();
@@ -899,13 +922,13 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn revalidate_capability_admits_with_no_cookie_at_all() {
+    #[tokio::test]
+    async fn revalidate_capability_admits_with_no_cookie_at_all() {
         // A forwarding-header/bearer caller has no session cookie to
         // revalidate at all -- the liveness check must be skipped
         // entirely, not treated as an automatic denial.
-        let mut c = conn();
-        let uid = seed_user(&mut c, "alice"); // sysadmin
+        let (_dir, c, db) = conn_with_sea_orm().await;
+        let uid = seed_user(&db, "alice").await; // sysadmin
         let outcome =
             revalidate_capability(&c, &uid, None, NOW_STR, Capability::SystemUsersManage).unwrap();
         assert!(matches!(outcome, RevalidateCapabilityOutcome::Allow(_)));
@@ -913,8 +936,8 @@ mod tests {
 
     // -- decide_create_project --------------------------------------------
 
-    #[test]
-    fn creates_a_project_and_registers_the_workspace() {
+    #[tokio::test]
+    async fn creates_a_project_and_registers_the_workspace() {
         // Phase G (router step 4 PR C): the membership grant this test
         // used to assert is no longer this function's job -- it moved
         // to the CALLER (see `decide_create_project`'s own doc), which
@@ -923,8 +946,8 @@ mod tests {
         // `lifecycle_rest.rs`'s `create_project_handler_grants_the_
         // creator_membership_via_sea_orm` for the real end-to-end
         // handler path.
-        let mut c = conn();
-        let uid = seed_user(&mut c, "alice");
+        let (_dir, c, db) = conn_with_sea_orm().await;
+        let uid = seed_user(&db, "alice").await;
         let dir = tempfile::tempdir().unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
         let parent = dir.path().join("workspaces");
@@ -1051,10 +1074,10 @@ mod tests {
         assert_eq!(resp.status, 400);
     }
 
-    #[test]
-    fn a_visible_member_sees_the_rich_already_registered_409() {
-        let mut c = conn();
-        let uid = seed_user(&mut c, "alice");
+    #[tokio::test]
+    async fn a_visible_member_sees_the_rich_already_registered_409() {
+        let (_dir, c, db) = conn_with_sea_orm().await;
+        let uid = seed_user(&db, "alice").await;
         c.execute(
             "INSERT INTO project_membership (project_name, user_id, role) VALUES ('proj-a', ?1, 'operator')",
             [&uid],
@@ -1083,12 +1106,12 @@ mod tests {
         assert_eq!(body["error"], "already_registered");
     }
 
-    #[test]
-    fn a_non_member_colliding_with_a_hidden_project_sees_uniform_not_found() {
-        let mut c = conn();
-        seed_user(&mut c, "alice"); // sysadmin, but irrelevant -- caller below is bob
+    #[tokio::test]
+    async fn a_non_member_colliding_with_a_hidden_project_sees_uniform_not_found() {
+        let (_dir, c, db) = conn_with_sea_orm().await;
+        seed_user(&db, "alice").await; // sysadmin, but irrelevant -- caller below is bob
         let bob = crate::identity::create_user(
-            &mut c,
+            &db,
             "bob",
             "correct horse battery staple",
             None,
@@ -1097,6 +1120,7 @@ mod tests {
             &[],
             NOW_STR,
         )
+        .await
         .unwrap();
         let dir = tempfile::tempdir().unwrap();
         let registry = registry_with(dir.path(), "proj-a"); // bob has no membership on it
@@ -1122,10 +1146,10 @@ mod tests {
         assert!(!body["message"].as_str().unwrap().contains("proj-a already"));
     }
 
-    #[test]
-    fn refuses_a_name_that_is_a_live_alias_of_another_project() {
-        let mut c = conn();
-        let uid = seed_user(&mut c, "alice");
+    #[tokio::test]
+    async fn refuses_a_name_that_is_a_live_alias_of_another_project() {
+        let (_dir, c, db) = conn_with_sea_orm().await;
+        let uid = seed_user(&db, "alice").await;
         c.execute(
             "INSERT INTO project_membership (project_name, user_id, role) VALUES ('proj-a', ?1, 'operator')",
             [&uid],
@@ -1157,17 +1181,17 @@ mod tests {
         assert_eq!(body["error"], "alias_collision");
     }
 
-    #[test]
-    fn a_non_member_colliding_with_a_hidden_alias_owner_sees_uniform_not_found() {
+    #[tokio::test]
+    async fn a_non_member_colliding_with_a_hidden_alias_owner_sees_uniform_not_found() {
         // The alias half of `a_non_member_colliding_with_a_hidden_project_
         // sees_uniform_not_found` above (test_sec_r1f1_create_rename_name_
         // oracle.py's `test_create_delegate_without_membership_alias_
         // collision_gets_uniform_404`): a hidden project's ALIAS must gate
         // identically to a hidden project's real name.
-        let mut c = conn();
-        seed_user(&mut c, "alice"); // sysadmin, but irrelevant -- caller below is bob
+        let (_dir, c, db) = conn_with_sea_orm().await;
+        seed_user(&db, "alice").await; // sysadmin, but irrelevant -- caller below is bob
         let bob = crate::identity::create_user(
-            &mut c,
+            &db,
             "bob",
             "correct horse battery staple",
             None,
@@ -1176,6 +1200,7 @@ mod tests {
             &[],
             NOW_STR,
         )
+        .await
         .unwrap();
         let dir = tempfile::tempdir().unwrap();
         let registry = registry_with(dir.path(), "hidden"); // bob has no membership on it
@@ -1212,12 +1237,12 @@ mod tests {
     // backstop, unreachable via a real race in this synchronous
     // handler today but fixed as defense-in-depth) -------------------
 
-    #[test]
-    fn create_backstop_project_name_taken_hidden_owner_gets_uniform_not_found() {
-        let mut c = conn();
-        seed_user(&mut c, "alice"); // sysadmin, irrelevant -- caller is bob
+    #[tokio::test]
+    async fn create_backstop_project_name_taken_hidden_owner_gets_uniform_not_found() {
+        let (_dir, c, db) = conn_with_sea_orm().await;
+        seed_user(&db, "alice").await; // sysadmin, irrelevant -- caller is bob
         let bob = crate::identity::create_user(
-            &mut c,
+            &db,
             "bob",
             "correct horse battery staple",
             None,
@@ -1226,6 +1251,7 @@ mod tests {
             &[],
             NOW_STR,
         )
+        .await
         .unwrap();
         let dir = tempfile::tempdir().unwrap();
         let registry = registry_with(dir.path(), "hidden"); // bob has no membership on it
@@ -1248,10 +1274,10 @@ mod tests {
         assert!(!json_str(&body).contains("already"));
     }
 
-    #[test]
-    fn create_backstop_project_name_taken_visible_owner_gets_the_real_409() {
-        let mut c = conn();
-        let uid = seed_user(&mut c, "alice");
+    #[tokio::test]
+    async fn create_backstop_project_name_taken_visible_owner_gets_the_real_409() {
+        let (_dir, c, db) = conn_with_sea_orm().await;
+        let uid = seed_user(&db, "alice").await;
         c.execute(
             "INSERT INTO project_membership (project_name, user_id, role) VALUES ('proj-a', ?1, 'operator')",
             [&uid],
@@ -1277,12 +1303,12 @@ mod tests {
         assert_eq!(body["error"], "already_registered");
     }
 
-    #[test]
-    fn create_backstop_alias_collision_hidden_owner_gets_uniform_not_found() {
-        let mut c = conn();
-        seed_user(&mut c, "alice"); // sysadmin, irrelevant -- caller is bob
+    #[tokio::test]
+    async fn create_backstop_alias_collision_hidden_owner_gets_uniform_not_found() {
+        let (_dir, c, db) = conn_with_sea_orm().await;
+        seed_user(&db, "alice").await; // sysadmin, irrelevant -- caller is bob
         let bob = crate::identity::create_user(
-            &mut c,
+            &db,
             "bob",
             "correct horse battery staple",
             None,
@@ -1291,6 +1317,7 @@ mod tests {
             &[],
             NOW_STR,
         )
+        .await
         .unwrap();
         let dir = tempfile::tempdir().unwrap();
         let registry = registry_with(dir.path(), "hidden"); // bob has no membership on it
@@ -1316,10 +1343,10 @@ mod tests {
         assert!(!json_str(&body).contains("alias"));
     }
 
-    #[test]
-    fn create_backstop_alias_collision_visible_owner_gets_the_real_409() {
-        let mut c = conn();
-        let uid = seed_user(&mut c, "alice");
+    #[tokio::test]
+    async fn create_backstop_alias_collision_visible_owner_gets_the_real_409() {
+        let (_dir, c, db) = conn_with_sea_orm().await;
+        let uid = seed_user(&db, "alice").await;
         c.execute(
             "INSERT INTO project_membership (project_name, user_id, role) VALUES ('proj-a', ?1, 'operator')",
             [&uid],

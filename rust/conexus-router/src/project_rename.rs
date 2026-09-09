@@ -541,19 +541,39 @@ mod tests {
         c
     }
 
+    /// A file-backed router DB opened as BOTH a `rusqlite::Connection`
+    /// (this file's own `rename_precheck`/`finish_rename_project`
+    /// fixtures, still sync) and a sea-orm `DatabaseConnection` (to
+    /// seed users through the now-converted `identity::create_user`)
+    /// -- same dual-connection recipe `identity.rs`'s own tests use,
+    /// since an in-memory `:memory:` DB can't be shared across two
+    /// separate connection handles the way a real file can.
+    async fn conn_with_sea_orm() -> (tempfile::TempDir, Connection, sea_orm::DatabaseConnection) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("project_rename_test.db");
+        let c = Connection::open(&path).unwrap();
+        c.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        init_router_schema(&c).unwrap();
+        let db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        (dir, c, db)
+    }
+
     fn now_dt() -> DateTime<Utc> {
         "2026-01-01T00:00:00Z".parse().unwrap()
     }
     const NOW_STR: &str = "2026-01-01T00:00:00.000+00:00";
 
-    fn seed_operator_member(
-        c: &mut Connection,
+    async fn seed_operator_member(
+        c: &Connection,
+        db: &sea_orm::DatabaseConnection,
         username: &str,
         project: &str,
         role: &str,
     ) -> String {
         let uid = identity::create_user(
-            c,
+            db,
             username,
             "correct horse battery staple",
             None,
@@ -562,6 +582,7 @@ mod tests {
             &[],
             NOW_STR,
         )
+        .await
         .unwrap();
         c.execute(
             "INSERT INTO project_membership (project_name, user_id, role) VALUES (?1, ?2, ?3)",
@@ -573,15 +594,15 @@ mod tests {
 
     // -- rename_precheck --------------------------------------------------
 
-    #[test]
-    fn precheck_proceeds_for_a_valid_rename() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn precheck_proceeds_for_a_valid_rename() {
+        let (_db_dir, c, db) = conn_with_sea_orm().await;
         let dir = tempfile::tempdir().unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
         registry
             .register("old-name", "/ws/old-name", "python", now_dt())
             .unwrap();
-        let uid = seed_operator_member(&mut c, "bob", "old-name", "operator");
+        let uid = seed_operator_member(&c, &db, "bob", "old-name", "operator").await;
         let store = RuntimeStore::default();
 
         let outcome = rename_precheck(
@@ -604,15 +625,15 @@ mod tests {
         assert_eq!(ok.grace_days, 14);
     }
 
-    #[test]
-    fn precheck_defaults_grace_days_to_thirty() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn precheck_defaults_grace_days_to_thirty() {
+        let (_db_dir, c, db) = conn_with_sea_orm().await;
         let dir = tempfile::tempdir().unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
         registry
             .register("old-name", "/ws/old-name", "python", now_dt())
             .unwrap();
-        let uid = seed_operator_member(&mut c, "bob", "old-name", "operator");
+        let uid = seed_operator_member(&c, &db, "bob", "old-name", "operator").await;
         let store = RuntimeStore::default();
 
         let outcome = rename_precheck(
@@ -633,15 +654,15 @@ mod tests {
         assert_eq!(ok.grace_days, 30);
     }
 
-    #[test]
-    fn precheck_rejects_grace_days_out_of_range() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn precheck_rejects_grace_days_out_of_range() {
+        let (_db_dir, c, db) = conn_with_sea_orm().await;
         let dir = tempfile::tempdir().unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
         registry
             .register("old-name", "/ws/old-name", "python", now_dt())
             .unwrap();
-        let uid = seed_operator_member(&mut c, "bob", "old-name", "operator");
+        let uid = seed_operator_member(&c, &db, "bob", "old-name", "operator").await;
         let store = RuntimeStore::default();
 
         let outcome = rename_precheck(
@@ -662,17 +683,17 @@ mod tests {
         assert_eq!(resp.status, 400);
     }
 
-    #[test]
-    fn precheck_rejects_a_non_finite_grace_days_before_any_destructive_step() {
+    #[tokio::test]
+    async fn precheck_rejects_a_non_finite_grace_days_before_any_destructive_step() {
         // PF-R18-1: int(float('inf')) raises OverflowError in Python;
         // this must 400 too, not panic or silently wrap.
-        let mut c = conn();
+        let (_db_dir, c, db) = conn_with_sea_orm().await;
         let dir = tempfile::tempdir().unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
         registry
             .register("old-name", "/ws/old-name", "python", now_dt())
             .unwrap();
-        let uid = seed_operator_member(&mut c, "bob", "old-name", "operator");
+        let uid = seed_operator_member(&c, &db, "bob", "old-name", "operator").await;
         let store = RuntimeStore::default();
 
         let huge: f64 = f64::INFINITY; // what a JSON `1e400` token parses to
@@ -694,18 +715,18 @@ mod tests {
         assert_eq!(resp.status, 400);
     }
 
-    #[test]
-    fn precheck_accepts_grace_days_at_the_upper_bound_3650() {
+    #[tokio::test]
+    async fn precheck_accepts_grace_days_at_the_upper_bound_3650() {
         // test_sec_r2_grace_days_bounds.py's `test_grace_days_upper_
         // bound_ok`: 3650 is a legitimate max grace, not off-by-one
         // rejected.
-        let mut c = conn();
+        let (_db_dir, c, db) = conn_with_sea_orm().await;
         let dir = tempfile::tempdir().unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
         registry
             .register("old-name", "/ws/old-name", "python", now_dt())
             .unwrap();
-        let uid = seed_operator_member(&mut c, "bob", "old-name", "operator");
+        let uid = seed_operator_member(&c, &db, "bob", "old-name", "operator").await;
         let store = RuntimeStore::default();
 
         let outcome = rename_precheck(
@@ -726,17 +747,17 @@ mod tests {
         assert_eq!(ok.grace_days, 3650);
     }
 
-    #[test]
-    fn precheck_rejects_a_negative_grace_days() {
+    #[tokio::test]
+    async fn precheck_rejects_a_negative_grace_days() {
         // test_sec_r2_grace_days_bounds.py's `test_grace_days_negative_
         // returns_400`.
-        let mut c = conn();
+        let (_db_dir, c, db) = conn_with_sea_orm().await;
         let dir = tempfile::tempdir().unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
         registry
             .register("old-name", "/ws/old-name", "python", now_dt())
             .unwrap();
-        let uid = seed_operator_member(&mut c, "bob", "old-name", "operator");
+        let uid = seed_operator_member(&c, &db, "bob", "old-name", "operator").await;
         let store = RuntimeStore::default();
 
         let outcome = rename_precheck(
@@ -757,19 +778,19 @@ mod tests {
         assert_eq!(resp.status, 400);
     }
 
-    #[test]
-    fn precheck_rejects_the_literal_sec_round_2_repro_value_of_10_pow_18() {
+    #[tokio::test]
+    async fn precheck_rejects_the_literal_sec_round_2_repro_value_of_10_pow_18() {
         // test_sec_r2_grace_days_bounds.py's exact repro: `10 ** 18`
         // fits in an i64 (unlike PF-R18-1's `1e400`/infinity sibling
         // above), so this exercises the plain `0..=3650` range guard
         // rather than the non-finite-float guard -- both must 400.
-        let mut c = conn();
+        let (_db_dir, c, db) = conn_with_sea_orm().await;
         let dir = tempfile::tempdir().unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
         registry
             .register("old-name", "/ws/old-name", "python", now_dt())
             .unwrap();
-        let uid = seed_operator_member(&mut c, "bob", "old-name", "operator");
+        let uid = seed_operator_member(&c, &db, "bob", "old-name", "operator").await;
         let store = RuntimeStore::default();
 
         let huge: i64 = 1_000_000_000_000_000_000;
@@ -791,18 +812,18 @@ mod tests {
         assert_eq!(resp.status, 400);
     }
 
-    #[test]
-    fn precheck_rejects_a_non_string_new_name() {
+    #[tokio::test]
+    async fn precheck_rejects_a_non_string_new_name() {
         // test_sec_r8_type_confusion.py's rename half (PF-R8-1): a
         // structured JSON value for `name` must 400 via `reject_non_
         // str_name`, never reach `.strip()`/`.trim()`.
-        let mut c = conn();
+        let (_db_dir, c, db) = conn_with_sea_orm().await;
         let dir = tempfile::tempdir().unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
         registry
             .register("old-name", "/ws/old-name", "python", now_dt())
             .unwrap();
-        let uid = seed_operator_member(&mut c, "bob", "old-name", "operator");
+        let uid = seed_operator_member(&c, &db, "bob", "old-name", "operator").await;
         let store = RuntimeStore::default();
 
         let outcome = rename_precheck(
@@ -823,15 +844,15 @@ mod tests {
         assert_eq!(resp.status, 400);
     }
 
-    #[test]
-    fn precheck_rejects_identical_old_and_new_names() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn precheck_rejects_identical_old_and_new_names() {
+        let (_db_dir, c, db) = conn_with_sea_orm().await;
         let dir = tempfile::tempdir().unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
         registry
             .register("proj-a", "/ws/proj-a", "python", now_dt())
             .unwrap();
-        let uid = seed_operator_member(&mut c, "bob", "proj-a", "operator");
+        let uid = seed_operator_member(&c, &db, "bob", "proj-a", "operator").await;
         let store = RuntimeStore::default();
 
         let outcome = rename_precheck(
@@ -849,9 +870,9 @@ mod tests {
         assert!(matches!(outcome, RenamePrecheck::Rejected(_)));
     }
 
-    #[test]
-    fn precheck_closes_the_oracle_on_a_hidden_name_collision() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn precheck_closes_the_oracle_on_a_hidden_name_collision() {
+        let (_db_dir, c, db) = conn_with_sea_orm().await;
         let dir = tempfile::tempdir().unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
         registry
@@ -861,7 +882,7 @@ mod tests {
             .register("hidden", "/ws/hidden", "python", now_dt())
             .unwrap();
         // bob is a member of old-name (can rename it) but NOT of "hidden".
-        let uid = seed_operator_member(&mut c, "bob", "old-name", "operator");
+        let uid = seed_operator_member(&c, &db, "bob", "old-name", "operator").await;
         let store = RuntimeStore::default();
 
         let outcome = rename_precheck(
@@ -885,14 +906,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn precheck_closes_the_oracle_on_a_hidden_alias_collision() {
+    #[tokio::test]
+    async fn precheck_closes_the_oracle_on_a_hidden_alias_collision() {
         // The alias half of `precheck_closes_the_oracle_on_a_hidden_name_
         // collision` above (test_sec_r1f1_create_rename_name_oracle.py's
         // `test_rename_delegate_without_membership_alias_collision_gets_
         // uniform_404`): a hidden project's ALIAS must gate identically
         // to a hidden project's real name.
-        let mut c = conn();
+        let (_db_dir, c, db) = conn_with_sea_orm().await;
         let dir = tempfile::tempdir().unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
         registry
@@ -905,7 +926,7 @@ mod tests {
             .add_alias("hidden", "alias-of-hidden", None, Some(30), now_dt())
             .unwrap();
         // bob is a member of old-name (can rename it) but NOT of "hidden".
-        let uid = seed_operator_member(&mut c, "bob", "old-name", "operator");
+        let uid = seed_operator_member(&c, &db, "bob", "old-name", "operator").await;
         let store = RuntimeStore::default();
 
         let outcome = rename_precheck(
@@ -933,19 +954,19 @@ mod tests {
         assert_eq!(body["error"], "not_found");
     }
 
-    #[test]
-    fn precheck_denies_a_viewer_tier_member_as_forbidden() {
+    #[tokio::test]
+    async fn precheck_denies_a_viewer_tier_member_as_forbidden() {
         // test_sec_r9f2_lifecycle_role_rank.py's rename half: a mere
         // `viewer`-tier member (even holding the deployment-wide
         // capability elsewhere) must not reach a destructive rename --
         // 403 forbidden, distinct from the 404 a genuine non-member sees.
-        let mut c = conn();
+        let (_db_dir, c, db) = conn_with_sea_orm().await;
         let dir = tempfile::tempdir().unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
         registry
             .register("old-name", "/ws/old-name", "python", now_dt())
             .unwrap();
-        let uid = seed_operator_member(&mut c, "bob", "old-name", "viewer");
+        let uid = seed_operator_member(&c, &db, "bob", "old-name", "viewer").await;
         let store = RuntimeStore::default();
 
         let outcome = rename_precheck(
@@ -970,15 +991,15 @@ mod tests {
         assert_eq!(body["error"], "forbidden");
     }
 
-    #[test]
-    fn precheck_denies_when_the_old_project_has_active_connections() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn precheck_denies_when_the_old_project_has_active_connections() {
+        let (_db_dir, c, db) = conn_with_sea_orm().await;
         let dir = tempfile::tempdir().unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
         registry
             .register("old-name", "/ws/old-name", "python", now_dt())
             .unwrap();
-        let uid = seed_operator_member(&mut c, "bob", "old-name", "operator");
+        let uid = seed_operator_member(&c, &db, "bob", "old-name", "operator").await;
         let store = RuntimeStore::default();
         store.with_runtime_mut("old-name", |rt| rt.active_conns = 1);
 
@@ -1000,13 +1021,13 @@ mod tests {
         assert_eq!(resp.status, 409);
     }
 
-    #[test]
-    fn precheck_rejects_renaming_onto_a_visible_registered_project_as_409() {
+    #[tokio::test]
+    async fn precheck_rejects_renaming_onto_a_visible_registered_project_as_409() {
         // test_sec_r37_rename_error_mapping.py's
         // `test_rename_to_existing_project_name_returns_409`: a plain,
         // non-racing rename onto an already-registered VISIBLE project
         // name must 409 name_taken, never a 500.
-        let mut c = conn();
+        let (_db_dir, c, db) = conn_with_sea_orm().await;
         let dir = tempfile::tempdir().unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
         registry
@@ -1015,7 +1036,7 @@ mod tests {
         registry
             .register("beta", "/ws/beta", "python", now_dt())
             .unwrap();
-        let uid = seed_operator_member(&mut c, "bob", "alpha", "operator");
+        let uid = seed_operator_member(&c, &db, "bob", "alpha", "operator").await;
         // bob must also see "beta" for the R1-F1 escape hatch to
         // surface the rich 409 rather than the hidden-collision 404.
         c.execute(
@@ -1128,14 +1149,14 @@ mod tests {
         assert_eq!(resp.status, 404);
     }
 
-    #[test]
-    fn toctou_recheck_denies_if_new_name_became_an_active_alias_mid_flight() {
+    #[tokio::test]
+    async fn toctou_recheck_denies_if_new_name_became_an_active_alias_mid_flight() {
         // PF-R36-1's alias-collision half (test_sec_r36_lifecycle_
         // parity.py's `test_rename_revalidates_alias_collision_inside_
         // lock`): if `new_name` became an active alias of ANOTHER
         // project between the outside-lock probe and the inside-lock
         // re-check, the destructive rename must never proceed.
-        let mut c = conn();
+        let (_db_dir, c, db) = conn_with_sea_orm().await;
         let dir = tempfile::tempdir().unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
         registry
@@ -1147,7 +1168,7 @@ mod tests {
         registry
             .add_alias("someoneelse", "target", None, Some(30), now_dt())
             .unwrap();
-        let uid = seed_operator_member(&mut c, "bob", "someoneelse", "operator");
+        let uid = seed_operator_member(&c, &db, "bob", "someoneelse", "operator").await;
         let store = RuntimeStore::default();
 
         let outcome = rename_toctou_recheck(
@@ -1173,8 +1194,8 @@ mod tests {
 
     // -- finish_rename_project --------------------------------------------
 
-    #[test]
-    fn finish_rename_project_moves_the_workspace() {
+    #[tokio::test]
+    async fn finish_rename_project_moves_the_workspace() {
         // Phase G (router step 4 PR C): the `project_membership` rekey
         // this test used to assert is no longer this function's job --
         // it moved to the CALLER (see `finish_rename_project`'s own
@@ -1185,7 +1206,7 @@ mod tests {
         // rekey itself, and `lifecycle_rest.rs`'s `rename_project_
         // handler_rekeys_project_membership_via_sea_orm` for the real
         // end-to-end handler path.
-        let mut c = conn();
+        let (_db_dir, c, db) = conn_with_sea_orm().await;
         let dir = tempfile::tempdir().unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
         let workspace_parent = dir.path().join("workspaces");
@@ -1200,7 +1221,7 @@ mod tests {
                 now_dt(),
             )
             .unwrap();
-        let uid = seed_operator_member(&mut c, "bob", "old-name", "operator");
+        let uid = seed_operator_member(&c, &db, "bob", "old-name", "operator").await;
         let store = RuntimeStore::default();
         let sock_dir = dir.path().join("sockets");
 
@@ -1251,9 +1272,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finish_rename_project_leaves_a_non_conventional_workspace_untouched() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn finish_rename_project_leaves_a_non_conventional_workspace_untouched() {
+        let (_db_dir, c, db) = conn_with_sea_orm().await;
         let dir = tempfile::tempdir().unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
         let custom_workspace = dir.path().join("custom-workspace-dir");
@@ -1266,7 +1287,7 @@ mod tests {
                 now_dt(),
             )
             .unwrap();
-        let uid = seed_operator_member(&mut c, "bob", "old-name", "operator");
+        let uid = seed_operator_member(&c, &db, "bob", "old-name", "operator").await;
         let store = RuntimeStore::default();
         let sock_dir = dir.path().join("sockets");
 
@@ -1296,9 +1317,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finish_rename_project_rolls_back_the_workspace_move_on_a_registry_race() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn finish_rename_project_rolls_back_the_workspace_move_on_a_registry_race() {
+        let (_db_dir, c, db) = conn_with_sea_orm().await;
         let dir = tempfile::tempdir().unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
         let workspace_parent = dir.path().join("workspaces");
@@ -1317,8 +1338,8 @@ mod tests {
         registry
             .register("new-name", "/ws/somewhere-else", "python", now_dt())
             .unwrap();
-        let uid = seed_operator_member(&mut c, "bob", "old-name", "operator");
-        seed_operator_member(&mut c, "carol", "new-name", "operator");
+        let uid = seed_operator_member(&c, &db, "bob", "old-name", "operator").await;
+        seed_operator_member(&c, &db, "carol", "new-name", "operator").await;
         let store = RuntimeStore::default();
         let sock_dir = dir.path().join("sockets");
 
@@ -1370,14 +1391,14 @@ mod tests {
     // old-names racing the SAME new-name never serialise against each
     // other) -----------------------------------------------------------
 
-    #[test]
-    fn rename_backstop_project_name_taken_hidden_owner_gets_uniform_not_found() {
+    #[tokio::test]
+    async fn rename_backstop_project_name_taken_hidden_owner_gets_uniform_not_found() {
         // test_sec_r2f1_rename_toctou_backstop.py's `test_rename_
         // delegate_loses_project_name_taken_race_gets_uniform_404`: the
         // delegate has ZERO membership on the project that won the race
         // for `new_name` -- must see the SAME uniform 404 a genuinely
         // free name would, not the raw `name_taken` 409.
-        let mut c = conn();
+        let (_db_dir, c, db) = conn_with_sea_orm().await;
         let dir = tempfile::tempdir().unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
         registry
@@ -1385,7 +1406,7 @@ mod tests {
             .unwrap();
         // bob has no membership on "shared-target" at all.
         let bob = identity::create_user(
-            &mut c,
+            &db,
             "bob",
             "correct horse battery staple",
             None,
@@ -1394,6 +1415,7 @@ mod tests {
             &[],
             NOW_STR,
         )
+        .await
         .unwrap();
 
         let resp = map_rename_registry_error(
@@ -1419,14 +1441,14 @@ mod tests {
         assert!(!text.contains("already"));
     }
 
-    #[test]
-    fn rename_backstop_alias_collision_hidden_owner_gets_uniform_not_found() {
+    #[tokio::test]
+    async fn rename_backstop_alias_collision_hidden_owner_gets_uniform_not_found() {
         // test_sec_r2f1_rename_toctou_backstop.py's `test_rename_
         // delegate_loses_alias_collision_race_gets_uniform_404`: the
         // winner is a concurrent `add_alias` on a HIDDEN project rather
         // than a create -- the delegate has no membership on the alias
         // OWNER either.
-        let mut c = conn();
+        let (_db_dir, c, db) = conn_with_sea_orm().await;
         let dir = tempfile::tempdir().unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
         registry
@@ -1436,7 +1458,7 @@ mod tests {
             .add_alias("hidden", "collision-target", None, Some(30), now_dt())
             .unwrap();
         let bob = identity::create_user(
-            &mut c,
+            &db,
             "bob",
             "correct horse battery staple",
             None,
@@ -1445,6 +1467,7 @@ mod tests {
             &[],
             NOW_STR,
         )
+        .await
         .unwrap();
 
         let resp = map_rename_registry_error(
@@ -1467,12 +1490,12 @@ mod tests {
         assert!(!text.contains("alias"));
     }
 
-    #[test]
-    fn rename_backstop_alias_collision_visible_owner_gets_the_real_409() {
+    #[tokio::test]
+    async fn rename_backstop_alias_collision_visible_owner_gets_the_real_409() {
         // Happy path: the SAME race, but the loser can see the alias
         // owner (here, a real membership on it) -- must still get the
         // real, informative 409, matching PF-R37-1's original behaviour.
-        let mut c = conn();
+        let (_db_dir, c, db) = conn_with_sea_orm().await;
         let dir = tempfile::tempdir().unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
         registry
@@ -1481,7 +1504,7 @@ mod tests {
         registry
             .add_alias("visible", "alias-target", None, Some(30), now_dt())
             .unwrap();
-        let uid = seed_operator_member(&mut c, "bob", "visible", "operator");
+        let uid = seed_operator_member(&c, &db, "bob", "visible", "operator").await;
 
         let resp = map_rename_registry_error(
             &c,

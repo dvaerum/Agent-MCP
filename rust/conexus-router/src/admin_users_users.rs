@@ -21,6 +21,7 @@
 #![allow(dead_code)]
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
+use sea_orm::DatabaseConnection;
 
 use crate::admin_users_gate::{self, AdminUsersError};
 use crate::identity::{self, IdentityError};
@@ -41,8 +42,10 @@ pub(crate) fn user_public_json(u: &identity::UserPublicRow) -> serde_json::Value
 }
 
 /// Port of `list_users_handler`.
-pub fn list_users_response(conn: &Connection) -> Result<HandlerResponse, IdentityError> {
-    let users = identity::list_users(conn)?;
+pub async fn list_users_response(
+    db: &DatabaseConnection,
+) -> Result<HandlerResponse, IdentityError> {
+    let users = identity::list_users(db).await?;
     let json_users: Vec<serde_json::Value> = users.iter().map(user_public_json).collect();
     Ok(admin_users_gate::success_envelope(
         serde_json::json!({"users": json_users}),
@@ -63,8 +66,8 @@ fn validation_rejected(message: &str) -> HandlerResponse {
 /// Port of `create_user_handler`. Argument extraction/validation
 /// order matches the real Python source exactly (matters for which
 /// error a multi-invalid-field body surfaces first).
-pub fn decide_create_user(
-    conn: &Connection,
+pub async fn decide_create_user(
+    db: &DatabaseConnection,
     caller_is_sysadmin: bool,
     caller_username: &str,
     raw_body: &serde_json::Value,
@@ -120,7 +123,7 @@ pub fn decide_create_user(
     }
     let email = email_val.and_then(|v| v.as_str());
 
-    match identity::admin_create_user(conn, &username, &password, email, is_sysadmin, now) {
+    match identity::admin_create_user(db, &username, &password, email, is_sysadmin, now).await {
         Ok(row) => Ok(CreateUserOutcome::Created(row)),
         Err(IdentityError::UsernameAlreadyExists(u)) => Ok(CreateUserOutcome::Rejected(
             admin_users_gate::error_envelope(
@@ -221,7 +224,8 @@ pub fn decide_edit_user(
             (&email_val, user_id),
         )?;
     }
-    let row = identity::get_user_public_by_id(&tx, user_id)?.expect("row confirmed to exist above");
+    let row = identity::get_user_public_by_id_in_transaction(&tx, user_id)?
+        .expect("row confirmed to exist above");
     tx.commit()?;
     Ok(EditUserOutcome::Updated(row))
 }
@@ -286,11 +290,31 @@ mod tests {
         init_router_schema(&c).unwrap();
         c
     }
+
+    /// A file-backed router DB opened as BOTH a `rusqlite::Connection`
+    /// (for the still-sync `decide_edit_user`/`decide_delete_user`) and
+    /// a sea-orm `DatabaseConnection` (for the now-converted
+    /// `identity::create_user`/`list_users_response`/`decide_create_user`)
+    /// -- see `identity.rs`'s own `conn_with_sea_orm` for why an
+    /// in-memory `:memory:` DB can't be shared across two connection
+    /// handles the way a real file can.
+    async fn conn_with_sea_orm() -> (tempfile::TempDir, Connection, sea_orm::DatabaseConnection) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("admin_users_users_test.db");
+        let c = Connection::open(&path).unwrap();
+        c.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        init_router_schema(&c).unwrap();
+        let db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        (dir, c, db)
+    }
+
     const NOW: &str = "2026-01-01T00:00:00.000+00:00";
 
-    fn seed_sysadmin(c: &mut Connection, username: &str) -> String {
+    async fn seed_sysadmin(db: &sea_orm::DatabaseConnection, username: &str) -> String {
         identity::create_user(
-            c,
+            db,
             username,
             "correct horse battery staple",
             None,
@@ -299,16 +323,17 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap()
     }
 
     // -- list_users_response ------------------------------------------
 
-    #[test]
-    fn list_users_response_omits_password_hash() {
-        let mut c = conn();
-        seed_sysadmin(&mut c, "alice");
-        let resp = list_users_response(&c).unwrap();
+    #[tokio::test]
+    async fn list_users_response_omits_password_hash() {
+        let (_dir, _c, db) = conn_with_sea_orm().await;
+        seed_sysadmin(&db, "alice").await;
+        let resp = list_users_response(&db).await.unwrap();
         let crate::mcp_handler::HandlerBody::Json(body) = resp.body else {
             panic!("expected JSON");
         };
@@ -320,16 +345,17 @@ mod tests {
 
     // -- decide_create_user ------------------------------------------
 
-    #[test]
-    fn creates_a_user_with_default_non_sysadmin() {
-        let c = conn();
+    #[tokio::test]
+    async fn creates_a_user_with_default_non_sysadmin() {
+        let (_dir, _c, db) = conn_with_sea_orm().await;
         let outcome = decide_create_user(
-            &c,
+            &db,
             false,
             "admin",
             &serde_json::json!({"username": "bob", "password": "correct horse battery staple"}),
             NOW,
         )
+        .await
         .unwrap();
         let CreateUserOutcome::Created(row) = outcome else {
             panic!("expected Created, got {outcome:?}");
@@ -338,16 +364,17 @@ mod tests {
         assert!(!row.is_sysadmin);
     }
 
-    #[test]
-    fn a_non_sysadmin_cannot_mint_a_sysadmin() {
-        let c = conn();
+    #[tokio::test]
+    async fn a_non_sysadmin_cannot_mint_a_sysadmin() {
+        let (_dir, _c, db) = conn_with_sea_orm().await;
         let outcome = decide_create_user(
-            &c,
+            &db,
             false,
             "admin",
             &serde_json::json!({"username": "bob", "password": "correct horse battery staple", "is_sysadmin": true}),
             NOW,
         )
+        .await
         .unwrap();
         let CreateUserOutcome::Rejected(resp) = outcome else {
             panic!("expected Rejected");
@@ -355,16 +382,17 @@ mod tests {
         assert_eq!(resp.status, 403);
     }
 
-    #[test]
-    fn a_sysadmin_can_mint_a_sysadmin() {
-        let c = conn();
+    #[tokio::test]
+    async fn a_sysadmin_can_mint_a_sysadmin() {
+        let (_dir, _c, db) = conn_with_sea_orm().await;
         let outcome = decide_create_user(
-            &c,
+            &db,
             true,
             "admin",
             &serde_json::json!({"username": "bob", "password": "correct horse battery staple", "is_sysadmin": true}),
             NOW,
         )
+        .await
         .unwrap();
         let CreateUserOutcome::Created(row) = outcome else {
             panic!("expected Created, got {outcome:?}");
@@ -372,16 +400,17 @@ mod tests {
         assert!(row.is_sysadmin);
     }
 
-    #[test]
-    fn rejects_a_missing_password() {
-        let c = conn();
+    #[tokio::test]
+    async fn rejects_a_missing_password() {
+        let (_dir, _c, db) = conn_with_sea_orm().await;
         let outcome = decide_create_user(
-            &c,
+            &db,
             false,
             "admin",
             &serde_json::json!({"username": "bob"}),
             NOW,
         )
+        .await
         .unwrap();
         let CreateUserOutcome::Rejected(resp) = outcome else {
             panic!("expected Rejected");
@@ -389,16 +418,17 @@ mod tests {
         assert_eq!(resp.status, 400);
     }
 
-    #[test]
-    fn rejects_a_weak_password() {
-        let c = conn();
+    #[tokio::test]
+    async fn rejects_a_weak_password() {
+        let (_dir, _c, db) = conn_with_sea_orm().await;
         let outcome = decide_create_user(
-            &c,
+            &db,
             false,
             "admin",
             &serde_json::json!({"username": "bob", "password": "short"}),
             NOW,
         )
+        .await
         .unwrap();
         let CreateUserOutcome::Rejected(resp) = outcome else {
             panic!("expected Rejected");
@@ -406,17 +436,18 @@ mod tests {
         assert_eq!(resp.status, 400);
     }
 
-    #[test]
-    fn rejects_a_duplicate_username_as_conflict() {
-        let mut c = conn();
-        seed_sysadmin(&mut c, "bob");
+    #[tokio::test]
+    async fn rejects_a_duplicate_username_as_conflict() {
+        let (_dir, _c, db) = conn_with_sea_orm().await;
+        seed_sysadmin(&db, "bob").await;
         let outcome = decide_create_user(
-            &c,
+            &db,
             true,
             "admin",
             &serde_json::json!({"username": "bob", "password": "correct horse battery staple"}),
             NOW,
         )
+        .await
         .unwrap();
         let CreateUserOutcome::Rejected(resp) = outcome else {
             panic!("expected Rejected");
@@ -426,10 +457,10 @@ mod tests {
 
     // -- decide_edit_user ----------------------------------------------
 
-    #[test]
-    fn edits_the_email_field() {
-        let mut c = conn();
-        let uid = seed_sysadmin(&mut c, "alice");
+    #[tokio::test]
+    async fn edits_the_email_field() {
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
+        let uid = seed_sysadmin(&db, "alice").await;
         let outcome = decide_edit_user(
             &mut c,
             true,
@@ -444,10 +475,10 @@ mod tests {
         assert_eq!(row.email.as_deref(), Some("alice@example.test"));
     }
 
-    #[test]
-    fn rejects_a_non_sysadmin_setting_is_sysadmin() {
-        let mut c = conn();
-        let uid = seed_sysadmin(&mut c, "alice");
+    #[tokio::test]
+    async fn rejects_a_non_sysadmin_setting_is_sysadmin() {
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
+        let uid = seed_sysadmin(&db, "alice").await;
         let outcome = decide_edit_user(
             &mut c,
             false,
@@ -462,10 +493,10 @@ mod tests {
         assert_eq!(resp.status, 403);
     }
 
-    #[test]
-    fn rejects_no_editable_fields() {
-        let mut c = conn();
-        let uid = seed_sysadmin(&mut c, "alice");
+    #[tokio::test]
+    async fn rejects_no_editable_fields() {
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
+        let uid = seed_sysadmin(&db, "alice").await;
         let outcome =
             decide_edit_user(&mut c, true, "admin", &uid, &serde_json::json!({})).unwrap();
         let EditUserOutcome::Rejected(resp) = outcome else {
@@ -491,10 +522,10 @@ mod tests {
         assert_eq!(resp.status, 404);
     }
 
-    #[test]
-    fn refuses_to_demote_the_last_sysadmin() {
-        let mut c = conn();
-        let uid = seed_sysadmin(&mut c, "alice");
+    #[tokio::test]
+    async fn refuses_to_demote_the_last_sysadmin() {
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
+        let uid = seed_sysadmin(&db, "alice").await;
         let outcome = decide_edit_user(
             &mut c,
             true,
@@ -508,16 +539,19 @@ mod tests {
         };
         assert_eq!(resp.status, 409);
         // Confirm the rollback actually took effect on disk.
-        let row = identity::get_user_public_by_id(&c, &uid).unwrap().unwrap();
+        let row = identity::get_user_public_by_id(&db, &uid)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(row.is_sysadmin);
     }
 
-    #[test]
-    fn allows_demoting_when_another_sysadmin_remains() {
-        let mut c = conn();
-        let alice = seed_sysadmin(&mut c, "alice");
+    #[tokio::test]
+    async fn allows_demoting_when_another_sysadmin_remains() {
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
+        let alice = seed_sysadmin(&db, "alice").await;
         identity::create_user(
-            &mut c,
+            &db,
             "bob",
             "correct horse battery staple",
             None,
@@ -526,6 +560,7 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
         let outcome = decide_edit_user(
             &mut c,
@@ -540,12 +575,12 @@ mod tests {
 
     // -- decide_delete_user ----------------------------------------------
 
-    #[test]
-    fn deletes_a_non_sysadmin_user() {
-        let mut c = conn();
-        seed_sysadmin(&mut c, "alice"); // first user, sysadmin -- keeps the invariant satisfied
+    #[tokio::test]
+    async fn deletes_a_non_sysadmin_user() {
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
+        seed_sysadmin(&db, "alice").await; // first user, sysadmin -- keeps the invariant satisfied
         let bob = identity::create_user(
-            &mut c,
+            &db,
             "bob",
             "correct horse battery staple",
             None,
@@ -554,10 +589,14 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
         let outcome = decide_delete_user(&mut c, true, "admin", &bob).unwrap();
         assert!(matches!(outcome, DeleteUserOutcome::Deleted(_)));
-        assert!(identity::get_user_public_by_id(&c, &bob).unwrap().is_none());
+        assert!(identity::get_user_public_by_id(&db, &bob)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     /// Regression (test_sec_r9_delete_sysadmin_guard.py): a non-
@@ -565,12 +604,12 @@ mod tests {
     /// an ORDINARY (non-sysadmin) user -- the sysadmin-target guard
     /// must fire only for a sysadmin target, never over-reject a plain
     /// delete.
-    #[test]
-    fn a_non_sysadmin_can_delete_a_normal_user() {
-        let mut c = conn();
-        seed_sysadmin(&mut c, "root"); // keeps the global invariant satisfied
+    #[tokio::test]
+    async fn a_non_sysadmin_can_delete_a_normal_user() {
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
+        seed_sysadmin(&db, "root").await; // keeps the global invariant satisfied
         let normie = identity::create_user(
-            &mut c,
+            &db,
             "normie",
             "correct horse battery staple",
             None,
@@ -579,10 +618,12 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
         let outcome = decide_delete_user(&mut c, false, "bob", &normie).unwrap();
         assert!(matches!(outcome, DeleteUserOutcome::Deleted(_)));
-        assert!(identity::get_user_public_by_id(&c, &normie)
+        assert!(identity::get_user_public_by_id(&db, &normie)
+            .await
             .unwrap()
             .is_none());
     }
@@ -591,12 +632,12 @@ mod tests {
     /// sysadmin account (the AZ-R9-1 guard only blocks a non-sysadmin
     /// caller from deleting a sysadmin target -- it must not shadow
     /// the legitimate sysadmin-deletes-sysadmin path).
-    #[test]
-    fn a_sysadmin_can_delete_a_non_last_sysadmin() {
-        let mut c = conn();
-        seed_sysadmin(&mut c, "root"); // stays behind as the surviving sysadmin
+    #[tokio::test]
+    async fn a_sysadmin_can_delete_a_non_last_sysadmin() {
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
+        seed_sysadmin(&db, "root").await; // stays behind as the surviving sysadmin
         let victim = identity::create_user(
-            &mut c,
+            &db,
             "deletable-admin",
             "correct horse battery staple",
             None,
@@ -605,10 +646,12 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
         let outcome = decide_delete_user(&mut c, true, "admin", &victim).unwrap();
         assert!(matches!(outcome, DeleteUserOutcome::Deleted(_)));
-        assert!(identity::get_user_public_by_id(&c, &victim)
+        assert!(identity::get_user_public_by_id(&db, &victim)
+            .await
             .unwrap()
             .is_none());
     }
@@ -620,12 +663,12 @@ mod tests {
         assert!(matches!(outcome, DeleteUserOutcome::Rejected(_)));
     }
 
-    #[test]
-    fn a_non_sysadmin_cannot_delete_a_sysadmin() {
-        let mut c = conn();
-        let alice = seed_sysadmin(&mut c, "alice");
+    #[tokio::test]
+    async fn a_non_sysadmin_cannot_delete_a_sysadmin() {
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
+        let alice = seed_sysadmin(&db, "alice").await;
         identity::create_user(
-            &mut c,
+            &db,
             "bob",
             "correct horse battery staple",
             None,
@@ -634,6 +677,7 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
         let outcome = decide_delete_user(&mut c, false, "bob", &alice).unwrap();
         let DeleteUserOutcome::Rejected(resp) = outcome else {
@@ -642,17 +686,20 @@ mod tests {
         assert_eq!(resp.status, 403);
     }
 
-    #[test]
-    fn refuses_to_delete_the_last_sysadmin() {
-        let mut c = conn();
-        let uid = seed_sysadmin(&mut c, "alice");
+    #[tokio::test]
+    async fn refuses_to_delete_the_last_sysadmin() {
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
+        let uid = seed_sysadmin(&db, "alice").await;
         let outcome = decide_delete_user(&mut c, true, "admin", &uid).unwrap();
         let DeleteUserOutcome::Rejected(resp) = outcome else {
             panic!("expected Rejected, got {outcome:?}");
         };
         assert_eq!(resp.status, 409);
         assert!(
-            identity::get_user_public_by_id(&c, &uid).unwrap().is_some(),
+            identity::get_user_public_by_id(&db, &uid)
+                .await
+                .unwrap()
+                .is_some(),
             "the delete must have rolled back"
         );
     }

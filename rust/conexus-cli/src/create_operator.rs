@@ -49,7 +49,7 @@ fn read_password(password_stdin: bool) -> anyhow::Result<String> {
     }
 }
 
-pub fn run(username: &str, email: Option<&str>, password_stdin: bool) -> anyhow::Result<()> {
+pub async fn run(username: &str, email: Option<&str>, password_stdin: bool) -> anyhow::Result<()> {
     let password = read_password(password_stdin)?;
 
     // Canonical single-source policy check -- every path that mints a
@@ -62,9 +62,20 @@ pub fn run(username: &str, email: Option<&str>, password_stdin: bool) -> anyhow:
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut conn = Connection::open(&db_path)?;
-    conn.pragma_update(None, "foreign_keys", true)?;
-    conexus_db::init_router_schema(&conn)?;
+    // Schema init/foreign-key setup stays on the rusqlite connection
+    // (schema authority for `router.db` stays with Python's Alembic --
+    // see this module's own doc); `identity::create_user` itself is
+    // sea-orm-backed (Phase G router step 4 PR D), so a SEPARATE
+    // `sea_orm::DatabaseConnection` is opened onto the SAME file for
+    // that one call -- the same dual-connection shape every other
+    // caller in this migration uses once a sync rusqlite setup step
+    // and an async sea-orm write need to share one on-disk database.
+    {
+        let conn = Connection::open(&db_path)?;
+        conn.pragma_update(None, "foreign_keys", true)?;
+        conexus_db::init_router_schema(&conn)?;
+    }
+    let db = sea_orm::Database::connect(format!("sqlite://{}", db_path.display())).await?;
 
     let registry = conexus_router::project_registry::ProjectRegistry::new(
         conexus_router::project_registry::default_registry_path(|k| std::env::var(k).ok()),
@@ -84,7 +95,7 @@ pub fn run(username: &str, email: Option<&str>, password_stdin: bool) -> anyhow:
     // forces the bit for the proxy-header default-sysadmin path,
     // never reachable from this CLI).
     let user_id = conexus_router::identity::create_user(
-        &mut conn,
+        &db,
         username,
         &password,
         email,
@@ -93,6 +104,7 @@ pub fn run(username: &str, email: Option<&str>, password_stdin: bool) -> anyhow:
         &registered_projects,
         &now,
     )
+    .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     println!("Created operator {username:?} (user_id={user_id}).");

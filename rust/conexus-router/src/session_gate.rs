@@ -468,6 +468,27 @@ mod tests {
         c
     }
 
+    /// A file-backed router DB opened as BOTH a `rusqlite::Connection`
+    /// (to exercise the still-sync `evaluate_session_gate`/
+    /// `try_proxy_header_identity` under test, and the still-sync
+    /// `identity::create_session`/`cookie_for`) and a sea-orm
+    /// `DatabaseConnection` (to seed fixture users through the now-
+    /// converted `identity::create_user`) -- the same dual-connection
+    /// recipe `identity.rs`'s own tests use, since an in-memory
+    /// `:memory:` DB can't be shared across two separate connection
+    /// handles the way a real file can.
+    async fn conn_with_sea_orm() -> (tempfile::TempDir, Connection, sea_orm::DatabaseConnection) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session_gate_test.db");
+        let c = Connection::open(&path).unwrap();
+        c.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        init_router_schema(&c).unwrap();
+        let db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        (dir, c, db)
+    }
+
     fn registry_with(dir: &std::path::Path, name: &str, now: DateTime<Utc>) -> ProjectRegistry {
         let registry = ProjectRegistry::new(dir.join("projects.local.json"));
         registry
@@ -481,9 +502,13 @@ mod tests {
         "2026-01-01T00:00:00Z".parse().unwrap()
     }
 
-    fn seed_operator(c: &mut Connection, username: &str, is_sysadmin_bootstrap: bool) -> String {
+    async fn seed_operator(
+        db: &sea_orm::DatabaseConnection,
+        username: &str,
+        is_sysadmin_bootstrap: bool,
+    ) -> String {
         identity::create_user(
-            c,
+            db,
             username,
             "correct horse battery staple",
             None,
@@ -492,6 +517,7 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap()
     }
 
@@ -644,11 +670,11 @@ mod tests {
         assert!(location.contains("%3F")); // the embedded `?` stays percent-encoded
     }
 
-    #[test]
-    fn admits_a_sysadmin_with_full_capabilities_and_no_project_role() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn admits_a_sysadmin_with_full_capabilities_and_no_project_role() {
+        let (_db_dir, mut c, db) = conn_with_sea_orm().await;
         let dir = tempfile::tempdir().unwrap();
-        let uid = seed_operator(&mut c, "alice", true);
+        let uid = seed_operator(&db, "alice", true).await;
         let cookie = cookie_for(&c, &uid);
         let registry = registry_with(dir.path(), "proj-a", now_dt());
         let cfg = SessionGateConfig::default();
@@ -667,11 +693,11 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn admits_a_router_admin_path_with_no_project_and_full_sysadmin_caps() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn admits_a_router_admin_path_with_no_project_and_full_sysadmin_caps() {
+        let (_db_dir, mut c, db) = conn_with_sea_orm().await;
         let dir = tempfile::tempdir().unwrap();
-        let uid = seed_operator(&mut c, "alice", true);
+        let uid = seed_operator(&db, "alice", true).await;
         let cookie = cookie_for(&c, &uid);
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
         let cfg = SessionGateConfig::default();
@@ -684,18 +710,18 @@ mod tests {
         assert!(identity.project.is_none());
     }
 
-    #[test]
-    fn falls_through_for_a_genuinely_nonexistent_project() {
+    #[tokio::test]
+    async fn falls_through_for_a_genuinely_nonexistent_project() {
         // A registered second operator, member of NOTHING, hitting a
         // URL segment that resolves to no real/aliased project at
         // all -- this gate admits it (project: None) and lets the
         // real downstream handler produce its own 404, per this
         // module's own doc.
-        let mut c = conn();
+        let (_db_dir, mut c, db) = conn_with_sea_orm().await;
         let dir = tempfile::tempdir().unwrap();
-        let uid = seed_operator(&mut c, "alice", true); // first user -> sysadmin, irrelevant here
+        let uid = seed_operator(&db, "alice", true).await; // first user -> sysadmin, irrelevant here
         let uid2 = identity::create_user(
-            &mut c,
+            &db,
             "bob",
             "correct horse battery staple",
             None,
@@ -704,6 +730,7 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
         let _ = uid;
         let cookie = cookie_for(&c, &uid2);
@@ -718,13 +745,13 @@ mod tests {
         assert!(identity.project.is_none());
     }
 
-    #[test]
-    fn non_member_on_app_path_gets_the_public_shell_outcome() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn non_member_on_app_path_gets_the_public_shell_outcome() {
+        let (_db_dir, mut c, db) = conn_with_sea_orm().await;
         let dir = tempfile::tempdir().unwrap();
-        seed_operator(&mut c, "alice", true); // first user, sysadmin
+        seed_operator(&db, "alice", true).await; // first user, sysadmin
         let bob = identity::create_user(
-            &mut c,
+            &db,
             "bob",
             "correct horse battery staple",
             None,
@@ -733,6 +760,7 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
         let cookie = cookie_for(&c, &bob);
         let registry = registry_with(dir.path(), "proj-a", now_dt());
@@ -759,13 +787,13 @@ mod tests {
     /// construction) and unconditionally serves the same static
     /// `index.html`, never the `name` path segment itself -- so this
     /// gate-level equivalence is the whole story, not just half of it.
-    #[test]
-    fn falls_through_for_a_genuinely_nonexistent_project_on_app_path() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn falls_through_for_a_genuinely_nonexistent_project_on_app_path() {
+        let (_db_dir, mut c, db) = conn_with_sea_orm().await;
         let dir = tempfile::tempdir().unwrap();
-        seed_operator(&mut c, "alice", true); // first user, sysadmin
+        seed_operator(&db, "alice", true).await; // first user, sysadmin
         let bob = identity::create_user(
-            &mut c,
+            &db,
             "bob",
             "correct horse battery staple",
             None,
@@ -774,6 +802,7 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
         let cookie = cookie_for(&c, &bob);
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
@@ -824,13 +853,13 @@ mod tests {
         assert_eq!(existing_body, ghost_body, "unauth 401 must be uniform");
     }
 
-    #[test]
-    fn non_member_on_api_path_gets_the_unknown_project_response() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn non_member_on_api_path_gets_the_unknown_project_response() {
+        let (_db_dir, mut c, db) = conn_with_sea_orm().await;
         let dir = tempfile::tempdir().unwrap();
-        seed_operator(&mut c, "alice", true);
+        seed_operator(&db, "alice", true).await;
         let bob = identity::create_user(
-            &mut c,
+            &db,
             "bob",
             "correct horse battery staple",
             None,
@@ -839,6 +868,7 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
         let cookie = cookie_for(&c, &bob);
         let registry = registry_with(dir.path(), "proj-a", now_dt());
@@ -853,13 +883,13 @@ mod tests {
         assert_eq!(resp.status, 404);
     }
 
-    #[test]
-    fn non_member_on_api_path_without_the_strict_accept_media_gets_a_406_first() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn non_member_on_api_path_without_the_strict_accept_media_gets_a_406_first() {
+        let (_db_dir, mut c, db) = conn_with_sea_orm().await;
         let dir = tempfile::tempdir().unwrap();
-        seed_operator(&mut c, "alice", true);
+        seed_operator(&db, "alice", true).await;
         let bob = identity::create_user(
-            &mut c,
+            &db,
             "bob",
             "correct horse battery staple",
             None,
@@ -868,6 +898,7 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
         let cookie = cookie_for(&c, &bob);
         let registry = registry_with(dir.path(), "proj-a", now_dt());
@@ -881,13 +912,13 @@ mod tests {
         assert_eq!(resp.status, 406);
     }
 
-    #[test]
-    fn a_viewer_can_read_but_not_mutate_their_project() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn a_viewer_can_read_but_not_mutate_their_project() {
+        let (_db_dir, mut c, db) = conn_with_sea_orm().await;
         let dir = tempfile::tempdir().unwrap();
-        seed_operator(&mut c, "alice", true);
+        seed_operator(&db, "alice", true).await;
         let bob = identity::create_user(
-            &mut c,
+            &db,
             "bob",
             "correct horse battery staple",
             None,
@@ -896,6 +927,7 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
         c.execute(
             "INSERT INTO project_membership (project_name, user_id, role) VALUES ('proj-a', ?1, 'viewer')",
@@ -926,13 +958,13 @@ mod tests {
         assert_eq!(body["error"], "forbidden");
     }
 
-    #[test]
-    fn an_operator_member_can_mutate_their_project() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn an_operator_member_can_mutate_their_project() {
+        let (_db_dir, mut c, db) = conn_with_sea_orm().await;
         let dir = tempfile::tempdir().unwrap();
-        seed_operator(&mut c, "alice", true);
+        seed_operator(&db, "alice", true).await;
         let bob = identity::create_user(
-            &mut c,
+            &db,
             "bob",
             "correct horse battery staple",
             None,
@@ -941,6 +973,7 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
         c.execute(
             "INSERT INTO project_membership (project_name, user_id, role) VALUES ('proj-a', ?1, 'operator')",
@@ -983,10 +1016,10 @@ mod tests {
     /// gate (already covered directly in `sso.rs`'s own tests) so this
     /// test exercises the session-gate WIRING, not the bootstrap edge
     /// case a second time.
-    #[test]
-    fn proxy_header_fallback_admits_when_no_cookie_and_the_header_is_trusted() {
-        let mut c = conn();
-        seed_operator(&mut c, "alice", true);
+    #[tokio::test]
+    async fn proxy_header_fallback_admits_when_no_cookie_and_the_header_is_trusted() {
+        let (_db_dir, mut c, db) = conn_with_sea_orm().await;
+        seed_operator(&db, "alice", true).await;
         let dir = tempfile::tempdir().unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
         let cfg = SessionGateConfig::default();
@@ -1018,10 +1051,10 @@ mod tests {
         assert!(!identity.is_sysadmin);
     }
 
-    #[test]
-    fn proxy_header_fallback_is_skipped_when_sso_mode_is_not_proxy_header() {
-        let mut c = conn();
-        seed_operator(&mut c, "alice", true);
+    #[tokio::test]
+    async fn proxy_header_fallback_is_skipped_when_sso_mode_is_not_proxy_header() {
+        let (_db_dir, mut c, db) = conn_with_sea_orm().await;
+        seed_operator(&db, "alice", true).await;
         let dir = tempfile::tempdir().unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
         let cfg = SessionGateConfig::default();
@@ -1049,10 +1082,10 @@ mod tests {
         assert!(matches!(outcome, SessionGateOutcome::Reject(_)));
     }
 
-    #[test]
-    fn proxy_header_fallback_is_skipped_for_an_untrusted_peer() {
-        let mut c = conn();
-        seed_operator(&mut c, "alice", true);
+    #[tokio::test]
+    async fn proxy_header_fallback_is_skipped_for_an_untrusted_peer() {
+        let (_db_dir, mut c, db) = conn_with_sea_orm().await;
+        seed_operator(&db, "alice", true).await;
         let dir = tempfile::tempdir().unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
         let cfg = SessionGateConfig::default();
@@ -1081,10 +1114,10 @@ mod tests {
         assert!(matches!(outcome, SessionGateOutcome::Reject(_)));
     }
 
-    #[test]
-    fn proxy_header_fallback_is_skipped_when_the_header_is_absent() {
-        let mut c = conn();
-        seed_operator(&mut c, "alice", true);
+    #[tokio::test]
+    async fn proxy_header_fallback_is_skipped_when_the_header_is_absent() {
+        let (_db_dir, mut c, db) = conn_with_sea_orm().await;
+        seed_operator(&db, "alice", true).await;
         let dir = tempfile::tempdir().unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
         let cfg = SessionGateConfig::default();
@@ -1111,10 +1144,10 @@ mod tests {
         assert!(matches!(outcome, SessionGateOutcome::Reject(_)));
     }
 
-    #[test]
-    fn cookie_identity_is_preferred_over_a_trusted_proxy_header_when_both_are_present() {
-        let mut c = conn();
-        let alice = seed_operator(&mut c, "alice", true);
+    #[tokio::test]
+    async fn cookie_identity_is_preferred_over_a_trusted_proxy_header_when_both_are_present() {
+        let (_db_dir, mut c, db) = conn_with_sea_orm().await;
+        let alice = seed_operator(&db, "alice", true).await;
         let cookie = cookie_for(&c, &alice);
         let dir = tempfile::tempdir().unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
