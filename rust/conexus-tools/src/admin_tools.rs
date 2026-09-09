@@ -3571,7 +3571,7 @@ mod tests {
         created_at: &str,
     ) {
         let guard = conn.lock().await;
-        conexus_db::task_repository::create(
+        conexus_db::task_repository::create_in_transaction(
             &guard,
             conexus_db::task_repository::NewTask {
                 task_id: Some(task_id),

@@ -501,7 +501,7 @@ impl TaskQueryEngine {
 mod tests {
     use super::*;
     use conexus_db::schema::init_schema;
-    use conexus_db::task_repository::{create, NewTask};
+    use conexus_db::task_repository::{create_in_transaction, NewTask};
     use rusqlite::Connection;
 
     fn test_conn() -> Connection {
@@ -561,7 +561,7 @@ mod tests {
     #[test]
     fn is_claimable_task_true_for_unassigned_active_task() {
         let conn = test_conn();
-        create(
+        create_in_transaction(
             &conn,
             new_task(
                 "t1",
@@ -584,7 +584,7 @@ mod tests {
     #[test]
     fn is_claimable_task_false_when_assigned() {
         let conn = test_conn();
-        create(
+        create_in_transaction(
             &conn,
             new_task(
                 "t1",
@@ -607,7 +607,7 @@ mod tests {
     #[test]
     fn is_claimable_task_false_when_terminal() {
         let conn = test_conn();
-        create(
+        create_in_transaction(
             &conn,
             new_task(
                 "t1",
@@ -723,7 +723,7 @@ mod tests {
     #[tokio::test]
     async fn query_filters_by_status() {
         let (_dir, conn, db) = test_conn_with_sea_orm().await;
-        create(
+        create_in_transaction(
             &conn,
             new_task(
                 "t1",
@@ -737,7 +737,7 @@ mod tests {
             ),
         )
         .unwrap();
-        create(
+        create_in_transaction(
             &conn,
             new_task(
                 "t2",
@@ -768,7 +768,7 @@ mod tests {
     #[tokio::test]
     async fn query_incomplete_alias_matches_active_statuses() {
         let (_dir, conn, db) = test_conn_with_sea_orm().await;
-        create(
+        create_in_transaction(
             &conn,
             new_task(
                 "t1",
@@ -782,7 +782,7 @@ mod tests {
             ),
         )
         .unwrap();
-        create(
+        create_in_transaction(
             &conn,
             new_task(
                 "t2",
@@ -813,7 +813,7 @@ mod tests {
     #[tokio::test]
     async fn query_agent_id_filter_scopes_to_own_tasks_only_by_default() {
         let (_dir, conn, db) = test_conn_with_sea_orm().await;
-        create(
+        create_in_transaction(
             &conn,
             new_task(
                 "t1",
@@ -827,7 +827,7 @@ mod tests {
             ),
         )
         .unwrap();
-        create(
+        create_in_transaction(
             &conn,
             new_task(
                 "t2",
@@ -858,7 +858,7 @@ mod tests {
     #[tokio::test]
     async fn query_agent_id_with_include_unassigned_widens_to_the_claimable_pool() {
         let (_dir, conn, db) = test_conn_with_sea_orm().await;
-        create(
+        create_in_transaction(
             &conn,
             new_task(
                 "t1",
@@ -872,7 +872,7 @@ mod tests {
             ),
         )
         .unwrap();
-        create(
+        create_in_transaction(
             &conn,
             new_task(
                 "t2",
@@ -886,7 +886,7 @@ mod tests {
             ),
         )
         .unwrap();
-        create(
+        create_in_transaction(
             &conn,
             new_task(
                 "t3",
@@ -926,7 +926,7 @@ mod tests {
     async fn query_agent_id_with_include_unassigned_excludes_terminal_pool_but_keeps_own_terminal()
     {
         let (_dir, conn, db) = test_conn_with_sea_orm().await;
-        create(
+        create_in_transaction(
             &conn,
             new_task(
                 "root",
@@ -940,7 +940,7 @@ mod tests {
             ),
         )
         .unwrap();
-        create(
+        create_in_transaction(
             &conn,
             new_task(
                 "pool_open",
@@ -954,7 +954,7 @@ mod tests {
             ),
         )
         .unwrap();
-        create(
+        create_in_transaction(
             &conn,
             new_task(
                 "pool_done",
@@ -968,7 +968,7 @@ mod tests {
             ),
         )
         .unwrap();
-        create(
+        create_in_transaction(
             &conn,
             new_task(
                 "mine_done",
@@ -982,7 +982,7 @@ mod tests {
             ),
         )
         .unwrap();
-        create(
+        create_in_transaction(
             &conn,
             new_task(
                 "foreign",
@@ -1018,7 +1018,7 @@ mod tests {
     #[tokio::test]
     async fn query_unassigned_filter_excludes_terminal_tasks() {
         let (_dir, conn, db) = test_conn_with_sea_orm().await;
-        create(
+        create_in_transaction(
             &conn,
             new_task(
                 "t1",
@@ -1032,7 +1032,7 @@ mod tests {
             ),
         )
         .unwrap();
-        create(
+        create_in_transaction(
             &conn,
             new_task(
                 "t2",
@@ -1063,7 +1063,7 @@ mod tests {
     #[tokio::test]
     async fn query_sorts_priority_descending() {
         let (_dir, conn, db) = test_conn_with_sea_orm().await;
-        create(
+        create_in_transaction(
             &conn,
             new_task(
                 "t1",
@@ -1077,7 +1077,7 @@ mod tests {
             ),
         )
         .unwrap();
-        create(
+        create_in_transaction(
             &conn,
             new_task(
                 "t2",
@@ -1091,7 +1091,7 @@ mod tests {
             ),
         )
         .unwrap();
-        create(
+        create_in_transaction(
             &conn,
             new_task(
                 "t3",
@@ -1129,7 +1129,7 @@ mod tests {
         // replay. `matched` must instead derive from `list_all`'s own
         // deterministic `Vec` order so repeated calls agree.
         let (_dir, conn, db) = test_conn_with_sea_orm().await;
-        create(
+        create_in_transaction(
             &conn,
             new_task(
                 "t1",
@@ -1143,7 +1143,7 @@ mod tests {
             ),
         )
         .unwrap();
-        create(
+        create_in_transaction(
             &conn,
             new_task(
                 "t2",
@@ -1186,7 +1186,7 @@ mod tests {
     #[tokio::test]
     async fn query_pagination_offset_and_limit() {
         let (_dir, conn, db) = test_conn_with_sea_orm().await;
-        create(
+        create_in_transaction(
             &conn,
             new_task(
                 "t1",
@@ -1200,7 +1200,7 @@ mod tests {
             ),
         )
         .unwrap();
-        create(
+        create_in_transaction(
             &conn,
             new_task(
                 "t2",
@@ -1214,7 +1214,7 @@ mod tests {
             ),
         )
         .unwrap();
-        create(
+        create_in_transaction(
             &conn,
             new_task(
                 "t3",
@@ -1267,7 +1267,7 @@ mod tests {
         // that already appeared on page 1 must not shift a later row
         // forward into a gap that spans both pages.
         let (_dir, conn, db) = test_conn_with_sea_orm().await;
-        create(
+        create_in_transaction(
             &conn,
             new_task(
                 "t1",
@@ -1281,7 +1281,7 @@ mod tests {
             ),
         )
         .unwrap();
-        create(
+        create_in_transaction(
             &conn,
             new_task(
                 "t2",
@@ -1295,7 +1295,7 @@ mod tests {
             ),
         )
         .unwrap();
-        create(
+        create_in_transaction(
             &conn,
             new_task(
                 "t3",
@@ -1309,7 +1309,7 @@ mod tests {
             ),
         )
         .unwrap();
-        create(
+        create_in_transaction(
             &conn,
             new_task(
                 "t4",
@@ -1341,7 +1341,7 @@ mod tests {
             vec!["t1", "t2"]
         );
 
-        task_repository::delete(&conn, "t2").unwrap();
+        task_repository::delete_in_transaction(&conn, "t2").unwrap();
 
         let page2 = engine
             .query(&db, &TaskFilterSpec::default(), &sort, 2, Some(2))

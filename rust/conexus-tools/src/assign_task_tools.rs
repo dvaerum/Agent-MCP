@@ -355,7 +355,7 @@ fn create_unassigned_tasks(
             }
         }
         for spec in specs {
-            let fresh = task_repository::create(
+            let fresh = task_repository::create_in_transaction(
                 tx,
                 NewTask {
                     task_id: None,
@@ -389,7 +389,7 @@ fn create_unassigned_tasks(
                 return Ok(conflict);
             }
         }
-        let fresh = task_repository::create(
+        let fresh = task_repository::create_in_transaction(
             tx,
             NewTask {
                 task_id: None,
@@ -680,7 +680,7 @@ fn create_and_assign_multiple_tasks(
 
     let mut created: Vec<(String, String, String)> = Vec::new();
     for spec in specs {
-        let fresh = task_repository::create(
+        let fresh = task_repository::create_in_transaction(
             tx,
             NewTask {
                 task_id: None,
@@ -1117,7 +1117,7 @@ impl Tool for AssignTaskTool {
                 });
             }
 
-            let fresh_task = match task_repository::create(
+            let fresh_task = match task_repository::create_in_transaction(
                 &tx,
                 NewTask {
                     task_id: Some(&new_task_id),
@@ -1437,7 +1437,7 @@ impl Tool for CreateSelfTaskTool {
                 }
             }
 
-            let fresh_task = match task_repository::create(
+            let fresh_task = match task_repository::create_in_transaction(
                 &tx,
                 NewTask {
                     task_id: Some(&new_task_id),
@@ -1606,7 +1606,7 @@ mod tests {
         created_by: &str,
         parent: Option<&str>,
     ) {
-        task_repository::create(
+        task_repository::create_in_transaction(
             conn,
             NewTask {
                 task_id: Some(id),
@@ -2777,7 +2777,7 @@ mod create_self_task_tests {
         created_by: &str,
         parent: Option<&str>,
     ) {
-        task_repository::create(
+        task_repository::create_in_transaction(
             conn,
             NewTask {
                 task_id: Some(id),

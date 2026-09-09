@@ -323,7 +323,8 @@ mod tests {
     }
 
     /// A file-backed DB opened as BOTH a `rusqlite::Connection` (to
-    /// seed task rows through the still-sync `task_repository::create`)
+    /// seed task rows through the still-sync
+    /// `task_repository::create_in_transaction`)
     /// and a sea-orm `DatabaseConnection` (for `render_status`'s
     /// `count_active_by_assignee` to see them) -- the dual-connection
     /// recipe every Phase G test needing both needs, since an
@@ -477,7 +478,7 @@ mod tests {
             [],
         )
         .unwrap();
-        task_repository::create(
+        task_repository::create_in_transaction(
             &conn,
             task_repository::NewTask {
                 task_id: Some("t1"),
@@ -495,7 +496,7 @@ mod tests {
             },
         )
         .unwrap();
-        task_repository::create(
+        task_repository::create_in_transaction(
             &conn,
             task_repository::NewTask {
                 task_id: Some("t2"),

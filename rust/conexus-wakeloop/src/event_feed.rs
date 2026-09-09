@@ -1112,7 +1112,7 @@ mod tests {
 
     /// A single real temp-file-backed DB opened as BOTH a `rusqlite::
     /// Connection` (still-legacy reads/writes: messages, agents, and
-    /// tasks via `task_repository::create`) and a sea-orm
+    /// tasks via `task_repository::create_in_transaction`) and a sea-orm
     /// `DatabaseConnection` (Phase G: `task_repository::
     /// list_assigned_updated_since`/`list_unassigned_active_updated_
     /// since`, and everything `pending_directive_repository`/
@@ -1205,7 +1205,7 @@ mod tests {
     async fn collect_events_with_cap_classifies_task_assigned_vs_changed() {
         let (_dir, conn, sea_orm_db) = test_conn_with_sea_orm().await;
         seed_agent(&conn, "alice");
-        task_repository::create(
+        task_repository::create_in_transaction(
             &conn,
             NewTask {
                 task_id: Some("task_1"),
@@ -1223,7 +1223,7 @@ mod tests {
             },
         )
         .unwrap();
-        task_repository::create(
+        task_repository::create_in_transaction(
             &conn,
             NewTask {
                 task_id: Some("task_2"),
@@ -1424,7 +1424,7 @@ mod tests {
             notes: None,
             now: "2026-01-01T00:00:00Z",
         };
-        task_repository::create(&conn, claimable).unwrap();
+        task_repository::create_in_transaction(&conn, claimable).unwrap();
         let done = NewTask {
             task_id: Some("task_2"),
             title: "finished",
@@ -1439,7 +1439,7 @@ mod tests {
             notes: None,
             now: "2026-01-01T00:00:00Z",
         };
-        task_repository::create(&conn, done).unwrap();
+        task_repository::create_in_transaction(&conn, done).unwrap();
 
         let conn = AsyncMutex::new(conn);
         let events = collect_unassigned_task_events_for(&conn, &sea_orm_db, "alice", None)
@@ -1715,7 +1715,7 @@ mod tests {
             notes: None,
             now: "2026-01-01T00:00:02Z",
         };
-        task_repository::create(&conn, unassigned).unwrap();
+        task_repository::create_in_transaction(&conn, unassigned).unwrap();
 
         let conn = AsyncMutex::new(conn);
         let feed = assemble_event_feed(
@@ -1882,7 +1882,7 @@ mod tests {
         // message -- in production this is exactly the scenario BL-R21-1
         // fixed: a newer, unbounded event dragging a naive global max()
         // cursor past undelivered messages.
-        task_repository::create(
+        task_repository::create_in_transaction(
             &conn,
             NewTask {
                 task_id: Some("task_newer"),
