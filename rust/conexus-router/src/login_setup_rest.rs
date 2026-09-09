@@ -716,13 +716,15 @@ mod http_tests {
     /// `path_policy::UNAUTH_PREFIXES`-exempt from all three in the
     /// real app anyway). `_dir` must outlive the router (the project
     /// registry's backing file lives under it).
-    fn test_app() -> (tempfile::TempDir, Arc<RouterState>, Router) {
+    async fn test_app() -> (tempfile::TempDir, Arc<RouterState>, Router) {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conexus_db::schema::init_router_schema(&conn).unwrap();
         let dir = tempfile::TempDir::new().unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
+        let sea_orm_db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
         let state = Arc::new(RouterState::new(
             conn,
+            sea_orm_db,
             registry,
             RateLimitConfig::resolve_from_process_env(),
             EnsureConfig::from_env(|_| None),
@@ -824,7 +826,7 @@ mod http_tests {
 
     #[tokio::test]
     async fn login_post_rejects_a_multipart_body_with_401_not_500() {
-        let (_dir, _state, router) = test_app();
+        let (_dir, _state, router) = test_app().await;
         let body = multipart_body("XBOUNDARY", true, true);
         let (status, _headers) = post(
             &router,
@@ -838,7 +840,7 @@ mod http_tests {
 
     #[tokio::test]
     async fn login_post_password_only_as_a_file_part_is_401_not_500() {
-        let (_dir, state, router) = test_app();
+        let (_dir, state, router) = test_app().await;
         {
             let mut conn = state.conn.lock().await;
             identity::create_user(
@@ -866,7 +868,7 @@ mod http_tests {
 
     #[tokio::test]
     async fn setup_post_rejects_a_multipart_body_with_400_not_500() {
-        let (_dir, _state, router) = test_app();
+        let (_dir, _state, router) = test_app().await;
         let body = multipart_body("XBOUNDARY", true, false);
         let (status, _headers) = post(
             &router,
@@ -882,7 +884,7 @@ mod http_tests {
 
     #[tokio::test]
     async fn login_post_urlencoded_credentials_still_authenticate() {
-        let (_dir, state, router) = test_app();
+        let (_dir, state, router) = test_app().await;
         {
             let mut conn = state.conn.lock().await;
             identity::create_user(
@@ -915,7 +917,7 @@ mod http_tests {
 
     #[tokio::test]
     async fn setup_post_urlencoded_fields_still_create_the_first_operator() {
-        let (_dir, state, router) = test_app();
+        let (_dir, state, router) = test_app().await;
         let (status, headers) = post(
             &router,
             "/agent-mcp/setup",
@@ -935,7 +937,7 @@ mod http_tests {
 
     #[tokio::test]
     async fn login_post_sso_passwordless_user_is_401_not_500() {
-        let (_dir, state, router) = test_app();
+        let (_dir, state, router) = test_app().await;
         {
             let mut conn = state.conn.lock().await;
             identity::create_sso_user(&mut conn, "sso-victim", "sub-1", None, false, false, NOW)
@@ -965,7 +967,7 @@ mod http_tests {
         // that it names an SSO account. POST one fixed username while
         // it's an SSO row, delete the row, then POST the identical
         // request again: both responses must be byte-identical 401s.
-        let (_dir, state, router) = test_app();
+        let (_dir, state, router) = test_app().await;
         {
             let mut conn = state.conn.lock().await;
             // A second account keeps the users table non-empty after
@@ -1030,7 +1032,7 @@ mod http_tests {
     async fn login_post_sso_account_status_and_copy_match_wrong_password_path() {
         // Port of `test_sec_r17_sso_login_enum_oracle.py::test_sso_
         // login_status_matches_wrong_password_path`.
-        let (_dir, state, router) = test_app();
+        let (_dir, state, router) = test_app().await;
         {
             let mut conn = state.conn.lock().await;
             identity::create_user(
@@ -1073,7 +1075,7 @@ mod http_tests {
 
     #[tokio::test]
     async fn login_post_invalid_utf8_body_is_401_not_500() {
-        let (_dir, _state, router) = test_app();
+        let (_dir, _state, router) = test_app().await;
         let (status, headers) = post(
             &router,
             "/agent-mcp/login",
@@ -1087,7 +1089,7 @@ mod http_tests {
 
     #[tokio::test]
     async fn setup_post_invalid_utf8_body_is_4xx_not_500() {
-        let (_dir, _state, router) = test_app();
+        let (_dir, _state, router) = test_app().await;
         let (status, _headers) = post(
             &router,
             "/agent-mcp/setup",

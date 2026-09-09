@@ -294,13 +294,15 @@ mod tests {
     use crate::state::RouterStateConfig;
     use conexus_db::schema::init_router_schema;
 
-    fn test_router_state() -> (tempfile::TempDir, Arc<RouterState>) {
+    async fn test_router_state() -> (tempfile::TempDir, Arc<RouterState>) {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         init_router_schema(&conn).unwrap();
         let dir = tempfile::TempDir::new().unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
+        let sea_orm_db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
         let state = Arc::new(RouterState::new(
             conn,
+            sea_orm_db,
             registry,
             RateLimitConfig::resolve(|_| None),
             EnsureConfig::from_env(|_| None),
@@ -331,17 +333,19 @@ mod tests {
         assert!(peer.uds_uid.is_none());
     }
 
-    #[test]
-    fn is_request_trusted_reflects_the_configured_allowlist() {
+    #[tokio::test]
+    async fn is_request_trusted_reflects_the_configured_allowlist() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         init_router_schema(&conn).unwrap();
         let dir = tempfile::TempDir::new().unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
+        let sea_orm_db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
         let mut rate_limit_config = RateLimitConfig::resolve(|_| None);
         rate_limit_config.trusted_proxies =
             std::collections::HashSet::from(["10.0.0.5".parse().unwrap()]);
         let state = RouterState::new(
             conn,
+            sea_orm_db,
             registry,
             rate_limit_config,
             EnsureConfig::from_env(|_| None),
@@ -431,7 +435,7 @@ mod tests {
 
         #[tokio::test]
         async fn a_handler_returned_500_still_carries_the_full_hardened_header_set() {
-            let (_dir, state) = test_router_state();
+            let (_dir, state) = test_router_state().await;
             let app = Router::new()
                 .route("/boom", get(boom))
                 .layer(axum::middleware::from_fn_with_state(
@@ -455,7 +459,7 @@ mod tests {
         /// synthetic error status.
         #[tokio::test]
         async fn an_inner_session_gate_rejection_still_carries_the_full_hardened_header_set() {
-            let (_dir, state) = test_router_state();
+            let (_dir, state) = test_router_state().await;
             let protected = Router::new()
                 .route(
                     "/agent-mcp/app/secret/",

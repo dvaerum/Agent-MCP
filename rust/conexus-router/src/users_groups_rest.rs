@@ -861,13 +861,15 @@ mod tests {
 
     const NOW: &str = "2026-01-01T00:00:00.000+00:00";
 
-    fn real_state() -> (tempfile::TempDir, Arc<RouterState>) {
+    async fn real_state() -> (tempfile::TempDir, Arc<RouterState>) {
         let dir = tempfile::TempDir::new().unwrap();
         let conn = Connection::open_in_memory().unwrap();
         init_router_schema(&conn).unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
+        let sea_orm_db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
         let state = Arc::new(RouterState::new(
             conn,
+            sea_orm_db,
             registry,
             RateLimitConfig::resolve(|_| None),
             EnsureConfig::from_env(|_| None),
@@ -1020,7 +1022,7 @@ mod tests {
     /// had zero test coverage proving it -- verified here end-to-end.
     #[tokio::test]
     async fn list_users_handler_denies_a_viewer_with_no_capability() {
-        let (_dir, state) = real_state();
+        let (_dir, state) = real_state().await;
         let (_vera_id, _group_id, identity) = seed_delegate(&state, "vera", &[]).await;
         let resp = list_users_handler(State(state.clone()), Extension(identity)).await;
         assert_eq!(resp_status(&resp), 403);
@@ -1034,7 +1036,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_groups_handler_denies_a_viewer_with_no_capability() {
-        let (_dir, state) = real_state();
+        let (_dir, state) = real_state().await;
         let (_vera_id, _group_id, identity) = seed_delegate(&state, "vera", &[]).await;
         let resp = list_groups_handler(State(state.clone()), Extension(identity)).await;
         assert_eq!(resp_status(&resp), 403);
@@ -1048,7 +1050,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_project_memberships_handler_denies_a_viewer_with_no_capability() {
-        let (_dir, state) = real_state();
+        let (_dir, state) = real_state().await;
         let (_vera_id, _group_id, identity) = seed_delegate(&state, "vera", &[]).await;
         state
             .registry
@@ -1075,7 +1077,7 @@ mod tests {
     /// read path.
     #[tokio::test]
     async fn list_users_handler_admits_a_delegated_capability_holder() {
-        let (_dir, state) = real_state();
+        let (_dir, state) = real_state().await;
         let (_alice_id, _group_id, identity) =
             seed_delegate(&state, "alice", &[Capability::SystemUsersManage.as_str()]).await;
         let resp = list_users_handler(State(state.clone()), Extension(identity)).await;
@@ -1084,7 +1086,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_groups_handler_admits_a_delegated_capability_holder() {
-        let (_dir, state) = real_state();
+        let (_dir, state) = real_state().await;
         let (_alice_id, _group_id, identity) =
             seed_delegate(&state, "alice", &[Capability::SystemGroupsManage.as_str()]).await;
         let resp = list_groups_handler(State(state.clone()), Extension(identity)).await;
@@ -1093,7 +1095,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_project_memberships_handler_admits_a_sysadmin() {
-        let (_dir, state) = real_state();
+        let (_dir, state) = real_state().await;
         state
             .registry
             .register("alpha", "/ws/alpha", "python", chrono::Utc::now())
@@ -1133,7 +1135,7 @@ mod tests {
     /// here end-to-end through the real handler.
     #[tokio::test]
     async fn create_user_handler_denies_deep_json_with_a_clean_400_not_a_crash() {
-        let (_dir, state) = real_state();
+        let (_dir, state) = real_state().await;
         let (_dev_id, _group_id, identity) =
             seed_delegate(&state, "dev", &[Capability::SystemUsersManage.as_str()]).await;
 
@@ -1169,7 +1171,7 @@ mod tests {
     /// end-to-end through the real handler.
     #[tokio::test]
     async fn create_user_handler_strips_hidden_unicode_from_email() {
-        let (_dir, state) = real_state();
+        let (_dir, state) = real_state().await;
         let (_dev_id, _group_id, identity) =
             seed_delegate(&state, "dev", &[Capability::SystemUsersManage.as_str()]).await;
 
@@ -1201,7 +1203,7 @@ mod tests {
     /// legitimate content.
     #[tokio::test]
     async fn create_user_handler_preserves_real_non_latin_email() {
-        let (_dir, state) = real_state();
+        let (_dir, state) = real_state().await;
         let (_dev_id, _group_id, identity) =
             seed_delegate(&state, "dev", &[Capability::SystemUsersManage.as_str()]).await;
 
@@ -1227,7 +1229,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_user_handler_denies_off_a_capability_revoked_before_the_call() {
-        let (_dir, state) = real_state();
+        let (_dir, state) = real_state().await;
         let (_dev_id, group_id, identity) =
             seed_delegate(&state, "dev", &[Capability::SystemUsersManage.as_str()]).await;
         revoke_capability(&state, &group_id).await;
@@ -1262,7 +1264,7 @@ mod tests {
     /// `identity.is_sysadmin`.
     #[tokio::test]
     async fn edit_user_handler_denies_a_sysadmin_grant_off_a_capability_revoked_before_the_call() {
-        let (_dir, state) = real_state();
+        let (_dir, state) = real_state().await;
         let (dev_id, group_id, identity) =
             seed_delegate(&state, "dev", &[Capability::SystemUsersManage.as_str()]).await;
         let (victim_id, _victim_group, _victim_identity) =
@@ -1297,7 +1299,7 @@ mod tests {
     /// enough on its own if the underlying SESSION is already dead.
     #[tokio::test]
     async fn edit_user_handler_denies_a_session_logged_out_before_the_call() {
-        let (_dir, state) = real_state();
+        let (_dir, state) = real_state().await;
         let (dev_id, _group_id, identity) =
             seed_delegate(&state, "dev", &[Capability::SystemUsersManage.as_str()]).await;
         let (victim_id, _victim_group, _victim_identity) =
@@ -1344,7 +1346,7 @@ mod tests {
     #[tokio::test]
     async fn create_group_handler_denies_a_sysadmin_flagged_group_off_a_capability_revoked_before_the_call(
     ) {
-        let (_dir, state) = real_state();
+        let (_dir, state) = real_state().await;
         let (_dev_id, group_id, identity) =
             seed_delegate(&state, "dev", &[Capability::SystemGroupsManage.as_str()]).await;
         revoke_capability(&state, &group_id).await;
@@ -1379,7 +1381,7 @@ mod tests {
 
     #[tokio::test]
     async fn edit_group_handler_denies_off_a_capability_revoked_before_the_call() {
-        let (_dir, state) = real_state();
+        let (_dir, state) = real_state().await;
         let (_dev_id, group_id, identity) =
             seed_delegate(&state, "dev", &[Capability::SystemGroupsManage.as_str()]).await;
         let target_group_id = {
@@ -1415,7 +1417,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_group_member_handler_denies_off_a_capability_revoked_before_the_call() {
-        let (_dir, state) = real_state();
+        let (_dir, state) = real_state().await;
         let (_dev_id, group_id, identity) =
             seed_delegate(&state, "dev", &[Capability::SystemGroupsManage.as_str()]).await;
         let (newbie_id, _newbie_group, _newbie_identity) =
@@ -1449,7 +1451,7 @@ mod tests {
 
     #[tokio::test]
     async fn replace_group_capabilities_handler_denies_off_a_capability_revoked_before_the_call() {
-        let (_dir, state) = real_state();
+        let (_dir, state) = real_state().await;
         let (_dev_id, group_id, identity) = seed_delegate(
             &state,
             "dev",
@@ -1487,7 +1489,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_project_membership_handler_denies_off_a_capability_revoked_before_the_call() {
-        let (_dir, state) = real_state();
+        let (_dir, state) = real_state().await;
         let (dev_id, group_id, identity) =
             seed_delegate(&state, "dev", &[Capability::SystemProjectsManage.as_str()]).await;
         let (newbie_id, _newbie_group, _newbie_identity) =
@@ -1543,7 +1545,7 @@ mod tests {
     /// delegate hit this wrong 403, not just the TOCTOU-race shape.
     #[tokio::test]
     async fn add_project_membership_handler_denies_a_zero_membership_delegate_with_uniform_404() {
-        let (_dir, state) = real_state();
+        let (_dir, state) = real_state().await;
         let (alice_id, _group_id, identity) = seed_delegate(
             &state,
             "alice",
@@ -1588,7 +1590,7 @@ mod tests {
     /// SAME uniform 404 must fire, not the old 403.
     #[tokio::test]
     async fn add_project_membership_handler_denies_off_a_membership_revoked_before_the_call() {
-        let (_dir, state) = real_state();
+        let (_dir, state) = real_state().await;
         let (alice_id, _group_id, identity) = seed_delegate(
             &state,
             "alice",
@@ -1645,7 +1647,7 @@ mod tests {
     #[tokio::test]
     async fn change_project_membership_role_handler_denies_off_a_capability_revoked_before_the_call(
     ) {
-        let (_dir, state) = real_state();
+        let (_dir, state) = real_state().await;
         let (dev_id, group_id, identity) =
             seed_delegate(&state, "dev", &[Capability::SystemProjectsManage.as_str()]).await;
         let (target_id, _target_group, _target_identity) =
@@ -1694,7 +1696,7 @@ mod tests {
     #[tokio::test]
     async fn change_project_membership_role_handler_denies_a_zero_membership_delegate_with_uniform_404(
     ) {
-        let (_dir, state) = real_state();
+        let (_dir, state) = real_state().await;
         let (_alice_id, _group_id, identity) = seed_delegate(
             &state,
             "alice",
@@ -1750,7 +1752,7 @@ mod tests {
     #[tokio::test]
     async fn delete_project_membership_handler_denies_a_zero_membership_delegate_with_uniform_404()
     {
-        let (_dir, state) = real_state();
+        let (_dir, state) = real_state().await;
         let (_alice_id, _group_id, identity) = seed_delegate(
             &state,
             "alice",
@@ -1796,7 +1798,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_racing_edit_user_still_succeeds() {
-        let (_dir, state) = real_state();
+        let (_dir, state) = real_state().await;
         let (_dev_id, _group_id, identity) =
             seed_delegate(&state, "dev", &[Capability::SystemUsersManage.as_str()]).await;
         let (victim_id, _victim_group, _victim_identity) =

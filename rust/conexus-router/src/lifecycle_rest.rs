@@ -923,13 +923,15 @@ mod handler_tests {
     /// `_dir` must outlive the state (the project registry's backing
     /// file, and every real workspace dir a test creates, live under
     /// it).
-    fn test_state() -> (tempfile::TempDir, Arc<RouterState>) {
+    async fn test_state() -> (tempfile::TempDir, Arc<RouterState>) {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         init_router_schema(&conn).unwrap();
         let dir = tempfile::TempDir::new().unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
+        let sea_orm_db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
         let state = Arc::new(RouterState::new(
             conn,
+            sea_orm_db,
             registry,
             RateLimitConfig::resolve_from_process_env(),
             EnsureConfig::from_env(|_| None),
@@ -1020,7 +1022,7 @@ mod handler_tests {
 
     #[tokio::test]
     async fn delete_project_handler_denies_a_non_cap_caller_before_any_destructive_step() {
-        let (dir, state) = test_state();
+        let (dir, state) = test_state().await;
         let ws = dir.path().join("workspaces").join("proj-a");
         register(&state, "proj-a", &ws);
         std::fs::write(ws.join("marker.txt"), b"still here").unwrap();
@@ -1059,7 +1061,7 @@ mod handler_tests {
 
     #[tokio::test]
     async fn stop_project_handler_denies_a_non_cap_caller() {
-        let (_dir, state) = test_state();
+        let (_dir, state) = test_state().await;
         let identity = identity_for("vera", false, HashSet::new());
         let resp = stop_project_handler(
             State(state.clone()),
@@ -1079,7 +1081,7 @@ mod handler_tests {
 
     #[tokio::test]
     async fn alias_usage_handler_denies_a_non_cap_caller() {
-        let (_dir, state) = test_state();
+        let (_dir, state) = test_state().await;
         let identity = identity_for("vera", false, HashSet::new());
         let resp = alias_usage_handler(
             State(state.clone()),
@@ -1098,7 +1100,7 @@ mod handler_tests {
 
     #[tokio::test]
     async fn remove_alias_handler_denies_a_non_cap_caller() {
-        let (_dir, state) = test_state();
+        let (_dir, state) = test_state().await;
         let identity = identity_for("vera", false, HashSet::new());
         let resp = remove_alias_handler(
             State(state.clone()),
@@ -1118,7 +1120,7 @@ mod handler_tests {
         // the new capability gate must not over-reject the legitimate
         // Wave-9 delegation shape every other lifecycle route already
         // supports.
-        let (dir, state) = test_state();
+        let (dir, state) = test_state().await;
         register(
             &state,
             "victim",
@@ -1177,7 +1179,7 @@ mod handler_tests {
 
     #[tokio::test]
     async fn delete_project_handler_drops_its_own_ensure_lock_on_success() {
-        let (dir, state) = test_state();
+        let (dir, state) = test_state().await;
         let uid = seed_real_sysadmin(&state, "root").await;
         register(
             &state,
@@ -1207,7 +1209,7 @@ mod handler_tests {
 
     #[tokio::test]
     async fn delete_project_handler_leaves_a_sibling_project_lock_untouched() {
-        let (dir, state) = test_state();
+        let (dir, state) = test_state().await;
         let uid = seed_real_sysadmin(&state, "root").await;
         register(&state, "gone", &dir.path().join("workspaces").join("gone"));
         register(
@@ -1237,7 +1239,7 @@ mod handler_tests {
 
     #[tokio::test]
     async fn rename_project_handler_drops_its_own_ensure_lock_on_success() {
-        let (dir, state) = test_state();
+        let (dir, state) = test_state().await;
         let uid = seed_real_sysadmin(&state, "root").await;
         register(
             &state,
@@ -1273,7 +1275,7 @@ mod handler_tests {
         // minted for it -- the pop only ever runs on the SUCCESS path,
         // mirroring `admin_api.py`'s own placement of this exact call
         // strictly after the block that acquires the lock.
-        let (dir, state) = test_state();
+        let (dir, state) = test_state().await;
         let uid = seed_real_sysadmin(&state, "root").await;
         register(
             &state,
@@ -1424,7 +1426,7 @@ mod handler_tests {
 
     #[tokio::test]
     async fn delete_project_handler_toctou_race_active_conns_lands_before_stop_gets_409() {
-        let (dir, state) = test_state();
+        let (dir, state) = test_state().await;
         let uid = seed_real_sysadmin(&state, "root").await;
         register(
             &state,
@@ -1466,7 +1468,7 @@ mod handler_tests {
 
     #[tokio::test]
     async fn rename_project_handler_toctou_race_active_conns_lands_before_stop_gets_409() {
-        let (dir, state) = test_state();
+        let (dir, state) = test_state().await;
         let uid = seed_real_sysadmin(&state, "root").await;
         register(
             &state,
@@ -1504,7 +1506,7 @@ mod handler_tests {
 
     #[tokio::test]
     async fn stop_project_handler_toctou_race_active_conns_lands_before_stop_gets_409() {
-        let (dir, state) = test_state();
+        let (dir, state) = test_state().await;
         let uid = seed_real_sysadmin(&state, "root").await;
         register(
             &state,
@@ -1545,7 +1547,7 @@ mod handler_tests {
 
     #[tokio::test]
     async fn delete_project_handler_denies_a_capability_revoked_while_blocked_on_the_lock() {
-        let (dir, state) = test_state();
+        let (dir, state) = test_state().await;
         register(
             &state,
             "race-delete-project",
@@ -1583,7 +1585,7 @@ mod handler_tests {
 
     #[tokio::test]
     async fn stop_project_handler_denies_a_capability_revoked_while_blocked_on_the_lock() {
-        let (dir, state) = test_state();
+        let (dir, state) = test_state().await;
         register(
             &state,
             "race-stop-project",
@@ -1623,7 +1625,7 @@ mod handler_tests {
 
     #[tokio::test]
     async fn rename_project_handler_denies_a_capability_revoked_while_blocked_on_the_lock() {
-        let (dir, state) = test_state();
+        let (dir, state) = test_state().await;
         register(
             &state,
             "race-rename-lock",
@@ -1662,7 +1664,7 @@ mod handler_tests {
 
     #[tokio::test]
     async fn rename_project_handler_denies_a_membership_revoked_while_blocked_on_the_lock() {
-        let (dir, state) = test_state();
+        let (dir, state) = test_state().await;
         register(
             &state,
             "race-rename-lock-membership",
@@ -1737,7 +1739,7 @@ mod handler_tests {
 
     #[tokio::test]
     async fn stop_project_handler_pops_the_project_orchestrator_state() {
-        let (dir, state) = test_state();
+        let (dir, state) = test_state().await;
         let uid = seed_real_sysadmin(&state, "root").await;
         register(
             &state,
@@ -1778,7 +1780,7 @@ mod handler_tests {
 
     #[tokio::test]
     async fn rename_project_handler_pops_the_old_name_orchestrator_state() {
-        let (dir, state) = test_state();
+        let (dir, state) = test_state().await;
         let uid = seed_real_sysadmin(&state, "root").await;
         register(
             &state,
@@ -1809,7 +1811,7 @@ mod handler_tests {
 
     #[tokio::test]
     async fn rename_project_handler_purges_the_old_name_runtime_dir() {
-        let (dir, state) = test_state();
+        let (dir, state) = test_state().await;
         let uid = seed_real_sysadmin(&state, "root").await;
         register(&state, "runt", &dir.path().join("workspaces").join("runt"));
         let runtime_dir = state.sock_dir.join("runt");
@@ -1855,15 +1857,17 @@ mod handler_tests {
         }
     }
 
-    fn test_state_with_ensure_config(
+    async fn test_state_with_ensure_config(
         ensure_config: EnsureConfig,
     ) -> (tempfile::TempDir, Arc<RouterState>) {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         init_router_schema(&conn).unwrap();
         let dir = tempfile::TempDir::new().unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
+        let sea_orm_db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
         let state = Arc::new(RouterState::new(
             conn,
+            sea_orm_db,
             registry,
             RateLimitConfig::resolve_from_process_env(),
             ensure_config,
@@ -1955,7 +1959,7 @@ exit 0
         let release = dir.path().join("release");
         let (program, _log) =
             write_fake_systemctl_blocking_on_stop(dir.path(), "contended", &started, &release, 3);
-        let (state_dir, state) = test_state_with_ensure_config(fast_ensure_config(&program));
+        let (state_dir, state) = test_state_with_ensure_config(fast_ensure_config(&program)).await;
         let uid = seed_real_sysadmin(&state, "root").await;
         register(
             &state,
@@ -2034,7 +2038,7 @@ exit 0
         // call runs to completion immediately.
         let (program, _log) =
             write_fake_systemctl_blocking_on_stop(dir.path(), "losesrc", &started, &release, 3);
-        let (state_dir, state) = test_state_with_ensure_config(fast_ensure_config(&program));
+        let (state_dir, state) = test_state_with_ensure_config(fast_ensure_config(&program)).await;
         let uid = seed_real_sysadmin(&state, "root").await;
         register(
             &state,
@@ -2104,7 +2108,7 @@ exit 0
         let release = dir.path().join("release");
         let (program, _log) =
             write_fake_systemctl_blocking_on_stop(dir.path(), "mover", &started, &release, 3);
-        let (state_dir, state) = test_state_with_ensure_config(fast_ensure_config(&program));
+        let (state_dir, state) = test_state_with_ensure_config(fast_ensure_config(&program)).await;
         let uid = seed_real_sysadmin(&state, "root").await;
         register(
             &state,
@@ -2174,7 +2178,7 @@ exit 0
     /// the identical ~10k-deep repro shape the Python finding used.
     #[tokio::test]
     async fn create_project_handler_denies_deep_json_with_a_clean_400_not_a_crash() {
-        let (_dir, state) = test_state();
+        let (_dir, state) = test_state().await;
         let uid = seed_real_sysadmin(&state, "root").await;
         let identity = identity_for(&uid, true, HashSet::new());
 
