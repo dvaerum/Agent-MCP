@@ -312,6 +312,22 @@ async fn main() -> Result<()> {
     let db_path = boot::router_db_path(get_env);
     let conn = boot::open_and_init_router_db(&db_path)
         .with_context(|| format!("boot router database at {}", db_path.display()))?;
+    // Phase G (sea-orm migration, router step 4 PR B): a second,
+    // sea-orm-flavored handle onto the SAME SQLite file `conn` above
+    // just opened/initialized -- see `state::RouterState::sea_orm_db`'s
+    // own doc for why this coexists with the legacy rusqlite
+    // connection rather than replacing it. Opened AFTER
+    // `open_and_init_router_db` so the schema already exists (same
+    // rusqlite-creates-then-sea-orm-connects sequencing
+    // `conexus-backend`'s own main.rs already uses).
+    let sea_orm_db = sea_orm::Database::connect(format!("sqlite://{}", db_path.display()))
+        .await
+        .with_context(|| {
+            format!(
+                "open sea-orm connection to router database {}",
+                db_path.display()
+            )
+        })?;
 
     let projects_file = cli
         .projects_file
@@ -339,6 +355,7 @@ async fn main() -> Result<()> {
 
     let state = std::sync::Arc::new(state::RouterState::new(
         conn,
+        sea_orm_db,
         registry,
         rate_limit_config,
         ensure_config,

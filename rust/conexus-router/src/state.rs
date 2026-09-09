@@ -74,6 +74,12 @@ pub struct RouterStateConfig {
 
 pub struct RouterState {
     pub conn: AsyncMutex<rusqlite::Connection>,
+    /// Phase G (sea-orm migration, router step 4 PR B): a sea-orm
+    /// connection opened onto the SAME underlying SQLite file as
+    /// `conn` above, threaded ahead of its first real consumer -- see
+    /// `conexus_backend::server::SharedState::sea_orm_db`'s own doc
+    /// for why both connection types coexist during the migration.
+    pub sea_orm_db: sea_orm::DatabaseConnection,
     pub registry: ProjectRegistry,
     pub runtime: RuntimeStore,
     /// `Arc`-wrapped (rather than bare, like every other field here)
@@ -108,6 +114,7 @@ impl RouterState {
     /// `::new()`).
     pub fn new(
         conn: rusqlite::Connection,
+        sea_orm_db: sea_orm::DatabaseConnection,
         registry: ProjectRegistry,
         rate_limit_config: RateLimitConfig,
         ensure_config: EnsureConfig,
@@ -116,6 +123,7 @@ impl RouterState {
         let rate_limit_state = RateLimitState::new(&rate_limit_config);
         Self {
             conn: AsyncMutex::new(conn),
+            sea_orm_db,
             registry,
             runtime: RuntimeStore::new(),
             stream_caps: std::sync::Arc::new(StreamCapRegistry::new(
@@ -185,14 +193,16 @@ mod tests {
         }
     }
 
-    #[test]
-    fn new_assembles_every_subsystem_from_cli_config() {
+    #[tokio::test]
+    async fn new_assembles_every_subsystem_from_cli_config() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         init_router_schema(&conn).unwrap();
         let dir = tempfile::TempDir::new().unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
+        let sea_orm_db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
         let state = RouterState::new(
             conn,
+            sea_orm_db,
             registry,
             RateLimitConfig::resolve_from_process_env(),
             EnsureConfig::from_env(|_| None),
@@ -204,16 +214,18 @@ mod tests {
         assert!(state.session_gate_config.single_tenant_name.is_none());
     }
 
-    #[test]
-    fn new_threads_single_tenant_name_into_both_configs() {
+    #[tokio::test]
+    async fn new_threads_single_tenant_name_into_both_configs() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         init_router_schema(&conn).unwrap();
         let dir = tempfile::TempDir::new().unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
+        let sea_orm_db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
         let mut config = test_config();
         config.single_tenant_name = Some("demo".to_string());
         let state = RouterState::new(
             conn,
+            sea_orm_db,
             registry,
             RateLimitConfig::resolve_from_process_env(),
             EnsureConfig::from_env(|_| None),
@@ -229,17 +241,19 @@ mod tests {
         );
     }
 
-    #[test]
-    fn new_makes_the_health_route_public_and_threads_workspace_and_token_dirs() {
+    #[tokio::test]
+    async fn new_makes_the_health_route_public_and_threads_workspace_and_token_dirs() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         init_router_schema(&conn).unwrap();
         let dir = tempfile::TempDir::new().unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
+        let sea_orm_db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
         let mut config = test_config();
         config.default_workspace_parent = dir.path().join("workspaces");
         config.token_dir = Some(dir.path().join("tokens"));
         let state = RouterState::new(
             conn,
+            sea_orm_db,
             registry,
             RateLimitConfig::resolve_from_process_env(),
             EnsureConfig::from_env(|_| None),

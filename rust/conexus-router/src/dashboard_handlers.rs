@@ -330,13 +330,15 @@ mod tests {
     use crate::state::{RouterState, RouterStateConfig};
     use conexus_db::schema::init_router_schema;
 
-    fn real_state() -> (tempfile::TempDir, Arc<RouterState>) {
+    async fn real_state() -> (tempfile::TempDir, Arc<RouterState>) {
         let dir = tempfile::TempDir::new().unwrap();
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         init_router_schema(&conn).unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
+        let sea_orm_db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
         let state = Arc::new(RouterState::new(
             conn,
+            sea_orm_db,
             registry,
             RateLimitConfig::resolve(|_| None),
             EnsureConfig::from_env(|_| None),
@@ -392,7 +394,7 @@ mod tests {
 
     #[tokio::test]
     async fn schedule_backend_warm_skips_a_project_already_known_active() {
-        let (_dir, state) = real_state();
+        let (_dir, state) = real_state().await;
         state.runtime.with_runtime_mut("proj-a", |rt| {
             rt.last_active
                 .insert("backend".to_string(), std::time::SystemTime::now());
@@ -405,7 +407,7 @@ mod tests {
 
     #[tokio::test]
     async fn schedule_backend_warm_marks_inflight_for_a_not_yet_active_project() {
-        let (_dir, state) = real_state();
+        let (_dir, state) = real_state().await;
         // A single-threaded runtime: the spawned task cannot run until
         // this test itself yields/awaits, so the flag is still
         // observably `true` right after the call returns.
@@ -426,7 +428,7 @@ mod tests {
 
     #[tokio::test]
     async fn dashboard_handler_impl_does_not_warm_when_not_authorized() {
-        let (_dir, state) = real_state();
+        let (_dir, state) = real_state().await;
         // Mirrors an authenticated NON-MEMBER's `GET /app/<victim>/`:
         // `session_gate_layer` maps that to `WarmAuthorized(false)` (see
         // that type's own doc) -- the shell is still served (asserted via
@@ -455,7 +457,7 @@ mod tests {
 
     #[tokio::test]
     async fn dashboard_handler_impl_warms_when_authorized() {
-        let (_dir, state) = real_state();
+        let (_dir, state) = real_state().await;
         // Mirrors an authorized member/sysadmin's `GET /app/<name>/`:
         // `session_gate_layer` maps that to `WarmAuthorized(true)`.
         let _ = dashboard_handler_impl(

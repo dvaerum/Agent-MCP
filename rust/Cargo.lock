@@ -527,6 +527,7 @@ dependencies = [
  "regex",
  "reqwest",
  "rusqlite",
+ "sea-orm",
  "serde",
  "serde_json",
  "sha2",

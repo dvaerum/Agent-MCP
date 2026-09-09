@@ -21,6 +21,18 @@ path = "src/main.rs"
 # just a convention).
 conexus-core = { path = "../conexus-core" }
 conexus-db = { path = "../conexus-db" }
+# RouterState::sea_orm_db (Phase G, router step 4 PR B) -- a second,
+# sea-orm-flavored handle opened onto the SAME router SQLite file the
+# existing rusqlite `conn` already targets. Threaded ahead of its
+# first real consumer, same "helpers ahead of their first consumer"
+# precedent this file's own doc comment already uses elsewhere.
+# Matches conexus-db's/conexus-backend's own sea-orm entry exactly
+# (same version/features).
+sea-orm = { version = "2", default-features = false, features = [
+    "macros",
+    "sqlx-sqlite",
+    "runtime-tokio-rustls",
+] }
 # session_gate.rs (Phase E2 PR 12) is the FIRST real consumer:
 # resolve_capabilities()/Principal construction at the operator-
 # session seam, exactly the "conexus-auth ONLY, never conexus-tools/
