@@ -45,8 +45,12 @@
 //!   code.
 
 use rusqlite::{Connection, OptionalExtension, Result, Row, ToSql};
+use sea_orm::{
+    ColumnTrait, DatabaseConnection, DbErr, EntityTrait, PaginatorTrait, QueryFilter, QuerySelect,
+};
 use std::collections::HashMap;
 
+use crate::entity::task::{Column, Entity};
 use crate::scheduled_directive_repository::NullableUpdate;
 
 /// One note entry in a task's `notes` JSON list.
@@ -144,12 +148,22 @@ pub fn list_all(conn: &Connection, limit: Option<i64>) -> Result<Vec<TaskRow>> {
     }
 }
 
-pub fn count_by_status(conn: &Connection) -> Result<HashMap<String, i64>> {
-    let mut stmt = conn.prepare("SELECT status, COUNT(*) FROM tasks GROUP BY status")?;
-    let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-    })?;
-    rows.collect()
+/// Task count per `status`. Built via sea-orm's typed aggregate query
+/// (`select_only` + `column_as(.count(), ..)` + `group_by`), not a raw
+/// `Statement` escape hatch -- `QuerySelect` cleanly expresses this
+/// exact `GROUP BY status, COUNT(*)` shape (proven by sea-orm's own
+/// `relational_tests::group_by` test), so there's nothing here a raw
+/// SQL string would express more simply.
+pub async fn count_by_status(db: &DatabaseConnection) -> Result<HashMap<String, i64>, DbErr> {
+    let counts: Vec<(String, i64)> = Entity::find()
+        .select_only()
+        .column(Column::Status)
+        .column_as(Column::TaskId.count(), "count")
+        .group_by(Column::Status)
+        .into_tuple()
+        .all(db)
+        .await?;
+    Ok(counts.into_iter().collect())
 }
 
 /// Tasks for one agent, newest first, with an optional status filter
@@ -271,20 +285,17 @@ pub fn list_unassigned_active_updated_since(
 /// `_TERMINAL_TASK_STATUSES = ("completed", "cancelled", "failed")`,
 /// a separate tuple from every other terminal-status constant in this
 /// codebase, not a shared import.
-pub fn count_active_by_assignee(
-    conn: &Connection,
+pub async fn count_active_by_assignee(
+    db: &DatabaseConnection,
     agent_id: &str,
     excluded_statuses: &[&str],
-) -> Result<i64> {
-    let placeholders = std::iter::repeat_n("?", excluded_statuses.len())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "SELECT COUNT(*) FROM tasks WHERE assigned_to = ? AND status NOT IN ({placeholders})"
-    );
-    let mut params: Vec<&dyn ToSql> = vec![&agent_id];
-    params.extend(excluded_statuses.iter().map(|s| s as &dyn ToSql));
-    conn.query_row(&sql, params.as_slice(), |row| row.get(0))
+) -> Result<i64, DbErr> {
+    let count = Entity::find()
+        .filter(Column::AssignedTo.eq(agent_id))
+        .filter(Column::Status.is_not_in(excluded_statuses.iter().copied()))
+        .count(db)
+        .await?;
+    Ok(count as i64)
 }
 
 /// Parameters for [`create`]. Unlike every other repository's
@@ -595,6 +606,25 @@ mod tests {
         conn
     }
 
+    /// A file-backed DB opened as BOTH a `rusqlite::Connection` (to
+    /// seed rows through the still-sync [`create`]) and a sea-orm
+    /// `DatabaseConnection` (to exercise the now-converted
+    /// [`count_by_status`]/[`count_active_by_assignee`]) -- the same
+    /// dual-connection recipe `pending_directive_repository`/
+    /// `scheduled_directive_repository`'s own tests use, since an
+    /// in-memory `:memory:` DB can't be shared across two separate
+    /// connection handles the way a real file can.
+    async fn test_conn_with_sea_orm() -> (tempfile::TempDir, Connection, DatabaseConnection) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn).unwrap();
+        let db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        (dir, conn, db)
+    }
+
     fn new_task<'a>(id: Option<&'a str>, title: &'a str) -> NewTask<'a> {
         NewTask {
             task_id: id,
@@ -701,9 +731,9 @@ mod tests {
         assert_eq!(limited[0].task_id, "task_2");
     }
 
-    #[test]
-    fn count_by_status_groups_correctly() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn count_by_status_groups_correctly() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         let mut t1 = new_task(Some("task_1"), "a");
         t1.status = "pending";
         create(&conn, t1).unwrap();
@@ -718,7 +748,7 @@ mod tests {
         t3.parent_task = Some("task_1");
         create(&conn, t3).unwrap();
 
-        let counts = count_by_status(&conn).unwrap();
+        let counts = count_by_status(&db).await.unwrap();
         assert_eq!(counts.get("pending"), Some(&2));
         assert_eq!(counts.get("completed"), Some(&1));
     }
@@ -1259,9 +1289,9 @@ mod tests {
 
     // -- count_active_by_assignee -----------------------------------
 
-    #[test]
-    fn count_active_by_assignee_counts_only_this_agents_non_terminal_tasks() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn count_active_by_assignee_counts_only_this_agents_non_terminal_tasks() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         let mut t1 = new_task(Some("task_1"), "active for alice");
         t1.assigned_to = Some("alice");
         create(&conn, t1).unwrap();
@@ -1271,32 +1301,35 @@ mod tests {
         create(&conn, t2).unwrap();
 
         assert_eq!(
-            count_active_by_assignee(&conn, "alice", &["completed", "cancelled", "failed"])
+            count_active_by_assignee(&db, "alice", &["completed", "cancelled", "failed"])
+                .await
                 .unwrap(),
             1
         );
     }
 
-    #[test]
-    fn count_active_by_assignee_excludes_the_given_terminal_statuses() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn count_active_by_assignee_excludes_the_given_terminal_statuses() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         let mut t = new_task(Some("task_1"), "done");
         t.assigned_to = Some("alice");
         t.status = "completed";
         create(&conn, t).unwrap();
 
         assert_eq!(
-            count_active_by_assignee(&conn, "alice", &["completed", "cancelled", "failed"])
+            count_active_by_assignee(&db, "alice", &["completed", "cancelled", "failed"])
+                .await
                 .unwrap(),
             0
         );
     }
 
-    #[test]
-    fn count_active_by_assignee_is_zero_for_an_agent_with_no_tasks() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn count_active_by_assignee_is_zero_for_an_agent_with_no_tasks() {
+        let (_dir, _conn, db) = test_conn_with_sea_orm().await;
         assert_eq!(
-            count_active_by_assignee(&conn, "nobody", &["completed", "cancelled", "failed"])
+            count_active_by_assignee(&db, "nobody", &["completed", "cancelled", "failed"])
+                .await
                 .unwrap(),
             0
         );

@@ -27,4 +27,5 @@ pub mod group_capability;
 pub mod pending_directive;
 pub mod project_context;
 pub mod scheduled_directive;
+pub mod task;
 pub mod task_comment;

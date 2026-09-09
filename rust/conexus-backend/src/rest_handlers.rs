@@ -1292,8 +1292,8 @@ pub async fn delete_setting(
 /// timezone read for one informational field nothing depends on for
 /// correctness.
 pub async fn simple_status(State(shared): State<Arc<SharedState>>) -> Response {
+    let task_counts = conexus_db::task_repository::count_by_status(&shared.sea_orm_db).await;
     let guard = shared.conn.lock().await;
-    let task_counts = conexus_db::task_repository::count_by_status(&guard);
     let agent_counts =
         conexus_db::agent_repository::AgentRepository::count_active_by_status(&guard);
     drop(guard);
