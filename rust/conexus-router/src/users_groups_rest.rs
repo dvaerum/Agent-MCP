@@ -640,15 +640,34 @@ pub async fn list_project_memberships_handler(
     if let Err(resp) = require_project_memberships_capability(&state, &identity) {
         return resp.into_response();
     }
-    let conn = state.conn.lock().await;
-    match admin_project_memberships::decide_list_project_memberships(
-        &conn,
-        &state.registry,
-        identity.is_sysadmin,
-        Some(&identity.user.user_id),
-        &name,
-    ) {
-        Ok(resp) => resp.into_response(),
+    let gate = {
+        let conn = state.conn.lock().await;
+        admin_project_memberships::gate_list_project_memberships(
+            &conn,
+            &state.registry,
+            identity.is_sysadmin,
+            Some(&identity.user.user_id),
+            &name,
+        )
+        // `conn`'s block-scoped borrow ends here -- the gate stays
+        // synchronous (see its own doc) so the actual `sea_orm`-backed
+        // read below runs with `conn` genuinely out of scope.
+    };
+    match gate {
+        Ok(admin_project_memberships::ListProjectMembershipsGate::Rejected(resp)) => {
+            resp.into_response()
+        }
+        Ok(admin_project_memberships::ListProjectMembershipsGate::Proceed) => {
+            match admin_project_memberships::finish_list_project_memberships(
+                &state.sea_orm_db,
+                &name,
+            )
+            .await
+            {
+                Ok(resp) => resp.into_response(),
+                Err(e) => HandlerResponse::from(e).into_response(),
+            }
+        }
         Err(e) => HandlerResponse::from(e).into_response(),
     }
 }
@@ -676,7 +695,6 @@ pub async fn add_project_membership_handler(
     if let Err(resp) = require_project_memberships_capability(&state, &identity) {
         return resp.into_response();
     }
-    let conn = state.conn.lock().await;
     let now_str = Utc::now().to_rfc3339();
     let spec = RevalidationSpec {
         stale_user_id: &identity.user.user_id,
@@ -688,26 +706,53 @@ pub async fn add_project_membership_handler(
             min_role: None,
         }),
     };
-    let (parsed, principal) = match perm_gates::read_body_and_revalidate(&conn, &body, &spec) {
-        Ok(v) => v,
-        Err(resp) => return resp.into_response(),
+    let gate = {
+        let conn = state.conn.lock().await;
+        let (parsed, principal) = match perm_gates::read_body_and_revalidate(&conn, &body, &spec) {
+            Ok(v) => v,
+            Err(resp) => return resp.into_response(),
+        };
+        let parsed_value = serde_json::Value::Object(parsed);
+        let caller_role = match resolve_caller_role_on_project(&conn, &identity.user.user_id, &name)
+        {
+            Ok(r) => r,
+            Err(e) => return HandlerResponse::from(e).into_response(),
+        };
+        admin_project_memberships::gate_add_project_membership(
+            &conn,
+            &state.registry,
+            fresh_is_sysadmin(&principal),
+            &identity.user.username,
+            Some(&identity.user.user_id),
+            caller_role.as_deref(),
+            &name,
+            &parsed_value,
+        )
+        // `conn`'s block-scoped borrow ends here -- the gate stays
+        // synchronous (see its own doc) so the actual `sea_orm`-backed
+        // write below runs with `conn` genuinely out of scope.
     };
-    let parsed_value = serde_json::Value::Object(parsed);
-    let caller_role = match resolve_caller_role_on_project(&conn, &identity.user.user_id, &name) {
-        Ok(r) => r,
-        Err(e) => return HandlerResponse::from(e).into_response(),
-    };
-    let outcome = match admin_project_memberships::decide_add_project_membership(
-        &conn,
-        &state.registry,
-        fresh_is_sysadmin(&principal),
-        &identity.user.username,
-        Some(&identity.user.user_id),
-        caller_role.as_deref(),
-        &name,
-        &parsed_value,
-    ) {
-        Ok(o) => o,
+    let outcome = match gate {
+        Ok(admin_project_memberships::AddProjectMembershipGate::Rejected(resp)) => {
+            return resp.into_response()
+        }
+        Ok(admin_project_memberships::AddProjectMembershipGate::Proceed {
+            project_name,
+            user_id,
+            group_id,
+            role,
+        }) => match admin_project_memberships::finish_add_project_membership(
+            &state.sea_orm_db,
+            &project_name,
+            user_id.as_deref(),
+            group_id.as_deref(),
+            &role,
+        )
+        .await
+        {
+            Ok(o) => o,
+            Err(e) => return HandlerResponse::from(e).into_response(),
+        },
         Err(e) => return HandlerResponse::from(e).into_response(),
     };
     match outcome {
@@ -734,7 +779,6 @@ pub async fn change_project_membership_role_handler(
     if let Err(resp) = require_project_memberships_capability(&state, &identity) {
         return resp.into_response();
     }
-    let conn = state.conn.lock().await;
     let now_str = Utc::now().to_rfc3339();
     let spec = RevalidationSpec {
         stale_user_id: &identity.user.user_id,
@@ -746,27 +790,62 @@ pub async fn change_project_membership_role_handler(
             min_role: None,
         }),
     };
-    let (parsed, principal) = match perm_gates::read_body_and_revalidate(&conn, &body, &spec) {
-        Ok(v) => v,
-        Err(resp) => return resp.into_response(),
+    let gate = {
+        let conn = state.conn.lock().await;
+        let (parsed, principal) = match perm_gates::read_body_and_revalidate(&conn, &body, &spec) {
+            Ok(v) => v,
+            Err(resp) => return resp.into_response(),
+        };
+        let parsed_value = serde_json::Value::Object(parsed);
+        let caller_role = match resolve_caller_role_on_project(&conn, &identity.user.user_id, &name)
+        {
+            Ok(r) => r,
+            Err(e) => return HandlerResponse::from(e).into_response(),
+        };
+        let is_sysadmin = fresh_is_sysadmin(&principal);
+        let gate = admin_project_memberships::gate_change_project_membership_role(
+            &conn,
+            &state.registry,
+            is_sysadmin,
+            &identity.user.username,
+            Some(&identity.user.user_id),
+            caller_role.as_deref(),
+            &name,
+            &membership_id,
+            &parsed_value,
+        );
+        (gate, is_sysadmin, caller_role)
+        // `conn`'s block-scoped borrow ends here -- the gate stays
+        // synchronous (see its own doc) so the actual `sea_orm`-backed
+        // read/write below runs with `conn` genuinely out of scope.
     };
-    let parsed_value = serde_json::Value::Object(parsed);
-    let caller_role = match resolve_caller_role_on_project(&conn, &identity.user.user_id, &name) {
-        Ok(r) => r,
-        Err(e) => return HandlerResponse::from(e).into_response(),
-    };
-    let outcome = match admin_project_memberships::decide_change_project_membership_role(
-        &conn,
-        &state.registry,
-        fresh_is_sysadmin(&principal),
-        &identity.user.username,
-        Some(&identity.user.user_id),
-        caller_role.as_deref(),
-        &name,
-        &membership_id,
-        &parsed_value,
-    ) {
-        Ok(o) => o,
+    let (gate, is_sysadmin, caller_role) = gate;
+    let outcome = match gate {
+        Ok(admin_project_memberships::ChangeProjectMembershipRoleGate::Rejected(resp)) => {
+            return resp.into_response()
+        }
+        Ok(admin_project_memberships::ChangeProjectMembershipRoleGate::Proceed {
+            project_name,
+            membership_id,
+            user_id,
+            group_id,
+            new_role,
+        }) => match admin_project_memberships::finish_change_project_membership_role(
+            &state.sea_orm_db,
+            is_sysadmin,
+            &identity.user.username,
+            caller_role.as_deref(),
+            &project_name,
+            &membership_id,
+            user_id.as_deref(),
+            group_id.as_deref(),
+            &new_role,
+        )
+        .await
+        {
+            Ok(o) => o,
+            Err(e) => return HandlerResponse::from(e).into_response(),
+        },
         Err(e) => return HandlerResponse::from(e).into_response(),
     };
     match outcome {
@@ -795,22 +874,51 @@ pub async fn delete_project_membership_handler(
     if let Err(resp) = require_project_memberships_capability(&state, &identity) {
         return resp.into_response();
     }
-    let conn = state.conn.lock().await;
-    let caller_role = match resolve_caller_role_on_project(&conn, &identity.user.user_id, &name) {
-        Ok(r) => r,
-        Err(e) => return HandlerResponse::from(e).into_response(),
+    let gate = {
+        let conn = state.conn.lock().await;
+        let caller_role = match resolve_caller_role_on_project(&conn, &identity.user.user_id, &name)
+        {
+            Ok(r) => r,
+            Err(e) => return HandlerResponse::from(e).into_response(),
+        };
+        let gate = admin_project_memberships::gate_delete_project_membership(
+            &conn,
+            &state.registry,
+            identity.is_sysadmin,
+            Some(&identity.user.user_id),
+            &name,
+            &membership_id,
+        );
+        (gate, caller_role)
+        // `conn`'s block-scoped borrow ends here -- the gate stays
+        // synchronous (see its own doc) so the actual `sea_orm`-backed
+        // read/write below runs with `conn` genuinely out of scope.
     };
-    let outcome = match admin_project_memberships::decide_delete_project_membership(
-        &conn,
-        &state.registry,
-        identity.is_sysadmin,
-        &identity.user.username,
-        Some(&identity.user.user_id),
-        caller_role.as_deref(),
-        &name,
-        &membership_id,
-    ) {
-        Ok(o) => o,
+    let (gate, caller_role) = gate;
+    let outcome = match gate {
+        Ok(admin_project_memberships::DeleteProjectMembershipGate::Rejected(resp)) => {
+            return resp.into_response()
+        }
+        Ok(admin_project_memberships::DeleteProjectMembershipGate::Proceed {
+            project_name,
+            membership_id,
+            user_id,
+            group_id,
+        }) => match admin_project_memberships::finish_delete_project_membership(
+            &state.sea_orm_db,
+            identity.is_sysadmin,
+            &identity.user.username,
+            caller_role.as_deref(),
+            &project_name,
+            &membership_id,
+            user_id.as_deref(),
+            group_id.as_deref(),
+        )
+        .await
+        {
+            Ok(o) => o,
+            Err(e) => return HandlerResponse::from(e).into_response(),
+        },
         Err(e) => return HandlerResponse::from(e).into_response(),
     };
     match outcome {
@@ -863,10 +971,23 @@ mod tests {
 
     async fn real_state() -> (tempfile::TempDir, Arc<RouterState>) {
         let dir = tempfile::TempDir::new().unwrap();
-        let conn = Connection::open_in_memory().unwrap();
+        // `conn`/`sea_orm_db` are two HANDLES onto the SAME real,
+        // tempfile-backed SQLite file, not two independent
+        // `sqlite::memory:` databases -- Phase G (router step 4 PR C):
+        // several tests below seed a `project_membership` row via the
+        // now-`sea_orm`-backed `identity::grant_project_membership`/
+        // `add_project_membership`, then assert on how the (still
+        // rusqlite-based) authorization gate reads it back through
+        // `conn` -- a disconnected `:memory:` `sea_orm_db` (each
+        // `:memory:` connection gets its own private database) would
+        // make that write invisible to the read side entirely.
+        let db_path = dir.path().join("router.db");
+        let conn = Connection::open(&db_path).unwrap();
         init_router_schema(&conn).unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
-        let sea_orm_db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
+        let sea_orm_db = sea_orm::Database::connect(format!("sqlite://{}", db_path.display()))
+            .await
+            .unwrap();
         let state = Arc::new(RouterState::new(
             conn,
             sea_orm_db,
@@ -1498,11 +1619,15 @@ mod tests {
             .registry
             .register("proj-a", "/ws/proj-a", "python", chrono::Utc::now())
             .unwrap();
-        {
-            let conn = state.conn.lock().await;
-            identity::grant_project_membership(&conn, "proj-a", Some(&dev_id), None, "operator")
-                .unwrap();
-        }
+        identity::grant_project_membership(
+            &state.sea_orm_db,
+            "proj-a",
+            Some(&dev_id),
+            None,
+            "operator",
+        )
+        .await
+        .unwrap();
         revoke_capability(&state, &group_id).await;
 
         let body = json_body(serde_json::json!({"user_id": newbie_id, "role": "viewer"}));
@@ -1603,19 +1728,25 @@ mod tests {
             .registry
             .register("proj-y", "/ws/proj-y", "python", chrono::Utc::now())
             .unwrap();
-        {
-            let conn = state.conn.lock().await;
-            identity::grant_project_membership(&conn, "proj-y", Some(&alice_id), None, "operator")
-                .unwrap();
-            // Strip it again before the handler ever runs -- capability
-            // is untouched, mirroring the "membership revoked mid-
-            // flight" repro without needing a real concurrent task
-            // (axum's `Bytes` extractor already resolves the body
-            // before any handler code runs -- see this module's own
-            // doc on why the real yield-point race isn't reproducible
-            // here).
-            identity::remove_project_membership(&conn, "proj-y", Some(&alice_id), None).unwrap();
-        }
+        identity::grant_project_membership(
+            &state.sea_orm_db,
+            "proj-y",
+            Some(&alice_id),
+            None,
+            "operator",
+        )
+        .await
+        .unwrap();
+        // Strip it again before the handler ever runs -- capability
+        // is untouched, mirroring the "membership revoked mid-
+        // flight" repro without needing a real concurrent task
+        // (axum's `Bytes` extractor already resolves the body
+        // before any handler code runs -- see this module's own
+        // doc on why the real yield-point race isn't reproducible
+        // here).
+        identity::remove_project_membership(&state.sea_orm_db, "proj-y", Some(&alice_id), None)
+            .await
+            .unwrap();
 
         let body = json_body(serde_json::json!({"user_id": mallory_id, "role": "operator"}));
         let resp = add_project_membership_handler(
@@ -1656,13 +1787,24 @@ mod tests {
             .registry
             .register("proj-b", "/ws/proj-b", "python", chrono::Utc::now())
             .unwrap();
-        {
-            let conn = state.conn.lock().await;
-            identity::grant_project_membership(&conn, "proj-b", Some(&dev_id), None, "operator")
-                .unwrap();
-            identity::grant_project_membership(&conn, "proj-b", Some(&target_id), None, "viewer")
-                .unwrap();
-        }
+        identity::grant_project_membership(
+            &state.sea_orm_db,
+            "proj-b",
+            Some(&dev_id),
+            None,
+            "operator",
+        )
+        .await
+        .unwrap();
+        identity::grant_project_membership(
+            &state.sea_orm_db,
+            "proj-b",
+            Some(&target_id),
+            None,
+            "viewer",
+        )
+        .await
+        .unwrap();
         revoke_capability(&state, &group_id).await;
 
         let body = json_body(serde_json::json!({"role": "operator"}));
@@ -1709,11 +1851,15 @@ mod tests {
             .registry
             .register("proj-z", "/ws/proj-z", "python", chrono::Utc::now())
             .unwrap();
-        {
-            let conn = state.conn.lock().await;
-            identity::grant_project_membership(&conn, "proj-z", Some(&target_id), None, "viewer")
-                .unwrap();
-        }
+        identity::grant_project_membership(
+            &state.sea_orm_db,
+            "proj-z",
+            Some(&target_id),
+            None,
+            "viewer",
+        )
+        .await
+        .unwrap();
         // Deliberately NO project_membership row for alice on proj-z.
 
         let body = json_body(serde_json::json!({"role": "operator"}));
@@ -1765,11 +1911,15 @@ mod tests {
             .registry
             .register("proj-w", "/ws/proj-w", "python", chrono::Utc::now())
             .unwrap();
-        {
-            let conn = state.conn.lock().await;
-            identity::grant_project_membership(&conn, "proj-w", Some(&target_id), None, "viewer")
-                .unwrap();
-        }
+        identity::grant_project_membership(
+            &state.sea_orm_db,
+            "proj-w",
+            Some(&target_id),
+            None,
+            "viewer",
+        )
+        .await
+        .unwrap();
         // Deliberately NO project_membership row for alice on proj-w.
 
         let resp = delete_project_membership_handler(

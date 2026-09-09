@@ -17,6 +17,20 @@
 //! `stamp_sso_subject_if_absent`/`upgrade_sso_subject` -- only needed
 //! once the SSO PRs land).
 //!
+//! **Phase G (sea-orm migration, router step 4 PR C)**: the 7
+//! `project_membership`-table functions below (`add_project_membership`/
+//! `grant_project_membership`/`project_membership_role`/
+//! `update_project_membership_role`/`remove_project_membership`/
+//! `remove_project_membership_by_project`/
+//! `rename_project_membership_project`) are rewritten onto
+//! `sea_orm::DatabaseConnection` against `conexus_db::entity::
+//! project_membership`, chosen to go first in the router-step-4
+//! sequence for its small, low-fan-out real call-site surface --
+//! `users`/`sessions`/`groups` (this same module's OTHER functions)
+//! are deliberately NOT touched here, sessions last since it's the
+//! highest-risk piece (`session_gate.rs`'s hot path). Every other
+//! function in this module remains `rusqlite::Connection`-based.
+//!
 //! **Threading, not a live connection pool**: every function here
 //! takes an explicit `&Connection` (this crate's own convention,
 //! matching every repository in `conexus-db`) rather than Python's
@@ -46,7 +60,12 @@ use std::sync::LazyLock;
 use argon2::password_hash::phc::PasswordHash;
 use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 use argon2::{Algorithm, Argon2, Params, Version};
+use conexus_db::entity::project_membership::{ActiveModel, Column, Entity};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
+use sea_orm::ActiveValue::{self, Set};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, Statement,
+};
 
 /// Base class for router identity errors -- port of Python's
 /// `IdentityError` hierarchy, collapsed into one enum (matching this
@@ -62,11 +81,24 @@ pub enum IdentityError {
     /// rejected value, and it never does (see [`validate_password_strength`]).
     WeakPassword(String),
     Db(rusqlite::Error),
+    /// Phase G (sea-orm migration, router step 4 PR C): every
+    /// `project_membership` function below is converted onto
+    /// `sea_orm::DatabaseConnection` -- their errors surface here
+    /// rather than through [`IdentityError::Db`], which stays
+    /// `rusqlite::Error`-shaped for the (still-sync) users/sessions
+    /// functions this same enum covers.
+    SeaOrm(sea_orm::DbErr),
 }
 
 impl From<rusqlite::Error> for IdentityError {
     fn from(e: rusqlite::Error) -> Self {
         IdentityError::Db(e)
+    }
+}
+
+impl From<sea_orm::DbErr> for IdentityError {
+    fn from(e: sea_orm::DbErr) -> Self {
+        IdentityError::SeaOrm(e)
     }
 }
 
@@ -78,6 +110,7 @@ impl std::fmt::Display for IdentityError {
             }
             IdentityError::WeakPassword(msg) => write!(f, "{msg}"),
             IdentityError::Db(e) => write!(f, "database error: {e}"),
+            IdentityError::SeaOrm(e) => write!(f, "database error: {e}"),
         }
     }
 }
@@ -724,16 +757,52 @@ pub fn prune_expired_sessions(conn: &Connection, now: &str) -> Result<usize, Ide
 /// `group_id`/explicit-`role`/`or_ignore` surface has no other caller
 /// in this crate yet, so it isn't ported wholesale -- matches this
 /// module's own "PR 3 ships a deliberately tight slice" precedent).
-pub fn add_project_membership(
-    conn: &Connection,
+pub async fn add_project_membership(
+    db: &DatabaseConnection,
     user_id: &str,
     project_name: &str,
 ) -> Result<(), IdentityError> {
-    conn.execute(
-        "INSERT OR IGNORE INTO project_membership (project_name, user_id) VALUES (?1, ?2)",
-        (project_name, user_id),
-    )?;
-    Ok(())
+    let am = ActiveModel {
+        rowid: ActiveValue::NotSet,
+        project_name: Set(project_name.to_string()),
+        user_id: Set(Some(user_id.to_string())),
+        group_id: Set(None),
+        role: ActiveValue::NotSet, // let the schema DEFAULT 'operator' apply
+    };
+    // `ON CONFLICT DO NOTHING` with NO target column list -- SQLite
+    // accepts this ambiguous-target form and it matches "ignore ANY
+    // constraint violation on this row" (the real `uq_project_
+    // membership_user` index this INSERT can hit is a PARTIAL unique
+    // index; sea-query's typed `OnConflict::columns(...)` target
+    // list has no vocabulary for a partial index's own `WHERE`
+    // clause, but the target-less form sidesteps that entirely and is
+    // exactly what rusqlite's verb-level `INSERT OR IGNORE` compiled
+    // to before this rewrite).
+    //
+    // `.try_insert()` (not plain `.insert()`) is load-bearing, found
+    // by a real failing test: sea-orm's own `Insert::exec` surfaces a
+    // skipped `DO NOTHING` conflict as `Err(DbErr::RecordNotInserted)`
+    // -- a real error, not a quiet no-op -- which broke this
+    // function's idempotency contract (a second call errored instead
+    // of silently succeeding). `TryInsert::exec` is sea-orm's own
+    // purpose-built wrapper for exactly this: it maps that SAME
+    // `RecordNotInserted` to `TryInsertResult::Conflicted` instead of
+    // an `Err`, matching `INSERT OR IGNORE`'s real semantics.
+    match Entity::insert(am)
+        .on_conflict(
+            sea_orm::sea_query::OnConflict::new()
+                .do_nothing()
+                .to_owned(),
+        )
+        .try_insert()
+        .exec(db)
+        .await?
+    {
+        sea_orm::TryInsertResult::Inserted(_) | sea_orm::TryInsertResult::Conflicted => Ok(()),
+        sea_orm::TryInsertResult::Empty => {
+            unreachable!("Insert::one always produces exactly one row to try")
+        }
+    }
 }
 
 /// Grant EXACTLY ONE of `user_id`/`group_id` `role` on `project_name`
@@ -746,8 +815,8 @@ pub fn add_project_membership(
 /// differently so the two deliberately different contracts (idempotent
 /// vs. fail-on-duplicate; user-only vs. user-or-group; DB-default role
 /// vs. explicit role) can never be confused at a call site.
-pub fn grant_project_membership(
-    conn: &Connection,
+pub async fn grant_project_membership(
+    db: &DatabaseConnection,
     project_name: &str,
     user_id: Option<&str>,
     group_id: Option<&str>,
@@ -757,10 +826,14 @@ pub fn grant_project_membership(
         user_id.is_some() != group_id.is_some(),
         "grant_project_membership requires exactly one of user_id or group_id"
     );
-    conn.execute(
-        "INSERT INTO project_membership (project_name, user_id, group_id, role) VALUES (?1, ?2, ?3, ?4)",
-        (project_name, user_id, group_id, role),
-    )?;
+    let am = ActiveModel {
+        rowid: ActiveValue::NotSet,
+        project_name: Set(project_name.to_string()),
+        user_id: Set(user_id.map(str::to_string)),
+        group_id: Set(group_id.map(str::to_string)),
+        role: Set(role.to_string()),
+    };
+    Entity::insert(am).exec(db).await?;
     Ok(())
 }
 
@@ -769,8 +842,8 @@ pub fn grant_project_membership(
 /// `change_project_membership_role_handler`'s existing-role lookup
 /// (AZ-R12-1's revoke-mirror guard needs the PRE-change role to apply
 /// the grant guard symmetrically).
-pub fn project_membership_role(
-    conn: &Connection,
+pub async fn project_membership_role(
+    db: &DatabaseConnection,
     project_name: &str,
     user_id: Option<&str>,
     group_id: Option<&str>,
@@ -778,14 +851,14 @@ pub fn project_membership_role(
     let id = user_id
         .or(group_id)
         .expect("project_membership_role requires exactly one of user_id or group_id");
-    let sql = if user_id.is_some() {
-        "SELECT role FROM project_membership WHERE project_name = ?1 AND user_id = ?2"
+    let query = Entity::find().filter(Column::ProjectName.eq(project_name));
+    let query = if user_id.is_some() {
+        query.filter(Column::UserId.eq(id))
     } else {
-        "SELECT role FROM project_membership WHERE project_name = ?1 AND group_id = ?2"
+        query.filter(Column::GroupId.eq(id))
     };
-    Ok(conn
-        .query_row(sql, (project_name, id), |r| r.get(0))
-        .optional()?)
+    let row = query.one(db).await?;
+    Ok(row.map(|m| m.role))
 }
 
 /// Change the role for exactly one of `user_id`/`group_id` on
@@ -793,8 +866,8 @@ pub fn project_membership_role(
 /// `UPDATE`. A no-op (no error) if the row doesn't exist -- the
 /// caller re-checks existence via [`project_membership_role`] first
 /// and 404s before ever calling this.
-pub fn update_project_membership_role(
-    conn: &Connection,
+pub async fn update_project_membership_role(
+    db: &DatabaseConnection,
     project_name: &str,
     user_id: Option<&str>,
     group_id: Option<&str>,
@@ -803,12 +876,15 @@ pub fn update_project_membership_role(
     let id = user_id
         .or(group_id)
         .expect("update_project_membership_role requires exactly one of user_id or group_id");
-    let sql = if user_id.is_some() {
-        "UPDATE project_membership SET role = ?1 WHERE project_name = ?2 AND user_id = ?3"
+    let query = Entity::update_many()
+        .col_expr(Column::Role, sea_orm::sea_query::Expr::value(role))
+        .filter(Column::ProjectName.eq(project_name));
+    let query = if user_id.is_some() {
+        query.filter(Column::UserId.eq(id))
     } else {
-        "UPDATE project_membership SET role = ?1 WHERE project_name = ?2 AND group_id = ?3"
+        query.filter(Column::GroupId.eq(id))
     };
-    conn.execute(sql, (role, project_name, id))?;
+    query.exec(db).await?;
     Ok(())
 }
 
@@ -818,8 +894,8 @@ pub fn update_project_membership_role(
 /// [`remove_project_membership_by_project`] below, which drops EVERY
 /// row for a project during project deletion -- a different contract
 /// for a different caller).
-pub fn remove_project_membership(
-    conn: &Connection,
+pub async fn remove_project_membership(
+    db: &DatabaseConnection,
     project_name: &str,
     user_id: Option<&str>,
     group_id: Option<&str>,
@@ -827,12 +903,14 @@ pub fn remove_project_membership(
     let id = user_id
         .or(group_id)
         .expect("remove_project_membership requires exactly one of user_id or group_id");
-    let sql = if user_id.is_some() {
-        "DELETE FROM project_membership WHERE project_name = ?1 AND user_id = ?2"
+    let query = Entity::delete_many().filter(Column::ProjectName.eq(project_name));
+    let query = if user_id.is_some() {
+        query.filter(Column::UserId.eq(id))
     } else {
-        "DELETE FROM project_membership WHERE project_name = ?1 AND group_id = ?2"
+        query.filter(Column::GroupId.eq(id))
     };
-    Ok(conn.execute(sql, (project_name, id))? > 0)
+    let result = query.exec(db).await?;
+    Ok(result.rows_affected > 0)
 }
 
 /// One row of [`list_project_memberships`] -- either a user or group
@@ -857,25 +935,36 @@ pub enum ProjectMembershipRow {
 /// membership row for `project_name` (user or group), each carrying a
 /// renderable label via a `LEFT JOIN` against `users`/`groups`.
 /// Ordered by the member's own display label.
-pub fn list_project_memberships(
-    conn: &Connection,
+/// Raw-SQL escape hatch (matching `rag_repository::search_similar`/
+/// `task_comments_repository::task_status`'s own precedent), not a
+/// typed sea-orm query-builder chain: this needs a two-way `LEFT
+/// JOIN` (against `users` AND `groups` simultaneously) ordered by
+/// `COALESCE(u.username, g.name)`, which sea-query's typed builder
+/// has no combinator for -- the SQL text is otherwise identical to
+/// the rusqlite version this replaces.
+pub async fn list_project_memberships(
+    db: &DatabaseConnection,
     project_name: &str,
 ) -> Result<Vec<ProjectMembershipRow>, IdentityError> {
-    let mut stmt = conn.prepare(
+    let stmt = Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Sqlite,
         "SELECT pm.user_id, pm.group_id, pm.role, u.username, g.name \
          FROM project_membership pm \
          LEFT JOIN users u ON pm.user_id = u.user_id \
          LEFT JOIN groups g ON pm.group_id = g.group_id \
-         WHERE pm.project_name = ?1 \
+         WHERE pm.project_name = ? \
          ORDER BY COALESCE(u.username, g.name)",
-    )?;
-    let rows = stmt.query_map([project_name], |row| {
-        let user_id: Option<String> = row.get(0)?;
-        let group_id: Option<String> = row.get(1)?;
-        let role: String = row.get(2)?;
-        let username: Option<String> = row.get(3)?;
-        let name: Option<String> = row.get(4)?;
-        Ok(if let Some(user_id) = user_id {
+        [project_name.into()],
+    );
+    let rows = db.query_all_raw(stmt).await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let user_id: Option<String> = row.try_get("", "user_id")?;
+        let group_id: Option<String> = row.try_get("", "group_id")?;
+        let role: String = row.try_get("", "role")?;
+        let username: Option<String> = row.try_get("", "username")?;
+        let name: Option<String> = row.try_get("", "name")?;
+        out.push(if let Some(user_id) = user_id {
             ProjectMembershipRow::User {
                 user_id,
                 username: username.unwrap_or_default(),
@@ -887,9 +976,9 @@ pub fn list_project_memberships(
                 name: name.unwrap_or_default(),
                 role,
             }
-        })
-    })?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
+        });
+    }
+    Ok(out)
 }
 
 /// Re-key every `project_membership` row from `old_name` to
@@ -897,28 +986,32 @@ pub fn list_project_memberships(
 /// best-effort `UPDATE` (AZ-R13-1). A project rename is registry-
 /// primary; a membership-repoint failure here is the caller's own
 /// best-effort-and-log concern, not this function's.
-pub fn rename_project_membership_project(
-    conn: &Connection,
+pub async fn rename_project_membership_project(
+    db: &DatabaseConnection,
     old_name: &str,
     new_name: &str,
 ) -> Result<(), IdentityError> {
-    conn.execute(
-        "UPDATE project_membership SET project_name = ?1 WHERE project_name = ?2",
-        (new_name, old_name),
-    )?;
+    Entity::update_many()
+        .col_expr(
+            Column::ProjectName,
+            sea_orm::sea_query::Expr::value(new_name),
+        )
+        .filter(Column::ProjectName.eq(old_name))
+        .exec(db)
+        .await?;
     Ok(())
 }
 
 /// Drop every `project_membership` row for `project_name` -- port of
 /// `delete_project_handler`'s inline best-effort `DELETE`.
-pub fn remove_project_membership_by_project(
-    conn: &Connection,
+pub async fn remove_project_membership_by_project(
+    db: &DatabaseConnection,
     project_name: &str,
 ) -> Result<(), IdentityError> {
-    conn.execute(
-        "DELETE FROM project_membership WHERE project_name = ?1",
-        [project_name],
-    )?;
+    Entity::delete_many()
+        .filter(Column::ProjectName.eq(project_name))
+        .exec(db)
+        .await?;
     Ok(())
 }
 
@@ -932,6 +1025,26 @@ mod tests {
         c.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
         init_router_schema(&c).unwrap();
         c
+    }
+
+    /// A file-backed router DB opened as BOTH a `rusqlite::Connection`
+    /// (to seed fixture rows through the still-sync `create_user`/
+    /// `group_membership_repository::create_group`) and a sea-orm
+    /// `DatabaseConnection` (to exercise the now-converted
+    /// `project_membership` functions) -- the same dual-connection
+    /// recipe `task_repository`'s own tests use, since an in-memory
+    /// `:memory:` DB can't be shared across two separate connection
+    /// handles the way a real file can.
+    async fn conn_with_sea_orm() -> (tempfile::TempDir, Connection, sea_orm::DatabaseConnection) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity_test.db");
+        let c = Connection::open(&path).unwrap();
+        c.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        init_router_schema(&c).unwrap();
+        let db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        (dir, c, db)
     }
 
     const NOW: &str = "2026-01-01T00:00:00.000+00:00";
@@ -1480,9 +1593,9 @@ mod tests {
         .unwrap()
     }
 
-    #[test]
-    fn add_project_membership_grants_and_is_idempotent() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn add_project_membership_grants_and_is_idempotent() {
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
         let uid = create_user(
             &mut c,
             "alice",
@@ -1494,17 +1607,17 @@ mod tests {
             NOW,
         )
         .unwrap();
-        add_project_membership(&c, &uid, "proj-a").unwrap();
-        add_project_membership(&c, &uid, "proj-a").unwrap(); // idempotent, no error
+        add_project_membership(&db, &uid, "proj-a").await.unwrap();
+        add_project_membership(&db, &uid, "proj-a").await.unwrap(); // idempotent, no error
         assert_eq!(
             membership_projects_for(&c, &uid),
             vec!["proj-a".to_string()]
         );
     }
 
-    #[test]
-    fn add_project_membership_defaults_to_the_operator_role() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn add_project_membership_defaults_to_the_operator_role() {
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
         let uid = create_user(
             &mut c,
             "alice",
@@ -1516,7 +1629,7 @@ mod tests {
             NOW,
         )
         .unwrap();
-        add_project_membership(&c, &uid, "proj-a").unwrap();
+        add_project_membership(&db, &uid, "proj-a").await.unwrap();
         let role: String = c
             .query_row(
                 "SELECT role FROM project_membership WHERE user_id = ?1 AND project_name = ?2",
@@ -1527,9 +1640,9 @@ mod tests {
         assert_eq!(role, "operator");
     }
 
-    #[test]
-    fn rename_project_membership_project_rekeys_every_matching_row() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn rename_project_membership_project_rekeys_every_matching_row() {
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
         let uid = create_user(
             &mut c,
             "alice",
@@ -1541,51 +1654,60 @@ mod tests {
             NOW,
         )
         .unwrap();
-        add_project_membership(&c, &uid, "old-name").unwrap();
-        rename_project_membership_project(&c, "old-name", "new-name").unwrap();
+        add_project_membership(&db, &uid, "old-name").await.unwrap();
+        rename_project_membership_project(&db, "old-name", "new-name")
+            .await
+            .unwrap();
         assert_eq!(
             membership_projects_for(&c, &uid),
             vec!["new-name".to_string()]
         );
     }
 
-    #[test]
-    fn rename_project_membership_project_rekeys_a_group_grant_too() {
+    #[tokio::test]
+    async fn rename_project_membership_project_rekeys_a_group_grant_too() {
         // AZ-R13-1 (test_sec_r13_project_rename_membership.py, exploit
         // 1): a GROUP-conferred grant must follow the rename exactly
         // like a user grant -- the UPDATE is keyed on project_name
         // alone, but confirm it directly since the Python regression
         // was specifically about group rows being missed by an
         // earlier, narrower fix attempt.
-        let c = conn();
+        let (_dir, c, db) = conn_with_sea_orm().await;
         c.execute(
             "INSERT INTO groups (group_id, name, is_sysadmin, created_at) \
              VALUES ('g-admins', 'Proj Admins', 0, ?1)",
             [NOW],
         )
         .unwrap();
-        grant_project_membership(&c, "old-name", None, Some("g-admins"), "viewer").unwrap();
-        rename_project_membership_project(&c, "old-name", "new-name").unwrap();
+        grant_project_membership(&db, "old-name", None, Some("g-admins"), "viewer")
+            .await
+            .unwrap();
+        rename_project_membership_project(&db, "old-name", "new-name")
+            .await
+            .unwrap();
         assert_eq!(
-            project_membership_role(&c, "new-name", None, Some("g-admins")).unwrap(),
+            project_membership_role(&db, "new-name", None, Some("g-admins"))
+                .await
+                .unwrap(),
             Some("viewer".to_string()),
             "the group grant must follow the rename"
         );
         assert!(
-            project_membership_role(&c, "old-name", None, Some("g-admins"))
+            project_membership_role(&db, "old-name", None, Some("g-admins"))
+                .await
                 .unwrap()
                 .is_none(),
             "nothing may be left orphaned under the old name"
         );
     }
 
-    #[test]
-    fn rename_project_membership_project_leaves_an_unrelated_project_untouched() {
+    #[tokio::test]
+    async fn rename_project_membership_project_leaves_an_unrelated_project_untouched() {
         // test_sec_r13_project_rename_membership.py's
         // `test_rename_leaves_unrelated_projects_membership_untouched`:
         // renaming one project's membership rows must not touch a
         // different project's rows, even for the SAME user.
-        let mut c = conn();
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
         let uid = create_user(
             &mut c,
             "carol",
@@ -1597,18 +1719,22 @@ mod tests {
             NOW,
         )
         .unwrap();
-        add_project_membership(&c, &uid, "moving").unwrap();
-        add_project_membership(&c, &uid, "bystander").unwrap();
-        rename_project_membership_project(&c, "moving", "moved").unwrap();
+        add_project_membership(&db, &uid, "moving").await.unwrap();
+        add_project_membership(&db, &uid, "bystander")
+            .await
+            .unwrap();
+        rename_project_membership_project(&db, "moving", "moved")
+            .await
+            .unwrap();
         assert_eq!(
             membership_projects_for(&c, &uid),
             vec!["bystander".to_string(), "moved".to_string()]
         );
     }
 
-    #[test]
-    fn remove_project_membership_by_project_drops_every_matching_row() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn remove_project_membership_by_project_drops_every_matching_row() {
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
         let uid = create_user(
             &mut c,
             "alice",
@@ -1620,24 +1746,28 @@ mod tests {
             NOW,
         )
         .unwrap();
-        add_project_membership(&c, &uid, "proj-a").unwrap();
-        add_project_membership(&c, &uid, "proj-b").unwrap();
-        remove_project_membership_by_project(&c, "proj-a").unwrap();
+        add_project_membership(&db, &uid, "proj-a").await.unwrap();
+        add_project_membership(&db, &uid, "proj-b").await.unwrap();
+        remove_project_membership_by_project(&db, "proj-a")
+            .await
+            .unwrap();
         assert_eq!(
             membership_projects_for(&c, &uid),
             vec!["proj-b".to_string()]
         );
     }
 
-    #[test]
-    fn remove_project_membership_by_project_on_an_unknown_project_is_a_noop() {
-        let c = conn();
-        remove_project_membership_by_project(&c, "never-existed").unwrap();
+    #[tokio::test]
+    async fn remove_project_membership_by_project_on_an_unknown_project_is_a_noop() {
+        let (_dir, _c, db) = conn_with_sea_orm().await;
+        remove_project_membership_by_project(&db, "never-existed")
+            .await
+            .unwrap();
     }
 
-    #[test]
-    fn grant_project_membership_grants_a_user_an_explicit_role() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn grant_project_membership_grants_a_user_an_explicit_role() {
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
         let uid = create_user(
             &mut c,
             "alice",
@@ -1649,7 +1779,9 @@ mod tests {
             NOW,
         )
         .unwrap();
-        grant_project_membership(&c, "proj-a", Some(&uid), None, "viewer").unwrap();
+        grant_project_membership(&db, "proj-a", Some(&uid), None, "viewer")
+            .await
+            .unwrap();
         let role: String = c
             .query_row(
                 "SELECT role FROM project_membership WHERE project_name = 'proj-a' AND user_id = ?1",
@@ -1660,15 +1792,17 @@ mod tests {
         assert_eq!(role, "viewer");
     }
 
-    #[test]
-    fn grant_project_membership_grants_a_group_an_explicit_role() {
-        let c = conn();
+    #[tokio::test]
+    async fn grant_project_membership_grants_a_group_an_explicit_role() {
+        let (_dir, c, db) = conn_with_sea_orm().await;
         c.execute(
             "INSERT INTO groups (group_id, name, is_sysadmin, created_at) VALUES ('g1', 'g1', 0, ?1)",
             [NOW],
         )
         .unwrap();
-        grant_project_membership(&c, "proj-a", None, Some("g1"), "operator").unwrap();
+        grant_project_membership(&db, "proj-a", None, Some("g1"), "operator")
+            .await
+            .unwrap();
         let role: String = c
             .query_row(
                 "SELECT role FROM project_membership WHERE project_name = 'proj-a' AND group_id = 'g1'",
@@ -1679,9 +1813,9 @@ mod tests {
         assert_eq!(role, "operator");
     }
 
-    #[test]
-    fn grant_project_membership_rejects_a_duplicate() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn grant_project_membership_rejects_a_duplicate() {
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
         let uid = create_user(
             &mut c,
             "alice",
@@ -1693,14 +1827,18 @@ mod tests {
             NOW,
         )
         .unwrap();
-        grant_project_membership(&c, "proj-a", Some(&uid), None, "operator").unwrap();
-        let err = grant_project_membership(&c, "proj-a", Some(&uid), None, "operator").unwrap_err();
-        assert!(matches!(err, IdentityError::Db(_)));
+        grant_project_membership(&db, "proj-a", Some(&uid), None, "operator")
+            .await
+            .unwrap();
+        let err = grant_project_membership(&db, "proj-a", Some(&uid), None, "operator")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, IdentityError::SeaOrm(_)));
     }
 
-    #[test]
-    fn project_membership_role_reads_back_the_granted_role() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn project_membership_role_reads_back_the_granted_role() {
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
         let uid = create_user(
             &mut c,
             "alice",
@@ -1712,22 +1850,27 @@ mod tests {
             NOW,
         )
         .unwrap();
-        grant_project_membership(&c, "proj-a", Some(&uid), None, "viewer").unwrap();
-        let role = project_membership_role(&c, "proj-a", Some(&uid), None).unwrap();
+        grant_project_membership(&db, "proj-a", Some(&uid), None, "viewer")
+            .await
+            .unwrap();
+        let role = project_membership_role(&db, "proj-a", Some(&uid), None)
+            .await
+            .unwrap();
         assert_eq!(role.as_deref(), Some("viewer"));
     }
 
-    #[test]
-    fn project_membership_role_is_none_for_a_missing_row() {
-        let c = conn();
-        assert!(project_membership_role(&c, "proj-a", Some("nobody"), None)
+    #[tokio::test]
+    async fn project_membership_role_is_none_for_a_missing_row() {
+        let (_dir, _c, db) = conn_with_sea_orm().await;
+        assert!(project_membership_role(&db, "proj-a", Some("nobody"), None)
+            .await
             .unwrap()
             .is_none());
     }
 
-    #[test]
-    fn update_project_membership_role_changes_an_existing_grant() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn update_project_membership_role_changes_an_existing_grant() {
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
         let uid = create_user(
             &mut c,
             "alice",
@@ -1739,21 +1882,29 @@ mod tests {
             NOW,
         )
         .unwrap();
-        grant_project_membership(&c, "proj-a", Some(&uid), None, "viewer").unwrap();
-        update_project_membership_role(&c, "proj-a", Some(&uid), None, "operator").unwrap();
-        let role = project_membership_role(&c, "proj-a", Some(&uid), None).unwrap();
+        grant_project_membership(&db, "proj-a", Some(&uid), None, "viewer")
+            .await
+            .unwrap();
+        update_project_membership_role(&db, "proj-a", Some(&uid), None, "operator")
+            .await
+            .unwrap();
+        let role = project_membership_role(&db, "proj-a", Some(&uid), None)
+            .await
+            .unwrap();
         assert_eq!(role.as_deref(), Some("operator"));
     }
 
-    #[test]
-    fn update_project_membership_role_on_a_missing_row_is_a_noop() {
-        let c = conn();
-        update_project_membership_role(&c, "proj-a", Some("nobody"), None, "operator").unwrap();
+    #[tokio::test]
+    async fn update_project_membership_role_on_a_missing_row_is_a_noop() {
+        let (_dir, _c, db) = conn_with_sea_orm().await;
+        update_project_membership_role(&db, "proj-a", Some("nobody"), None, "operator")
+            .await
+            .unwrap();
     }
 
-    #[test]
-    fn remove_project_membership_deletes_a_user_row_and_reports_whether_one_existed() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn remove_project_membership_deletes_a_user_row_and_reports_whether_one_existed() {
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
         let uid = create_user(
             &mut c,
             "alice",
@@ -1765,28 +1916,41 @@ mod tests {
             NOW,
         )
         .unwrap();
-        grant_project_membership(&c, "proj-a", Some(&uid), None, "operator").unwrap();
-        assert!(remove_project_membership(&c, "proj-a", Some(&uid), None).unwrap());
-        assert!(project_membership_role(&c, "proj-a", Some(&uid), None)
+        grant_project_membership(&db, "proj-a", Some(&uid), None, "operator")
+            .await
+            .unwrap();
+        assert!(remove_project_membership(&db, "proj-a", Some(&uid), None)
+            .await
+            .unwrap());
+        assert!(project_membership_role(&db, "proj-a", Some(&uid), None)
+            .await
             .unwrap()
             .is_none());
-        assert!(!remove_project_membership(&c, "proj-a", Some(&uid), None).unwrap());
+        assert!(!remove_project_membership(&db, "proj-a", Some(&uid), None)
+            .await
+            .unwrap());
     }
 
-    #[test]
-    fn remove_project_membership_deletes_a_group_row() {
-        let c = conn();
+    #[tokio::test]
+    async fn remove_project_membership_deletes_a_group_row() {
+        let (_dir, c, db) = conn_with_sea_orm().await;
         let group_id =
             conexus_db::group_membership_repository::create_group(&c, "engineers", false, NOW)
                 .unwrap()
                 .group_id;
-        grant_project_membership(&c, "proj-a", None, Some(&group_id), "viewer").unwrap();
-        assert!(remove_project_membership(&c, "proj-a", None, Some(&group_id)).unwrap());
+        grant_project_membership(&db, "proj-a", None, Some(&group_id), "viewer")
+            .await
+            .unwrap();
+        assert!(
+            remove_project_membership(&db, "proj-a", None, Some(&group_id))
+                .await
+                .unwrap()
+        );
     }
 
-    #[test]
-    fn list_project_memberships_projects_both_kinds() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn list_project_memberships_projects_both_kinds() {
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
         let uid = create_user(
             &mut c,
             "alice",
@@ -1802,9 +1966,13 @@ mod tests {
             conexus_db::group_membership_repository::create_group(&c, "engineers", false, NOW)
                 .unwrap()
                 .group_id;
-        grant_project_membership(&c, "proj-a", Some(&uid), None, "operator").unwrap();
-        grant_project_membership(&c, "proj-a", None, Some(&group_id), "viewer").unwrap();
-        let rows = list_project_memberships(&c, "proj-a").unwrap();
+        grant_project_membership(&db, "proj-a", Some(&uid), None, "operator")
+            .await
+            .unwrap();
+        grant_project_membership(&db, "proj-a", None, Some(&group_id), "viewer")
+            .await
+            .unwrap();
+        let rows = list_project_memberships(&db, "proj-a").await.unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(
             rows[0],
@@ -1824,10 +1992,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn list_project_memberships_is_empty_for_an_unmembered_project() {
-        let c = conn();
-        assert!(list_project_memberships(&c, "proj-a").unwrap().is_empty());
+    #[tokio::test]
+    async fn list_project_memberships_is_empty_for_an_unmembered_project() {
+        let (_dir, _c, db) = conn_with_sea_orm().await;
+        assert!(list_project_memberships(&db, "proj-a")
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
