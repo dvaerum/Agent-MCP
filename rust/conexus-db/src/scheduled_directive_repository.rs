@@ -43,98 +43,73 @@
 //! that stays the caller's responsibility, matching every other
 //! repository here, but the caller must not skip it for this
 //! function the way it safely could for a single independent UPDATE.
+//!
+//! Phase G (sea-orm migration): the seventh repository converted.
+//! Every function that touches the DB takes the `&DatabaseConnection`
+//! it should run against — this crate has no separate "opens its own
+//! connection" path, matching every other repository here.
+//! [`parse_flexible`] stays a pure, connection-less function
+//! throughout — it never touches the DB, and is reused as a plain
+//! date-parsing utility elsewhere in the workspace
+//! (`conexus-wakeloop`, `conexus-router`).
 
 use crate::pending_directive_repository::{DirectiveEvent, DirectiveEventData};
 use chrono::{DateTime, NaiveDateTime, Utc};
-use rusqlite::{Connection, OptionalExtension, Result, Row, ToSql};
+use sea_orm::{
+    ActiveValue::Set, ColumnTrait, Condition, DatabaseConnection, DbErr, EntityTrait,
+    PaginatorTrait, QueryFilter, QueryOrder,
+};
 
-/// One row of the `scheduled_directive` table.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ScheduledDirectiveRow {
-    pub directive_id: String,
-    pub agent_id: String,
-    pub prompt: String,
-    pub interval_seconds: i64,
-    pub next_due_at: String,
-    pub enabled: bool,
-    pub status: String,
-    pub until_at: Option<String>,
-    pub max_runs: Option<i64>,
-    pub run_count: i64,
-    pub created_at: String,
-    pub created_by: Option<String>,
-    pub updated_at: Option<String>,
-    pub updated_by: Option<String>,
-}
+pub use crate::entity::scheduled_directive::Model as ScheduledDirectiveRow;
+use crate::entity::scheduled_directive::{ActiveModel, Column, Entity};
 
-const COLUMNS: &str =
-    "directive_id, agent_id, prompt, interval_seconds, next_due_at, enabled, status, \
-     until_at, max_runs, run_count, created_at, created_by, updated_at, updated_by";
-
-fn row_to_directive(row: &Row) -> rusqlite::Result<ScheduledDirectiveRow> {
-    Ok(ScheduledDirectiveRow {
-        directive_id: row.get(0)?,
-        agent_id: row.get(1)?,
-        prompt: row.get(2)?,
-        interval_seconds: row.get(3)?,
-        next_due_at: row.get(4)?,
-        enabled: row.get(5)?,
-        status: row.get(6)?,
-        until_at: row.get(7)?,
-        max_runs: row.get(8)?,
-        run_count: row.get(9)?,
-        created_at: row.get(10)?,
-        created_by: row.get(11)?,
-        updated_at: row.get(12)?,
-        updated_by: row.get(13)?,
-    })
-}
-
-pub fn get(conn: &Connection, directive_id: &str) -> Result<Option<ScheduledDirectiveRow>> {
-    conn.query_row(
-        &format!("SELECT {COLUMNS} FROM scheduled_directive WHERE directive_id = ?1"),
-        [directive_id],
-        row_to_directive,
-    )
-    .optional()
+pub async fn get(
+    db: &DatabaseConnection,
+    directive_id: &str,
+) -> Result<Option<ScheduledDirectiveRow>, DbErr> {
+    Entity::find_by_id(directive_id.to_string()).one(db).await
 }
 
 /// Soonest-due first for one agent.
-pub fn list_for_agent(conn: &Connection, agent_id: &str) -> Result<Vec<ScheduledDirectiveRow>> {
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {COLUMNS} FROM scheduled_directive WHERE agent_id = ?1 ORDER BY next_due_at ASC"
-    ))?;
-    let rows = stmt.query_map([agent_id], row_to_directive)?;
-    rows.collect()
+pub async fn list_for_agent(
+    db: &DatabaseConnection,
+    agent_id: &str,
+) -> Result<Vec<ScheduledDirectiveRow>, DbErr> {
+    Entity::find()
+        .filter(Column::AgentId.eq(agent_id))
+        .order_by_asc(Column::NextDueAt)
+        .all(db)
+        .await
 }
 
 /// Project-wide, grouped by agent then soonest-due.
-pub fn list_all(conn: &Connection) -> Result<Vec<ScheduledDirectiveRow>> {
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {COLUMNS} FROM scheduled_directive ORDER BY agent_id ASC, next_due_at ASC"
-    ))?;
-    let rows = stmt.query_map([], row_to_directive)?;
-    rows.collect()
+pub async fn list_all(db: &DatabaseConnection) -> Result<Vec<ScheduledDirectiveRow>, DbErr> {
+    Entity::find()
+        .order_by_asc(Column::AgentId)
+        .order_by_asc(Column::NextDueAt)
+        .all(db)
+        .await
 }
 
 /// The guardrail count backing `config_max_schedules_per_agent`.
-pub fn count_active_for_agent(conn: &Connection, agent_id: &str) -> Result<i64> {
-    conn.query_row(
-        "SELECT COUNT(*) FROM scheduled_directive WHERE agent_id = ?1 AND enabled = 1 AND status = 'active'",
-        [agent_id],
-        |row| row.get(0),
-    )
+pub async fn count_active_for_agent(db: &DatabaseConnection, agent_id: &str) -> Result<i64, DbErr> {
+    let count = Entity::find()
+        .filter(Column::AgentId.eq(agent_id))
+        .filter(Column::Enabled.eq(true))
+        .filter(Column::Status.eq("active"))
+        .count(db)
+        .await?;
+    Ok(count as i64)
 }
 
 /// INSERT a fresh `active`/`enabled` schedule with `run_count = 0`.
 /// Returns the row built from its own INSERT parameters, not a
 /// re-`SELECT` — matches the `pending_directive_repository::
 /// create_poke` pattern. A duplicate `directive_id` surfaces as a
-/// real `rusqlite::Error` (PK violation); Python has no pre-check
-/// here either.
+/// real `DbErr` (PK violation); Python has no pre-check here either.
 #[allow(clippy::too_many_arguments)]
-pub fn create(
-    conn: &Connection,
+pub async fn create(
+    db: &DatabaseConnection,
     directive_id: &str,
     agent_id: &str,
     prompt: &str,
@@ -144,13 +119,24 @@ pub fn create(
     max_runs: Option<i64>,
     created_by: Option<&str>,
     now_iso: &str,
-) -> Result<ScheduledDirectiveRow> {
-    conn.execute(
-        "INSERT INTO scheduled_directive (directive_id, agent_id, prompt, interval_seconds, next_due_at, \
-         enabled, status, until_at, max_runs, run_count, created_at, created_by, updated_at, updated_by) \
-         VALUES (?1, ?2, ?3, ?4, ?5, 1, 'active', ?6, ?7, 0, ?8, ?9, ?8, ?9)",
-        (directive_id, agent_id, prompt, interval_seconds, next_due_at, until_at, max_runs, now_iso, created_by),
-    )?;
+) -> Result<ScheduledDirectiveRow, DbErr> {
+    let am = ActiveModel {
+        directive_id: Set(directive_id.to_string()),
+        agent_id: Set(agent_id.to_string()),
+        prompt: Set(prompt.to_string()),
+        interval_seconds: Set(interval_seconds),
+        next_due_at: Set(next_due_at.to_string()),
+        enabled: Set(true),
+        status: Set("active".to_string()),
+        until_at: Set(until_at.map(String::from)),
+        max_runs: Set(max_runs),
+        run_count: Set(0),
+        created_at: Set(now_iso.to_string()),
+        created_by: Set(created_by.map(String::from)),
+        updated_at: Set(Some(now_iso.to_string())),
+        updated_by: Set(created_by.map(String::from)),
+    };
+    Entity::insert(am).exec(db).await?;
     Ok(ScheduledDirectiveRow {
         directive_id: directive_id.to_string(),
         agent_id: agent_id.to_string(),
@@ -175,7 +161,11 @@ pub fn create(
 /// (matching a key present with a real value). Plain `Option<T>`
 /// would collapse the "absent" and "explicitly null" cases together
 /// (clippy's `option_option` lint also flags `Option<Option<T>>` as
-/// confusing), so this is a real 3-state enum instead.
+/// confusing), so this is a real 3-state enum instead. Maps onto
+/// sea-orm's own `ActiveValue` 2-state (`Set`/`NotSet`) exactly:
+/// `Unchanged` leaves the `ActiveModel` field `NotSet` (untouched by
+/// the generated `UPDATE`), `Clear` becomes `Set(None)`, and `Set(v)`
+/// becomes `Set(Some(v))`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub enum NullableUpdate<T> {
     #[default]
@@ -204,103 +194,113 @@ pub struct ScheduledDirectiveFields {
 /// `updated_at`/`updated_by` regardless of whether any other field
 /// changed (matching Python exactly — even an all-`Unchanged` call
 /// still bumps them). `None` if `directive_id` doesn't exist.
-pub fn update_fields(
-    conn: &Connection,
+///
+/// Built as an `ActiveModel` with the primary key `Set` and every
+/// other field either `Set` (a real change) or left `NotSet` (an
+/// `Unchanged` field never appears in the generated `UPDATE ... SET`
+/// list at all) — `Entity::update(am).exec(db)` both performs the
+/// partial write and returns the refreshed row in one round trip, so
+/// there is no separate re-`SELECT` the way the old raw-SQL version
+/// needed.
+pub async fn update_fields(
+    db: &DatabaseConnection,
     directive_id: &str,
     fields: &ScheduledDirectiveFields,
     updated_by: &str,
     now_iso: &str,
-) -> Result<Option<ScheduledDirectiveRow>> {
-    if get(conn, directive_id)?.is_none() {
+) -> Result<Option<ScheduledDirectiveRow>, DbErr> {
+    if get(db, directive_id).await?.is_none() {
         return Ok(None);
     }
 
-    let mut set_clauses: Vec<&str> = Vec::new();
-    let mut params: Vec<Box<dyn ToSql>> = Vec::new();
+    let mut am = ActiveModel {
+        directive_id: Set(directive_id.to_string()),
+        ..Default::default()
+    };
 
     if let Some(v) = &fields.prompt {
-        set_clauses.push("prompt = ?");
-        params.push(Box::new(v.clone()));
+        am.prompt = Set(v.clone());
     }
     if let Some(v) = fields.interval_seconds {
-        set_clauses.push("interval_seconds = ?");
-        params.push(Box::new(v));
+        am.interval_seconds = Set(v);
     }
     if let Some(v) = &fields.next_due_at {
-        set_clauses.push("next_due_at = ?");
-        params.push(Box::new(v.clone()));
+        am.next_due_at = Set(v.clone());
     }
     if let Some(v) = fields.enabled {
-        set_clauses.push("enabled = ?");
-        params.push(Box::new(v));
+        am.enabled = Set(v);
     }
     if let Some(v) = &fields.status {
-        set_clauses.push("status = ?");
-        params.push(Box::new(v.clone()));
+        am.status = Set(v.clone());
     }
     match &fields.until_at {
         NullableUpdate::Unchanged => {}
-        NullableUpdate::Clear => set_clauses.push("until_at = NULL"),
-        NullableUpdate::Set(v) => {
-            set_clauses.push("until_at = ?");
-            params.push(Box::new(v.clone()));
-        }
+        NullableUpdate::Clear => am.until_at = Set(None),
+        NullableUpdate::Set(v) => am.until_at = Set(Some(v.clone())),
     }
     match &fields.max_runs {
         NullableUpdate::Unchanged => {}
-        NullableUpdate::Clear => set_clauses.push("max_runs = NULL"),
-        NullableUpdate::Set(v) => {
-            set_clauses.push("max_runs = ?");
-            params.push(Box::new(*v));
-        }
+        NullableUpdate::Clear => am.max_runs = Set(None),
+        NullableUpdate::Set(v) => am.max_runs = Set(Some(*v)),
     }
     if let Some(v) = fields.run_count {
-        set_clauses.push("run_count = ?");
-        params.push(Box::new(v));
+        am.run_count = Set(v);
     }
 
-    set_clauses.push("updated_at = ?");
-    params.push(Box::new(now_iso.to_string()));
-    set_clauses.push("updated_by = ?");
-    params.push(Box::new(updated_by.to_string()));
-    params.push(Box::new(directive_id.to_string()));
+    am.updated_at = Set(Some(now_iso.to_string()));
+    am.updated_by = Set(Some(updated_by.to_string()));
 
-    let sql = format!(
-        "UPDATE scheduled_directive SET {} WHERE directive_id = ?",
-        set_clauses.join(", ")
-    );
-    let param_refs: Vec<&dyn ToSql> = params.iter().map(|b| b.as_ref()).collect();
-    conn.execute(&sql, param_refs.as_slice())?;
-
-    get(conn, directive_id)
+    let row = Entity::update(am).exec(db).await?;
+    Ok(Some(row))
 }
 
 /// `true` iff a row existed and was removed.
-pub fn delete(conn: &Connection, directive_id: &str) -> Result<bool> {
-    let changed = conn.execute(
-        "DELETE FROM scheduled_directive WHERE directive_id = ?1",
-        [directive_id],
-    )?;
-    Ok(changed > 0)
+pub async fn delete(db: &DatabaseConnection, directive_id: &str) -> Result<bool, DbErr> {
+    let result = Entity::delete_by_id(directive_id.to_string())
+        .exec(db)
+        .await?;
+    Ok(result.rows_affected > 0)
 }
 
 /// Soonest `next_due_at` among the agent's still-fireable schedules —
 /// `None` means no wake condition (nothing enabled/active, or every
 /// active schedule's window has closed). Backs the idle-stop
 /// suppression gate ([`has_active`]).
-pub fn soonest_due_at(conn: &Connection, agent_id: &str, now_iso: &str) -> Result<Option<String>> {
-    conn.query_row(
-        "SELECT MIN(next_due_at) FROM scheduled_directive \
-         WHERE agent_id = ?1 AND enabled = 1 AND status = 'active' AND (until_at IS NULL OR until_at > ?2)",
-        (agent_id, now_iso),
-        |row| row.get(0),
-    )
+///
+/// Ordering by `next_due_at ASC` and taking the first row is
+/// equivalent to a SQL `MIN(next_due_at)` over the same filter (both
+/// return the smallest value among the matching rows, or nothing when
+/// none match) — this reads more naturally through sea-orm's query
+/// builder than a raw scalar aggregate would, with no behavioral
+/// difference.
+pub async fn soonest_due_at(
+    db: &DatabaseConnection,
+    agent_id: &str,
+    now_iso: &str,
+) -> Result<Option<String>, DbErr> {
+    let row = Entity::find()
+        .filter(Column::AgentId.eq(agent_id))
+        .filter(Column::Enabled.eq(true))
+        .filter(Column::Status.eq("active"))
+        .filter(
+            Condition::any()
+                .add(Column::UntilAt.is_null())
+                .add(Column::UntilAt.gt(now_iso)),
+        )
+        .order_by_asc(Column::NextDueAt)
+        .one(db)
+        .await?;
+    Ok(row.map(|r| r.next_due_at))
 }
 
 /// `true` iff the agent has at least one fireable schedule — the
 /// idle-stop suppression gate.
-pub fn has_active(conn: &Connection, agent_id: &str, now_iso: &str) -> Result<bool> {
-    Ok(soonest_due_at(conn, agent_id, now_iso)?.is_some())
+pub async fn has_active(
+    db: &DatabaseConnection,
+    agent_id: &str,
+    now_iso: &str,
+) -> Result<bool, DbErr> {
+    Ok(soonest_due_at(db, agent_id, now_iso).await?.is_some())
 }
 
 /// Failure modes of [`collect_due_and_fire`]: a real DB error, or a
@@ -310,12 +310,12 @@ pub fn has_active(conn: &Connection, agent_id: &str, now_iso: &str) -> Result<bo
 /// formats the parser accepts).
 #[derive(Debug)]
 pub enum CollectDueError {
-    Db(rusqlite::Error),
+    Db(DbErr),
     InvalidTimestamp(String),
 }
 
-impl From<rusqlite::Error> for CollectDueError {
-    fn from(e: rusqlite::Error) -> Self {
+impl From<DbErr> for CollectDueError {
+    fn from(e: DbErr) -> Self {
         CollectDueError::Db(e)
     }
 }
@@ -345,7 +345,9 @@ impl std::error::Error for CollectDueError {}
 /// flexible-ISO-8601 parsing this repository already solved — a
 /// second copy of this dual-format fallback would be the kind of
 /// drift-prone duplication this crate's own `sql_util`/
-/// `pagination_cache` consolidation already avoided elsewhere.
+/// `pagination_cache` consolidation already avoided elsewhere. Pure
+/// (no `db` parameter) and untouched by the Phase G sea-orm
+/// migration — it never had any DB involvement to begin with.
 pub fn parse_flexible(timestamp: &str) -> Result<DateTime<Utc>, CollectDueError> {
     if let Ok(dt) = DateTime::parse_from_rfc3339(timestamp) {
         return Ok(dt.with_timezone(&Utc));
@@ -414,15 +416,6 @@ fn compute_next_and_terminal(
     })
 }
 
-struct Candidate {
-    directive_id: String,
-    prompt: String,
-    interval_seconds: i64,
-    run_count: i64,
-    max_runs: Option<i64>,
-    until_at: Option<String>,
-}
-
 /// The firing step. Selects every schedule for `agent_id` that is
 /// either genuinely due (`next_due_at <= now_iso`) or whose `until_at`
 /// window has already closed, then per row either:
@@ -440,43 +433,42 @@ struct Candidate {
 /// requires from its caller (it is NOT self-healing/idempotent —
 /// a failed downstream push after this commits is a LOST fire, not a
 /// retried one).
-pub fn collect_due_and_fire(
-    conn: &Connection,
+pub async fn collect_due_and_fire(
+    db: &DatabaseConnection,
     agent_id: &str,
     now_iso: &str,
 ) -> Result<Vec<DirectiveEvent>, CollectDueError> {
-    let mut stmt = conn.prepare(
-        "SELECT directive_id, prompt, interval_seconds, run_count, max_runs, until_at FROM scheduled_directive \
-         WHERE agent_id = ?1 AND enabled = 1 AND status = 'active' \
-         AND (next_due_at <= ?2 OR (until_at IS NOT NULL AND until_at <= ?2)) \
-         ORDER BY next_due_at ASC",
-    )?;
-    let candidates: Vec<Candidate> = stmt
-        .query_map((agent_id, now_iso), |row| {
-            Ok(Candidate {
-                directive_id: row.get(0)?,
-                prompt: row.get(1)?,
-                interval_seconds: row.get(2)?,
-                run_count: row.get(3)?,
-                max_runs: row.get(4)?,
-                until_at: row.get(5)?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    drop(stmt);
+    let candidates = Entity::find()
+        .filter(Column::AgentId.eq(agent_id))
+        .filter(Column::Enabled.eq(true))
+        .filter(Column::Status.eq("active"))
+        .filter(
+            Condition::any().add(Column::NextDueAt.lte(now_iso)).add(
+                Condition::all()
+                    .add(Column::UntilAt.is_not_null())
+                    .add(Column::UntilAt.lte(now_iso)),
+            ),
+        )
+        .order_by_asc(Column::NextDueAt)
+        .all(db)
+        .await?;
 
     let mut events = Vec::new();
     for c in candidates {
-        // Mirrors the SQL's own `until_at <= now_iso` predicate
+        // Mirrors the SQL filter's own `until_at <= now_iso` predicate
         // exactly (plain string compare) — this decides whether the
         // row was pulled in because it's window-closed, so it must
-        // use the identical comparison the SQL used to select it.
+        // use the identical comparison the query used to select it.
         if c.until_at.as_deref().is_some_and(|u| u <= now_iso) {
-            conn.execute(
-                "UPDATE scheduled_directive SET status = 'completed', enabled = 0, updated_at = ?1, \
-                 updated_by = 'system' WHERE directive_id = ?2",
-                (now_iso, &c.directive_id),
-            )?;
+            let am = ActiveModel {
+                directive_id: Set(c.directive_id.clone()),
+                status: Set("completed".to_string()),
+                enabled: Set(false),
+                updated_at: Set(Some(now_iso.to_string())),
+                updated_by: Set(Some("system".to_string())),
+                ..Default::default()
+            };
+            Entity::update(am).exec(db).await?;
             continue; // reaped -- no event
         }
 
@@ -488,19 +480,19 @@ pub fn collect_due_and_fire(
             now_iso,
         )?;
 
+        let mut am = ActiveModel {
+            directive_id: Set(c.directive_id.clone()),
+            run_count: Set(fire.new_run_count),
+            next_due_at: Set(fire.new_next_due_at.clone()),
+            updated_at: Set(Some(now_iso.to_string())),
+            updated_by: Set(Some("system".to_string())),
+            ..Default::default()
+        };
         if fire.completed {
-            conn.execute(
-                "UPDATE scheduled_directive SET run_count = ?1, next_due_at = ?2, status = 'completed', \
-                 enabled = 0, updated_at = ?3, updated_by = 'system' WHERE directive_id = ?4",
-                (fire.new_run_count, &fire.new_next_due_at, now_iso, &c.directive_id),
-            )?;
-        } else {
-            conn.execute(
-                "UPDATE scheduled_directive SET run_count = ?1, next_due_at = ?2, updated_at = ?3, \
-                 updated_by = 'system' WHERE directive_id = ?4",
-                (fire.new_run_count, &fire.new_next_due_at, now_iso, &c.directive_id),
-            )?;
+            am.status = Set("completed".to_string());
+            am.enabled = Set(false);
         }
+        Entity::update(am).exec(db).await?;
 
         events.push(DirectiveEvent {
             event_type: "directive".to_string(),
@@ -522,16 +514,24 @@ pub fn collect_due_and_fire(
 mod tests {
     use super::*;
     use crate::schema::init_schema;
+    use sea_orm::Database;
 
-    fn test_conn() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        init_schema(&conn).unwrap();
-        conn
+    async fn test_conn() -> (tempfile::TempDir, DatabaseConnection) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        {
+            let c = rusqlite::Connection::open(&path).unwrap();
+            init_schema(&c).unwrap();
+        }
+        let db = Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        (dir, db)
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn seed(
-        conn: &Connection,
+    async fn seed(
+        db: &DatabaseConnection,
         directive_id: &str,
         agent_id: &str,
         interval_seconds: i64,
@@ -540,7 +540,7 @@ mod tests {
         max_runs: Option<i64>,
     ) -> ScheduledDirectiveRow {
         create(
-            conn,
+            db,
             directive_id,
             agent_id,
             "check in",
@@ -551,21 +551,14 @@ mod tests {
             Some("admin"),
             "2026-01-01T00:00:00Z",
         )
+        .await
         .unwrap()
     }
 
-    #[test]
-    fn create_returns_the_row_it_just_inserted_with_zeroed_run_count() {
-        let conn = test_conn();
-        let row = seed(
-            &conn,
-            "s1",
-            "alice",
-            3600,
-            "2026-01-01T01:00:00Z",
-            None,
-            None,
-        );
+    #[tokio::test]
+    async fn create_returns_the_row_it_just_inserted_with_zeroed_run_count() {
+        let (_dir, db) = test_conn().await;
+        let row = seed(&db, "s1", "alice", 3600, "2026-01-01T01:00:00Z", None, None).await;
         assert_eq!(row.status, "active");
         assert!(row.enabled);
         assert_eq!(row.run_count, 0);
@@ -573,90 +566,60 @@ mod tests {
         assert_eq!(row.max_runs, None);
     }
 
-    #[test]
-    fn get_returns_none_for_unknown_directive() {
-        let conn = test_conn();
-        assert_eq!(get(&conn, "nope").unwrap(), None);
+    #[tokio::test]
+    async fn get_returns_none_for_unknown_directive() {
+        let (_dir, db) = test_conn().await;
+        assert_eq!(get(&db, "nope").await.unwrap(), None);
     }
 
-    #[test]
-    fn list_for_agent_orders_by_next_due_at_ascending() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn list_for_agent_orders_by_next_due_at_ascending() {
+        let (_dir, db) = test_conn().await;
         seed(
-            &conn,
+            &db,
             "s-late",
             "alice",
             3600,
             "2026-01-02T00:00:00Z",
             None,
             None,
-        );
+        )
+        .await;
         seed(
-            &conn,
+            &db,
             "s-early",
             "alice",
             3600,
             "2026-01-01T00:00:00Z",
             None,
             None,
-        );
+        )
+        .await;
 
-        let rows = list_for_agent(&conn, "alice").unwrap();
+        let rows = list_for_agent(&db, "alice").await.unwrap();
         let ids: Vec<&str> = rows.iter().map(|r| r.directive_id.as_str()).collect();
         assert_eq!(ids, vec!["s-early", "s-late"]);
     }
 
-    #[test]
-    fn list_all_groups_by_agent_then_due_time() {
-        let conn = test_conn();
-        seed(&conn, "b1", "bob", 3600, "2026-01-01T00:00:00Z", None, None);
-        seed(
-            &conn,
-            "a2",
-            "alice",
-            3600,
-            "2026-01-02T00:00:00Z",
-            None,
-            None,
-        );
-        seed(
-            &conn,
-            "a1",
-            "alice",
-            3600,
-            "2026-01-01T00:00:00Z",
-            None,
-            None,
-        );
+    #[tokio::test]
+    async fn list_all_groups_by_agent_then_due_time() {
+        let (_dir, db) = test_conn().await;
+        seed(&db, "b1", "bob", 3600, "2026-01-01T00:00:00Z", None, None).await;
+        seed(&db, "a2", "alice", 3600, "2026-01-02T00:00:00Z", None, None).await;
+        seed(&db, "a1", "alice", 3600, "2026-01-01T00:00:00Z", None, None).await;
 
-        let rows = list_all(&conn).unwrap();
+        let rows = list_all(&db).await.unwrap();
         let ids: Vec<&str> = rows.iter().map(|r| r.directive_id.as_str()).collect();
         assert_eq!(ids, vec!["a1", "a2", "b1"]);
     }
 
-    #[test]
-    fn count_active_for_agent_excludes_disabled_and_completed() {
-        let conn = test_conn();
-        seed(
-            &conn,
-            "s1",
-            "alice",
-            3600,
-            "2026-01-01T00:00:00Z",
-            None,
-            None,
-        );
-        seed(
-            &conn,
-            "s2",
-            "alice",
-            3600,
-            "2026-01-01T00:00:00Z",
-            None,
-            None,
-        );
+    #[tokio::test]
+    async fn count_active_for_agent_excludes_disabled_and_completed() {
+        let (_dir, db) = test_conn().await;
+        seed(&db, "s1", "alice", 3600, "2026-01-01T00:00:00Z", None, None).await;
+        seed(&db, "s2", "alice", 3600, "2026-01-01T00:00:00Z", None, None).await;
         update_fields(
-            &conn,
+            &db,
             "s2",
             &ScheduledDirectiveFields {
                 enabled: Some(false),
@@ -665,65 +628,52 @@ mod tests {
             "admin",
             "2026-01-01T00:00:01Z",
         )
+        .await
         .unwrap();
 
-        assert_eq!(count_active_for_agent(&conn, "alice").unwrap(), 1);
+        assert_eq!(count_active_for_agent(&db, "alice").await.unwrap(), 1);
     }
 
-    #[test]
-    fn update_fields_unknown_directive_returns_none() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn update_fields_unknown_directive_returns_none() {
+        let (_dir, db) = test_conn().await;
         let result = update_fields(
-            &conn,
+            &db,
             "nope",
             &ScheduledDirectiveFields::default(),
             "admin",
             "2026-01-01T00:00:00Z",
-        );
+        )
+        .await;
         assert_eq!(result.unwrap(), None);
     }
 
-    #[test]
-    fn update_fields_always_bumps_updated_at_even_with_no_field_changes() {
-        let conn = test_conn();
-        seed(
-            &conn,
-            "s1",
-            "alice",
-            3600,
-            "2026-01-01T00:00:00Z",
-            None,
-            None,
-        );
+    #[tokio::test]
+    async fn update_fields_always_bumps_updated_at_even_with_no_field_changes() {
+        let (_dir, db) = test_conn().await;
+        seed(&db, "s1", "alice", 3600, "2026-01-01T00:00:00Z", None, None).await;
 
         let row = update_fields(
-            &conn,
+            &db,
             "s1",
             &ScheduledDirectiveFields::default(),
             "bob",
             "2026-01-02T00:00:00Z",
         )
+        .await
         .unwrap()
         .unwrap();
         assert_eq!(row.updated_at.as_deref(), Some("2026-01-02T00:00:00Z"));
         assert_eq!(row.updated_by.as_deref(), Some("bob"));
     }
 
-    #[test]
-    fn update_fields_can_pause_a_schedule() {
-        let conn = test_conn();
-        seed(
-            &conn,
-            "s1",
-            "alice",
-            3600,
-            "2026-01-01T00:00:00Z",
-            None,
-            None,
-        );
+    #[tokio::test]
+    async fn update_fields_can_pause_a_schedule() {
+        let (_dir, db) = test_conn().await;
+        seed(&db, "s1", "alice", 3600, "2026-01-01T00:00:00Z", None, None).await;
 
         let row = update_fields(
-            &conn,
+            &db,
             "s1",
             &ScheduledDirectiveFields {
                 enabled: Some(false),
@@ -733,27 +683,29 @@ mod tests {
             "admin",
             "2026-01-01T00:00:01Z",
         )
+        .await
         .unwrap()
         .unwrap();
         assert!(!row.enabled);
         assert_eq!(row.status, "paused");
     }
 
-    #[test]
-    fn update_fields_nullable_update_can_clear_and_set_until_at() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn update_fields_nullable_update_can_clear_and_set_until_at() {
+        let (_dir, db) = test_conn().await;
         seed(
-            &conn,
+            &db,
             "s1",
             "alice",
             3600,
             "2026-01-01T00:00:00Z",
             Some("2026-06-01T00:00:00Z"),
             None,
-        );
+        )
+        .await;
 
         let cleared = update_fields(
-            &conn,
+            &db,
             "s1",
             &ScheduledDirectiveFields {
                 until_at: NullableUpdate::Clear,
@@ -762,12 +714,13 @@ mod tests {
             "admin",
             "2026-01-01T00:00:01Z",
         )
+        .await
         .unwrap()
         .unwrap();
         assert_eq!(cleared.until_at, None);
 
         let set_again = update_fields(
-            &conn,
+            &db,
             "s1",
             &ScheduledDirectiveFields {
                 until_at: NullableUpdate::Set("2026-07-01T00:00:00Z".to_string()),
@@ -776,85 +729,79 @@ mod tests {
             "admin",
             "2026-01-01T00:00:02Z",
         )
+        .await
         .unwrap()
         .unwrap();
         assert_eq!(set_again.until_at.as_deref(), Some("2026-07-01T00:00:00Z"));
     }
 
-    #[test]
-    fn delete_removes_row_and_returns_true() {
-        let conn = test_conn();
-        seed(
-            &conn,
-            "s1",
-            "alice",
-            3600,
-            "2026-01-01T00:00:00Z",
-            None,
-            None,
-        );
-        assert!(delete(&conn, "s1").unwrap());
-        assert_eq!(get(&conn, "s1").unwrap(), None);
+    #[tokio::test]
+    async fn delete_removes_row_and_returns_true() {
+        let (_dir, db) = test_conn().await;
+        seed(&db, "s1", "alice", 3600, "2026-01-01T00:00:00Z", None, None).await;
+        assert!(delete(&db, "s1").await.unwrap());
+        assert_eq!(get(&db, "s1").await.unwrap(), None);
     }
 
-    #[test]
-    fn delete_missing_directive_returns_false() {
-        let conn = test_conn();
-        assert!(!delete(&conn, "nope").unwrap());
+    #[tokio::test]
+    async fn delete_missing_directive_returns_false() {
+        let (_dir, db) = test_conn().await;
+        assert!(!delete(&db, "nope").await.unwrap());
     }
 
-    #[test]
-    fn soonest_due_at_none_when_nothing_fireable() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn soonest_due_at_none_when_nothing_fireable() {
+        let (_dir, db) = test_conn().await;
         assert_eq!(
-            soonest_due_at(&conn, "alice", "2026-01-01T00:00:00Z").unwrap(),
+            soonest_due_at(&db, "alice", "2026-01-01T00:00:00Z")
+                .await
+                .unwrap(),
             None
         );
     }
 
-    #[test]
-    fn soonest_due_at_excludes_windows_already_closed() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn soonest_due_at_excludes_windows_already_closed() {
+        let (_dir, db) = test_conn().await;
         seed(
-            &conn,
+            &db,
             "s1",
             "alice",
             3600,
             "2026-06-01T00:00:00Z",
             Some("2026-01-01T00:00:00Z"),
             None,
-        );
+        )
+        .await;
         // until_at already passed relative to "now" -> not fireable.
         assert_eq!(
-            soonest_due_at(&conn, "alice", "2026-01-02T00:00:00Z").unwrap(),
+            soonest_due_at(&db, "alice", "2026-01-02T00:00:00Z")
+                .await
+                .unwrap(),
             None
         );
     }
 
-    #[test]
-    fn has_active_reflects_soonest_due_at() {
-        let conn = test_conn();
-        assert!(!has_active(&conn, "alice", "2026-01-01T00:00:00Z").unwrap());
-        seed(
-            &conn,
-            "s1",
-            "alice",
-            3600,
-            "2026-06-01T00:00:00Z",
-            None,
-            None,
-        );
-        assert!(has_active(&conn, "alice", "2026-01-01T00:00:00Z").unwrap());
+    #[tokio::test]
+    async fn has_active_reflects_soonest_due_at() {
+        let (_dir, db) = test_conn().await;
+        assert!(!has_active(&db, "alice", "2026-01-01T00:00:00Z")
+            .await
+            .unwrap());
+        seed(&db, "s1", "alice", 3600, "2026-06-01T00:00:00Z", None, None).await;
+        assert!(has_active(&db, "alice", "2026-01-01T00:00:00Z")
+            .await
+            .unwrap());
     }
 
-    #[test]
-    fn fire_resets_next_due_from_delivery_time_not_the_old_grid() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn fire_resets_next_due_from_delivery_time_not_the_old_grid() {
+        let (_dir, db) = test_conn().await;
         // Overdue by 5 minutes, 60s interval.
-        seed(&conn, "s1", "alice", 60, "2026-01-01T00:00:00Z", None, None);
+        seed(&db, "s1", "alice", 60, "2026-01-01T00:00:00Z", None, None).await;
 
         let now = "2026-01-01T00:05:00Z";
-        let events = collect_due_and_fire(&conn, "alice", now).unwrap();
+        let events = collect_due_and_fire(&db, "alice", now).await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "directive");
         assert_eq!(events[0].ref_id, "s1");
@@ -862,7 +809,7 @@ mod tests {
         assert_eq!(events[0].data.source, "schedule");
         assert_eq!(events[0].data.schedule_id.as_deref(), Some("s1"));
 
-        let row = get(&conn, "s1").unwrap().unwrap();
+        let row = get(&db, "s1").await.unwrap().unwrap();
         assert_eq!(row.run_count, 1);
         assert_eq!(row.status, "active");
         assert!(row.enabled);
@@ -871,101 +818,104 @@ mod tests {
         assert_eq!(row.next_due_at, "2026-01-01T00:06:00.000000Z");
     }
 
-    #[test]
-    fn offline_across_many_intervals_fires_exactly_once() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn offline_across_many_intervals_fires_exactly_once() {
+        let (_dir, db) = test_conn().await;
         // 15-minute interval, overdue by 3 days (288 missed slots).
-        seed(
-            &conn,
-            "s1",
-            "alice",
-            900,
-            "2025-12-29T00:00:00Z",
-            None,
-            None,
-        );
+        seed(&db, "s1", "alice", 900, "2025-12-29T00:00:00Z", None, None).await;
 
         let now = "2026-01-01T00:00:00Z";
-        let events = collect_due_and_fire(&conn, "alice", now).unwrap();
+        let events = collect_due_and_fire(&db, "alice", now).await.unwrap();
         assert_eq!(
             events.len(),
             1,
             "must fire exactly once regardless of how many intervals were missed"
         );
 
-        let row = get(&conn, "s1").unwrap().unwrap();
+        let row = get(&db, "s1").await.unwrap().unwrap();
         assert_eq!(row.run_count, 1);
         assert_eq!(row.next_due_at, "2026-01-01T00:15:00.000000Z");
     }
 
-    #[test]
-    fn max_runs_end_condition_completes_but_still_fires_the_last_event() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn max_runs_end_condition_completes_but_still_fires_the_last_event() {
+        let (_dir, db) = test_conn().await;
         seed(
-            &conn,
+            &db,
             "s1",
             "alice",
             60,
             "2026-01-01T00:00:00Z",
             None,
             Some(1),
-        );
+        )
+        .await;
 
-        let events = collect_due_and_fire(&conn, "alice", "2026-01-01T00:00:00Z").unwrap();
+        let events = collect_due_and_fire(&db, "alice", "2026-01-01T00:00:00Z")
+            .await
+            .unwrap();
         assert_eq!(events.len(), 1, "the terminal fire still emits an event");
 
-        let row = get(&conn, "s1").unwrap().unwrap();
+        let row = get(&db, "s1").await.unwrap().unwrap();
         assert_eq!(row.run_count, 1);
         assert_eq!(row.status, "completed");
         assert!(!row.enabled);
-        assert!(!has_active(&conn, "alice", "2026-01-01T00:00:01Z").unwrap());
+        assert!(!has_active(&db, "alice", "2026-01-01T00:00:01Z")
+            .await
+            .unwrap());
     }
 
-    #[test]
-    fn until_window_next_fire_beyond_completes() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn until_window_next_fire_beyond_completes() {
+        let (_dir, db) = test_conn().await;
         // until_at 30s out, interval 60s -> the computed next-due
         // (now+60) exceeds until_at, so THIS fire is the last one.
         seed(
-            &conn,
+            &db,
             "s1",
             "alice",
             60,
             "2026-01-01T00:00:00Z",
             Some("2026-01-01T00:00:30Z"),
             None,
-        );
+        )
+        .await;
 
-        let events = collect_due_and_fire(&conn, "alice", "2026-01-01T00:00:00Z").unwrap();
+        let events = collect_due_and_fire(&db, "alice", "2026-01-01T00:00:00Z")
+            .await
+            .unwrap();
         assert_eq!(events.len(), 1);
 
-        let row = get(&conn, "s1").unwrap().unwrap();
+        let row = get(&db, "s1").await.unwrap().unwrap();
         assert_eq!(row.status, "completed");
         assert!(!row.enabled);
         assert_eq!(row.run_count, 1);
     }
 
-    #[test]
-    fn until_already_passed_reaps_without_firing() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn until_already_passed_reaps_without_firing() {
+        let (_dir, db) = test_conn().await;
         seed(
-            &conn,
+            &db,
             "s1",
             "alice",
             60,
             "2025-12-01T00:00:00Z",
             Some("2025-12-31T00:00:00Z"),
             None,
-        );
+        )
+        .await;
 
-        let events = collect_due_and_fire(&conn, "alice", "2026-01-01T00:00:00Z").unwrap();
+        let events = collect_due_and_fire(&db, "alice", "2026-01-01T00:00:00Z")
+            .await
+            .unwrap();
         assert_eq!(
             events,
             Vec::new(),
             "a closed window must be reaped, not fired"
         );
 
-        let row = get(&conn, "s1").unwrap().unwrap();
+        let row = get(&db, "s1").await.unwrap().unwrap();
         assert_eq!(row.status, "completed");
         assert!(!row.enabled);
         assert_eq!(
@@ -974,22 +924,26 @@ mod tests {
         );
     }
 
-    #[test]
-    fn not_yet_due_does_not_fire() {
-        let conn = test_conn();
-        seed(&conn, "s1", "alice", 60, "2026-06-01T00:00:00Z", None, None);
+    #[tokio::test]
+    async fn not_yet_due_does_not_fire() {
+        let (_dir, db) = test_conn().await;
+        seed(&db, "s1", "alice", 60, "2026-06-01T00:00:00Z", None, None).await;
 
-        let events = collect_due_and_fire(&conn, "alice", "2026-01-01T00:00:00Z").unwrap();
+        let events = collect_due_and_fire(&db, "alice", "2026-01-01T00:00:00Z")
+            .await
+            .unwrap();
         assert_eq!(events, Vec::new());
-        assert!(has_active(&conn, "alice", "2026-01-01T00:00:00Z").unwrap());
+        assert!(has_active(&db, "alice", "2026-01-01T00:00:00Z")
+            .await
+            .unwrap());
     }
 
-    #[test]
-    fn disabled_schedule_never_fires_or_counts() {
-        let conn = test_conn();
-        seed(&conn, "s1", "alice", 60, "2026-01-01T00:00:00Z", None, None);
+    #[tokio::test]
+    async fn disabled_schedule_never_fires_or_counts() {
+        let (_dir, db) = test_conn().await;
+        seed(&db, "s1", "alice", 60, "2026-01-01T00:00:00Z", None, None).await;
         update_fields(
-            &conn,
+            &db,
             "s1",
             &ScheduledDirectiveFields {
                 enabled: Some(false),
@@ -999,25 +953,32 @@ mod tests {
             "admin",
             "2026-01-01T00:00:00Z",
         )
+        .await
         .unwrap();
 
-        let events = collect_due_and_fire(&conn, "alice", "2026-01-01T00:00:01Z").unwrap();
+        let events = collect_due_and_fire(&db, "alice", "2026-01-01T00:00:01Z")
+            .await
+            .unwrap();
         assert_eq!(events, Vec::new());
-        assert_eq!(count_active_for_agent(&conn, "alice").unwrap(), 0);
-        assert!(!has_active(&conn, "alice", "2026-01-01T00:00:01Z").unwrap());
+        assert_eq!(count_active_for_agent(&db, "alice").await.unwrap(), 0);
+        assert!(!has_active(&db, "alice", "2026-01-01T00:00:01Z")
+            .await
+            .unwrap());
     }
 
-    #[test]
-    fn collect_due_and_fire_is_scoped_per_agent() {
-        let conn = test_conn();
-        seed(&conn, "s1", "alice", 60, "2026-01-01T00:00:00Z", None, None);
-        seed(&conn, "s2", "bob", 60, "2026-01-01T00:00:00Z", None, None);
+    #[tokio::test]
+    async fn collect_due_and_fire_is_scoped_per_agent() {
+        let (_dir, db) = test_conn().await;
+        seed(&db, "s1", "alice", 60, "2026-01-01T00:00:00Z", None, None).await;
+        seed(&db, "s2", "bob", 60, "2026-01-01T00:00:00Z", None, None).await;
 
-        let events = collect_due_and_fire(&conn, "alice", "2026-01-01T00:00:01Z").unwrap();
+        let events = collect_due_and_fire(&db, "alice", "2026-01-01T00:00:01Z")
+            .await
+            .unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].ref_id, "s1");
         // bob's schedule must still be pending, untouched.
-        assert_eq!(get(&conn, "s2").unwrap().unwrap().run_count, 0);
+        assert_eq!(get(&db, "s2").await.unwrap().unwrap().run_count, 0);
     }
 
     #[test]

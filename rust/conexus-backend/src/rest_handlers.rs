@@ -463,8 +463,8 @@ fn is_json_falsy(value: Option<&serde_json::Value>) -> bool {
 /// is scoped to the caller's own schedules; reuses that tool's
 /// `serialize()` for an identical row shape, nothing else).
 pub async fn list_schedules(State(shared): State<Arc<SharedState>>) -> Response {
-    let guard = shared.conn.lock().await;
-    let rows = match conexus_db::scheduled_directive_repository::list_all(&guard) {
+    let rows = match conexus_db::scheduled_directive_repository::list_all(&shared.sea_orm_db).await
+    {
         Ok(rows) => rows,
         Err(_) => {
             return (
@@ -474,7 +474,6 @@ pub async fn list_schedules(State(shared): State<Arc<SharedState>>) -> Response 
                 .into_response()
         }
     };
-    drop(guard);
     let schedules: Vec<_> = rows
         .iter()
         .map(conexus_tools::scheduled_directive_tools::serialize)

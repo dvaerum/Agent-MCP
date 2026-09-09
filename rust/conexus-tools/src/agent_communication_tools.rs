@@ -305,10 +305,10 @@ pub async fn wait_for_events_entry(
         let guard = conn.lock().await;
         event_feed::idle_stop_seconds_remaining(&guard, &agent_id, now_iso)
     };
-    let has_schedule = {
-        let guard = conn.lock().await;
-        scheduled_directive_repository::has_active(&guard, &agent_id, now_iso).unwrap_or(false)
-    };
+    let has_schedule =
+        scheduled_directive_repository::has_active(ctx.sea_orm_db, &agent_id, now_iso)
+            .await
+            .unwrap_or(false);
     if let Some(remaining) = idle_remaining {
         if remaining <= 0.0 && !has_schedule {
             ctx.waiter_registry.unregister(&agent_id, &sender);
@@ -465,11 +465,10 @@ pub async fn wait_for_events_slow_path(
     loop {
         let now = Instant::now();
         let now_iso_str = now_iso();
-        let soonest_due = {
-            let guard = conn.lock().await;
-            scheduled_directive_repository::soonest_due_at(&guard, &agent_id, &now_iso_str)
-                .unwrap_or(None)
-        };
+        let soonest_due =
+            scheduled_directive_repository::soonest_due_at(ctx.sea_orm_db, &agent_id, &now_iso_str)
+                .await
+                .unwrap_or(None);
         let has_schedule = soonest_due.is_some();
 
         // Idle-stop wins over the hold deadline -- UNLESS an enabled
@@ -1490,32 +1489,54 @@ impl conexus_auth::Tool for GetAgentMessagesTool {
 
 #[cfg(test)]
 mod tests {
-    // Phase G (sea-orm migration infra): a throwaway in-memory
-    // sea-orm connection for ToolCallContext::sea_orm_db -- no test in
-    // this file queries through it yet, it only needs to exist so
-    // off_wire's now-mandatory last argument has something to point
-    // at.
+    // Phase G (sea-orm migration): a real, schema-initialized,
+    // temp-file-backed sea-orm connection for ToolCallContext::
+    // sea_orm_db -- `scheduled_directive_repository` (has_active/
+    // soonest_due_at/create) is sea-orm-backed now and every
+    // `wait_for_events_entry`/`wait_for_events_slow_path` call in this
+    // file reads through it unconditionally, so a schema-less
+    // `sqlite::memory:` would make every such read a silent `DbErr`
+    // (swallowed by `.unwrap_or(false)`/`.unwrap_or(None)` -- masking
+    // real bugs rather than surfacing them) and would hard-fail any
+    // test that seeds a schedule via `scheduled_directive_repository::
+    // create`. A SEPARATE temp file from `test_conn`'s legacy
+    // connection is fine -- nothing in this module's tests needs the
+    // rusqlite and sea-orm sides to see each other's data (agents/
+    // settings stay on the legacy connection; `scheduled_directive`
+    // reads/writes go exclusively through this one). The returned
+    // `TempDir` must be kept alive by the caller for as long as the
+    // connection is used.
     //
-    // A bare `Database::connect("sqlite::memory:")` reliably hit
+    // The temp-file `Database::connect` still reliably hit
     // `Conn(SqlxError(PoolTimedOut))` under this module's
-    // `#[tokio::test(start_paused = true)]` tests: sqlx's default
-    // ~30s pool-acquire deadline is a REAL timer race against tokio's
-    // paused/auto-advancing virtual clock, and the paused clock can
-    // jump straight past it before the real (wall-clock, off-runtime)
-    // connection open finishes. An explicit, generous
-    // `acquire_timeout` sidesteps that race instead of relying on the
-    // default -- this is test-scaffolding tuning, not a behavior
-    // change to anything production code depends on.
-    async fn test_sea_orm_db() -> sea_orm::DatabaseConnection {
-        sea_orm::Database::connect("sqlite::memory:").await.unwrap()
+    // `#[tokio::test(start_paused = true)]` tests before this fixture
+    // existed: sqlx's default pool-acquire deadline is a REAL timer
+    // race against tokio's paused/auto-advancing virtual clock, and
+    // the paused clock can jump straight past it before the real
+    // (wall-clock, off-runtime) connection open finishes -- this
+    // unpaused variant is only safe to call from a NOT-`start_paused`
+    // test; see [`test_sea_orm_db_paused`] for the paused-clock
+    // counterpart.
+    async fn test_sea_orm_db() -> (tempfile::TempDir, sea_orm::DatabaseConnection) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        {
+            let c = Connection::open(&path).unwrap();
+            init_schema(&c).unwrap();
+        }
+        let db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        (dir, db)
     }
 
-    // Phase G (sea-orm migration infra): the `start_paused = true`
-    // counterpart of `test_sea_orm_db` above. A plain
-    // `test_sea_orm_db().await` reliably hit
-    // `Conn(SqlxError(PoolTimedOut))` in every test below this point --
+    // The `start_paused = true` counterpart of `test_sea_orm_db` above
+    // -- same real-schema, real-temp-file rationale, but wrapping only
+    // the `Database::connect` itself in `resume()`/`pause()`. A plain
+    // (unpaused-around) connect reliably hit `Conn(SqlxError(
+    // PoolTimedOut))` in every test below this point --
     // `#[tokio::test(start_paused = true)]`'s auto-fast-forward (see
-    // this module's own doc a few lines down) jumps the paused virtual
+    // this module's own doc a few lines up) jumps the paused virtual
     // clock straight through sqlx's internal pool-acquire deadline the
     // instant the test task has nothing ELSE runnable, regardless of
     // how that deadline is configured -- the real (wall-clock)
@@ -1523,12 +1544,22 @@ mod tests {
     // un-pausing for just the connect sidesteps the race entirely: the
     // handful of milliseconds of real time this adds to the virtual
     // clock before it's re-paused is negligible against every one of
-    // these tests' multi-second timing assertions.
-    async fn test_sea_orm_db_paused() -> sea_orm::DatabaseConnection {
+    // these tests' multi-second timing assertions. The synchronous
+    // schema-init file I/O before it doesn't await anything, so it
+    // isn't part of that race at all.
+    async fn test_sea_orm_db_paused() -> (tempfile::TempDir, sea_orm::DatabaseConnection) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        {
+            let c = Connection::open(&path).unwrap();
+            init_schema(&c).unwrap();
+        }
         tokio::time::resume();
-        let db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
+        let db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
         tokio::time::pause();
-        db
+        (dir, db)
     }
 
     use super::*;
@@ -1606,7 +1637,7 @@ mod tests {
 
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -1647,7 +1678,7 @@ mod tests {
 
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -1699,7 +1730,7 @@ mod tests {
 
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -1743,24 +1774,25 @@ mod tests {
                 "2025-01-01T00:00:00Z",
             )
             .unwrap();
-            scheduled_directive_repository::create(
-                &guard,
-                "sched_1",
-                "alice",
-                "ping",
-                3600,
-                "2027-01-01T00:00:00Z", // far in the future -- not due, just active
-                None,
-                None,
-                Some("operator"),
-                "2025-12-31T00:00:00Z",
-            )
-            .unwrap();
         }
 
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
+        scheduled_directive_repository::create(
+            &sea_orm_db,
+            "sched_1",
+            "alice",
+            "ping",
+            3600,
+            "2027-01-01T00:00:00Z", // far in the future -- not due, just active
+            None,
+            None,
+            Some("operator"),
+            "2025-12-31T00:00:00Z",
+        )
+        .await
+        .unwrap();
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -1782,7 +1814,7 @@ mod tests {
 
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -1804,7 +1836,7 @@ mod tests {
         seed_agent(&conn, "alice").await;
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -1831,7 +1863,7 @@ mod tests {
         seed_agent(&conn, "alice").await;
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -1905,7 +1937,7 @@ mod tests {
         seed_agent(&conn, "bob").await;
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db_paused().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db_paused().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -1928,7 +1960,7 @@ mod tests {
         seed_agent(&conn, "carol").await;
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db_paused().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db_paused().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -1974,7 +2006,7 @@ mod tests {
         seed_agent(&conn, "erin").await;
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db_paused().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db_paused().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -2003,7 +2035,7 @@ mod tests {
         };
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db_paused().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db_paused().await;
         let ctx = ToolCallContext {
             progress_token_present: true,
             client_name: Some("claude-code"),
@@ -2033,7 +2065,7 @@ mod tests {
         };
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db_paused().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db_paused().await;
         let ctx = ToolCallContext {
             progress_token_present: true,
             client_name: Some("claude-code"),
@@ -2071,7 +2103,7 @@ mod tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db_paused().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db_paused().await;
         let ctx = ToolCallContext {
             progress_token_present: true,
             client_name: Some("claude-code"),
@@ -2123,7 +2155,7 @@ mod tests {
         seed_agent(&conn, "kate").await;
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db_paused().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db_paused().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -2201,7 +2233,7 @@ mod tests {
         send_message(&conn, "m1", "kate", &now_iso(), "text").await;
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db_paused().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db_paused().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -2256,7 +2288,7 @@ mod tests {
         send_message(&conn, "m1", "leo", &now_iso(), "text").await;
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -2284,7 +2316,7 @@ mod tests {
         seed_agent(&conn, "mia").await;
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -2314,7 +2346,7 @@ mod tests {
         seed_agent(&conn, "nora").await;
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -2334,7 +2366,7 @@ mod tests {
         let conn = test_conn();
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -2392,7 +2424,7 @@ mod tests {
         seed_agent(&conn, "bob").await;
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -2419,7 +2451,7 @@ mod tests {
         seed_agent(&conn, "bob").await;
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -2465,7 +2497,7 @@ mod tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -2524,7 +2556,7 @@ mod tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -2603,7 +2635,7 @@ mod tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -2673,7 +2705,7 @@ mod tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -2738,7 +2770,7 @@ mod tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -2779,7 +2811,7 @@ mod tests {
         seed_agent(&conn, "bob").await;
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -2811,7 +2843,7 @@ mod tests {
         seed_agent(&conn, "alice").await;
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -2840,7 +2872,7 @@ mod tests {
         seed_agent(&conn, "alice").await;
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -2870,7 +2902,7 @@ mod tests {
         seed_agent(&conn, "bob").await;
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -2938,7 +2970,7 @@ mod tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -2965,7 +2997,7 @@ mod tests {
         let conn = test_conn();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -3006,7 +3038,7 @@ mod tests {
         seed_agent(&conn, "alice").await;
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -3063,7 +3095,7 @@ mod tests {
         seed_agent(&conn, "bob").await;
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -3095,7 +3127,7 @@ mod tests {
         seed_agent(&conn, "bob").await;
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -3159,7 +3191,7 @@ mod tests {
         let conn = test_conn();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -3188,7 +3220,7 @@ mod tests {
         let conn = test_conn();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -3210,7 +3242,7 @@ mod tests {
         let conn = test_conn();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -3258,7 +3290,7 @@ mod tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,

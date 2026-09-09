@@ -377,7 +377,6 @@ impl Tool for CreateScheduledDirectiveTool {
                 };
             }
 
-            let guard = conn.lock().await;
             let now_dt = match repo::parse_flexible(now) {
                 Ok(dt) => dt,
                 Err(_) => {
@@ -387,38 +386,55 @@ impl Tool for CreateScheduledDirectiveTool {
                 }
             };
 
-            let interval =
-                match validate_interval(arguments.get("interval_seconds"), floor_seconds(&guard)) {
+            // Phase G: `scheduled_directive_repository` is sea-orm-backed
+            // now; the legacy `guard` is only needed for the still-legacy
+            // `project_settings_repository`/`authorize_target_write` reads
+            // below, so it's scoped narrowly and dropped before any
+            // `ctx.sea_orm_db` `.await` -- holding a `MutexGuard<Connection>`
+            // (`!Sync`) live across an `.await` would make this function's
+            // generated future `!Send`, which `Tool::call`'s `BoxFuture`
+            // bound forbids (see `conexus_tools::project_context_tools::
+            // single_update_project_context`'s own doc comment for the same
+            // rule spelled out in full).
+            let (interval, until_iso, max_runs, target_agent_id) = {
+                let guard = conn.lock().await;
+                let interval = match validate_interval(
+                    arguments.get("interval_seconds"),
+                    floor_seconds(&guard),
+                ) {
                     Ok(v) => v,
                     Err(e) => return e,
                 };
-            let until_iso = match validate_until(arguments.get("until"), now_dt) {
-                Ok(v) => v,
-                Err(e) => return e,
-            };
-            let max_runs = match validate_count(arguments.get("count")) {
-                Ok(v) => v,
-                Err(e) => return e,
-            };
+                let until_iso = match validate_until(arguments.get("until"), now_dt) {
+                    Ok(v) => v,
+                    Err(e) => return e,
+                };
+                let max_runs = match validate_count(arguments.get("count")) {
+                    Ok(v) => v,
+                    Err(e) => return e,
+                };
 
-            let caller_id = (principal.kind == PrincipalKind::AgentBearer)
-                .then_some(principal.agent_id.as_deref())
-                .flatten();
-            let target_raw = arguments.get("agent_id").and_then(Value::as_str);
-            let target_agent_id = match target_raw.or(caller_id) {
-                Some(id) if !id.is_empty() => id.to_string(),
-                _ => {
-                    return ToolResult::Invalid {
-                        field: Some("agent_id".to_string()),
-                        message: "agent_id is required (no calling agent to default to)"
-                            .to_string(),
+                let caller_id = (principal.kind == PrincipalKind::AgentBearer)
+                    .then_some(principal.agent_id.as_deref())
+                    .flatten();
+                let target_raw = arguments.get("agent_id").and_then(Value::as_str);
+                let target_agent_id = match target_raw.or(caller_id) {
+                    Some(id) if !id.is_empty() => id.to_string(),
+                    _ => {
+                        return ToolResult::Invalid {
+                            field: Some("agent_id".to_string()),
+                            message: "agent_id is required (no calling agent to default to)"
+                                .to_string(),
+                        }
                     }
-                }
-            };
+                };
 
-            if let Some(denial) = authorize_target_write(&guard, principal, &target_agent_id) {
-                return denial;
-            }
+                if let Some(denial) = authorize_target_write(&guard, principal, &target_agent_id) {
+                    return denial;
+                }
+
+                (interval, until_iso, max_runs, target_agent_id)
+            };
 
             let run_now = bool_arg(arguments, "run_now");
             let next_due_dt = if run_now {
@@ -435,7 +451,8 @@ impl Tool for CreateScheduledDirectiveTool {
                 }
             }
 
-            let active = match repo::count_active_for_agent(&guard, &target_agent_id) {
+            let active = match repo::count_active_for_agent(ctx.sea_orm_db, &target_agent_id).await
+            {
                 Ok(n) => n,
                 Err(_e) => {
                     return ToolResult::Failed {
@@ -443,7 +460,10 @@ impl Tool for CreateScheduledDirectiveTool {
                     }
                 }
             };
-            let cap = max_per_agent(&guard);
+            let cap = {
+                let guard = conn.lock().await;
+                max_per_agent(&guard)
+            };
             if active >= cap {
                 return ToolResult::Invalid {
                     field: Some("interval_seconds".to_string()),
@@ -457,7 +477,7 @@ impl Tool for CreateScheduledDirectiveTool {
             let directive_id = generate_directive_id();
             let created_by = principal.actor_label();
             let created = repo::create(
-                &guard,
+                ctx.sea_orm_db,
                 &directive_id,
                 &target_agent_id,
                 &prompt,
@@ -467,7 +487,8 @@ impl Tool for CreateScheduledDirectiveTool {
                 max_runs,
                 Some(created_by),
                 now,
-            );
+            )
+            .await;
             let created = match created {
                 Ok(row) => row,
                 Err(_e) => {
@@ -476,20 +497,22 @@ impl Tool for CreateScheduledDirectiveTool {
                     }
                 }
             };
-            let _ = agent_action_repository::log_agent_action(
-                &guard,
-                created_by,
-                "create_scheduled_directive",
-                None,
-                Some(&serde_json::json!({
-                    "directive_id": directive_id,
-                    "agent_id": target_agent_id,
-                    "interval_seconds": interval,
-                    "run_now": run_now,
-                })),
-                now,
-            );
-            drop(guard);
+            {
+                let guard = conn.lock().await;
+                let _ = agent_action_repository::log_agent_action(
+                    &guard,
+                    created_by,
+                    "create_scheduled_directive",
+                    None,
+                    Some(&serde_json::json!({
+                        "directive_id": directive_id,
+                        "agent_id": target_agent_id,
+                        "interval_seconds": interval,
+                        "run_now": run_now,
+                    })),
+                    now,
+                );
+            }
             // Wake a currently-holding wait_for_events so a run_now (or an
             // immediately-due) schedule fires now rather than on the next
             // ~2s flag-recheck slice.
@@ -540,7 +563,7 @@ impl Tool for ListScheduledDirectivesTool {
         arguments: &'a Value,
         conn: &'a AsyncMutex<Connection>,
         _now: &'a str,
-        _ctx: &'a conexus_auth::ToolCallContext<'a>,
+        ctx: &'a conexus_auth::ToolCallContext<'a>,
     ) -> conexus_auth::BoxFuture<'a, ToolResult> {
         Box::pin(async move {
             let principal = principal.unwrap();
@@ -559,14 +582,14 @@ impl Tool for ListScheduledDirectivesTool {
                 }
             };
 
-            let guard = conn.lock().await;
             if Some(target_agent_id.as_str()) != caller_id {
+                let guard = conn.lock().await;
                 if let Some(denial) = authorize_target_write(&guard, principal, &target_agent_id) {
                     return denial;
                 }
             }
 
-            let rows = match repo::list_for_agent(&guard, &target_agent_id) {
+            let rows = match repo::list_for_agent(ctx.sea_orm_db, &target_agent_id).await {
                 Ok(r) => r,
                 Err(_e) => {
                     return ToolResult::Failed {
@@ -635,7 +658,6 @@ impl Tool for UpdateScheduledDirectiveTool {
                 };
             };
 
-            let guard = conn.lock().await;
             let now_dt = match repo::parse_flexible(now) {
                 Ok(dt) => dt,
                 Err(_) => {
@@ -645,7 +667,7 @@ impl Tool for UpdateScheduledDirectiveTool {
                 }
             };
 
-            let existing = match repo::get(&guard, &directive_id) {
+            let existing = match repo::get(ctx.sea_orm_db, &directive_id).await {
                 Ok(Some(r)) => r,
                 Ok(None) => {
                     return ToolResult::NotFound {
@@ -660,9 +682,11 @@ impl Tool for UpdateScheduledDirectiveTool {
                     }
                 }
             };
-            if let Some(denial) =
+            let denial = {
+                let guard = conn.lock().await;
                 authorize_existing_or_notfound(&guard, principal, &existing, &directive_id)
-            {
+            };
+            if let Some(denial) = denial {
                 return denial;
             }
 
@@ -691,7 +715,11 @@ impl Tool for UpdateScheduledDirectiveTool {
             let mut new_interval = existing.interval_seconds;
             if let Some(v) = arguments.get("interval_seconds") {
                 if !v.is_null() {
-                    new_interval = match validate_interval(Some(v), floor_seconds(&guard)) {
+                    let floor = {
+                        let guard = conn.lock().await;
+                        floor_seconds(&guard)
+                    };
+                    new_interval = match validate_interval(Some(v), floor) {
                         Ok(v) => v,
                         Err(e) => return e,
                     };
@@ -729,17 +757,23 @@ impl Tool for UpdateScheduledDirectiveTool {
                     let enabled = v.as_bool().unwrap_or(false);
                     if enabled {
                         if !existing.enabled {
-                            let active =
-                                match repo::count_active_for_agent(&guard, &existing.agent_id) {
-                                    Ok(n) => n,
-                                    Err(_e) => {
-                                        return ToolResult::Failed {
-                                            message: "Failed to update scheduled directive"
-                                                .to_string(),
-                                        }
+                            let active = match repo::count_active_for_agent(
+                                ctx.sea_orm_db,
+                                &existing.agent_id,
+                            )
+                            .await
+                            {
+                                Ok(n) => n,
+                                Err(_e) => {
+                                    return ToolResult::Failed {
+                                        message: "Failed to update scheduled directive".to_string(),
                                     }
-                                };
-                            let cap = max_per_agent(&guard);
+                                }
+                            };
+                            let cap = {
+                                let guard = conn.lock().await;
+                                max_per_agent(&guard)
+                            };
                             if active >= cap {
                                 return ToolResult::Invalid {
                                     field: Some("enabled".to_string()),
@@ -773,7 +807,8 @@ impl Tool for UpdateScheduledDirectiveTool {
             }
 
             let updated_by = principal.actor_label();
-            let updated = repo::update_fields(&guard, &directive_id, &fields, updated_by, now);
+            let updated =
+                repo::update_fields(ctx.sea_orm_db, &directive_id, &fields, updated_by, now).await;
             let updated = match updated {
                 Ok(Some(row)) => row,
                 Ok(None) => {
@@ -789,18 +824,20 @@ impl Tool for UpdateScheduledDirectiveTool {
                     }
                 }
             };
-            let _ = agent_action_repository::log_agent_action(
-                &guard,
-                updated_by,
-                "update_scheduled_directive",
-                None,
-                Some(&serde_json::json!({
-                    "directive_id": directive_id,
-                    "agent_id": existing.agent_id,
-                })),
-                now,
-            );
-            drop(guard);
+            {
+                let guard = conn.lock().await;
+                let _ = agent_action_repository::log_agent_action(
+                    &guard,
+                    updated_by,
+                    "update_scheduled_directive",
+                    None,
+                    Some(&serde_json::json!({
+                        "directive_id": directive_id,
+                        "agent_id": existing.agent_id,
+                    })),
+                    now,
+                );
+            }
             ctx.waiter_registry.notify(&existing.agent_id);
 
             ToolResult::Ok {
@@ -837,7 +874,7 @@ impl Tool for DeleteScheduledDirectiveTool {
         arguments: &'a Value,
         conn: &'a AsyncMutex<Connection>,
         now: &'a str,
-        _ctx: &'a conexus_auth::ToolCallContext<'a>,
+        ctx: &'a conexus_auth::ToolCallContext<'a>,
     ) -> conexus_auth::BoxFuture<'a, ToolResult> {
         Box::pin(async move {
             let principal = principal.unwrap();
@@ -849,8 +886,7 @@ impl Tool for DeleteScheduledDirectiveTool {
                 };
             };
 
-            let guard = conn.lock().await;
-            let existing = match repo::get(&guard, &directive_id) {
+            let existing = match repo::get(ctx.sea_orm_db, &directive_id).await {
                 Ok(Some(r)) => r,
                 Ok(None) => {
                     return ToolResult::NotFound {
@@ -865,28 +901,33 @@ impl Tool for DeleteScheduledDirectiveTool {
                     }
                 }
             };
-            if let Some(denial) =
+            let denial = {
+                let guard = conn.lock().await;
                 authorize_existing_or_notfound(&guard, principal, &existing, &directive_id)
-            {
+            };
+            if let Some(denial) = denial {
                 return denial;
             }
 
-            if let Err(_e) = repo::delete(&guard, &directive_id) {
+            if let Err(_e) = repo::delete(ctx.sea_orm_db, &directive_id).await {
                 return ToolResult::Failed {
                     message: "Failed to delete scheduled directive".to_string(),
                 };
             }
-            let _ = agent_action_repository::log_agent_action(
-                &guard,
-                principal.actor_label(),
-                "delete_scheduled_directive",
-                None,
-                Some(&serde_json::json!({
-                    "directive_id": directive_id,
-                    "agent_id": existing.agent_id,
-                })),
-                now,
-            );
+            {
+                let guard = conn.lock().await;
+                let _ = agent_action_repository::log_agent_action(
+                    &guard,
+                    principal.actor_label(),
+                    "delete_scheduled_directive",
+                    None,
+                    Some(&serde_json::json!({
+                        "directive_id": directive_id,
+                        "agent_id": existing.agent_id,
+                    })),
+                    now,
+                );
+            }
 
             ToolResult::Ok {
                 data: Some(serde_json::json!({"deleted": directive_id})),
@@ -981,12 +1022,27 @@ mod tests {
         ToolCallContext::off_wire(registry, file_map, std::path::Path::new("/tmp"), sea_orm_db)
     }
 
-    // Phase G (sea-orm migration infra): a throwaway in-memory sea-orm
-    // connection for ToolCallContext::sea_orm_db -- no test in this
-    // file queries through it yet, it only needs to exist so ctx()'s
-    // now-mandatory last argument has something to point at.
-    async fn test_sea_orm_db() -> sea_orm::DatabaseConnection {
-        sea_orm::Database::connect("sqlite::memory:").await.unwrap()
+    // Phase G (sea-orm migration): `scheduled_directive_repository` is
+    // sea-orm-backed now, so this needs a real, schema-initialized
+    // temp-file-backed connection, not a schema-less `sqlite::memory:`.
+    // A SEPARATE temp file from `setup()`'s legacy `conn` is fine --
+    // nothing in this module's tests needs the rusqlite and sea-orm
+    // sides to see each other's data (agents/settings stay on the
+    // legacy connection; `scheduled_directive` reads/writes go
+    // exclusively through `sea_orm_db` now). The returned `TempDir`
+    // must be kept alive by the caller for as long as `sea_orm_db` is
+    // used.
+    async fn test_sea_orm_db() -> (tempfile::TempDir, sea_orm::DatabaseConnection) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        {
+            let c = Connection::open(&path).unwrap();
+            init_schema(&c).unwrap();
+        }
+        let db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        (dir, db)
     }
 
     #[tokio::test]
@@ -999,7 +1055,7 @@ mod tests {
         let alice = worker("alice");
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = CreateScheduledDirectiveTool::call(
             Some(&alice),
@@ -1027,7 +1083,7 @@ mod tests {
         let alice = worker("alice");
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = CreateScheduledDirectiveTool::call(
             Some(&alice),
@@ -1075,7 +1131,7 @@ mod tests {
         let alice = worker("alice");
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         for interval in [
             serde_json::json!(86_400_000_000_000_000_i64), // finite, exceeds the 10-year bound
@@ -1114,7 +1170,7 @@ mod tests {
         let alice = worker("alice");
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let count = serde_json::from_str::<serde_json::Value>("99999999999999999999999").unwrap();
         let result = CreateScheduledDirectiveTool::call(
@@ -1156,7 +1212,7 @@ mod tests {
         let alice = worker("alice");
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = CreateScheduledDirectiveTool::call(
             Some(&alice),
@@ -1181,7 +1237,7 @@ mod tests {
         let mgr = manager("mgr");
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
 
         let ok = CreateScheduledDirectiveTool::call(
@@ -1215,7 +1271,7 @@ mod tests {
         let op = operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = CreateScheduledDirectiveTool::call(
             Some(&op),
@@ -1244,7 +1300,7 @@ mod tests {
         let alice = worker("alice");
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let first = CreateScheduledDirectiveTool::call(
             Some(&alice),
@@ -1276,7 +1332,7 @@ mod tests {
         let alice = worker("alice");
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         CreateScheduledDirectiveTool::call(
             Some(&alice),
@@ -1306,7 +1362,7 @@ mod tests {
         let bob = worker("bob");
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = ListScheduledDirectivesTool::call(
             Some(&bob),
@@ -1329,7 +1385,7 @@ mod tests {
         let alice = worker("alice");
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let created = CreateScheduledDirectiveTool::call(
             Some(&alice),
@@ -1386,7 +1442,7 @@ mod tests {
         let bob = worker("bob");
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let created = CreateScheduledDirectiveTool::call(
             Some(&alice),
@@ -1434,7 +1490,7 @@ mod tests {
         let alice = worker("alice");
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let created = CreateScheduledDirectiveTool::call(
             Some(&alice),
@@ -1460,8 +1516,7 @@ mod tests {
         )
         .await;
         assert!(matches!(deleted, ToolResult::Ok { .. }));
-        let guard = conn.lock().await;
-        assert_eq!(repo::get(&guard, &directive_id).unwrap(), None);
+        assert_eq!(repo::get(&sea_orm_db, &directive_id).await.unwrap(), None);
     }
 
     #[tokio::test]
@@ -1474,7 +1529,7 @@ mod tests {
         let alice = worker("alice");
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = CreateScheduledDirectiveTool::call(
             Some(&alice),
@@ -1503,7 +1558,7 @@ mod tests {
         let alice = worker("alice");
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = CreateScheduledDirectiveTool::call(
             Some(&alice),
@@ -1543,7 +1598,7 @@ mod tests {
         let alice = worker("alice");
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
 
         let mut stored: Vec<String> = Vec::new();
@@ -1599,7 +1654,7 @@ mod tests {
         let alice = worker("alice");
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let created = CreateScheduledDirectiveTool::call(
             Some(&bob),
@@ -1638,8 +1693,10 @@ mod tests {
         assert!(matches!(missing, ToolResult::NotFound { .. }));
         // Bob's directive must still be there -- the phantom NotFound
         // did not actually delete it.
-        let guard = conn.lock().await;
-        assert!(repo::get(&guard, &directive_id).unwrap().is_some());
+        assert!(repo::get(&sea_orm_db, &directive_id)
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]
@@ -1652,7 +1709,7 @@ mod tests {
         let alice = worker("alice");
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let result = CreateScheduledDirectiveTool::call(
             Some(&alice),
