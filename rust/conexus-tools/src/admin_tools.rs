@@ -1348,15 +1348,21 @@ impl Tool for TerminateAgentTool {
             // the now-terminated agent. Terminal tasks keep their
             // attribution -- terminate is a soft-delete, and reverting
             // a completed task would destroy completion history.
-            let reassigned: Vec<String> =
-                match conexus_db::task_repository::list_by_agent(&guard, agent_id, None, None) {
-                    Ok(rows) => rows
-                        .into_iter()
-                        .filter(|t| !TERMINAL_TASK_STATUSES.contains(&t.status.as_str()))
-                        .map(|t| t.task_id)
-                        .collect(),
-                    Err(_e) => Vec::new(),
-                };
+            let reassigned: Vec<String> = match conexus_db::task_repository::list_by_agent(
+                ctx.sea_orm_db,
+                agent_id,
+                None,
+                None,
+            )
+            .await
+            {
+                Ok(rows) => rows
+                    .into_iter()
+                    .filter(|t| !TERMINAL_TASK_STATUSES.contains(&t.status.as_str()))
+                    .map(|t| t.task_id)
+                    .collect(),
+                Err(_e) => Vec::new(),
+            };
             for task_id in &reassigned {
                 let _ = conexus_db::task_repository::update_fields(
                     &guard,
@@ -1697,7 +1703,9 @@ impl Tool for PurgeAgentTool {
             // change -- reverting a finished task's status would
             // resurrect completed/cancelled/failed work.
             let assigned_tasks =
-                task_repository::list_by_agent(&guard, agent_id, None, None).unwrap_or_default();
+                task_repository::list_by_agent(ctx.sea_orm_db, agent_id, None, None)
+                    .await
+                    .unwrap_or_default();
             let mut reassigned_tasks: Vec<String> = Vec::new();
             for task in &assigned_tasks {
                 if TERMINAL_TASK_STATUSES.contains(&task.status.as_str()) {

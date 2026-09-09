@@ -395,7 +395,11 @@ pub fn advance_dependents_after_completion(
     now: &str,
 ) -> rusqlite::Result<Vec<TaskUpdateApplied>> {
     let mut advanced = Vec::new();
-    let all_tasks = task_repository::list_all(conn, None)?;
+    // sea-orm's `list_all` can't serve this call -- see
+    // `list_all_in_transaction`'s own doc comment (this function reads
+    // inside an in-flight, uncommitted `rusqlite::Transaction` shared
+    // with the caller's own writes).
+    let all_tasks = task_repository::list_all_in_transaction(conn, None)?;
     let by_id: HashMap<&str, &TaskRow> =
         all_tasks.iter().map(|t| (t.task_id.as_str(), t)).collect();
 

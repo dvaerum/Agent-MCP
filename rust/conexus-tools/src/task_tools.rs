@@ -485,7 +485,7 @@ impl Tool for ViewTasksTool {
         arguments: &'a Value,
         conn: &'a AsyncMutex<Connection>,
         now: &'a str,
-        _ctx: &'a conexus_auth::ToolCallContext<'a>,
+        ctx: &'a conexus_auth::ToolCallContext<'a>,
     ) -> conexus_auth::BoxFuture<'a, ToolResult> {
         Box::pin(async move {
             let principal = principal.expect("Cap-gated tool always has a resolved principal");
@@ -558,15 +558,17 @@ impl Tool for ViewTasksTool {
                 by: parse_sort_by(&sort_by),
             };
 
-            let query_result =
-                match VIEW_TASKS_ENGINE.query(&conn, &filters_spec, &sort_spec, 0, None) {
-                    Ok(r) => r,
-                    Err(_) => {
-                        return ToolResult::Failed {
-                            message: "Database error reading tasks".to_string(),
-                        }
+            let query_result = match VIEW_TASKS_ENGINE
+                .query(ctx.sea_orm_db, &filters_spec, &sort_spec, 0, None)
+                .await
+            {
+                Ok(r) => r,
+                Err(_) => {
+                    return ToolResult::Failed {
+                        message: "Database error reading tasks".to_string(),
                     }
-                };
+                }
+            };
             let mut tasks_to_display = query_result.tasks;
 
             // Dependency analysis needs the FULL snapshot (not just the
@@ -575,7 +577,7 @@ impl Tool for ViewTasksTool {
             let dependency_analyses: Option<std::collections::HashMap<String, TaskHealth>> =
                 if show_dependencies {
                     let full_snapshot: std::collections::HashMap<String, TaskRow> =
-                        match task_repository::list_all(&conn, None) {
+                        match task_repository::list_all(ctx.sea_orm_db, None).await {
                             Ok(rows) => rows.into_iter().map(|t| (t.task_id.clone(), t)).collect(),
                             Err(_) => {
                                 return ToolResult::Failed {
@@ -853,7 +855,7 @@ impl Tool for SearchTasksTool {
         arguments: &'a Value,
         conn: &'a AsyncMutex<Connection>,
         now: &'a str,
-        _ctx: &'a conexus_auth::ToolCallContext<'a>,
+        ctx: &'a conexus_auth::ToolCallContext<'a>,
     ) -> conexus_auth::BoxFuture<'a, ToolResult> {
         Box::pin(async move {
             let principal = principal.expect("Cap-gated tool always has a resolved principal");
@@ -922,7 +924,7 @@ impl Tool for SearchTasksTool {
                 "config_allow_worker_view_foreign_tasks",
                 true,
             );
-            let all_tasks = match task_repository::list_all(&conn, None) {
+            let all_tasks = match task_repository::list_all(ctx.sea_orm_db, None).await {
                 Ok(rows) => rows,
                 Err(_) => {
                     return ToolResult::Failed {
@@ -3789,8 +3791,15 @@ mod view_search_tests {
     // tests` -- each is its own top-level `#[cfg(test)] mod` block)
     // needs its own copy since `use super::*;` only reaches the
     // file's top-level items, not another sibling test module's.
-    async fn test_sea_orm_db() -> sea_orm::DatabaseConnection {
-        sea_orm::Database::connect("sqlite::memory:").await.unwrap()
+    // Real-temp-file-backed, not `:memory:` -- `view_tasks`/`search_tasks`
+    // now read through `sea_orm_db` for the ENTIRE task snapshot
+    // (`task_repository::list_all`/`TaskQueryEngine::query`), so it
+    // must see the SAME rows `test_conn`'s rusqlite connection seeds;
+    // two disconnected `:memory:` handles don't share state.
+    async fn test_sea_orm_db(dir: &std::path::Path) -> sea_orm::DatabaseConnection {
+        sea_orm::Database::connect(format!("sqlite://{}", dir.join("test.db").display()))
+            .await
+            .unwrap()
     }
 
     use super::*;
@@ -3802,10 +3811,11 @@ mod view_search_tests {
 
     const NOW: &str = "2026-01-15T00:00:00Z";
 
-    fn test_conn() -> AsyncMutex<Connection> {
-        let conn = Connection::open_in_memory().unwrap();
+    fn test_conn() -> (tempfile::TempDir, AsyncMutex<Connection>) {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = Connection::open(dir.path().join("test.db")).unwrap();
         init_schema(&conn).unwrap();
-        AsyncMutex::new(conn)
+        (dir, AsyncMutex::new(conn))
     }
 
     fn worker(agent_id: &str) -> Principal {
@@ -3919,10 +3929,10 @@ mod view_search_tests {
 
     #[tokio::test]
     async fn view_tasks_empty_store_reports_no_tasks() {
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let sea_orm_db = test_sea_orm_db(dir.path()).await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -3941,7 +3951,7 @@ mod view_search_tests {
 
     #[tokio::test]
     async fn view_tasks_admin_sees_tasks_across_every_agent() {
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         {
             let guard = conn.lock().await;
             seed(&guard, "t1", Some("alice"), "bob", "pending");
@@ -3949,7 +3959,7 @@ mod view_search_tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let sea_orm_db = test_sea_orm_db(dir.path()).await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -3972,7 +3982,7 @@ mod view_search_tests {
 
     #[tokio::test]
     async fn view_tasks_worker_sees_own_task_and_the_unassigned_pool_but_not_a_foreign_task() {
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         {
             let guard = conn.lock().await;
             seed(&guard, "mine", Some("alice"), "bob", "pending");
@@ -3984,7 +3994,7 @@ mod view_search_tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let sea_orm_db = test_sea_orm_db(dir.path()).await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -4001,7 +4011,7 @@ mod view_search_tests {
 
     #[tokio::test]
     async fn view_tasks_non_admin_targeting_a_foreign_agent_is_denied_when_policy_is_off() {
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         {
             let guard = conn.lock().await;
             seed(&guard, "t1", Some("carol"), "bob", "pending");
@@ -4009,7 +4019,7 @@ mod view_search_tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let sea_orm_db = test_sea_orm_db(dir.path()).await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -4029,14 +4039,14 @@ mod view_search_tests {
 
     #[tokio::test]
     async fn view_tasks_summary_mode_omits_created_by_line() {
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         {
             let guard = conn.lock().await;
             seed(&guard, "t1", None, "bob", "pending");
         }
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let sea_orm_db = test_sea_orm_db(dir.path()).await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -4058,14 +4068,14 @@ mod view_search_tests {
 
     #[tokio::test]
     async fn view_tasks_show_dependencies_renders_a_dependency_analysis_block() {
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         {
             let guard = conn.lock().await;
             seed(&guard, "t1", None, "bob", "pending");
         }
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let sea_orm_db = test_sea_orm_db(dir.path()).await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -4087,14 +4097,14 @@ mod view_search_tests {
 
     #[tokio::test]
     async fn view_tasks_show_health_analysis_renders_a_health_block() {
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         {
             let guard = conn.lock().await;
             seed(&guard, "t1", None, "bob", "completed");
         }
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let sea_orm_db = test_sea_orm_db(dir.path()).await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -4115,7 +4125,7 @@ mod view_search_tests {
 
     #[tokio::test]
     async fn view_tasks_start_after_skips_the_anchor_task() {
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         {
             let guard = conn.lock().await;
             seed(&guard, "t1", None, "bob", "pending");
@@ -4123,7 +4133,7 @@ mod view_search_tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let sea_orm_db = test_sea_orm_db(dir.path()).await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -4161,7 +4171,7 @@ mod view_search_tests {
 
     #[tokio::test]
     async fn view_tasks_limit_reports_a_total_line() {
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         {
             let guard = conn.lock().await;
             seed(&guard, "t1", None, "bob", "pending");
@@ -4170,7 +4180,7 @@ mod view_search_tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let sea_orm_db = test_sea_orm_db(dir.path()).await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -4193,10 +4203,10 @@ mod view_search_tests {
 
     #[tokio::test]
     async fn search_tasks_requires_a_query_or_a_filter() {
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let sea_orm_db = test_sea_orm_db(dir.path()).await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -4210,10 +4220,10 @@ mod view_search_tests {
 
     #[tokio::test]
     async fn search_tasks_rejects_a_query_with_only_short_terms() {
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let sea_orm_db = test_sea_orm_db(dir.path()).await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -4235,7 +4245,7 @@ mod view_search_tests {
 
     #[tokio::test]
     async fn search_tasks_filter_only_lists_by_status_sorted_by_updated_at_desc() {
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         {
             let guard = conn.lock().await;
             seed(&guard, "old", None, "bob", "pending");
@@ -4263,7 +4273,7 @@ mod view_search_tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let sea_orm_db = test_sea_orm_db(dir.path()).await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -4284,7 +4294,7 @@ mod view_search_tests {
 
     #[tokio::test]
     async fn search_tasks_scores_a_title_match_above_a_notes_only_match() {
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         {
             let guard = conn.lock().await;
             ensure_root(&guard);
@@ -4331,7 +4341,7 @@ mod view_search_tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let sea_orm_db = test_sea_orm_db(dir.path()).await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -4352,14 +4362,14 @@ mod view_search_tests {
 
     #[tokio::test]
     async fn search_tasks_with_no_matches_reports_the_query() {
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         {
             let guard = conn.lock().await;
             seed(&guard, "t1", None, "bob", "pending");
         }
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let sea_orm_db = test_sea_orm_db(dir.path()).await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -4385,7 +4395,7 @@ mod view_search_tests {
 
     #[tokio::test]
     async fn search_tasks_worker_does_not_see_a_foreign_task_when_policy_is_off() {
-        let conn = test_conn();
+        let (dir, conn) = test_conn();
         {
             let guard = conn.lock().await;
             seed(&guard, "mine", Some("alice"), "bob", "pending");
@@ -4394,7 +4404,7 @@ mod view_search_tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let sea_orm_db = test_sea_orm_db(dir.path()).await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,

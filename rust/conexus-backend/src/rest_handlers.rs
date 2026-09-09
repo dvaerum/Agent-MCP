@@ -654,12 +654,17 @@ pub async fn list_tasks(
     let created_by_filter = params.get("created_by");
     let limit = crate::read_limits::clamp_section_limit(params.get("limit").map(String::as_str));
 
-    let guard = shared.conn.lock().await;
     let candidates = match assigned_to_filter {
         Some(agent_id) => {
-            conexus_db::task_repository::list_by_agent(&guard, agent_id, None, Some(limit))
+            conexus_db::task_repository::list_by_agent(
+                &shared.sea_orm_db,
+                agent_id,
+                None,
+                Some(limit),
+            )
+            .await
         }
-        None => conexus_db::task_repository::list_all(&guard, Some(limit)),
+        None => conexus_db::task_repository::list_all(&shared.sea_orm_db, Some(limit)).await,
     };
     let candidates = match candidates {
         Ok(rows) => rows,
@@ -671,7 +676,6 @@ pub async fn list_tasks(
                 .into_response()
         }
     };
-    drop(guard);
 
     let keep = |t: &conexus_db::task_repository::TaskRow| -> bool {
         if unassigned_filter && !conexus_tools::task_query_engine::is_claimable_task(t) {
@@ -1701,7 +1705,9 @@ pub async fn all_data(
         })
         .collect();
 
-    let tasks = match conexus_db::task_repository::list_all(&guard, Some(section_limit)) {
+    let tasks = match conexus_db::task_repository::list_all(&shared.sea_orm_db, Some(section_limit))
+        .await
+    {
         Ok(rows) => rows,
         Err(_) => {
             drop(guard);
