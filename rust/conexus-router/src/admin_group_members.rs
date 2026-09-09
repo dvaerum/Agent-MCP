@@ -320,6 +320,27 @@ mod tests {
         init_router_schema(&c).unwrap();
         c
     }
+
+    /// A file-backed router DB opened as BOTH a `rusqlite::Connection`
+    /// (this module's own `decide_add_group_member`/`decide_remove_
+    /// group_member` under test stay rusqlite-based) and a sea-orm
+    /// `DatabaseConnection` (for the now-converted `identity::
+    /// grant_project_membership` fixture seed via
+    /// [`seed_project_membership`]) -- same dual-connection recipe
+    /// `identity.rs`'s own tests use, since an in-memory `:memory:` DB
+    /// can't be shared across two separate connection handles the way
+    /// a real file can.
+    async fn conn_with_sea_orm() -> (tempfile::TempDir, Connection, sea_orm::DatabaseConnection) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("admin_group_members_test.db");
+        let c = Connection::open(&path).unwrap();
+        c.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        init_router_schema(&c).unwrap();
+        let db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        (dir, c, db)
+    }
     const NOW: &str = "2026-01-01T00:00:00.000+00:00";
 
     fn seed_group(c: &Connection, name: &str) -> String {
@@ -646,14 +667,15 @@ mod tests {
         }
     }
 
-    fn seed_project_membership(
-        c: &Connection,
+    async fn seed_project_membership(
+        db: &sea_orm::DatabaseConnection,
         project_name: &str,
         user_id: Option<&str>,
         group_id: Option<&str>,
         role: &str,
     ) {
-        crate::identity::grant_project_membership(c, project_name, user_id, group_id, role)
+        crate::identity::grant_project_membership(db, project_name, user_id, group_id, role)
+            .await
             .unwrap();
     }
 
@@ -708,16 +730,16 @@ mod tests {
     // -- AZ-R6-1 (test_sec_r6_groupjoin_membership.py): group-join
     // project-membership amplification -----------------------------------
 
-    #[test]
-    fn a_delegate_cannot_join_themselves_into_a_project_member_group() {
+    #[tokio::test]
+    async fn a_delegate_cannot_join_themselves_into_a_project_member_group() {
         // A non-sysadmin holding only `system.groups.manage` with NO
         // membership on the victim project must not be able to add
         // THEMSELVES into a group that is an operator-member of it --
         // joining confers the project's operator role via the
         // resolver the data middleware gates on.
-        let mut c = conn();
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
         let gid = seed_group(&c, "r6team");
-        seed_project_membership(&c, "r6victim", None, Some(&gid), "operator");
+        seed_project_membership(&db, "r6victim", None, Some(&gid), "operator").await;
         let alice = seed_user(&mut c, "alice");
         let principal = principal_with_caps(&alice, ["system.groups.manage"]);
         let outcome = decide_add_group_member(
@@ -737,15 +759,15 @@ mod tests {
         assert_eq!(resp.status, 403);
     }
 
-    #[test]
-    fn a_delegate_cannot_add_a_controlled_group_into_a_project_member_group() {
+    #[tokio::test]
+    async fn a_delegate_cannot_add_a_controlled_group_into_a_project_member_group() {
         // Group-indirection: adding a GROUP (rather than a user)
         // member into the project-member group must be guarded the
         // same way -- the nested group (and anyone in it) would
         // transitively inherit the project's operator role.
-        let mut c = conn();
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
         let gid = seed_group(&c, "r6team");
-        seed_project_membership(&c, "r6victim", None, Some(&gid), "operator");
+        seed_project_membership(&db, "r6victim", None, Some(&gid), "operator").await;
         let controlled = seed_group(&c, "g-controlled");
         let alice = seed_user(&mut c, "alice");
         let principal = principal_with_caps(&alice, ["system.groups.manage"]);
@@ -766,11 +788,11 @@ mod tests {
         assert_eq!(resp.status, 403);
     }
 
-    #[test]
-    fn a_sysadmin_can_add_a_member_to_a_project_member_group() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn a_sysadmin_can_add_a_member_to_a_project_member_group() {
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
         let gid = seed_group(&c, "r6team");
-        seed_project_membership(&c, "r6victim", None, Some(&gid), "operator");
+        seed_project_membership(&db, "r6victim", None, Some(&gid), "operator").await;
         let newbie = seed_user(&mut c, "newbie");
         let outcome = decide_add_group_member(
             &mut c,
@@ -786,17 +808,17 @@ mod tests {
         assert!(matches!(outcome, AddGroupMemberOutcome::Added(_)));
     }
 
-    #[test]
-    fn an_operator_delegate_can_add_a_member_to_a_viewer_member_group() {
+    #[tokio::test]
+    async fn an_operator_delegate_can_add_a_member_to_a_viewer_member_group() {
         // Regression: a delegate who holds OPERATOR on the project may
         // add a member into a group that is only a VIEWER-member of
         // that project -- conferring viewer is at or below their own
         // role.
-        let mut c = conn();
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
         let alice = seed_user(&mut c, "alice");
-        seed_project_membership(&c, "r6victim", Some(&alice), None, "operator");
+        seed_project_membership(&db, "r6victim", Some(&alice), None, "operator").await;
         let gid = seed_group(&c, "r6viewteam");
-        seed_project_membership(&c, "r6victim", None, Some(&gid), "viewer");
+        seed_project_membership(&db, "r6victim", None, Some(&gid), "viewer").await;
         let newbie = seed_user(&mut c, "newbie2");
         let principal = principal_with_caps(&alice, ["system.groups.manage"]);
         let outcome = decide_add_group_member(
@@ -945,15 +967,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_delegate_cannot_remove_a_member_from_a_project_role_group() {
+    #[tokio::test]
+    async fn a_delegate_cannot_remove_a_member_from_a_project_role_group() {
         // The project-role vector: a delegate with NO role on the
         // victim project may not remove a member from a group that is
         // an operator-member of it -- stripping the project role the
         // delegate could never grant.
-        let mut c = conn();
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
         let gid = seed_group(&c, "g-proj");
-        seed_project_membership(&c, "proj-r12", None, Some(&gid), "operator");
+        seed_project_membership(&db, "proj-r12", None, Some(&gid), "operator").await;
         let victim = seed_user(&mut c, "victim");
         group_membership_repository::add_group_member(&c, &gid, Some(&victim), None, NOW).unwrap();
         let principal = principal_with_caps("alice", ["system.groups.manage"]);

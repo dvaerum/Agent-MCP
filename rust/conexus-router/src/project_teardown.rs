@@ -217,8 +217,22 @@ pub fn maybe_delete_workspace(
 /// originally did NEITHER purge, an asymmetry with
 /// `project_rename::finish_rename_project`'s equivalent (correct)
 /// purge from the SAME phase, not a documented scope decision.
+///
+/// Deliberately still fully SYNCHRONOUS -- `conn: &Connection` is not
+/// `Send` (`rusqlite::Connection` is deliberately not `Sync`), and an
+/// `async fn` taking `&Connection` as its OWN parameter captures that
+/// reference for its ENTIRE body, breaking axum's `Handler: Send`
+/// bound for any REST handler that would await it (see
+/// `project_gate::decide_create_project`'s own doc for the same
+/// finding, empirically confirmed there). The best-effort
+/// `project_membership` purge (AZ-R13-1) this function used to do
+/// inline is now the CALLER's job -- see
+/// `lifecycle_rest::delete_project_handler`. `conn: &Connection` is no
+/// longer a parameter here at all (it has nothing left to do): unlike
+/// `decide_create_project`/`finish_rename_project` (which still need
+/// `conn` for other synchronous work), this function's ONLY use of it
+/// was that purge call.
 pub fn finish_delete_project(
-    conn: &Connection,
     registry: &ProjectRegistry,
     store: &RuntimeStore,
     name: &str,
@@ -227,7 +241,6 @@ pub fn finish_delete_project(
 ) -> Result<(), GateError> {
     registry.unregister(name)?;
     store.forget(name, false, true);
-    let _ = crate::identity::remove_project_membership_by_project(conn, name);
     purge_token_files(token_dir, name);
     if lifecycle::SLUG_RE.is_match(name) {
         let runtime_dir = sock_dir.join(name);
@@ -586,7 +599,16 @@ mod tests {
     // -- finish_delete_project / finish_stop_project --------------------
 
     #[test]
-    fn finish_delete_project_unregisters_clears_runtime_and_purges_membership() {
+    fn finish_delete_project_unregisters_and_clears_runtime() {
+        // Phase G (router step 4 PR C): the `project_membership` purge
+        // this test used to assert is no longer this function's job --
+        // `finish_delete_project` dropped its `conn: &Connection`
+        // parameter entirely once the purge moved to the CALLER (see
+        // this fn's own doc), which now runs it via `sea_orm_db`
+        // through `crate::identity::remove_project_membership_by_project`.
+        // Verified end-to-end through the REAL handler in
+        // `lifecycle_rest::delete_project_handler_purges_project_
+        // membership_via_sea_orm`, not here.
         let mut c = conn();
         let dir = tempfile::tempdir().unwrap();
         let registry = registry_with(dir.path(), "proj-a");
@@ -595,15 +617,7 @@ mod tests {
         store.with_runtime_mut("proj-a", |rt| rt.active_conns = 0);
         store.ensure_lock("proj-a", "backend"); // simulate a held lock
 
-        finish_delete_project(
-            &c,
-            &registry,
-            &store,
-            "proj-a",
-            &dir.path().join("sock"),
-            None,
-        )
-        .unwrap();
+        finish_delete_project(&registry, &store, "proj-a", &dir.path().join("sock"), None).unwrap();
 
         assert!(registry.get("proj-a").unwrap().is_none());
         assert!(store.snapshot("proj-a").is_none());
@@ -614,18 +628,19 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(count, 0);
+        assert_eq!(
+            count, 1,
+            "this function no longer purges project_membership -- the row survives it"
+        );
         let _ = uid;
     }
 
     #[test]
     fn finish_delete_project_on_an_already_gone_project_is_a_noop() {
-        let c = conn();
         let dir = tempfile::tempdir().unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
         let store = RuntimeStore::default();
         finish_delete_project(
-            &c,
             &registry,
             &store,
             "never-existed",
@@ -639,7 +654,6 @@ mod tests {
 
     #[test]
     fn finish_delete_project_purges_matching_token_files_but_leaves_others() {
-        let c = conn();
         let dir = tempfile::tempdir().unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
         let store = RuntimeStore::default();
@@ -650,7 +664,6 @@ mod tests {
         std::fs::write(token_dir.join("proj-b--worker1.token"), b"secret").unwrap();
 
         finish_delete_project(
-            &c,
             &registry,
             &store,
             "proj-a",
@@ -669,7 +682,6 @@ mod tests {
 
     #[test]
     fn finish_delete_project_purges_the_runtime_dir_under_sock_dir() {
-        let c = conn();
         let dir = tempfile::tempdir().unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
         let store = RuntimeStore::default();
@@ -679,7 +691,7 @@ mod tests {
         std::fs::write(runtime_dir.join("backend.sock"), b"").unwrap();
         std::fs::write(runtime_dir.join("forwarding_hmac"), b"key").unwrap();
 
-        finish_delete_project(&c, &registry, &store, "proj-a", &sock_dir, None).unwrap();
+        finish_delete_project(&registry, &store, "proj-a", &sock_dir, None).unwrap();
 
         assert!(
             !runtime_dir.exists(),
@@ -689,13 +701,11 @@ mod tests {
 
     #[test]
     fn finish_delete_project_is_a_noop_when_neither_token_dir_nor_runtime_dir_exist() {
-        let c = conn();
         let dir = tempfile::tempdir().unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
         let store = RuntimeStore::default();
         // No token_dir, no pre-existing sock_dir/proj-a -- must not error.
         finish_delete_project(
-            &c,
             &registry,
             &store,
             "proj-a",

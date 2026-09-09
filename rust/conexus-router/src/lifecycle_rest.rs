@@ -148,6 +148,24 @@ pub async fn create_project_handler(
         Ok(o) => o,
         Err(e) => return HandlerResponse::from(e).into_response(),
     };
+    // Release the DB lock before the (unrelated) async membership
+    // grant below -- `decide_create_project` stays deliberately
+    // synchronous (see its own doc: `&Connection` is not `Send`, so
+    // mixing it with an internal `.await` there breaks axum's
+    // `Handler: Send` bound), so the best-effort grant happens HERE
+    // instead, once `conn`'s borrow has genuinely ended.
+    drop(conn);
+
+    if let CreateProjectOutcome::Created { ref name, .. } = outcome {
+        // Best-effort, matching Python: a membership-grant failure is
+        // logged, never surfaced as a create failure.
+        let _ = crate::identity::add_project_membership(
+            &state.sea_orm_db,
+            &identity.user.user_id,
+            name,
+        )
+        .await;
+    }
 
     match outcome {
         CreateProjectOutcome::Created {
@@ -299,20 +317,19 @@ pub async fn delete_project_handler(
         return resp.into_response();
     }
 
-    let finish_result = {
-        let conn = state.conn.lock().await;
-        project_teardown::finish_delete_project(
-            &conn,
-            &state.registry,
-            &state.runtime,
-            &name,
-            &state.sock_dir,
-            state.token_dir.as_deref(),
-        )
-    };
-    if let Err(e) = finish_result {
+    // `finish_delete_project` no longer needs `conn` at all (see its
+    // own doc) -- the best-effort `project_membership` purge
+    // (AZ-R13-1) happens below instead, via `state.sea_orm_db`.
+    if let Err(e) = project_teardown::finish_delete_project(
+        &state.registry,
+        &state.runtime,
+        &name,
+        &state.sock_dir,
+        state.token_dir.as_deref(),
+    ) {
         return HandlerResponse::from(e).into_response();
     }
+    let _ = crate::identity::remove_project_membership_by_project(&state.sea_orm_db, &name).await;
 
     // SC-R8-1 (mirrors admin_api.py's `ensure_locks.pop((name,
     // "backend"), None)`): drop the per-name ensure lock too -- but
@@ -586,6 +603,10 @@ pub async fn rename_project_handler(
             state.token_dir.as_deref(),
             now,
         )
+        // `conn`'s block-scoped borrow ends here -- `finish_rename_project`
+        // stays deliberately synchronous (see its own doc), so the
+        // best-effort `project_membership` rekey (AZ-R13-1) happens
+        // below instead, once `conn` has genuinely gone out of scope.
     };
     match outcome {
         Ok(project_rename::RenameOutcome::Renamed {
@@ -594,6 +615,9 @@ pub async fn rename_project_handler(
             grace_days,
             alias_expires_at,
         }) => {
+            let _ =
+                crate::identity::rename_project_membership_project(&state.sea_orm_db, &from, &to)
+                    .await;
             // SC-R8-1 (mirrors delete): drop the per-OLD-name ensure
             // lock now that `_lock_guard` has actually released it --
             // see the identical comment on `delete_project_handler`
@@ -929,6 +953,42 @@ mod handler_tests {
         let dir = tempfile::TempDir::new().unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
         let sea_orm_db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
+        let state = Arc::new(RouterState::new(
+            conn,
+            sea_orm_db,
+            registry,
+            RateLimitConfig::resolve_from_process_env(),
+            EnsureConfig::from_env(|_| None),
+            test_state_config(dir.path()),
+        ));
+        (dir, state)
+    }
+
+    /// Like [`test_state`], but `conn`/`sea_orm_db` are two HANDLES
+    /// onto the SAME real, tempfile-backed SQLite file, not two
+    /// independent `sqlite::memory:` databases. `test_state`'s
+    /// in-memory `sea_orm_db` is schema-less AND disconnected from
+    /// `conn`'s own in-memory database (each `:memory:` connection
+    /// gets its own private database) -- fine for every existing test
+    /// in this module (none of them read back a `sea_orm_db` write),
+    /// but the router step-4 PR C `project_membership` conversion is
+    /// the FIRST code in this module that actually writes through
+    /// `state.sea_orm_db` for real (`decide_create_project`'s grant /
+    /// `finish_rename_project`'s rekey / `finish_delete_project`'s
+    /// purge, all fired by the handlers below) -- a test that wants to
+    /// observe one of those writes needs a `sea_orm_db` that shares
+    /// real state with `conn`, hence this second helper rather than
+    /// changing `test_state` itself (touching every existing caller's
+    /// fixture is unrelated churn this PR doesn't need).
+    async fn test_state_file_backed() -> (tempfile::TempDir, Arc<RouterState>) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("router.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        init_router_schema(&conn).unwrap();
+        let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
+        let sea_orm_db = sea_orm::Database::connect(format!("sqlite://{}", db_path.display()))
+            .await
+            .unwrap();
         let state = Arc::new(RouterState::new(
             conn,
             sea_orm_db,
@@ -2194,5 +2254,117 @@ exit 0
         )
         .await;
         assert_eq!(resp.status(), 400, "{:?}", json_body(resp).await);
+    }
+
+    // -- Phase G (router step 4 PR C): project_membership now flows
+    // through `state.sea_orm_db`, not the legacy rusqlite `conn` --
+    // verify the REAL handlers persist it end-to-end, not just
+    // `identity.rs`'s own unit tests of the underlying functions. ----
+
+    #[tokio::test]
+    async fn create_project_handler_grants_the_creator_membership_via_sea_orm() {
+        let (_dir, state) = test_state_file_backed().await;
+        let uid = seed_real_sysadmin(&state, "root").await;
+        let identity = identity_for(&uid, true, HashSet::new());
+
+        let resp = create_project_handler(
+            State(state.clone()),
+            Extension(identity),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"name": "proj-new"}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), 201, "{:?}", json_body(resp).await);
+
+        let role =
+            identity::project_membership_role(&state.sea_orm_db, "proj-new", Some(&uid), None)
+                .await
+                .unwrap();
+        assert_eq!(
+            role.as_deref(),
+            Some("operator"),
+            "the creator must be granted operator-tier membership via sea-orm"
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_project_handler_rekeys_project_membership_via_sea_orm() {
+        let (dir, state) = test_state_file_backed().await;
+        let uid = seed_real_sysadmin(&state, "root").await;
+        register(
+            &state,
+            "old-name",
+            &dir.path().join("workspaces").join("old-name"),
+        );
+        identity::add_project_membership(&state.sea_orm_db, &uid, "old-name")
+            .await
+            .unwrap();
+
+        let identity = identity_for(&uid, true, HashSet::new());
+        let resp = rename_project_handler(
+            State(state.clone()),
+            Extension(identity),
+            Path("old-name".to_string()),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"name": "new-name", "grace_days": 7}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), 200, "{:?}", json_body(resp).await);
+
+        assert!(
+            identity::project_membership_role(&state.sea_orm_db, "old-name", Some(&uid), None)
+                .await
+                .unwrap()
+                .is_none(),
+            "the OLD project name must carry no membership row after rename"
+        );
+        assert_eq!(
+            identity::project_membership_role(&state.sea_orm_db, "new-name", Some(&uid), None)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("operator"),
+            "the rekey must land under the NEW project name via sea-orm"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_project_handler_purges_project_membership_via_sea_orm() {
+        let (dir, state) = test_state_file_backed().await;
+        let uid = seed_real_sysadmin(&state, "root").await;
+        register(
+            &state,
+            "proj-a",
+            &dir.path().join("workspaces").join("proj-a"),
+        );
+        identity::add_project_membership(&state.sea_orm_db, &uid, "proj-a")
+            .await
+            .unwrap();
+        assert!(
+            identity::project_membership_role(&state.sea_orm_db, "proj-a", Some(&uid), None)
+                .await
+                .unwrap()
+                .is_some(),
+            "fixture setup sanity check"
+        );
+
+        let identity = identity_for(&uid, true, HashSet::new());
+        let resp = delete_project_handler(
+            State(state.clone()),
+            Extension(identity),
+            Path("proj-a".to_string()),
+            Query(HashMap::new()),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(resp.status(), 200, "{:?}", json_body(resp).await);
+
+        assert!(
+            identity::project_membership_role(&state.sea_orm_db, "proj-a", Some(&uid), None)
+                .await
+                .unwrap()
+                .is_none(),
+            "delete must purge every project_membership row via sea-orm"
+        );
     }
 }

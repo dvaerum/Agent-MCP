@@ -337,6 +337,24 @@ pub enum CreateProjectOutcome {
     Rejected(crate::mcp_handler::HandlerResponse),
 }
 
+/// Deliberately still fully SYNCHRONOUS (unlike most of this PR's
+/// other conversions) -- `conn: &Connection` is not `Send`
+/// (`rusqlite::Connection` is deliberately not `Sync`), and an
+/// `async fn` taking `&Connection` as its OWN parameter captures that
+/// reference in its generated `Future` state for the fn's ENTIRE
+/// body, even past the point where it's last textually used --
+/// confirmed empirically (not assumed): splitting the `conn`-using
+/// prefix into its own nested `fn` and awaiting only afterward still
+/// produced the same `Future` is not `Send` error, because the
+/// OUTER `async fn`'s own `conn` parameter was still what got
+/// captured, not the nested fn's. Breaks axum's `Handler: Send` bound
+/// for every REST handler that would await this function. The fix:
+/// this function returns a value (never itself does any DB write to
+/// `project_membership`), and its caller -- already an `async fn`
+/// axum handler -- performs the best-effort
+/// [`crate::identity::add_project_membership`] grant itself, AFTER
+/// this function returns, once `conn`'s borrow has genuinely ended.
+#[allow(clippy::too_many_arguments)]
 pub fn decide_create_project(
     conn: &Connection,
     registry: &ProjectRegistry,
@@ -440,12 +458,6 @@ pub fn decide_create_project(
             )?));
         }
         Err(e) => return Err(e.into()),
-    }
-
-    if let Some(user_id) = caller_user_id {
-        // Best-effort, matching Python: a membership-grant failure is
-        // logged, never surfaced as a create failure.
-        let _ = crate::identity::add_project_membership(conn, user_id, &name);
     }
 
     Ok(CreateProjectOutcome::Created {
@@ -902,7 +914,15 @@ mod tests {
     // -- decide_create_project --------------------------------------------
 
     #[test]
-    fn creates_a_project_and_grants_the_creator_membership() {
+    fn creates_a_project_and_registers_the_workspace() {
+        // Phase G (router step 4 PR C): the membership grant this test
+        // used to assert is no longer this function's job -- it moved
+        // to the CALLER (see `decide_create_project`'s own doc), which
+        // now runs it via `sea_orm_db` through `crate::identity::
+        // add_project_membership`. Not re-verified here; see
+        // `lifecycle_rest.rs`'s `create_project_handler_grants_the_
+        // creator_membership_via_sea_orm` for the real end-to-end
+        // handler path.
         let mut c = conn();
         let uid = seed_user(&mut c, "alice");
         let dir = tempfile::tempdir().unwrap();
@@ -929,14 +949,17 @@ mod tests {
         assert_eq!(name, "proj-a");
         assert_eq!(workspace_label, "proj-a");
         assert!(registry.get("proj-a").unwrap().is_some());
-        let role: String = c
+        let membership_rows: i64 = c
             .query_row(
-                "SELECT role FROM project_membership WHERE user_id = ?1 AND project_name = 'proj-a'",
+                "SELECT COUNT(*) FROM project_membership WHERE user_id = ?1 AND project_name = 'proj-a'",
                 [&uid],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(role, "operator");
+        assert_eq!(
+            membership_rows, 0,
+            "this function no longer grants membership itself"
+        );
     }
 
     #[test]

@@ -121,6 +121,25 @@ mod tests {
         c
     }
 
+    /// A file-backed router DB opened as BOTH a `rusqlite::Connection`
+    /// (this module's own `resolve_cookie_project_role` under test
+    /// stays rusqlite-based) and a sea-orm `DatabaseConnection` (for
+    /// the now-converted `identity::project_membership` fixture
+    /// writes) -- same dual-connection recipe `identity.rs`'s own
+    /// tests use, since an in-memory `:memory:` DB can't be shared
+    /// across two separate connection handles the way a real file can.
+    async fn conn_with_sea_orm() -> (tempfile::TempDir, Connection, sea_orm::DatabaseConnection) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cookie_forwarding_test.db");
+        let c = Connection::open(&path).unwrap();
+        c.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        init_router_schema(&c).unwrap();
+        let db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        (dir, c, db)
+    }
+
     fn seed_user(c: &mut Connection, username: &str) -> String {
         identity::create_user(
             c,
@@ -166,11 +185,13 @@ mod tests {
         .is_none());
     }
 
-    #[test]
-    fn a_project_member_resolves_their_real_operator_role() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn a_project_member_resolves_their_real_operator_role() {
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
         let user_id = seed_user(&mut c, "alice");
-        identity::add_project_membership(&c, &user_id, "proj-a").unwrap();
+        identity::add_project_membership(&db, &user_id, "proj-a")
+            .await
+            .unwrap();
         let cookie = cookie_for(&c, &user_id);
 
         let (resolved_id, role) =
@@ -181,14 +202,16 @@ mod tests {
         assert_eq!(role, ForwardedRole::Operator);
     }
 
-    #[test]
-    fn a_viewer_tier_member_resolves_the_viewer_role_not_operator() {
+    #[tokio::test]
+    async fn a_viewer_tier_member_resolves_the_viewer_role_not_operator() {
         // SEC-1 parity with `forwarding_header.rs`'s own module doc:
         // signing a FIXED role would let a viewer-tier operator collect
         // the full operator capability bundle over this transport.
-        let mut c = conn();
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
         let user_id = seed_user(&mut c, "bob");
-        identity::grant_project_membership(&c, "proj-a", Some(&user_id), None, "viewer").unwrap();
+        identity::grant_project_membership(&db, "proj-a", Some(&user_id), None, "viewer")
+            .await
+            .unwrap();
         let cookie = cookie_for(&c, &user_id);
 
         let (_id, role) = resolve_cookie_project_role(&c, Some(&cookie), "proj-a", now_dt())
@@ -211,14 +234,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn membership_in_one_project_does_not_leak_into_another_via_the_url_segment() {
+    #[tokio::test]
+    async fn membership_in_one_project_does_not_leak_into_another_via_the_url_segment() {
         // The exact cross-tenant scenario the task brief calls out:
         // a member of "proj-a" must not be able to mint a header for
         // "proj-b" by hitting a different URL segment.
-        let mut c = conn();
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
         let user_id = seed_user(&mut c, "dave");
-        identity::add_project_membership(&c, &user_id, "proj-a").unwrap();
+        identity::add_project_membership(&db, &user_id, "proj-a")
+            .await
+            .unwrap();
         let cookie = cookie_for(&c, &user_id);
 
         assert!(
@@ -235,11 +260,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn an_expired_session_resolves_to_none() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn an_expired_session_resolves_to_none() {
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
         let user_id = seed_user(&mut c, "erin");
-        identity::add_project_membership(&c, &user_id, "proj-a").unwrap();
+        identity::add_project_membership(&db, &user_id, "proj-a")
+            .await
+            .unwrap();
         let sid = identity::create_session(
             &c,
             &user_id,
@@ -258,9 +285,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_project_member_via_group_membership_resolves_a_role() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn a_project_member_via_group_membership_resolves_a_role() {
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
         let user_id = seed_user(&mut c, "frank");
         let group =
             conexus_db::group_membership_repository::create_group(&c, "team-a", false, NOW_STR)
@@ -273,7 +300,8 @@ mod tests {
             NOW_STR,
         )
         .unwrap();
-        identity::grant_project_membership(&c, "proj-a", None, Some(&group.group_id), "operator")
+        identity::grant_project_membership(&db, "proj-a", None, Some(&group.group_id), "operator")
+            .await
             .unwrap();
         let cookie = cookie_for(&c, &user_id);
 

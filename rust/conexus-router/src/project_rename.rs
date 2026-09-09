@@ -275,10 +275,22 @@ pub enum RenameOutcome {
 
 /// Port of everything AFTER the deferred `systemctl stop` await
 /// resolves: `forget`, the workspace directory move, best-effort
-/// token-file renames, the atomic `registry.rename` (with PF-R37-1's
-/// full error-mapping ladder + a workspace-move rollback on failure),
-/// a best-effort `project_membership` rekey (AZ-R13-1), and a
-/// best-effort runtime-dir purge (BL-R35-1 parity with delete).
+/// token-file renames, and the atomic `registry.rename` (with
+/// PF-R37-1's full error-mapping ladder + a workspace-move rollback
+/// on failure), and a best-effort runtime-dir purge (BL-R35-1 parity
+/// with delete).
+///
+/// Deliberately still fully SYNCHRONOUS -- `conn: &Connection` is not
+/// `Send` (`rusqlite::Connection` is deliberately not `Sync`), and an
+/// `async fn` taking `&Connection` as its OWN parameter captures that
+/// reference for its ENTIRE body, breaking axum's `Handler: Send`
+/// bound for any REST handler that would await it (see
+/// `project_gate::decide_create_project`'s own doc for the same
+/// finding, empirically confirmed there). The best-effort
+/// `project_membership` rekey (AZ-R13-1) this function used to do
+/// inline is now the CALLER's job, once this function returns and
+/// `conn`'s borrow has genuinely ended -- see
+/// `lifecycle_rest::rename_project_handler`.
 #[allow(clippy::too_many_arguments)]
 pub fn finish_rename_project(
     conn: &Connection,
@@ -336,8 +348,6 @@ pub fn finish_rename_project(
             now,
         )?));
     }
-
-    let _ = crate::identity::rename_project_membership_project(conn, old_name, new_name);
 
     if lifecycle::SLUG_RE.is_match(old_name) {
         let runtime_dir = sock_dir.join(old_name);
@@ -1164,7 +1174,17 @@ mod tests {
     // -- finish_rename_project --------------------------------------------
 
     #[test]
-    fn finish_rename_project_moves_the_workspace_and_rekeys_membership() {
+    fn finish_rename_project_moves_the_workspace() {
+        // Phase G (router step 4 PR C): the `project_membership` rekey
+        // this test used to assert is no longer this function's job --
+        // it moved to the CALLER (see `finish_rename_project`'s own
+        // doc), which now runs it via `sea_orm_db` through
+        // `crate::identity::rename_project_membership_project`. Not
+        // re-verified here; see `identity.rs`'s own
+        // `rename_project_membership_project_rekeys_*` tests for the
+        // rekey itself, and `lifecycle_rest.rs`'s `rename_project_
+        // handler_rekeys_project_membership_via_sea_orm` for the real
+        // end-to-end handler path.
         let mut c = conn();
         let dir = tempfile::tempdir().unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
@@ -1218,14 +1238,17 @@ mod tests {
         let alias_owner = registry.resolve_alias("old-name", now_dt()).unwrap();
         assert_eq!(alias_owner.as_deref(), Some("new-name"));
 
-        let rekeyed: String = c
+        let unchanged: String = c
             .query_row(
                 "SELECT project_name FROM project_membership WHERE user_id = ?1",
                 [&uid],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(rekeyed, "new-name");
+        assert_eq!(
+            unchanged, "old-name",
+            "this function no longer rekeys project_membership -- the row is untouched"
+        );
     }
 
     #[test]
