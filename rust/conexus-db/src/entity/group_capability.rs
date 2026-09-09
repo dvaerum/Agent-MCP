@@ -6,12 +6,11 @@
 //! sea-orm `Entity` is just a table-shape definition, not bound to a
 //! specific connection.
 //!
-//! No `Relation` to a `groups` Entity yet — `groups`/`users` have no
-//! dedicated `conexus-db` repository or Entity anywhere in this
-//! workspace today (a real, tracked scope gap; see the plan's own
-//! Phase G research pass 2 notes). The real `FOREIGN KEY (group_id)
-//! REFERENCES groups(group_id) ON DELETE CASCADE` constraint still
-//! exists at the SQL level regardless of whether sea-orm models it.
+//! `Relation` now carries the real `FOREIGN KEY (group_id) REFERENCES
+//! groups(group_id) ON DELETE CASCADE` constraint, retrofitted once
+//! this PR added a real `groups::Entity` to relate to (the scope gap
+//! this doc comment used to flag — see git history for the original
+//! empty-`Relation` version and its own note on why it was empty).
 
 use sea_orm::entity::prelude::*;
 
@@ -25,7 +24,21 @@ pub struct Model {
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-pub enum Relation {}
+pub enum Relation {
+    #[sea_orm(
+        belongs_to = "super::groups::Entity",
+        from = "Column::GroupId",
+        to = "super::groups::Column::GroupId",
+        on_delete = "Cascade"
+    )]
+    Group,
+}
+
+impl Related<super::groups::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Group.def()
+    }
+}
 
 impl ActiveModelBehavior for ActiveModel {}
 
