@@ -14,6 +14,7 @@
 
 use conexus_db::group_membership_repository::{self, GroupCrudError, GroupFieldUpdate, GroupRow};
 use rusqlite::{Connection, TransactionBehavior};
+use sea_orm::DatabaseConnection;
 
 use crate::admin_users_gate::{self, AdminUsersError};
 use crate::mcp_handler::HandlerResponse;
@@ -42,9 +43,16 @@ fn not_found(group_id: &str) -> HandlerResponse {
     )
 }
 
-/// Port of `list_groups_handler`.
-pub fn list_groups_response(conn: &Connection) -> rusqlite::Result<HandlerResponse> {
-    let groups = group_membership_repository::list_groups_with_member_counts(conn)?;
+/// Port of `list_groups_handler`. Async/sea-orm: its only real
+/// caller, `users_groups_rest.rs::list_groups_handler`, is a plain
+/// read with no transaction requirement -- converted alongside
+/// `group_membership_repository::list_groups_with_member_counts`
+/// (this PR's own call-site classification found no forced-sync
+/// caller for either).
+pub async fn list_groups_response(
+    db: &DatabaseConnection,
+) -> std::result::Result<HandlerResponse, sea_orm::DbErr> {
+    let groups = group_membership_repository::list_groups_with_member_counts(db).await?;
     let json_groups: Vec<serde_json::Value> = groups
         .iter()
         .map(|(g, count)| group_public_json(g, *count))
@@ -63,13 +71,19 @@ pub enum CreateGroupOutcome {
 
 /// Port of `create_group_handler`. Argument extraction/validation
 /// order matches the real Python source exactly.
-pub fn decide_create_group(
-    conn: &Connection,
+///
+/// Async/sea-orm: its only real caller, `users_groups_rest.rs::
+/// create_group_handler`, opens no transaction of its own around this
+/// call (`group_membership_repository::create_group`'s single INSERT
+/// is already atomic) -- converted alongside that function per this
+/// PR's own call-site classification.
+pub async fn decide_create_group(
+    db: &DatabaseConnection,
     caller_is_sysadmin: bool,
     caller_username: &str,
     raw_body: &serde_json::Value,
     now: &str,
-) -> rusqlite::Result<CreateGroupOutcome> {
+) -> std::result::Result<CreateGroupOutcome, sea_orm::DbErr> {
     let name_val = raw_body.get("name");
     if let Some(err) = admin_users_gate::reject_non_str(name_val, "name", true) {
         return Ok(CreateGroupOutcome::Rejected(validation_rejected(&err)));
@@ -98,7 +112,7 @@ pub fn decide_create_group(
         return Ok(CreateGroupOutcome::Rejected(validation_rejected(&err)));
     }
 
-    match group_membership_repository::create_group(conn, &name, is_sysadmin, now) {
+    match group_membership_repository::create_group(db, &name, is_sysadmin, now).await {
         Ok(group) => Ok(CreateGroupOutcome::Created(group)),
         Err(GroupCrudError::NameConflict) => Ok(CreateGroupOutcome::Rejected(
             admin_users_gate::error_envelope(
@@ -107,7 +121,10 @@ pub fn decide_create_group(
                 None,
             ),
         )),
-        Err(GroupCrudError::Db(e)) => Err(e),
+        Err(GroupCrudError::SeaOrm(e)) => Err(e),
+        Err(GroupCrudError::Db(_)) => {
+            unreachable!("create_group (sea-orm) never returns GroupCrudError::Db, only ::SeaOrm")
+        }
     }
 }
 
@@ -174,7 +191,7 @@ pub fn decide_edit_group(
     let demoting = has_is_sysadmin && !is_sysadmin_val;
 
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let Some(existing) = group_membership_repository::get_group(&tx, group_id)? else {
+    let Some(existing) = group_membership_repository::get_group_sync(&tx, group_id)? else {
         return Ok(EditGroupOutcome::Rejected(not_found(group_id)));
     };
 
@@ -195,6 +212,9 @@ pub fn decide_edit_group(
             ))
         }
         Err(GroupCrudError::Db(e)) => return Err(e),
+        Err(GroupCrudError::SeaOrm(_)) => unreachable!(
+            "update_group_fields (rusqlite) never returns GroupCrudError::SeaOrm, only ::Db"
+        ),
     }
 
     // R5-F4: re-evaluate the GLOBAL invariant AFTER the UPDATE has
@@ -205,9 +225,9 @@ pub fn decide_edit_group(
         ));
     }
 
-    let row = group_membership_repository::get_group(&tx, group_id)?
+    let row = group_membership_repository::get_group_sync(&tx, group_id)?
         .expect("row confirmed to exist above");
-    let member_count = group_membership_repository::group_member_count(&tx, group_id)?;
+    let member_count = group_membership_repository::group_member_count_sync(&tx, group_id)?;
     tx.commit()?;
     Ok(EditGroupOutcome::Updated(row, member_count))
 }
@@ -230,7 +250,7 @@ pub fn decide_delete_group(
     group_id: &str,
 ) -> rusqlite::Result<DeleteGroupOutcome> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    if group_membership_repository::get_group(&tx, group_id)?.is_none() {
+    if group_membership_repository::get_group_sync(&tx, group_id)?.is_none() {
         return Ok(DeleteGroupOutcome::Rejected(not_found(group_id)));
     }
     if !caller_is_sysadmin
@@ -283,19 +303,28 @@ mod tests {
 
     const NOW: &str = "2026-01-01T00:00:00.000+00:00";
 
+    /// Raw INSERT, standing in for the now-async
+    /// `group_membership_repository::create_group` -- this module's
+    /// own `decide_edit_group`/`decide_delete_group` tests only need a
+    /// sysadmin-flagged group ROW to exist (no assertion here
+    /// exercises `create_group` itself, which has its own coverage in
+    /// `group_membership_repository.rs`).
     fn seed_sysadmin_group(c: &Connection) -> String {
-        group_membership_repository::create_group(c, "engineers", true, NOW)
-            .unwrap()
-            .group_id
+        c.execute(
+            "INSERT INTO groups (group_id, name, is_sysadmin, created_at) VALUES ('engineers', 'engineers', 1, ?1)",
+            [NOW],
+        )
+        .unwrap();
+        "engineers".to_string()
     }
 
     // -- list_groups_response --------------------------------------
 
-    #[test]
-    fn list_groups_response_includes_member_count() {
-        let c = conn();
+    #[tokio::test]
+    async fn list_groups_response_includes_member_count() {
+        let (_dir, c, db) = conn_with_sea_orm().await;
         seed_sysadmin_group(&c);
-        let resp = list_groups_response(&c).unwrap();
+        let resp = list_groups_response(&db).await.unwrap();
         let crate::mcp_handler::HandlerBody::Json(body) = resp.body else {
             panic!("expected JSON");
         };
@@ -307,16 +336,17 @@ mod tests {
 
     // -- decide_create_group -----------------------------------------
 
-    #[test]
-    fn creates_a_non_sysadmin_group_by_default() {
-        let c = conn();
+    #[tokio::test]
+    async fn creates_a_non_sysadmin_group_by_default() {
+        let (_dir, _c, db) = conn_with_sea_orm().await;
         let outcome = decide_create_group(
-            &c,
+            &db,
             false,
             "admin",
             &serde_json::json!({"name": "team-a"}),
             NOW,
         )
+        .await
         .unwrap();
         let CreateGroupOutcome::Created(group) = outcome else {
             panic!("expected Created, got {outcome:?}");
@@ -325,16 +355,17 @@ mod tests {
         assert!(!group.is_sysadmin);
     }
 
-    #[test]
-    fn a_non_sysadmin_cannot_mint_a_sysadmin_group() {
-        let c = conn();
+    #[tokio::test]
+    async fn a_non_sysadmin_cannot_mint_a_sysadmin_group() {
+        let (_dir, _c, db) = conn_with_sea_orm().await;
         let outcome = decide_create_group(
-            &c,
+            &db,
             false,
             "admin",
             &serde_json::json!({"name": "team-a", "is_sysadmin": true}),
             NOW,
         )
+        .await
         .unwrap();
         let CreateGroupOutcome::Rejected(resp) = outcome else {
             panic!("expected Rejected");
@@ -342,16 +373,17 @@ mod tests {
         assert_eq!(resp.status, 403);
     }
 
-    #[test]
-    fn a_sysadmin_can_mint_a_sysadmin_group() {
-        let c = conn();
+    #[tokio::test]
+    async fn a_sysadmin_can_mint_a_sysadmin_group() {
+        let (_dir, _c, db) = conn_with_sea_orm().await;
         let outcome = decide_create_group(
-            &c,
+            &db,
             true,
             "admin",
             &serde_json::json!({"name": "team-a", "is_sysadmin": true}),
             NOW,
         )
+        .await
         .unwrap();
         let CreateGroupOutcome::Created(group) = outcome else {
             panic!("expected Created, got {outcome:?}");
@@ -359,17 +391,18 @@ mod tests {
         assert!(group.is_sysadmin);
     }
 
-    #[test]
-    fn rejects_a_duplicate_group_name_as_conflict() {
-        let c = conn();
+    #[tokio::test]
+    async fn rejects_a_duplicate_group_name_as_conflict() {
+        let (_dir, c, db) = conn_with_sea_orm().await;
         seed_sysadmin_group(&c);
         let outcome = decide_create_group(
-            &c,
+            &db,
             true,
             "admin",
             &serde_json::json!({"name": "engineers"}),
             NOW,
         )
+        .await
         .unwrap();
         let CreateGroupOutcome::Rejected(resp) = outcome else {
             panic!("expected Rejected");
@@ -377,11 +410,12 @@ mod tests {
         assert_eq!(resp.status, 409);
     }
 
-    #[test]
-    fn rejects_an_invalid_group_name() {
-        let c = conn();
+    #[tokio::test]
+    async fn rejects_an_invalid_group_name() {
+        let (_dir, _c, db) = conn_with_sea_orm().await;
         let outcome =
-            decide_create_group(&c, true, "admin", &serde_json::json!({"name": "!!!"}), NOW)
+            decide_create_group(&db, true, "admin", &serde_json::json!({"name": "!!!"}), NOW)
+                .await
                 .unwrap();
         let CreateGroupOutcome::Rejected(resp) = outcome else {
             panic!("expected Rejected");
@@ -476,7 +510,7 @@ mod tests {
         )
         .await
         .unwrap();
-        conexus_db::group_membership_repository::add_group_member(
+        conexus_db::group_membership_repository::add_group_member_sync(
             &c,
             &gid,
             Some(&alice),
@@ -496,7 +530,7 @@ mod tests {
             panic!("expected Rejected, got {outcome:?}");
         };
         assert_eq!(resp.status, 409);
-        let row = group_membership_repository::get_group(&c, &gid)
+        let row = group_membership_repository::get_group_sync(&c, &gid)
             .unwrap()
             .unwrap();
         assert!(row.is_sysadmin, "the demotion must have rolled back");
@@ -532,15 +566,22 @@ mod tests {
     #[test]
     fn rejects_a_duplicate_name_on_edit_as_conflict() {
         let mut c = conn();
-        group_membership_repository::create_group(&c, "taken", false, NOW).unwrap();
-        let gid = group_membership_repository::create_group(&c, "other", false, NOW)
-            .unwrap()
-            .group_id;
+        c.execute(
+            "INSERT INTO groups (group_id, name, is_sysadmin, created_at) VALUES ('taken', 'taken', 0, ?1)",
+            [NOW],
+        )
+        .unwrap();
+        let gid = "other";
+        c.execute(
+            "INSERT INTO groups (group_id, name, is_sysadmin, created_at) VALUES ('other', 'other', 0, ?1)",
+            [NOW],
+        )
+        .unwrap();
         let outcome = decide_edit_group(
             &mut c,
             true,
             "admin",
-            &gid,
+            gid,
             &serde_json::json!({"name": "taken"}),
         )
         .unwrap();
@@ -571,12 +612,13 @@ mod tests {
         )
         .await
         .unwrap();
-        let gid = group_membership_repository::create_group(&c, "team-a", false, NOW)
+        let gid = group_membership_repository::create_group(&db, "team-a", false, NOW)
+            .await
             .unwrap()
             .group_id;
         let outcome = decide_delete_group(&mut c, true, "admin", &gid).unwrap();
         assert!(matches!(outcome, DeleteGroupOutcome::Deleted(_)));
-        assert!(group_membership_repository::get_group(&c, &gid)
+        assert!(group_membership_repository::get_group_sync(&c, &gid)
             .unwrap()
             .is_none());
     }
@@ -622,7 +664,7 @@ mod tests {
         let gid = seed_sysadmin_group(&c);
         let outcome = decide_delete_group(&mut c, true, "root", &gid).unwrap();
         assert!(matches!(outcome, DeleteGroupOutcome::Deleted(_)));
-        assert!(group_membership_repository::get_group(&c, &gid)
+        assert!(group_membership_repository::get_group_sync(&c, &gid)
             .unwrap()
             .is_none());
     }
@@ -645,7 +687,7 @@ mod tests {
         )
         .await
         .unwrap();
-        conexus_db::group_membership_repository::add_group_member(
+        conexus_db::group_membership_repository::add_group_member_sync(
             &c,
             &gid,
             Some(&alice),
@@ -659,7 +701,7 @@ mod tests {
         };
         assert_eq!(resp.status, 409);
         assert!(
-            group_membership_repository::get_group(&c, &gid)
+            group_membership_repository::get_group_sync(&c, &gid)
                 .unwrap()
                 .is_some(),
             "the delete must have rolled back"

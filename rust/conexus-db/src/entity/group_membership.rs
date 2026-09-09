@@ -111,7 +111,7 @@ mod tests {
             // Use the real repository function (not a hand-rolled
             // INSERT) for the user-membership edge, per this PR's own
             // "write via the existing repository" option.
-            crate::group_membership_repository::add_group_member(
+            crate::group_membership_repository::add_group_member_sync(
                 &conn,
                 "g1",
                 Some("u1"),
@@ -121,7 +121,7 @@ mod tests {
             .unwrap();
             // And the group-inside-group edge, exercising the OTHER FK
             // to `groups` (`member_group_id`).
-            crate::group_membership_repository::add_group_member(
+            crate::group_membership_repository::add_group_member_sync(
                 &conn,
                 "g1",
                 None,

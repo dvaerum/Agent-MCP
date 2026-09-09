@@ -62,12 +62,14 @@ mod tests {
                 [],
             )
             .unwrap();
-            crate::group_capability_repository::replace(&conn, "g1", ["system.projects.manage"])
-                .unwrap();
         }
 
         let url = format!("sqlite://{}", path.display());
         let db = Database::connect(&url).await.unwrap();
+
+        crate::group_capability_repository::replace(&db, "g1", ["system.projects.manage"])
+            .await
+            .unwrap();
 
         let rows = Entity::find().all(&db).await.unwrap();
         assert_eq!(rows.len(), 1);
@@ -81,10 +83,10 @@ mod tests {
             capability: Set("system.users.manage".to_string()),
         };
         am.insert(&db).await.unwrap();
-        drop(db);
 
-        let conn = rusqlite::Connection::open(&path).unwrap();
-        let caps = crate::group_capability_repository::fetch(&conn, "g1").unwrap();
+        let caps = crate::group_capability_repository::fetch(&db, "g1")
+            .await
+            .unwrap();
         assert_eq!(caps.len(), 2);
         assert!(caps.contains("system.projects.manage"));
         assert!(caps.contains("system.users.manage"));

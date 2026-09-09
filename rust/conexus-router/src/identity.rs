@@ -2395,9 +2395,10 @@ mod tests {
 
     #[tokio::test]
     async fn remove_project_membership_deletes_a_group_row() {
-        let (_dir, c, db) = conn_with_sea_orm().await;
+        let (_dir, _c, db) = conn_with_sea_orm().await;
         let group_id =
-            conexus_db::group_membership_repository::create_group(&c, "engineers", false, NOW)
+            conexus_db::group_membership_repository::create_group(&db, "engineers", false, NOW)
+                .await
                 .unwrap()
                 .group_id;
         grant_project_membership(&db, "proj-a", None, Some(&group_id), "viewer")
@@ -2412,7 +2413,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_project_memberships_projects_both_kinds() {
-        let (_dir, c, db) = conn_with_sea_orm().await;
+        let (_dir, _c, db) = conn_with_sea_orm().await;
         let uid = create_user(
             &db,
             "alice",
@@ -2426,7 +2427,8 @@ mod tests {
         .await
         .unwrap();
         let group_id =
-            conexus_db::group_membership_repository::create_group(&c, "engineers", false, NOW)
+            conexus_db::group_membership_repository::create_group(&db, "engineers", false, NOW)
+                .await
                 .unwrap()
                 .group_id;
         grant_project_membership(&db, "proj-a", Some(&uid), None, "operator")

@@ -26,11 +26,22 @@
 //! manual grant, and an explicit-mapping target group (an arbitrary
 //! local slug an operator bound a claim to), are both left
 //! additive-only -- an SSO login can never remove either.
+//!
+//! **Phase G (sea-orm migration, router step 4 PR G)**: both public
+//! functions converted to `sea_orm::DatabaseConnection` -- found via
+//! this PR's own "verify against the real current files" mandate as a
+//! real caller not in the originally-handed-in inventory. Their one
+//! real caller, `oidc_handlers.rs`'s ID-token handler, is already
+//! async; PR D already established that SAME handler's OTHER call
+//! (`find_or_create_oidc_user`) has no hot-path-sync constraint, and
+//! this pair of calls has none either -- they run sequentially before
+//! (still out-of-scope, rusqlite-based) `identity::create_session`,
+//! with no shared transaction between the two steps to preserve.
 
 use std::collections::{HashMap, HashSet};
 
 use conexus_db::group_membership_repository as repo;
-use rusqlite::Connection;
+use sea_orm::DatabaseConnection;
 
 use crate::sso::sanitise_username;
 
@@ -91,8 +102,8 @@ fn mapped_group_names(
 /// own `except sqlite3.OperationalError: return False/None` posture
 /// on a backlevel deploy whose groups tables haven't migrated in yet)
 /// rather than aborting the whole login on a partial-schema gap.
-pub fn apply_group_mapping(
-    conn: &Connection,
+pub async fn apply_group_mapping(
+    db: &DatabaseConnection,
     user_id: &str,
     group_claims: &[String],
     mapping: &HashMap<String, String>,
@@ -105,16 +116,19 @@ pub fn apply_group_mapping(
         let Some(group_name) = mapped_name(claim, mapping, wildcard) else {
             continue;
         };
-        let Ok(group_id) = repo::ensure_group(conn, &group_name) else {
+        let Ok(group_id) = repo::ensure_group(db, &group_name).await else {
             continue;
         };
-        let Ok(already_member) = repo::is_direct_user_member(conn, &group_id, user_id) else {
+        let Ok(already_member) = repo::is_direct_user_member(db, &group_id, user_id).await else {
             continue;
         };
         if already_member {
             continue;
         }
-        if repo::add_group_member(conn, &group_id, Some(user_id), None, now).is_ok() {
+        if repo::add_group_member(db, &group_id, Some(user_id), None, now)
+            .await
+            .is_ok()
+        {
             added.insert(group_name);
         }
     }
@@ -130,8 +144,8 @@ pub fn apply_group_mapping(
 /// otherwise keep the local `group_membership` row -- and, since
 /// group-resolution derives sysadmin/project-role transitively from
 /// those rows, keep the privilege indefinitely).
-pub fn reconcile_oidc_group_membership(
-    conn: &Connection,
+pub async fn reconcile_oidc_group_membership(
+    db: &DatabaseConnection,
     user_id: &str,
     group_claims: &[String],
     mapping: &HashMap<String, String>,
@@ -144,7 +158,7 @@ pub fn reconcile_oidc_group_membership(
         .collect();
 
     let Ok(current_oidc) =
-        repo::user_group_memberships_by_name_prefix(conn, user_id, WILDCARD_GROUP_PREFIX)
+        repo::user_group_memberships_by_name_prefix(db, user_id, WILDCARD_GROUP_PREFIX).await
     else {
         return HashSet::new();
     };
@@ -154,7 +168,10 @@ pub fn reconcile_oidc_group_membership(
         if claimed_oidc.contains(name.as_str()) {
             continue;
         }
-        if repo::remove_group_member(conn, &group_id, user_id).unwrap_or(false) {
+        if repo::remove_group_member(db, &group_id, user_id)
+            .await
+            .unwrap_or(false)
+        {
             removed.insert(name);
         }
     }
@@ -168,15 +185,26 @@ mod tests {
 
     const NOW: &str = "2026-09-06T00:00:00Z";
 
-    fn conn() -> Connection {
-        let c = Connection::open_in_memory().unwrap();
-        init_router_schema(&c).unwrap();
-        c.execute(
-            "INSERT INTO users (user_id, username, created_at) VALUES ('u1', 'alice', ?1)",
-            [NOW],
-        )
-        .unwrap();
-        c
+    /// A file-backed router DB, sea-orm only -- every DB primitive
+    /// this module's own functions now call is async/sea-orm, so
+    /// there's nothing left in this test module that needs a live
+    /// rusqlite handle after schema init/seeding.
+    async fn db() -> (tempfile::TempDir, DatabaseConnection) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oidc_group_mapping_test.db");
+        {
+            let c = rusqlite::Connection::open(&path).unwrap();
+            init_router_schema(&c).unwrap();
+            c.execute(
+                "INSERT INTO users (user_id, username, created_at) VALUES ('u1', 'alice', ?1)",
+                [NOW],
+            )
+            .unwrap();
+        }
+        let db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        (dir, db)
     }
 
     fn mapping(pairs: &[(&str, &str)]) -> HashMap<String, String> {
@@ -190,116 +218,123 @@ mod tests {
         names.iter().map(|s| s.to_string()).collect()
     }
 
-    fn user_group_names(c: &Connection, user_id: &str) -> HashSet<String> {
-        repo::user_group_memberships_by_name_prefix(c, user_id, "")
+    async fn user_group_names(db: &DatabaseConnection, user_id: &str) -> HashSet<String> {
+        repo::user_group_memberships_by_name_prefix(db, user_id, "")
+            .await
             .unwrap()
             .into_keys()
             .collect()
     }
 
-    #[test]
-    fn an_explicit_mapping_adds_the_user_to_the_named_local_group() {
-        let c = conn();
+    #[tokio::test]
+    async fn an_explicit_mapping_adds_the_user_to_the_named_local_group() {
+        let (_dir, db) = db().await;
         let map = mapping(&[("admins", "admins")]);
-        let added = apply_group_mapping(&c, "u1", &claims(&["admins"]), &map, NOW);
+        let added = apply_group_mapping(&db, "u1", &claims(&["admins"]), &map, NOW).await;
         assert_eq!(added, HashSet::from(["admins".to_string()]));
-        assert!(user_group_names(&c, "u1").contains("admins"));
+        assert!(user_group_names(&db, "u1").await.contains("admins"));
     }
 
-    #[test]
-    fn an_unmapped_claim_with_no_wildcard_is_silently_ignored() {
-        let c = conn();
+    #[tokio::test]
+    async fn an_unmapped_claim_with_no_wildcard_is_silently_ignored() {
+        let (_dir, db) = db().await;
         let map = mapping(&[("admins", "admins")]);
-        let added = apply_group_mapping(&c, "u1", &claims(&["engineers"]), &map, NOW);
+        let added = apply_group_mapping(&db, "u1", &claims(&["engineers"]), &map, NOW).await;
         assert!(added.is_empty());
-        assert!(user_group_names(&c, "u1").is_empty());
+        assert!(user_group_names(&db, "u1").await.is_empty());
     }
 
-    #[test]
-    fn the_wildcard_jit_creates_a_namespaced_group_for_an_unmapped_claim() {
-        let c = conn();
+    #[tokio::test]
+    async fn the_wildcard_jit_creates_a_namespaced_group_for_an_unmapped_claim() {
+        let (_dir, db) = db().await;
         let map = mapping(&[("*", "*")]);
-        let added = apply_group_mapping(&c, "u1", &claims(&["Site Admins!"]), &map, NOW);
+        let added = apply_group_mapping(&db, "u1", &claims(&["Site Admins!"]), &map, NOW).await;
         assert_eq!(added, HashSet::from(["oidc:site-admins".to_string()]));
     }
 
-    #[test]
-    fn an_explicit_mapping_takes_priority_over_the_wildcard() {
-        let c = conn();
+    #[tokio::test]
+    async fn an_explicit_mapping_takes_priority_over_the_wildcard() {
+        let (_dir, db) = db().await;
         let map = mapping(&[("admins", "admins"), ("*", "*")]);
-        let added = apply_group_mapping(&c, "u1", &claims(&["admins"]), &map, NOW);
+        let added = apply_group_mapping(&db, "u1", &claims(&["admins"]), &map, NOW).await;
         // Not `oidc:admins` -- the explicit target wins, matching
         // Python's own `target = mapping.get(claim); if target: ...`
         // precedence.
         assert_eq!(added, HashSet::from(["admins".to_string()]));
     }
 
-    #[test]
-    fn a_second_call_with_the_same_claims_is_idempotent() {
-        let c = conn();
+    #[tokio::test]
+    async fn a_second_call_with_the_same_claims_is_idempotent() {
+        let (_dir, db) = db().await;
         let map = mapping(&[("*", "*")]);
-        apply_group_mapping(&c, "u1", &claims(&["engineers"]), &map, NOW);
-        let second = apply_group_mapping(&c, "u1", &claims(&["engineers"]), &map, NOW);
+        apply_group_mapping(&db, "u1", &claims(&["engineers"]), &map, NOW).await;
+        let second = apply_group_mapping(&db, "u1", &claims(&["engineers"]), &map, NOW).await;
         // Already a member -- nothing NEWLY added the second time.
         assert!(second.is_empty());
         assert_eq!(
-            user_group_names(&c, "u1"),
+            user_group_names(&db, "u1").await,
             HashSet::from(["oidc:engineers".to_string()])
         );
     }
 
-    #[test]
-    fn reconcile_revokes_an_oidc_group_no_longer_claimed() {
-        let c = conn();
+    #[tokio::test]
+    async fn reconcile_revokes_an_oidc_group_no_longer_claimed() {
+        let (_dir, db) = db().await;
         let map = mapping(&[("*", "*")]);
-        apply_group_mapping(&c, "u1", &claims(&["engineers", "admins"]), &map, NOW);
+        apply_group_mapping(&db, "u1", &claims(&["engineers", "admins"]), &map, NOW).await;
 
-        let removed = reconcile_oidc_group_membership(&c, "u1", &claims(&["engineers"]), &map);
+        let removed =
+            reconcile_oidc_group_membership(&db, "u1", &claims(&["engineers"]), &map).await;
 
         assert_eq!(removed, HashSet::from(["oidc:admins".to_string()]));
-        let remaining = user_group_names(&c, "u1");
+        let remaining = user_group_names(&db, "u1").await;
         assert!(remaining.contains("oidc:engineers"));
         assert!(!remaining.contains("oidc:admins"));
     }
 
-    #[test]
-    fn reconcile_never_touches_a_manually_managed_group() {
+    #[tokio::test]
+    async fn reconcile_never_touches_a_manually_managed_group() {
         // A local, non-`oidc:`-namespaced group must survive
         // reconciliation even when nothing in the current claim set
         // justifies it -- an SSO login must never undo a manual grant.
-        let c = conn();
-        let group_id = repo::ensure_group(&c, "trusted-operators").unwrap();
-        repo::add_group_member(&c, &group_id, Some("u1"), None, NOW).unwrap();
+        let (_dir, db) = db().await;
+        let group_id = repo::ensure_group(&db, "trusted-operators").await.unwrap();
+        repo::add_group_member(&db, &group_id, Some("u1"), None, NOW)
+            .await
+            .unwrap();
 
         let map = mapping(&[("*", "*")]);
-        let removed = reconcile_oidc_group_membership(&c, "u1", &claims(&[]), &map);
+        let removed = reconcile_oidc_group_membership(&db, "u1", &claims(&[]), &map).await;
 
         assert!(removed.is_empty());
-        assert!(user_group_names(&c, "u1").contains("trusted-operators"));
+        assert!(user_group_names(&db, "u1")
+            .await
+            .contains("trusted-operators"));
     }
 
-    #[test]
-    fn reconcile_never_touches_an_explicit_mapping_target_even_when_unclaimed() {
+    #[tokio::test]
+    async fn reconcile_never_touches_an_explicit_mapping_target_even_when_unclaimed() {
         // An explicit-mapping target group (an arbitrary local slug an
         // operator bound a claim to) is left additive-only, same as a
         // fully manual grant -- only `oidc:`-namespaced wildcard
         // groups are ever revoked.
-        let c = conn();
+        let (_dir, db) = db().await;
         let map = mapping(&[("admins", "admins")]);
-        apply_group_mapping(&c, "u1", &claims(&["admins"]), &map, NOW);
+        apply_group_mapping(&db, "u1", &claims(&["admins"]), &map, NOW).await;
 
-        let removed = reconcile_oidc_group_membership(&c, "u1", &claims(&[]), &map);
+        let removed = reconcile_oidc_group_membership(&db, "u1", &claims(&[]), &map).await;
 
         assert!(removed.is_empty());
-        assert!(user_group_names(&c, "u1").contains("admins"));
+        assert!(user_group_names(&db, "u1").await.contains("admins"));
     }
 
-    #[test]
-    fn reconcile_is_idempotent_when_the_claim_set_is_unchanged() {
-        let c = conn();
+    #[tokio::test]
+    async fn reconcile_is_idempotent_when_the_claim_set_is_unchanged() {
+        let (_dir, db) = db().await;
         let map = mapping(&[("*", "*")]);
-        apply_group_mapping(&c, "u1", &claims(&["engineers"]), &map, NOW);
-        let removed = reconcile_oidc_group_membership(&c, "u1", &claims(&["engineers"]), &map);
+        apply_group_mapping(&db, "u1", &claims(&["engineers"]), &map, NOW).await;
+        let removed =
+            reconcile_oidc_group_membership(&db, "u1", &claims(&["engineers"]), &map).await;
         assert!(removed.is_empty());
     }
 }
