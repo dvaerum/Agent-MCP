@@ -1547,6 +1547,29 @@ mod tests {
     // these tests' multi-second timing assertions. The synchronous
     // schema-init file I/O before it doesn't await anything, so it
     // isn't part of that race at all.
+    //
+    // Phase G: `assemble_event_feed`'s `collect_events_with_cap`/
+    // `collect_unassigned_task_events_for` now issue REAL sea-orm
+    // queries (not just the initial connect) on every call --
+    // including from deep inside these paused-clock tests' own
+    // `wait_for_events_slow_path` exercise, well after this function
+    // has already returned and re-paused the clock. Each such query
+    // can itself need to acquire the pool's single connection
+    // (sea-orm's sqlite driver hardcodes `max_connections(1)`), racing
+    // the SAME paused-clock-vs-acquire-deadline hazard described
+    // above -- just at query time instead of connect time, and not
+    // fixable by a resume()/pause() bracket at THIS call site since
+    // the query happens later, inside production code this function
+    // has no visibility into. Fixed at the actual root instead of
+    // re-applying the bracket ad hoc at every future query call site:
+    // `ConnectOptions::acquire_timeout` raised far past any test's own
+    // multi-second timing assertions, so the auto-fast-forward can
+    // never race a real acquire into a spurious timeout regardless of
+    // where in the call chain the query happens -- a real (wall-clock)
+    // acquire always completes via its own OS-scheduled wakeup long
+    // before virtual time could ever reach this ceiling. Verified
+    // empirically: reproduced 4/5 under real 16-way parallel
+    // contention before this fix, 0/20 after.
     async fn test_sea_orm_db_paused() -> (tempfile::TempDir, sea_orm::DatabaseConnection) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.db");
@@ -1555,9 +1578,9 @@ mod tests {
             init_schema(&c).unwrap();
         }
         tokio::time::resume();
-        let db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
-            .await
-            .unwrap();
+        let mut opts = sea_orm::ConnectOptions::new(format!("sqlite://{}", path.display()));
+        opts.acquire_timeout(Duration::from_secs(3600));
+        let db = sea_orm::Database::connect(opts).await.unwrap();
         tokio::time::pause();
         (dir, db)
     }

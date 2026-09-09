@@ -46,11 +46,12 @@
 
 use rusqlite::{Connection, OptionalExtension, Result, Row, ToSql};
 use sea_orm::{
-    ColumnTrait, DatabaseConnection, DbErr, EntityTrait, PaginatorTrait, QueryFilter, QuerySelect,
+    ColumnTrait, DatabaseConnection, DbErr, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
+    QuerySelect,
 };
 use std::collections::HashMap;
 
-use crate::entity::task::{Column, Entity};
+use crate::entity::task::{self, Column, Entity};
 use crate::scheduled_directive_repository::NullableUpdate;
 
 /// One note entry in a task's `notes` JSON list.
@@ -208,15 +209,15 @@ pub struct TaskEventRow {
     pub updated_at: String,
 }
 
-fn row_to_task_event(row: &Row) -> rusqlite::Result<TaskEventRow> {
-    Ok(TaskEventRow {
-        task_id: row.get(0)?,
-        title: row.get(1)?,
-        status: row.get(2)?,
-        priority: row.get(3)?,
-        created_at: row.get(4)?,
-        updated_at: row.get(5)?,
-    })
+fn task_event_from_model(m: task::Model) -> TaskEventRow {
+    TaskEventRow {
+        task_id: m.task_id,
+        title: m.title,
+        status: m.status,
+        priority: m.priority,
+        created_at: m.created_at,
+        updated_at: m.updated_at,
+    }
 }
 
 /// Tasks assigned to `agent_id` touched since `since` (`updated_at >
@@ -224,17 +225,21 @@ fn row_to_task_event(row: &Row) -> rusqlite::Result<TaskEventRow> {
 /// `task_assigned`/`task_changed` stream -- the caller classifies each
 /// row using `created_at` vs `since` (v1 heuristic: `created_at >
 /// since` is a fresh assignment, else a mutation of an existing one).
-pub fn list_assigned_updated_since(
-    conn: &Connection,
+/// Built via sea-orm's typed query builder (`.filter(...).order_by_asc(...)`),
+/// not a raw `Statement` -- a plain `WHERE ... ORDER BY` this crate's
+/// established `count_active_by_assignee`-style idiom already covers.
+pub async fn list_assigned_updated_since(
+    db: &DatabaseConnection,
     agent_id: &str,
     since: &str,
-) -> Result<Vec<TaskEventRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT task_id, title, status, priority, created_at, updated_at FROM tasks \
-         WHERE assigned_to = ?1 AND updated_at > ?2 ORDER BY updated_at ASC",
-    )?;
-    let rows = stmt.query_map((agent_id, since), row_to_task_event)?;
-    rows.collect()
+) -> Result<Vec<TaskEventRow>, DbErr> {
+    let rows = Entity::find()
+        .filter(Column::AssignedTo.eq(agent_id))
+        .filter(Column::UpdatedAt.gt(since))
+        .order_by_asc(Column::UpdatedAt)
+        .all(db)
+        .await?;
+    Ok(rows.into_iter().map(task_event_from_model).collect())
 }
 
 /// Unassigned tasks NOT in `excluded_statuses`, touched since `since`
@@ -257,24 +262,19 @@ pub fn list_assigned_updated_since(
 /// 3-element set (`completed`/`cancelled`/`failed`) -- hardcoding
 /// either constant here would risk silently reusing the wrong one at a
 /// future call site. The caller owns which set applies.
-pub fn list_unassigned_active_updated_since(
-    conn: &Connection,
+pub async fn list_unassigned_active_updated_since(
+    db: &DatabaseConnection,
     since: &str,
     excluded_statuses: &[&str],
-) -> Result<Vec<TaskEventRow>> {
-    let placeholders = std::iter::repeat_n("?", excluded_statuses.len())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "SELECT task_id, title, status, priority, created_at, updated_at FROM tasks \
-         WHERE assigned_to IS NULL AND status NOT IN ({placeholders}) AND updated_at > ? \
-         ORDER BY updated_at ASC"
-    );
-    let mut params: Vec<&dyn ToSql> = excluded_statuses.iter().map(|s| s as &dyn ToSql).collect();
-    params.push(&since);
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params.as_slice(), row_to_task_event)?;
-    rows.collect()
+) -> Result<Vec<TaskEventRow>, DbErr> {
+    let rows = Entity::find()
+        .filter(Column::AssignedTo.is_null())
+        .filter(Column::Status.is_not_in(excluded_statuses.iter().copied()))
+        .filter(Column::UpdatedAt.gt(since))
+        .order_by_asc(Column::UpdatedAt)
+        .all(db)
+        .await?;
+    Ok(rows.into_iter().map(task_event_from_model).collect())
 }
 
 /// Count of tasks assigned to `agent_id` NOT in `excluded_statuses`.
@@ -1183,42 +1183,46 @@ mod tests {
 
     // -- list_assigned_updated_since ------------------------------------
 
-    #[test]
-    fn list_assigned_updated_since_excludes_rows_at_or_before_the_cursor() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn list_assigned_updated_since_excludes_rows_at_or_before_the_cursor() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         let mut t = new_task(Some("task_1"), "a");
         t.assigned_to = Some("alice");
         create(&conn, t).unwrap();
         set_updated_at(&conn, "task_1", "2026-01-01T00:00:00Z");
 
         assert!(
-            list_assigned_updated_since(&conn, "alice", "2026-01-01T00:00:00Z")
+            list_assigned_updated_since(&db, "alice", "2026-01-01T00:00:00Z")
+                .await
                 .unwrap()
                 .is_empty()
         );
-        let after = list_assigned_updated_since(&conn, "alice", "2025-12-31T00:00:00Z").unwrap();
+        let after = list_assigned_updated_since(&db, "alice", "2025-12-31T00:00:00Z")
+            .await
+            .unwrap();
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].task_id, "task_1");
     }
 
-    #[test]
-    fn list_assigned_updated_since_ignores_other_agents_tasks() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn list_assigned_updated_since_ignores_other_agents_tasks() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         let mut t = new_task(Some("task_1"), "a");
         t.assigned_to = Some("bob");
         create(&conn, t).unwrap();
         set_updated_at(&conn, "task_1", "2026-01-01T00:00:01Z");
 
         assert!(
-            list_assigned_updated_since(&conn, "alice", "2025-01-01T00:00:00Z")
+            list_assigned_updated_since(&db, "alice", "2025-01-01T00:00:00Z")
+                .await
                 .unwrap()
                 .is_empty()
         );
     }
 
-    #[test]
-    fn list_assigned_updated_since_is_oldest_first() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn list_assigned_updated_since_is_oldest_first() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         let mut t1 = new_task(Some("task_1"), "first");
         t1.assigned_to = Some("alice");
         create(&conn, t1).unwrap();
@@ -1229,59 +1233,64 @@ mod tests {
         set_updated_at(&conn, "task_1", "2026-01-01T00:00:02Z");
         set_updated_at(&conn, "task_2", "2026-01-01T00:00:01Z");
 
-        let rows = list_assigned_updated_since(&conn, "alice", "2025-01-01T00:00:00Z").unwrap();
+        let rows = list_assigned_updated_since(&db, "alice", "2025-01-01T00:00:00Z")
+            .await
+            .unwrap();
         assert_eq!(rows[0].task_id, "task_2");
         assert_eq!(rows[1].task_id, "task_1");
     }
 
     // -- list_unassigned_active_updated_since ----------------------------
 
-    #[test]
-    fn list_unassigned_active_updated_since_excludes_assigned_tasks() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn list_unassigned_active_updated_since_excludes_assigned_tasks() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         let mut t = new_task(Some("task_1"), "a");
         t.assigned_to = Some("alice");
         create(&conn, t).unwrap();
         set_updated_at(&conn, "task_1", "2026-01-01T00:00:00Z");
 
         assert!(list_unassigned_active_updated_since(
-            &conn,
+            &db,
             "2025-01-01T00:00:00Z",
             &["completed", "cancelled", "failed"],
         )
+        .await
         .unwrap()
         .is_empty());
     }
 
-    #[test]
-    fn list_unassigned_active_updated_since_excludes_the_given_terminal_statuses() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn list_unassigned_active_updated_since_excludes_the_given_terminal_statuses() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         let mut t = new_task(Some("task_1"), "done");
         t.status = "completed";
         create(&conn, t).unwrap();
         set_updated_at(&conn, "task_1", "2026-01-01T00:00:00Z");
 
         assert!(list_unassigned_active_updated_since(
-            &conn,
+            &db,
             "2025-01-01T00:00:00Z",
             &["completed", "cancelled", "failed"],
         )
+        .await
         .unwrap()
         .is_empty());
     }
 
-    #[test]
-    fn list_unassigned_active_updated_since_returns_claimable_tasks() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn list_unassigned_active_updated_since_returns_claimable_tasks() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         let t = new_task(Some("task_1"), "up for grabs");
         create(&conn, t).unwrap();
         set_updated_at(&conn, "task_1", "2026-01-01T00:00:00Z");
 
         let rows = list_unassigned_active_updated_since(
-            &conn,
+            &db,
             "2025-01-01T00:00:00Z",
             &["completed", "cancelled", "failed"],
         )
+        .await
         .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].task_id, "task_1");
@@ -1335,12 +1344,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn list_unassigned_active_updated_since_keys_on_updated_at_not_created_at() {
+    #[tokio::test]
+    async fn list_unassigned_active_updated_since_keys_on_updated_at_not_created_at() {
         // BL-R10-2: a task orphaned by reassignment keeps its original
         // created_at but must still surface once its updated_at (the
         // transition-to-unassigned time) crosses the cursor.
-        let conn = test_conn();
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         let t = new_task(Some("task_1"), "orphaned");
         create(&conn, t).unwrap();
         // created_at is "2026-01-01T00:00:00Z" (from new_task's `now`);
@@ -1348,10 +1357,11 @@ mod tests {
         set_updated_at(&conn, "task_1", "2026-06-01T00:00:00Z");
 
         let rows = list_unassigned_active_updated_since(
-            &conn,
+            &db,
             "2026-03-01T00:00:00Z", // after created_at, before updated_at
             &["completed", "cancelled", "failed"],
         )
+        .await
         .unwrap();
         assert_eq!(rows.len(), 1, "must surface via updated_at, not created_at");
     }
