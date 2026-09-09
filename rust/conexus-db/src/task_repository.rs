@@ -108,6 +108,30 @@ fn row_to_task(row: &Row) -> rusqlite::Result<TaskRow> {
     })
 }
 
+/// `task::Model` -> `TaskRow`, applying the identical lenient
+/// JSON-in-TEXT parsing [`row_to_task`] uses (malformed JSON or a NULL
+/// column degrades to `None`) -- the sea-orm counterpart of that
+/// row-mapper, used by [`list_all`]/[`list_by_agent`].
+fn task_row_from_model(m: task::Model) -> TaskRow {
+    TaskRow {
+        task_id: m.task_id,
+        title: m.title,
+        description: m.description,
+        assigned_to: m.assigned_to,
+        created_by: m.created_by,
+        status: m.status,
+        priority: m.priority,
+        created_at: m.created_at,
+        updated_at: m.updated_at,
+        parent_task: m.parent_task,
+        child_tasks: m.child_tasks.and_then(|s| serde_json::from_str(&s).ok()),
+        depends_on_tasks: m
+            .depends_on_tasks
+            .and_then(|s| serde_json::from_str(&s).ok()),
+        notes: m.notes.and_then(|s| serde_json::from_str(&s).ok()),
+    }
+}
+
 /// Mints a collision-resistant task id: `task_` + 12 hex chars from
 /// the OS CSPRNG (mirrors Python's `secrets.token_hex(6)`) — NOT a
 /// timestamp, which is exactly the bug class this replaced (two
@@ -129,8 +153,33 @@ pub fn get_by_id(conn: &Connection, task_id: &str) -> Result<Option<TaskRow>> {
     .optional()
 }
 
-/// Every task, newest first, optionally capped.
-pub fn list_all(conn: &Connection, limit: Option<i64>) -> Result<Vec<TaskRow>> {
+/// Every task, newest first, optionally capped. Built via sea-orm's
+/// typed query builder (`.order_by_desc(...)` + `.limit(...)`), same
+/// idiom as [`list_assigned_updated_since`].
+pub async fn list_all(db: &DatabaseConnection, limit: Option<i64>) -> Result<Vec<TaskRow>, DbErr> {
+    let mut query = Entity::find().order_by_desc(Column::CreatedAt);
+    if let Some(l) = limit {
+        query = query.limit(l as u64);
+    }
+    let rows = query.all(db).await?;
+    Ok(rows.into_iter().map(task_row_from_model).collect())
+}
+
+/// Deliberately-still-sync twin of [`list_all`] for the ONE remaining
+/// caller that cannot use the sea-orm version: `task_mutation_engine::
+/// advance_dependents_after_completion`, which reads inside an
+/// in-flight, uncommitted `rusqlite::Transaction` shared with the
+/// caller's own writes. `sea_orm_db` is a genuinely SEPARATE connection
+/// pool from the legacy rusqlite connection -- a read through it would
+/// see pre-transaction (stale) data, not this transaction's own
+/// not-yet-committed rows, silently breaking BL-R29-1's dependency
+/// auto-advance. Matches this migration's established "keep legacy
+/// alive for a not-yet-converted call in the same function body"
+/// pattern (see `rag_repository::embeddings_table_exists_sync`'s own
+/// precedent). Not deleted when `advance_dependents_after_completion`
+/// itself is eventually converted (PR4/5+) -- delete this helper THEN,
+/// once nothing calls it.
+pub fn list_all_in_transaction(conn: &Connection, limit: Option<i64>) -> Result<Vec<TaskRow>> {
     match limit {
         Some(l) => {
             let mut stmt = conn.prepare(&format!(
@@ -168,29 +217,25 @@ pub async fn count_by_status(db: &DatabaseConnection) -> Result<HashMap<String, 
 }
 
 /// Tasks for one agent, newest first, with an optional status filter
-/// and an optional cap.
-pub fn list_by_agent(
-    conn: &Connection,
+/// and an optional cap. Built via sea-orm's typed query builder, same
+/// idiom as [`list_all`].
+pub async fn list_by_agent(
+    db: &DatabaseConnection,
     agent_id: &str,
     status_filter: Option<&str>,
     limit: Option<i64>,
-) -> Result<Vec<TaskRow>> {
-    let mut sql = format!("SELECT {COLUMNS} FROM tasks WHERE assigned_to = ?");
-    let mut params: Vec<Box<dyn ToSql>> = vec![Box::new(agent_id.to_string())];
+) -> Result<Vec<TaskRow>, DbErr> {
+    let mut query = Entity::find()
+        .filter(Column::AssignedTo.eq(agent_id))
+        .order_by_desc(Column::CreatedAt);
     if let Some(s) = status_filter {
-        sql.push_str(" AND status = ?");
-        params.push(Box::new(s.to_string()));
+        query = query.filter(Column::Status.eq(s));
     }
-    sql.push_str(" ORDER BY created_at DESC");
     if let Some(l) = limit {
-        sql.push_str(" LIMIT ?");
-        params.push(Box::new(l));
+        query = query.limit(l as u64);
     }
-
-    let param_refs: Vec<&dyn ToSql> = params.iter().map(|b| b.as_ref()).collect();
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(param_refs.as_slice(), row_to_task)?;
-    rows.collect()
+    let rows = query.all(db).await?;
+    Ok(rows.into_iter().map(task_row_from_model).collect())
 }
 
 /// Skinny row for the `wait_for_events`/`fetch_events_since` task-event
@@ -706,9 +751,9 @@ mod tests {
         assert_eq!(get_by_id(&conn, "nope").unwrap(), None);
     }
 
-    #[test]
-    fn list_all_orders_newest_first_and_respects_limit() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn list_all_orders_newest_first_and_respects_limit() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         let mut t1 = new_task(Some("task_1"), "first");
         t1.now = "2026-01-01T00:00:00Z";
         create(&conn, t1).unwrap();
@@ -720,13 +765,13 @@ mod tests {
         t2.parent_task = Some("task_1");
         create(&conn, t2).unwrap();
 
-        let all = list_all(&conn, None).unwrap();
+        let all = list_all(&db, None).await.unwrap();
         assert_eq!(
             all.iter().map(|t| t.task_id.as_str()).collect::<Vec<_>>(),
             vec!["task_2", "task_1"]
         );
 
-        let limited = list_all(&conn, Some(1)).unwrap();
+        let limited = list_all(&db, Some(1)).await.unwrap();
         assert_eq!(limited.len(), 1);
         assert_eq!(limited[0].task_id, "task_2");
     }
@@ -753,9 +798,9 @@ mod tests {
         assert_eq!(counts.get("completed"), Some(&1));
     }
 
-    #[test]
-    fn list_by_agent_filters_by_assignee_and_status() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn list_by_agent_filters_by_assignee_and_status() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         let mut t1 = new_task(Some("task_1"), "a");
         t1.assigned_to = Some("alice");
         t1.status = "pending";
@@ -772,10 +817,12 @@ mod tests {
         t3.parent_task = Some("task_1");
         create(&conn, t3).unwrap();
 
-        let for_alice = list_by_agent(&conn, "alice", None, None).unwrap();
+        let for_alice = list_by_agent(&db, "alice", None, None).await.unwrap();
         assert_eq!(for_alice.len(), 2);
 
-        let alice_pending = list_by_agent(&conn, "alice", Some("pending"), None).unwrap();
+        let alice_pending = list_by_agent(&db, "alice", Some("pending"), None)
+            .await
+            .unwrap();
         assert_eq!(alice_pending.len(), 1);
         assert_eq!(alice_pending[0].task_id, "task_1");
     }

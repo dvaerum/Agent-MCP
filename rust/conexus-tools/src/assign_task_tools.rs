@@ -1528,6 +1528,30 @@ mod tests {
         AsyncMutex::new(conn)
     }
 
+    // `call_assign`'s own `sea_orm_db` is a throwaway `:memory:`
+    // connection, discarded once the call returns -- unreachable for a
+    // POST-call `task_repository::list_all` assertion. Tests that need
+    // to verify the write landed use this real-temp-file-backed `conn`
+    // instead, then open a FRESH sea-orm connection to the SAME path
+    // afterward (never reusing `call_assign`'s own internal one).
+    fn test_conn_file() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        AsyncMutex<Connection>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn).unwrap();
+        (dir, path, AsyncMutex::new(conn))
+    }
+
+    async fn reconnect_sea_orm(path: &std::path::Path) -> sea_orm::DatabaseConnection {
+        sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap()
+    }
+
     fn worker(agent_id: &str) -> Principal {
         Principal {
             kind: PrincipalKind::AgentBearer,
@@ -1813,7 +1837,7 @@ mod tests {
         // worker filing an unassigned task via Mode 0 must be recorded
         // as the REAL creator in both the task row and the audit row --
         // not the forged literal "admin".
-        let conn = test_conn();
+        let (_dir, db_path, conn) = test_conn_file();
         {
             let guard = conn.lock().await;
             seed_task(&guard, "root", "pending", Some("bob"), "bob", None);
@@ -1829,8 +1853,8 @@ mod tests {
         )
         .await;
         assert!(matches!(result, ToolResult::Ok { .. }));
-        let guard = conn.lock().await;
-        let rows = task_repository::list_all(&guard, None).unwrap();
+        let db = reconnect_sea_orm(&db_path).await;
+        let rows = task_repository::list_all(&db, None).await.unwrap();
         let new_task = rows
             .iter()
             .find(|t| t.title == "worker filed this")
@@ -1839,6 +1863,7 @@ mod tests {
             new_task.created_by, "bob",
             "Mode-0 must record the real worker as created_by, not 'admin'"
         );
+        let guard = conn.lock().await;
         let audit_actor: String = guard
             .query_row(
                 "SELECT agent_id FROM agent_actions WHERE action_type = 'created_unassigned_task' \
@@ -1859,7 +1884,7 @@ mod tests {
         // a worker filing a batch of unassigned tasks with no
         // parent_task_id on any entry must be rejected, and no row
         // persisted.
-        let conn = test_conn();
+        let (_dir, db_path, conn) = test_conn_file();
         let result = call_assign(
             serde_json::json!({
                 "tasks": [
@@ -1871,8 +1896,8 @@ mod tests {
         )
         .await;
         assert!(matches!(result, ToolResult::Conflict { .. }));
-        let guard = conn.lock().await;
-        let rows = task_repository::list_all(&guard, None).unwrap();
+        let db = reconnect_sea_orm(&db_path).await;
+        let rows = task_repository::list_all(&db, None).await.unwrap();
         assert!(
             rows.is_empty(),
             "rejected Mode-0 batch create must not persist a row"
@@ -1881,7 +1906,7 @@ mod tests {
 
     #[tokio::test]
     async fn mode0_admin_can_file_an_unassigned_root_task() {
-        let conn = test_conn();
+        let (_dir, db_path, conn) = test_conn_file();
         let result = call_assign(
             serde_json::json!({"task_title": "root", "task_description": "desc"}),
             &admin("alice"),
@@ -1889,8 +1914,8 @@ mod tests {
         )
         .await;
         assert!(matches!(result, ToolResult::Ok { .. }));
-        let guard = conn.lock().await;
-        let rows = task_repository::list_all(&guard, None).unwrap();
+        let db = reconnect_sea_orm(&db_path).await;
+        let rows = task_repository::list_all(&db, None).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status, "unassigned");
         assert_eq!(
@@ -1907,7 +1932,7 @@ mod tests {
     /// be persisted (all-or-nothing).
     #[tokio::test]
     async fn mode0_two_parentless_tasks_in_one_batch_is_a_clean_conflict() {
-        let conn = test_conn();
+        let (_dir, db_path, conn) = test_conn_file();
         let result = call_assign(
             serde_json::json!({
                 "tasks": [
@@ -1920,8 +1945,11 @@ mod tests {
         )
         .await;
         assert!(matches!(result, ToolResult::Conflict { .. }));
-        let guard = conn.lock().await;
-        assert!(task_repository::list_all(&guard, None).unwrap().is_empty());
+        let db = reconnect_sea_orm(&db_path).await;
+        assert!(task_repository::list_all(&db, None)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     /// R5-F5 (ported from `tests/test_sec_r5_f5_bulk_task_single_root.py::
@@ -1930,7 +1958,7 @@ mod tests {
     /// exists in the DB, must also be a clean `Conflict`.
     #[tokio::test]
     async fn mode0_one_parentless_task_in_batch_when_root_exists_is_a_clean_conflict() {
-        let conn = test_conn();
+        let (_dir, db_path, conn) = test_conn_file();
         {
             let guard = conn.lock().await;
             seed_task(&guard, "root", "pending", None, "alice", None);
@@ -1942,8 +1970,8 @@ mod tests {
         )
         .await;
         assert!(matches!(result, ToolResult::Conflict { .. }));
-        let guard = conn.lock().await;
-        assert_eq!(task_repository::list_all(&guard, None).unwrap().len(), 1);
+        let db = reconnect_sea_orm(&db_path).await;
+        assert_eq!(task_repository::list_all(&db, None).await.unwrap().len(), 1);
     }
 
     // -- AssignTaskTool: Mode 3 (existing) ---------------------------------
@@ -2204,7 +2232,7 @@ mod tests {
 
     #[tokio::test]
     async fn mode1_admin_creates_and_assigns_a_single_task() {
-        let conn = test_conn();
+        let (_dir, db_path, conn) = test_conn_file();
         {
             let guard = conn.lock().await;
             seed_agent(&guard, "bob");
@@ -2221,8 +2249,8 @@ mod tests {
         .await;
         let msg = message_of(&result);
         assert!(msg.contains("Task Assigned Successfully"));
-        let guard = conn.lock().await;
-        let rows = task_repository::list_all(&guard, None).unwrap();
+        let db = reconnect_sea_orm(&db_path).await;
+        let rows = task_repository::list_all(&db, None).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].assigned_to.as_deref(), Some("bob"));
     }
@@ -2339,7 +2367,7 @@ mod tests {
     /// covers both the "cold" and "warm" cases identically.
     #[tokio::test]
     async fn mode1_rejects_a_terminated_target_agent() {
-        let conn = test_conn();
+        let (_dir, db_path, conn) = test_conn_file();
         {
             let guard = conn.lock().await;
             AgentRepository::create(
@@ -2368,8 +2396,8 @@ mod tests {
         )
         .await;
         assert!(matches!(result, ToolResult::NotFound { .. }));
-        let guard = conn.lock().await;
-        let rows = task_repository::list_all(&guard, None).unwrap();
+        let db = reconnect_sea_orm(&db_path).await;
+        let rows = task_repository::list_all(&db, None).await.unwrap();
         assert!(
             rows.is_empty(),
             "no task should have been persisted for a terminated target agent"
@@ -2552,7 +2580,7 @@ mod tests {
     /// agent (all-or-nothing).
     #[tokio::test]
     async fn mode2_two_parentless_tasks_in_one_batch_is_a_clean_conflict() {
-        let conn = test_conn();
+        let (_dir, db_path, conn) = test_conn_file();
         {
             let guard = conn.lock().await;
             seed_agent(&guard, "bob");
@@ -2570,15 +2598,18 @@ mod tests {
         )
         .await;
         assert!(matches!(result, ToolResult::Conflict { .. }));
-        let guard = conn.lock().await;
-        assert!(task_repository::list_all(&guard, None).unwrap().is_empty());
+        let db = reconnect_sea_orm(&db_path).await;
+        assert!(task_repository::list_all(&db, None)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     /// R5-F5 (ported from `tests/test_sec_r5_f5_bulk_task_single_root.py::
     /// test_mode2_one_parentless_task_when_root_exists_is_clean_conflict`).
     #[tokio::test]
     async fn mode2_one_parentless_task_in_batch_when_root_exists_is_a_clean_conflict() {
-        let conn = test_conn();
+        let (_dir, db_path, conn) = test_conn_file();
         {
             let guard = conn.lock().await;
             seed_agent(&guard, "bob");
@@ -2594,8 +2625,8 @@ mod tests {
         )
         .await;
         assert!(matches!(result, ToolResult::Conflict { .. }));
-        let guard = conn.lock().await;
-        assert_eq!(task_repository::list_all(&guard, None).unwrap().len(), 1);
+        let db = reconnect_sea_orm(&db_path).await;
+        assert_eq!(task_repository::list_all(&db, None).await.unwrap().len(), 1);
     }
 
     // -- agent_id alias -----------------------------------------------------
@@ -2663,6 +2694,25 @@ mod create_self_task_tests {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
         AsyncMutex::new(conn)
+    }
+
+    // See `mod tests`'s own copy of this pair for the rationale.
+    fn test_conn_file() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        AsyncMutex<Connection>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn).unwrap();
+        (dir, path, AsyncMutex::new(conn))
+    }
+
+    async fn reconnect_sea_orm(path: &std::path::Path) -> sea_orm::DatabaseConnection {
+        sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap()
     }
 
     fn worker(agent_id: &str) -> Principal {
@@ -2774,7 +2824,7 @@ mod create_self_task_tests {
 
     #[tokio::test]
     async fn a_worker_creates_a_self_task_under_its_own_parent() {
-        let conn = test_conn();
+        let (_dir, db_path, conn) = test_conn_file();
         {
             let guard = conn.lock().await;
             seed_task(&guard, "root", Some("bob"), "bob", None);
@@ -2786,8 +2836,8 @@ mod create_self_task_tests {
         )
         .await;
         assert!(matches!(result, ToolResult::Ok { .. }));
-        let guard = conn.lock().await;
-        let rows = task_repository::list_all(&guard, None).unwrap();
+        let db = reconnect_sea_orm(&db_path).await;
+        let rows = task_repository::list_all(&db, None).await.unwrap();
         let created = rows.iter().find(|t| t.task_id != "root").unwrap();
         assert_eq!(created.assigned_to.as_deref(), Some("bob"));
         assert_eq!(created.created_by, "bob");
@@ -2864,7 +2914,7 @@ mod create_self_task_tests {
     /// ownership gate must not over-restrict past cross-agent edges.
     #[tokio::test]
     async fn a_worker_can_depend_on_its_own_task() {
-        let conn = test_conn();
+        let (_dir, db_path, conn) = test_conn_file();
         {
             let guard = conn.lock().await;
             seed_task(&guard, "root", Some("bob"), "bob", None);
@@ -2882,8 +2932,9 @@ mod create_self_task_tests {
         )
         .await;
         assert!(matches!(result, ToolResult::Ok { .. }));
-        let guard = conn.lock().await;
-        let created = task_repository::list_all(&guard, None)
+        let db = reconnect_sea_orm(&db_path).await;
+        let created = task_repository::list_all(&db, None)
+            .await
             .unwrap()
             .into_iter()
             .find(|t| !["root", "own_dep"].contains(&t.task_id.as_str()))
@@ -2920,7 +2971,7 @@ mod create_self_task_tests {
 
     #[tokio::test]
     async fn falls_back_to_the_agents_current_task_when_no_parent_given() {
-        let conn = test_conn();
+        let (_dir, db_path, conn) = test_conn_file();
         {
             let guard = conn.lock().await;
             seed_agent(&guard, "bob");
@@ -2944,8 +2995,8 @@ mod create_self_task_tests {
         )
         .await;
         assert!(matches!(result, ToolResult::Ok { .. }));
-        let guard = conn.lock().await;
-        let rows = task_repository::list_all(&guard, None).unwrap();
+        let db = reconnect_sea_orm(&db_path).await;
+        let rows = task_repository::list_all(&db, None).await.unwrap();
         let created = rows.iter().find(|t| t.task_id != "root").unwrap();
         assert_eq!(created.parent_task.as_deref(), Some("root"));
     }

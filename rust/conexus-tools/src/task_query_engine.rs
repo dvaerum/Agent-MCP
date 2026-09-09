@@ -15,8 +15,8 @@
 //! separate write-side cache-upsert convention that has no Rust
 //! equivalent anywhere in this migration — every other repository
 //! ported so far goes straight to SQL, with no in-memory mirror). This
-//! port takes a real `&Connection` and reads a fresh
-//! `task_repository::list_all` snapshot per `query()` call instead —
+//! port reads a fresh `task_repository::list_all` snapshot (Phase G:
+//! sea-orm, via `sea_orm_db`) per `query()` call instead —
 //! strictly MORE correct than Python's `g.tasks` (which can only be as
 //! fresh as its own upsert discipline), and consistent with this
 //! workspace's own established repository pattern, not a new
@@ -43,7 +43,6 @@ use conexus_core::task_ownership::can_access_task;
 use conexus_db::pagination_cache::StableOrderCache;
 use conexus_db::scheduled_directive_repository::parse_flexible;
 use conexus_db::task_repository::{self, TaskRow};
-use rusqlite::Connection;
 use serde_json::{json, Value};
 
 use crate::task_tools::status_filter_matches;
@@ -349,14 +348,14 @@ impl TaskQueryEngine {
     /// of re-filtering from scratch, so a task that leaves the matched
     /// set between two calls can no longer shift a still-matching task
     /// out of both pages.
-    pub fn query(
+    pub async fn query(
         &self,
-        conn: &Connection,
+        sea_orm_db: &sea_orm::DatabaseConnection,
         filters: &TaskFilterSpec,
         sort: &TaskSortSpec,
         offset: i64,
         limit: Option<i64>,
-    ) -> rusqlite::Result<QueryResult> {
+    ) -> Result<QueryResult, sea_orm::DbErr> {
         // Two representations of the same read on purpose: `task_list`
         // is the deterministic SQL-ordered `Vec` `list_all` returns,
         // walked below to build `matched` -- the base order a stable
@@ -373,7 +372,7 @@ impl TaskQueryEngine {
         // fixture returned tasks in a different relative order on a
         // second `query()` call within one test, with no write between
         // the two calls.
-        let task_list: Vec<TaskRow> = task_repository::list_all(conn, None)?;
+        let task_list: Vec<TaskRow> = task_repository::list_all(sea_orm_db, None).await?;
         let snapshot: HashMap<String, TaskRow> = task_list
             .iter()
             .map(|t| (t.task_id.clone(), t.clone()))
@@ -387,7 +386,7 @@ impl TaskQueryEngine {
                 .cloned()
                 .collect();
             sort_tasks(&mut matched, sort);
-            Ok::<_, rusqlite::Error>(matched.into_iter().map(|t| t.task_id).collect())
+            Ok::<_, sea_orm::DbErr>(matched.into_iter().map(|t| t.task_id).collect())
         })?;
 
         // R21-F3: `ordered_ids` is the anchor frozen at sweep-start --
@@ -503,11 +502,31 @@ mod tests {
     use super::*;
     use conexus_db::schema::init_schema;
     use conexus_db::task_repository::{create, NewTask};
+    use rusqlite::Connection;
 
     fn test_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
         conn
+    }
+
+    // The `query()` counterpart of `test_conn` above -- a real
+    // temp-file-backed connection pair (rusqlite + sea-orm), needed
+    // because tasks seeded through the rusqlite side must be visible
+    // to `query()`'s own sea-orm `list_all` read in the SAME test; two
+    // separate `:memory:` handles don't share state the way a real
+    // file does. Same recipe as `event_feed.rs`'s own
+    // `test_conn_with_sea_orm`.
+    async fn test_conn_with_sea_orm() -> (tempfile::TempDir, Connection, sea_orm::DatabaseConnection)
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn).unwrap();
+        let db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        (dir, conn, db)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -695,9 +714,9 @@ mod tests {
 
     // -- TaskQueryEngine::query ---------------------------------------------
 
-    #[test]
-    fn query_filters_by_status() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn query_filters_by_status() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         create(
             &conn,
             new_task(
@@ -733,15 +752,16 @@ mod tests {
             ..Default::default()
         };
         let result = engine
-            .query(&conn, &filters, &TaskSortSpec::default(), 0, None)
+            .query(&db, &filters, &TaskSortSpec::default(), 0, None)
+            .await
             .unwrap();
         assert_eq!(result.total_count, 1);
         assert_eq!(result.tasks[0].task_id, "t2");
     }
 
-    #[test]
-    fn query_incomplete_alias_matches_active_statuses() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn query_incomplete_alias_matches_active_statuses() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         create(
             &conn,
             new_task(
@@ -777,15 +797,16 @@ mod tests {
             ..Default::default()
         };
         let result = engine
-            .query(&conn, &filters, &TaskSortSpec::default(), 0, None)
+            .query(&db, &filters, &TaskSortSpec::default(), 0, None)
+            .await
             .unwrap();
         assert_eq!(result.total_count, 1);
         assert_eq!(result.tasks[0].task_id, "t1");
     }
 
-    #[test]
-    fn query_agent_id_filter_scopes_to_own_tasks_only_by_default() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn query_agent_id_filter_scopes_to_own_tasks_only_by_default() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         create(
             &conn,
             new_task(
@@ -821,15 +842,16 @@ mod tests {
             ..Default::default()
         };
         let result = engine
-            .query(&conn, &filters, &TaskSortSpec::default(), 0, None)
+            .query(&db, &filters, &TaskSortSpec::default(), 0, None)
+            .await
             .unwrap();
         assert_eq!(result.total_count, 1);
         assert_eq!(result.tasks[0].task_id, "t1");
     }
 
-    #[test]
-    fn query_agent_id_with_include_unassigned_widens_to_the_claimable_pool() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn query_agent_id_with_include_unassigned_widens_to_the_claimable_pool() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         create(
             &conn,
             new_task(
@@ -880,7 +902,8 @@ mod tests {
             ..Default::default()
         };
         let result = engine
-            .query(&conn, &filters, &TaskSortSpec::default(), 0, None)
+            .query(&db, &filters, &TaskSortSpec::default(), 0, None)
+            .await
             .unwrap();
         let ids: std::collections::BTreeSet<_> =
             result.tasks.iter().map(|t| t.task_id.as_str()).collect();
@@ -893,9 +916,10 @@ mod tests {
     /// row (nobody can claim dead-end work) but keeps the caller's OWN
     /// terminal task visible (it's their history, not the claimable
     /// pool) -- and still excludes a foreign agent's non-terminal task.
-    #[test]
-    fn query_agent_id_with_include_unassigned_excludes_terminal_pool_but_keeps_own_terminal() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn query_agent_id_with_include_unassigned_excludes_terminal_pool_but_keeps_own_terminal()
+    {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         create(
             &conn,
             new_task(
@@ -974,7 +998,8 @@ mod tests {
             ..Default::default()
         };
         let result = engine
-            .query(&conn, &filters, &TaskSortSpec::default(), 0, None)
+            .query(&db, &filters, &TaskSortSpec::default(), 0, None)
+            .await
             .unwrap();
         let ids: std::collections::BTreeSet<_> =
             result.tasks.iter().map(|t| t.task_id.as_str()).collect();
@@ -984,9 +1009,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn query_unassigned_filter_excludes_terminal_tasks() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn query_unassigned_filter_excludes_terminal_tasks() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         create(
             &conn,
             new_task(
@@ -1022,15 +1047,16 @@ mod tests {
             ..Default::default()
         };
         let result = engine
-            .query(&conn, &filters, &TaskSortSpec::default(), 0, None)
+            .query(&db, &filters, &TaskSortSpec::default(), 0, None)
+            .await
             .unwrap();
         assert_eq!(result.total_count, 1);
         assert_eq!(result.tasks[0].task_id, "t1");
     }
 
-    #[test]
-    fn query_sorts_priority_descending() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn query_sorts_priority_descending() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         create(
             &conn,
             new_task(
@@ -1079,14 +1105,15 @@ mod tests {
             by: SortBy::Priority,
         };
         let result = engine
-            .query(&conn, &TaskFilterSpec::default(), &sort, 0, None)
+            .query(&db, &TaskFilterSpec::default(), &sort, 0, None)
+            .await
             .unwrap();
         let ids: Vec<&str> = result.tasks.iter().map(|t| t.task_id.as_str()).collect();
         assert_eq!(ids, vec!["t2", "t3", "t1"]); // high, medium, low
     }
 
-    #[test]
-    fn query_ties_sort_the_same_way_on_every_call() {
+    #[tokio::test]
+    async fn query_ties_sort_the_same_way_on_every_call() {
         // Regression: `matched` used to be built from
         // `snapshot.values()` (a `HashMap`), whose iteration order is
         // randomized per-instance and can differ between two `query()`
@@ -1095,7 +1122,7 @@ mod tests {
         // `created_at` here) between an anchoring call and a later
         // replay. `matched` must instead derive from `list_all`'s own
         // deterministic `Vec` order so repeated calls agree.
-        let conn = test_conn();
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         create(
             &conn,
             new_task(
@@ -1130,7 +1157,8 @@ mod tests {
             by: SortBy::CreatedAt,
         };
         let first: Vec<String> = engine
-            .query(&conn, &TaskFilterSpec::default(), &sort, 0, None)
+            .query(&db, &TaskFilterSpec::default(), &sort, 0, None)
+            .await
             .unwrap()
             .tasks
             .into_iter()
@@ -1138,7 +1166,8 @@ mod tests {
             .collect();
         for _ in 0..20 {
             let again: Vec<String> = engine
-                .query(&conn, &TaskFilterSpec::default(), &sort, 0, None)
+                .query(&db, &TaskFilterSpec::default(), &sort, 0, None)
+                .await
                 .unwrap()
                 .tasks
                 .into_iter()
@@ -1148,9 +1177,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn query_pagination_offset_and_limit() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn query_pagination_offset_and_limit() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         create(
             &conn,
             new_task(
@@ -1199,7 +1228,8 @@ mod tests {
             by: SortBy::CreatedAt,
         }; // descending -> t1, t2, t3
         let page1 = engine
-            .query(&conn, &TaskFilterSpec::default(), &sort, 0, Some(2))
+            .query(&db, &TaskFilterSpec::default(), &sort, 0, Some(2))
+            .await
             .unwrap();
         assert_eq!(page1.total_count, 3);
         assert_eq!(
@@ -1212,7 +1242,8 @@ mod tests {
         );
 
         let page2 = engine
-            .query(&conn, &TaskFilterSpec::default(), &sort, 2, Some(2))
+            .query(&db, &TaskFilterSpec::default(), &sort, 2, Some(2))
+            .await
             .unwrap();
         assert_eq!(
             page2
@@ -1224,12 +1255,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn query_pagination_survives_a_deletion_between_pages() {
+    #[tokio::test]
+    async fn query_pagination_survives_a_deletion_between_pages() {
         // R17-F2/R21-F3: page 1 anchors an ordering; deleting a row
         // that already appeared on page 1 must not shift a later row
         // forward into a gap that spans both pages.
-        let conn = test_conn();
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         create(
             &conn,
             new_task(
@@ -1292,7 +1323,8 @@ mod tests {
             by: SortBy::CreatedAt,
         };
         let page1 = engine
-            .query(&conn, &TaskFilterSpec::default(), &sort, 0, Some(2))
+            .query(&db, &TaskFilterSpec::default(), &sort, 0, Some(2))
+            .await
             .unwrap();
         assert_eq!(
             page1
@@ -1306,7 +1338,8 @@ mod tests {
         task_repository::delete(&conn, "t2").unwrap();
 
         let page2 = engine
-            .query(&conn, &TaskFilterSpec::default(), &sort, 2, Some(2))
+            .query(&db, &TaskFilterSpec::default(), &sort, 2, Some(2))
+            .await
             .unwrap();
         // The anchored ordering still has t3 at index 2 -- t2's removal
         // does not shift t4 into page 1's territory.

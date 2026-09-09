@@ -48,6 +48,7 @@ use conexus_db::task_repository::{self, TaskRow};
 use conexus_db::{MessageQueryFilters, MessageRepository, MessageRow};
 use rusqlite::Connection;
 use serde_json::Value;
+use tokio::sync::Mutex as AsyncMutex;
 
 /// Task statuses that are still "open" -- a reminder nudges these.
 /// Anything else (completed/cancelled/failed) is terminal and left
@@ -133,26 +134,52 @@ fn subject_of(row: &MessageRow) -> String {
 /// Fully defensive -- any DB error yields `None` (no reminder) rather
 /// than breaking the wait loop, matching Python's own `except Exception`
 /// wrapper here.
-pub fn collect_backlog(conn: &Connection, agent_id: &str) -> Option<Backlog> {
-    let unread_rows: Vec<MessageRow> = MessageRepository::new()
-        .query(
-            conn,
-            &MessageQueryFilters {
-                to: Some(agent_id),
-                read: Some(false),
-                limit: LIST_CAP,
-                ..Default::default()
-            },
-            true, // oldest_first
-        )
-        .ok()?;
-    let unread_count = conexus_db::message_repository::count_unread(conn, agent_id).ok()?;
+///
+/// Phase G: the open-tasks half reads through `sea_orm_db` now
+/// (`task_repository::list_by_agent`). Takes the whole `conn:
+/// &AsyncMutex<Connection>`, NOT a bare `&Connection` -- an async fn's
+/// parameters are captured into its generated future's environment the
+/// same way a closure captures upvars, eagerly, independent of internal
+/// control flow, so a bare `&Connection` parameter would poison this
+/// function's `Send`ness the moment the body references it anywhere,
+/// even strictly before the new `.await` below (see `conexus_wakeloop::
+/// event_feed::collect_events_with_cap`'s own doc comment for the full
+/// rule, empirically verified against a real build failure there).
+/// `conn` is locked ONCE, in a scope confined to the synchronous
+/// message-repository reads, with the guard dropped BEFORE the
+/// `list_by_agent` call -- exactly `collect_scheduled_directive_
+/// events_for`'s already-established idiom.
+pub async fn collect_backlog(
+    conn: &AsyncMutex<Connection>,
+    sea_orm_db: &sea_orm::DatabaseConnection,
+    agent_id: &str,
+) -> Option<Backlog> {
+    let (unread_rows, unread_count) = {
+        let guard = conn.lock().await;
+        let unread_rows: Vec<MessageRow> = MessageRepository::new()
+            .query(
+                &guard,
+                &MessageQueryFilters {
+                    to: Some(agent_id),
+                    read: Some(false),
+                    limit: LIST_CAP,
+                    ..Default::default()
+                },
+                true, // oldest_first
+            )
+            .ok()?;
+        let unread_count = conexus_db::message_repository::count_unread(&guard, agent_id).ok()?;
+        (unread_rows, unread_count)
+    };
+    // `guard` is dropped here, before the sea-orm `.await` below.
 
-    let open_tasks: Vec<TaskRow> = task_repository::list_by_agent(conn, agent_id, None, Some(200))
-        .ok()?
-        .into_iter()
-        .filter(|t| !TERMINAL_TASK_STATUSES.contains(&t.status.to_lowercase().as_str()))
-        .collect();
+    let open_tasks: Vec<TaskRow> =
+        task_repository::list_by_agent(sea_orm_db, agent_id, None, Some(200))
+            .await
+            .ok()?
+            .into_iter()
+            .filter(|t| !TERMINAL_TASK_STATUSES.contains(&t.status.to_lowercase().as_str()))
+            .collect();
 
     if unread_count == 0 && open_tasks.is_empty() {
         return None;
@@ -267,10 +294,23 @@ mod tests {
         result
     }
 
-    fn test_conn() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
+    // The `collect_backlog` counterpart of `test_conn` above -- a real
+    // temp-file-backed connection pair (rusqlite + sea-orm), needed
+    // because a task/message seeded through the rusqlite side must be
+    // visible to `collect_backlog`'s own sea-orm read of `list_by_agent`
+    // in the SAME test; two separate `:memory:` handles don't share
+    // state the way a real file does. Same recipe as `event_feed.rs`'s
+    // own `test_conn_with_sea_orm`.
+    async fn test_conn_with_sea_orm() -> (tempfile::TempDir, Connection, sea_orm::DatabaseConnection)
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let conn = Connection::open(&path).unwrap();
         init_schema(&conn).unwrap();
-        conn
+        let db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        (dir, conn, db)
     }
 
     // ── timer ─────────────────────────────────────────────────────────
@@ -347,54 +387,60 @@ mod tests {
         .unwrap();
     }
 
-    #[test]
-    fn no_backlog_is_none() {
-        let conn = test_conn();
-        assert_eq!(collect_backlog(&conn, "a1"), None);
+    #[tokio::test]
+    async fn no_backlog_is_none() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
+        let conn = AsyncMutex::new(conn);
+        assert_eq!(collect_backlog(&conn, &db, "a1").await, None);
     }
 
-    #[test]
-    fn unread_messages_are_collected() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn unread_messages_are_collected() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         insert_message(&conn, "m1", "op1", "a1", false);
-        let backlog = collect_backlog(&conn, "a1").unwrap();
+        let conn = AsyncMutex::new(conn);
+        let backlog = collect_backlog(&conn, &db, "a1").await.unwrap();
         assert_eq!(backlog.unread_count, 1);
         assert_eq!(backlog.unread_messages.len(), 1);
         assert_eq!(backlog.unread_messages[0].sender_id, "op1");
         assert_eq!(backlog.unread_messages[0].subject, "(no subject)");
     }
 
-    #[test]
-    fn read_messages_are_not_backlog() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn read_messages_are_not_backlog() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         insert_message(&conn, "m1", "op1", "a1", true);
-        assert_eq!(collect_backlog(&conn, "a1"), None);
+        let conn = AsyncMutex::new(conn);
+        assert_eq!(collect_backlog(&conn, &db, "a1").await, None);
     }
 
-    #[test]
-    fn open_tasks_are_collected_and_terminal_ones_excluded() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn open_tasks_are_collected_and_terminal_ones_excluded() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         insert_task(&conn, "t1", "Fix the bug", "in_progress", "a1", None);
         insert_task(&conn, "t2", "Done already", "completed", "a1", Some("t1"));
         insert_task(&conn, "t3", "Cancelled one", "cancelled", "a1", Some("t1"));
-        let backlog = collect_backlog(&conn, "a1").unwrap();
+        let conn = AsyncMutex::new(conn);
+        let backlog = collect_backlog(&conn, &db, "a1").await.unwrap();
         assert_eq!(backlog.task_count, 1);
         assert_eq!(backlog.open_tasks[0].task_id, "t1");
     }
 
-    #[test]
-    fn untitled_task_gets_a_placeholder_title() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn untitled_task_gets_a_placeholder_title() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         insert_task(&conn, "t1", "", "in_progress", "a1", None);
-        let backlog = collect_backlog(&conn, "a1").unwrap();
+        let conn = AsyncMutex::new(conn);
+        let backlog = collect_backlog(&conn, &db, "a1").await.unwrap();
         assert_eq!(backlog.open_tasks[0].title, "(untitled)");
     }
 
-    #[test]
-    fn reminder_event_shape() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn reminder_event_shape() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         insert_message(&conn, "m1", "op1", "a1", false);
-        let backlog = collect_backlog(&conn, "a1").unwrap();
+        let conn = AsyncMutex::new(conn);
+        let backlog = collect_backlog(&conn, &db, "a1").await.unwrap();
         let ev = reminder_event(&backlog, "2026-01-01T00:00:00Z");
         assert_eq!(ev["type"], "reminder");
         assert_eq!(ev["timestamp"], "2026-01-01T00:00:00Z");

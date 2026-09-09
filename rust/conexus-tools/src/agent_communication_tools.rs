@@ -490,10 +490,7 @@ pub async fn wait_for_events_slow_path(
             if now >= reminder_at {
                 idle_reminder::mark_checked(&agent_id, now_mono());
                 reminder_deadline = Some(now + Duration::from_secs(reminder_interval as u64));
-                let backlog = {
-                    let guard = conn.lock().await;
-                    idle_reminder::collect_backlog(&guard, &agent_id)
-                };
+                let backlog = idle_reminder::collect_backlog(conn, ctx.sea_orm_db, &agent_id).await;
                 if let Some(backlog) = backlog {
                     hold_ladder::reset(&agent_id);
                     ctx.waiter_registry.unregister(&agent_id, &sender);
