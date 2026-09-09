@@ -57,13 +57,39 @@
 //! whole `&AsyncMutex<Connection>` so it can lock fresh AFTER its own
 //! internal sea-orm await, matching this migration's established
 //! "keep legacy alive for a not-yet-converted call in the same
-//! function body" pattern. `collect_events_with_cap`,
-//! `collect_unassigned_task_events_for`, and
-//! `collect_agent_profile_events_for` are still legacy rusqlite,
-//! reading from a guard locked and dropped BEFORE the `fire_scheduled`
-//! block (which needs to `.await`) -- see `assemble_event_feed`'s own
-//! body comment. A future batch PR flips the remaining collectors one
-//! at a time without touching this function's signature again.
+//! function body" pattern. [`collect_events_with_cap`] and
+//! [`collect_unassigned_task_events_for`] are the third/fourth,
+//! `task_repository`'s own PR2, and take the SAME `&AsyncMutex<
+//! Connection>` shape as `collect_scheduled_directive_events_for` --
+//! NOT a bare `&Connection`, even though each function's own
+//! `Connection`-touching work (message/agent-gate reads) finishes
+//! well before its own `task_repository`-via-`sea_orm_db` `.await`.
+//! This is a real, empirically-verified Rust constraint worth stating
+//! plainly: unlike a `MutexGuard<Connection>` LOCAL (safe to hold
+//! across an `.await` because `MutexGuard<Connection>: Send`, since
+//! `Connection: Send` even though `!Sync`), a bare `&Connection`
+//! PARAMETER poisons an `async fn`'s returned future's `Send`ness
+//! UNCONDITIONALLY the moment the body references it ANYWHERE --
+//! including strictly before the function's own first `.await` point.
+//! This is NOT the same rule as "a value held live across a
+//! suspension must be `Send`": an async fn's own parameters are
+//! captured into its generated future's environment the same way a
+//! closure captures its upvars (eagerly, at the point the future
+//! value is constructed, independent of internal control flow), so
+//! "last real use before the await" -- the rule that correctly governs
+//! a LOCAL `MutexGuard` -- does NOT rescue a non-Send PARAMETER TYPE.
+//! Each of these two functions therefore locks `conn` itself,
+//! internally, in its own short-lived scope around ONLY its
+//! synchronous work, dropping the guard before its own `.await` --
+//! exactly `collect_scheduled_directive_events_for`'s own idiom, not
+//! the "receive an already-locked `&Connection`" shape those two
+//! functions had before this conversion. `collect_agent_profile_
+//! events_for` is still fully legacy rusqlite (untouched, still takes
+//! a bare `&Connection` -- it has no `.await` in its own body, so the
+//! constraint above doesn't apply to it), locked fresh by
+//! `assemble_event_feed` itself right before that one call. A future
+//! batch PR flips the remaining collector one at a time without
+//! touching this function's signature again.
 
 use conexus_core::ToolResult;
 use conexus_db::agent_repository::{AgentField, AgentRepository, FieldValue};
@@ -281,88 +307,119 @@ fn within_title_hold(msg_ts: &str, now_iso: &str) -> bool {
 /// unbounded streams a caller merges in afterwards
 /// (`unassigned_task_appeared`, `agent_profile_updated`) would
 /// otherwise drag the merged cursor past the un-returned messages.
-pub fn collect_events_with_cap(
-    conn: &Connection,
+///
+/// Phase G: the assigned-task half of this collector reads through
+/// `sea_orm_db` now (`task_repository::list_assigned_updated_since`).
+/// Takes the whole `conn: &AsyncMutex<Connection>`, NOT a bare
+/// `&Connection` -- a bare `&Connection` PARAMETER poisons an async
+/// fn's own future's `Send`ness unconditionally the moment the body
+/// references it anywhere, even strictly before the function's own
+/// first `.await` (see this module's own doc comment for the full
+/// rule, empirically verified against a real build failure, not
+/// assumed). `conn` is locked ONCE, in a scope confined to this
+/// function's own synchronous message-handling work, with the guard
+/// dropped BEFORE the `list_assigned_updated_since` call below --
+/// exactly `collect_scheduled_directive_events_for`'s own idiom.
+pub async fn collect_events_with_cap(
+    conn: &AsyncMutex<Connection>,
+    sea_orm_db: &sea_orm::DatabaseConnection,
     agent_id: &str,
     since: Option<&str>,
     now_iso: &str,
     get_env: impl Fn(&str) -> Option<String>,
 ) -> rusqlite::Result<CollectedEvents> {
     let since_iso = since.unwrap_or("0000-01-01T00:00:00");
-    let mut events: Vec<Value> = Vec::new();
 
-    // BL-R20-1: request the OLDEST messages since the cursor first
-    // (ASC, capped) so a truncated batch is a contiguous prefix -- the
-    // cursor can then only advance past messages actually delivered.
-    let msg_repo = message_repository::MessageRepository::new();
-    let msg_rows = msg_repo.query(
-        conn,
-        &message_repository::MessageQueryFilters {
-            to: Some(agent_id),
-            since: Some(since_iso),
-            limit: MESSAGE_EVENT_QUERY_CAP,
-            ..Default::default()
-        },
-        true,
-    )?;
-    let mut messages_truncated = (msg_rows.len() as i64) >= MESSAGE_EVENT_QUERY_CAP;
-    let mut msg_cap_ts: Option<String> = msg_rows.last().map(|r| r.timestamp.clone());
+    let (mut events, messages_truncated, msg_cap_ts) = {
+        let guard = conn.lock().await;
+        let mut events: Vec<Value> = Vec::new();
 
-    let gen_on = get_env("AGENT_MCP_SUBJECT_MODEL").is_some_and(|v| !v.trim().is_empty());
-    let mut last_emitted_ts: Option<String> = None;
-
-    for row in &msg_rows {
-        // The repo's `since` filter is inclusive (`>=`); re-apply the
-        // strict `>` filter here so a message exactly at `since_iso`
-        // doesn't fire again on the next poll.
-        let ts = row.timestamp.as_str();
-        if ts <= since_iso {
-            continue;
-        }
-        let is_reply = row.parent_message_id.is_some();
-        let (display_subject, is_placeholder) = if is_reply {
-            (None, false)
-        } else {
-            let (subject, placeholder) = message_repository::message_subject_view(
-                row.subject.as_deref(),
-                &row.message_content,
-            );
-            (subject, placeholder)
-        };
-        // Title gate (roots only): hold an untitled root while subject-gen
-        // is on and the backfill window hasn't expired, reusing the
-        // truncation boundary so the cursor can't advance past the held
-        // row (re-queried next poll).
-        if !is_reply && is_placeholder && gen_on && within_title_hold(ts, now_iso) {
-            messages_truncated = true;
-            msg_cap_ts = Some(
-                last_emitted_ts
-                    .clone()
-                    .unwrap_or_else(|| since_iso.to_string()),
-            );
-            break;
-        }
-        let evt_type = if BROADCAST_MESSAGE_TYPES.contains(&row.message_type.as_str()) {
-            "broadcast"
-        } else {
-            "message"
-        };
-        events.push(json!({
-            "type": evt_type,
-            "timestamp": ts,
-            "data": {
-                "message_id": row.message_id,
-                "sender_id": row.sender_id,
-                "subject": display_subject,
-                "is_reply": is_reply,
-                "priority": row.priority,
-                "timestamp": ts,
+        // BL-R20-1: request the OLDEST messages since the cursor first
+        // (ASC, capped) so a truncated batch is a contiguous prefix -- the
+        // cursor can then only advance past messages actually delivered.
+        let msg_repo = message_repository::MessageRepository::new();
+        let msg_rows = msg_repo.query(
+            &guard,
+            &message_repository::MessageQueryFilters {
+                to: Some(agent_id),
+                since: Some(since_iso),
+                limit: MESSAGE_EVENT_QUERY_CAP,
+                ..Default::default()
             },
-        }));
-        last_emitted_ts = Some(ts.to_string());
-    }
+            true,
+        )?;
+        let mut messages_truncated = (msg_rows.len() as i64) >= MESSAGE_EVENT_QUERY_CAP;
+        let mut msg_cap_ts: Option<String> = msg_rows.last().map(|r| r.timestamp.clone());
 
-    for row in task_repository::list_assigned_updated_since(conn, agent_id, since_iso)? {
+        let gen_on = get_env("AGENT_MCP_SUBJECT_MODEL").is_some_and(|v| !v.trim().is_empty());
+        let mut last_emitted_ts: Option<String> = None;
+
+        for row in &msg_rows {
+            // The repo's `since` filter is inclusive (`>=`); re-apply the
+            // strict `>` filter here so a message exactly at `since_iso`
+            // doesn't fire again on the next poll.
+            let ts = row.timestamp.as_str();
+            if ts <= since_iso {
+                continue;
+            }
+            let is_reply = row.parent_message_id.is_some();
+            let (display_subject, is_placeholder) = if is_reply {
+                (None, false)
+            } else {
+                let (subject, placeholder) = message_repository::message_subject_view(
+                    row.subject.as_deref(),
+                    &row.message_content,
+                );
+                (subject, placeholder)
+            };
+            // Title gate (roots only): hold an untitled root while subject-gen
+            // is on and the backfill window hasn't expired, reusing the
+            // truncation boundary so the cursor can't advance past the held
+            // row (re-queried next poll).
+            if !is_reply && is_placeholder && gen_on && within_title_hold(ts, now_iso) {
+                messages_truncated = true;
+                msg_cap_ts = Some(
+                    last_emitted_ts
+                        .clone()
+                        .unwrap_or_else(|| since_iso.to_string()),
+                );
+                break;
+            }
+            let evt_type = if BROADCAST_MESSAGE_TYPES.contains(&row.message_type.as_str()) {
+                "broadcast"
+            } else {
+                "message"
+            };
+            events.push(json!({
+                "type": evt_type,
+                "timestamp": ts,
+                "data": {
+                    "message_id": row.message_id,
+                    "sender_id": row.sender_id,
+                    "subject": display_subject,
+                    "is_reply": is_reply,
+                    "priority": row.priority,
+                    "timestamp": ts,
+                },
+            }));
+            last_emitted_ts = Some(ts.to_string());
+        }
+
+        (events, messages_truncated, msg_cap_ts)
+    };
+    // `guard` is dropped here, before the sea-orm `.await` below.
+
+    let assigned_rows =
+        task_repository::list_assigned_updated_since(sea_orm_db, agent_id, since_iso)
+            .await
+            // rusqlite::Error has no generic "foreign error" variant; its
+            // `ToSqlConversionFailure`'s boxed-`dyn Error` slot is the only
+            // one not gated behind a cargo feature, so it's the established
+            // escape hatch for smuggling a non-rusqlite error (here, a real
+            // sea-orm `DbErr`) through this function's still-`rusqlite::
+            // Result` return type.
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    for row in assigned_rows {
         // v1 heuristic: a row created since the cursor is a fresh
         // assignment; an older row touched since the cursor is a mutation.
         let evt_type = if row.created_at.as_str() > since_iso {
@@ -405,20 +462,37 @@ pub fn collect_events_with_cap(
 /// Port of `_collect_unassigned_task_events_for`. Returns nothing for
 /// an unknown/tombstoned `agent_id` (the gate is kept only for that
 /// case -- every unassigned task surfaces to every KNOWN agent).
-pub fn collect_unassigned_task_events_for(
-    conn: &Connection,
+///
+/// Phase G: reads through `sea_orm_db` now (`task_repository::
+/// list_unassigned_active_updated_since`). Takes the whole `conn:
+/// &AsyncMutex<Connection>`, NOT a bare `&Connection` -- see
+/// `collect_events_with_cap`'s own doc comment for the full rule.
+/// `conn` is locked ONCE, in a scope confined to the
+/// `AgentRepository::get_by_id` gate, with the guard dropped BEFORE
+/// the `list_unassigned_active_updated_since` call below.
+pub async fn collect_unassigned_task_events_for(
+    conn: &AsyncMutex<Connection>,
+    sea_orm_db: &sea_orm::DatabaseConnection,
     agent_id: &str,
     since: Option<&str>,
 ) -> rusqlite::Result<Vec<Value>> {
-    if AgentRepository::get_by_id(conn, agent_id)?.is_none() {
+    let agent_known = {
+        let guard = conn.lock().await;
+        AgentRepository::get_by_id(&guard, agent_id)?.is_some()
+    };
+    if !agent_known {
         return Ok(Vec::new());
     }
     let since_iso = since.unwrap_or("0000-01-01T00:00:00");
     let rows = task_repository::list_unassigned_active_updated_since(
-        conn,
+        sea_orm_db,
         since_iso,
         &UNASSIGNED_TASK_TERMINAL_STATUSES,
-    )?;
+    )
+    .await
+    // See `collect_events_with_cap`'s own comment on this exact
+    // `ToSqlConversionFailure`-as-generic-error-box pattern.
+    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
     Ok(rows
         .into_iter()
         .map(|row| {
@@ -690,36 +764,45 @@ pub struct AssembledFeed {
 /// async fn's own generated future would make every CALLER's future
 /// `!Send` across the `.await` point (the exact hazard `conexus_auth::
 /// tool::ToolCallContext`'s own doc explains, already hit and fixed
-/// several times elsewhere in this migration). The legacy connection is
-/// locked ONCE for the synchronous `collect_events_with_cap`/
-/// `collect_unassigned_task_events_for`/`collect_agent_profile_events_for`
-/// trio, in a scope that ends BEFORE the `fire_scheduled` block below --
-/// that block needs to `.await` on `sea_orm_db`, and a
-/// `MutexGuard<Connection>` (or a reborrowed `let conn = &*guard;`
-/// local, if still live) held across an `.await` point IS a `!Sync`-
-/// derived reference held across a suspension, which poisons this
-/// whole future's `Send`ness exactly the same way a bare `&Connection`
-/// parameter would (Phase G's own poke conversion originally proved
-/// this by hitting the compile error). Every synchronous collector
-/// therefore takes `&guard` directly at its own call site (a
-/// transient reborrow that ends the moment the call returns) rather
-/// than through a named `conn` variable spanning an `.await`.
+/// several times elsewhere in this migration).
 ///
 /// `sea_orm_db` feeds [`collect_pending_pokes_for`] and
-/// [`collect_scheduled_directive_events_for`] (Phase G: the first two
-/// collectors converted to sea-orm). The latter also takes the whole
-/// `conn: &AsyncMutex<Connection>` (not `&guard`) so it can lock fresh,
-/// itself, AFTER its own internal `collect_due_and_fire(...).await`,
-/// for its still-legacy `agent_actions` audit write -- passing the
-/// already-consumed `guard` from the scope above would be a use-after-
-/// drop, and passing `&guard` while it's still locked would deadlock
-/// on the inner `conn.lock().await` (the same connection can't be
-/// locked twice from one task). `collect_events_with_cap`,
-/// `collect_unassigned_task_events_for`, and
-/// `collect_agent_profile_events_for` are still legacy rusqlite, reading
-/// from the scoped `guard` above; this signature just carries
-/// `sea_orm_db` through for whichever collector a future batch PR
-/// converts next.
+/// [`collect_scheduled_directive_events_for`] (Phase G's first two
+/// collectors converted to sea-orm), and now also
+/// [`collect_events_with_cap`] and [`collect_unassigned_task_events_for`]
+/// (Phase G's third/fourth, `task_repository` PR2). All FOUR of these
+/// now take the whole `conn: &AsyncMutex<Connection>` (never an
+/// already-acquired `&guard`) and lock it fresh, themselves, in their
+/// OWN scope confined to their own synchronous work -- this function
+/// therefore calls them by passing `conn` straight through, NOT a
+/// pre-acquired guard, and never holds a guard of its own across any
+/// of their `.await`s. This is a deliberate correction from an earlier
+/// shape (both new collectors briefly took a bare `&Connection` and
+/// were called from inside one shared `let guard = conn.lock().await`
+/// block spanning both their `.await`s): that shape does NOT compile.
+/// A bare `&Connection` PARAMETER poisons an async fn's own future's
+/// `Send`ness unconditionally the moment the body references it
+/// ANYWHERE, even strictly before that function's own first `.await`
+/// -- unlike a locally-scoped `MutexGuard<Connection>` (which really
+/// IS safe to hold across an `.await`, since `Connection: Send` even
+/// though `!Sync`), an async fn's OWN parameters are captured into its
+/// generated future's environment the same way a closure captures its
+/// upvars: eagerly, independent of internal control flow. So "last
+/// real use before this function's own await" -- the rule that
+/// correctly governs a scoped `MutexGuard` LOCAL -- does NOT rescue a
+/// non-Send PARAMETER TYPE (confirmed by a real build failure, not
+/// assumed). Each of the four `sea_orm_db`-reading collectors above
+/// therefore owns its OWN lock/unlock cycle -- exactly `collect_
+/// scheduled_directive_events_for`'s already-established idiom (it
+/// takes the whole `conn: &AsyncMutex<Connection>` so it can lock
+/// fresh, itself, AFTER its own internal `collect_due_and_fire(...)
+/// .await`, for its still-legacy `agent_actions` audit write). Calling
+/// them sequentially like this (never two overlapping locks at once)
+/// cannot deadlock: each collector's own guard is dropped before this
+/// function's next line runs. `collect_agent_profile_events_for` is
+/// the one still-fully-legacy-rusqlite collector with no `.await` of
+/// its own -- it's fine to pass it a fresh, short-lived `&guard`
+/// locked right at its own call site below.
 #[allow(clippy::too_many_arguments)]
 pub async fn assemble_event_feed(
     conn: &AsyncMutex<Connection>,
@@ -731,25 +814,26 @@ pub async fn assemble_event_feed(
     get_env: impl Fn(&str) -> Option<String>,
     sea_orm_db: &sea_orm::DatabaseConnection,
 ) -> rusqlite::Result<AssembledFeed> {
-    // Scoped so `guard` is dropped before the `fire_scheduled` block
-    // below, which needs to `.await` on `sea_orm_db` -- see this
-    // function's own doc comment on why a live `MutexGuard<Connection>`
-    // can never span an `.await` point, and
-    // `collect_scheduled_directive_events_for`'s doc comment for why it
-    // takes the whole `&AsyncMutex<Connection>` (to lock fresh, itself,
-    // after its own internal `collect_due_and_fire` await) rather than
-    // an already-locked `&guard`.
-    let (mut events, msg_cap_ts) = {
+    // `conn` (the whole mutex) is passed straight through to each of
+    // the three collectors below -- never an already-acquired guard --
+    // so each one locks and unlocks it independently, in its own scope.
+    // See this function's own doc comment for why that's required (a
+    // bare `&Connection` PARAMETER can never coexist with an `.await`
+    // in the SAME async fn, so `collect_events_with_cap`/`collect_
+    // unassigned_task_events_for` must do their own locking now that
+    // they each have an internal `.await`) and why calling them
+    // sequentially like this can't deadlock (no two locks ever overlap).
+    let collected =
+        collect_events_with_cap(conn, sea_orm_db, agent_id, cursor, now_iso, get_env).await?;
+    let mut events = collected.events;
+    let msg_cap_ts = collected.msg_cap_ts;
+    events.extend(collect_unassigned_task_events_for(conn, sea_orm_db, agent_id, cursor).await?);
+    events.extend({
+        // `collect_agent_profile_events_for` has no `.await` of its own,
+        // so a short-lived guard locked right here is fine.
         let guard = conn.lock().await;
-        let collected = collect_events_with_cap(&guard, agent_id, cursor, now_iso, get_env)?;
-        let mut events = collected.events;
-        let msg_cap_ts = collected.msg_cap_ts;
-        events.extend(collect_unassigned_task_events_for(
-            &guard, agent_id, cursor,
-        )?);
-        events.extend(collect_agent_profile_events_for(&guard, agent_id, cursor)?);
-        (events, msg_cap_ts)
-    };
+        collect_agent_profile_events_for(&guard, agent_id, cursor)?
+    });
     events.extend(drain_queue);
 
     // BL-R21-1: cap the MERGED batch to the message-truncation boundary
@@ -1000,16 +1084,19 @@ mod tests {
         None
     }
 
-    /// A real temp-file-backed sea-orm connection for `assemble_event_
-    /// feed`'s tests, schema-initialized the same way `test_conn`'s
-    /// rusqlite connection is -- `pending_directive_repository` reads
-    /// and writes through this connection now (Phase G), so it needs
-    /// the real `pending_directive` table, not a schema-less
-    /// `sqlite::memory:`. A SEPARATE temp file from `test_conn`'s is
-    /// fine here: nothing in this module's tests needs the rusqlite
-    /// and sea-orm sides to see each other's data -- `pending_
-    /// directive` is read and written exclusively through this
-    /// connection, never through the rusqlite one.
+    /// A real temp-file-backed sea-orm connection, schema-initialized
+    /// the same way `test_conn`'s rusqlite connection is. A SEPARATE
+    /// temp file from `test_conn`'s is fine for the tests that still
+    /// use this helper (`collect_pending_pokes_for`/`collect_scheduled_
+    /// directive_events_for`'s own tests): nothing in those tests needs
+    /// the rusqlite and sea-orm sides to see each other's data --
+    /// `pending_directive`/`scheduled_directive` are read and written
+    /// exclusively through this connection, never through the rusqlite
+    /// one. Anything that ALSO needs a task seeded through the
+    /// rusqlite side to be visible to a sea-orm task read (`collect_
+    /// events_with_cap`/`collect_unassigned_task_events_for`/
+    /// `assemble_event_feed`'s own tests, Phase G) needs
+    /// [`test_conn_with_sea_orm`]'s single SHARED file instead.
     async fn test_sea_orm_db() -> (tempfile::TempDir, sea_orm::DatabaseConnection) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.db");
@@ -1021,6 +1108,31 @@ mod tests {
             .await
             .unwrap();
         (dir, db)
+    }
+
+    /// A single real temp-file-backed DB opened as BOTH a `rusqlite::
+    /// Connection` (still-legacy reads/writes: messages, agents, and
+    /// tasks via `task_repository::create`) and a sea-orm
+    /// `DatabaseConnection` (Phase G: `task_repository::
+    /// list_assigned_updated_since`/`list_unassigned_active_updated_
+    /// since`, and everything `pending_directive_repository`/
+    /// `scheduled_directive_repository` already read/wrote through
+    /// sea-orm) -- the same dual-connection recipe `task_repository`'s
+    /// own tests use (see its `test_conn_with_sea_orm`), needed here
+    /// because a task seeded through the rusqlite side must be visible
+    /// to a sea-orm read in the SAME test; an in-memory `:memory:` DB
+    /// can't be shared across two separate connection handles the way
+    /// a real file can.
+    async fn test_conn_with_sea_orm() -> (tempfile::TempDir, Connection, sea_orm::DatabaseConnection)
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn).unwrap();
+        let db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        (dir, conn, db)
     }
 
     fn send_message(conn: &Connection, id: &str, to: &str, ts: &str, message_type: &str) {
@@ -1045,41 +1157,53 @@ mod tests {
 
     // -- collect_events_with_cap ------------------------------------------
 
-    #[test]
-    fn collect_events_with_cap_classifies_direct_message_vs_broadcast() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn collect_events_with_cap_classifies_direct_message_vs_broadcast() {
+        let (_dir, conn, sea_orm_db) = test_conn_with_sea_orm().await;
         seed_agent(&conn, "alice");
         send_message(&conn, "m1", "alice", "2026-01-01T00:00:01Z", "text");
         send_message(&conn, "m2", "alice", "2026-01-01T00:00:02Z", "broadcast");
 
-        let result =
-            collect_events_with_cap(&conn, "alice", None, "2026-01-01T00:01:00Z", no_env).unwrap();
+        let conn = AsyncMutex::new(conn);
+        let result = collect_events_with_cap(
+            &conn,
+            &sea_orm_db,
+            "alice",
+            None,
+            "2026-01-01T00:01:00Z",
+            no_env,
+        )
+        .await
+        .unwrap();
         assert_eq!(result.events.len(), 2);
         assert_eq!(result.events[0]["type"], "message");
         assert_eq!(result.events[1]["type"], "broadcast");
         assert!(result.msg_cap_ts.is_none());
     }
 
-    #[test]
-    fn collect_events_with_cap_excludes_messages_at_or_before_since() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn collect_events_with_cap_excludes_messages_at_or_before_since() {
+        let (_dir, conn, sea_orm_db) = test_conn_with_sea_orm().await;
         seed_agent(&conn, "alice");
         send_message(&conn, "m1", "alice", "2026-01-01T00:00:01Z", "text");
 
+        let conn = AsyncMutex::new(conn);
         let result = collect_events_with_cap(
             &conn,
+            &sea_orm_db,
             "alice",
             Some("2026-01-01T00:00:01Z"),
             "2026-01-01T00:01:00Z",
             no_env,
         )
+        .await
         .unwrap();
         assert!(result.events.is_empty());
     }
 
-    #[test]
-    fn collect_events_with_cap_classifies_task_assigned_vs_changed() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn collect_events_with_cap_classifies_task_assigned_vs_changed() {
+        let (_dir, conn, sea_orm_db) = test_conn_with_sea_orm().await;
         seed_agent(&conn, "alice");
         task_repository::create(
             &conn,
@@ -1123,13 +1247,16 @@ mod tests {
         )
         .unwrap();
 
+        let conn = AsyncMutex::new(conn);
         let result = collect_events_with_cap(
             &conn,
+            &sea_orm_db,
             "alice",
             Some("2026-01-01T00:00:00Z"),
             "2026-01-01T00:01:00Z",
             no_env,
         )
+        .await
         .unwrap();
         let types: Vec<_> = result
             .events
@@ -1140,22 +1267,31 @@ mod tests {
         assert!(types.contains(&"task_changed"));
     }
 
-    #[test]
-    fn collect_events_with_cap_events_are_timestamp_ascending() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn collect_events_with_cap_events_are_timestamp_ascending() {
+        let (_dir, conn, sea_orm_db) = test_conn_with_sea_orm().await;
         seed_agent(&conn, "alice");
         send_message(&conn, "m1", "alice", "2026-01-01T00:00:03Z", "text");
         send_message(&conn, "m2", "alice", "2026-01-01T00:00:01Z", "text");
 
-        let result =
-            collect_events_with_cap(&conn, "alice", None, "2026-01-01T00:01:00Z", no_env).unwrap();
+        let conn = AsyncMutex::new(conn);
+        let result = collect_events_with_cap(
+            &conn,
+            &sea_orm_db,
+            "alice",
+            None,
+            "2026-01-01T00:01:00Z",
+            no_env,
+        )
+        .await
+        .unwrap();
         assert_eq!(result.events[0]["timestamp"], "2026-01-01T00:00:01Z");
         assert_eq!(result.events[1]["timestamp"], "2026-01-01T00:00:03Z");
     }
 
-    #[test]
-    fn collect_events_with_cap_untitled_root_is_held_only_when_subject_gen_is_on() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn collect_events_with_cap_untitled_root_is_held_only_when_subject_gen_is_on() {
+        let (_dir, conn, sea_orm_db) = test_conn_with_sea_orm().await;
         seed_agent(&conn, "alice");
         // NULL subject -> placeholder preview -> held while within the
         // title-hold window, IF subject-gen is on.
@@ -1177,31 +1313,55 @@ mod tests {
         )
         .unwrap();
 
+        let conn = AsyncMutex::new(conn);
+
         // subject-gen OFF: fires immediately with the preview.
-        let off =
-            collect_events_with_cap(&conn, "alice", None, "2026-01-01T00:00:02Z", no_env).unwrap();
+        let off = collect_events_with_cap(
+            &conn,
+            &sea_orm_db,
+            "alice",
+            None,
+            "2026-01-01T00:00:02Z",
+            no_env,
+        )
+        .await
+        .unwrap();
         assert_eq!(off.events.len(), 1);
 
         // subject-gen ON, still within the 120s hold window: held.
         let get_env_on =
             |k: &str| (k == "AGENT_MCP_SUBJECT_MODEL").then(|| "some-model".to_string());
-        let held =
-            collect_events_with_cap(&conn, "alice", None, "2026-01-01T00:00:02Z", get_env_on)
-                .unwrap();
+        let held = collect_events_with_cap(
+            &conn,
+            &sea_orm_db,
+            "alice",
+            None,
+            "2026-01-01T00:00:02Z",
+            get_env_on,
+        )
+        .await
+        .unwrap();
         assert!(held.events.is_empty());
         assert!(held.msg_cap_ts.is_some());
 
         // subject-gen ON, past the hold window: fires anyway (never
         // stranded by a stalled backfill).
-        let expired =
-            collect_events_with_cap(&conn, "alice", None, "2026-01-01T00:02:30Z", get_env_on)
-                .unwrap();
+        let expired = collect_events_with_cap(
+            &conn,
+            &sea_orm_db,
+            "alice",
+            None,
+            "2026-01-01T00:02:30Z",
+            get_env_on,
+        )
+        .await
+        .unwrap();
         assert_eq!(expired.events.len(), 1);
     }
 
-    #[test]
-    fn collect_events_with_cap_caps_at_the_message_query_cap() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn collect_events_with_cap_caps_at_the_message_query_cap() {
+        let (_dir, conn, sea_orm_db) = test_conn_with_sea_orm().await;
         seed_agent(&conn, "alice");
         for i in 0..(MESSAGE_EVENT_QUERY_CAP + 5) {
             send_message(
@@ -1217,25 +1377,38 @@ mod tests {
                 "text",
             );
         }
-        let result =
-            collect_events_with_cap(&conn, "alice", None, "2026-01-02T00:00:00Z", no_env).unwrap();
+        let conn = AsyncMutex::new(conn);
+        let result = collect_events_with_cap(
+            &conn,
+            &sea_orm_db,
+            "alice",
+            None,
+            "2026-01-02T00:00:00Z",
+            no_env,
+        )
+        .await
+        .unwrap();
         assert_eq!(result.events.len() as i64, MESSAGE_EVENT_QUERY_CAP);
         assert!(result.msg_cap_ts.is_some());
     }
 
     // -- collect_unassigned_task_events_for --------------------------------
 
-    #[test]
-    fn collect_unassigned_task_events_for_unknown_agent_is_empty() {
-        let conn = test_conn();
-        assert!(collect_unassigned_task_events_for(&conn, "nobody", None)
-            .unwrap()
-            .is_empty());
+    #[tokio::test]
+    async fn collect_unassigned_task_events_for_unknown_agent_is_empty() {
+        let (_dir, conn, sea_orm_db) = test_conn_with_sea_orm().await;
+        let conn = AsyncMutex::new(conn);
+        assert!(
+            collect_unassigned_task_events_for(&conn, &sea_orm_db, "nobody", None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
-    #[test]
-    fn collect_unassigned_task_events_for_returns_claimable_and_excludes_terminal() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn collect_unassigned_task_events_for_returns_claimable_and_excludes_terminal() {
+        let (_dir, conn, sea_orm_db) = test_conn_with_sea_orm().await;
         seed_agent(&conn, "alice");
         let claimable = NewTask {
             task_id: Some("task_1"),
@@ -1268,7 +1441,10 @@ mod tests {
         };
         task_repository::create(&conn, done).unwrap();
 
-        let events = collect_unassigned_task_events_for(&conn, "alice", None).unwrap();
+        let conn = AsyncMutex::new(conn);
+        let events = collect_unassigned_task_events_for(&conn, &sea_orm_db, "alice", None)
+            .await
+            .unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["payload"]["task_id"], "task_1");
     }
@@ -1522,7 +1698,7 @@ mod tests {
 
     #[tokio::test]
     async fn assemble_event_feed_merges_messages_and_unassigned_tasks() {
-        let conn = test_conn();
+        let (_dir, conn, sea_orm_db) = test_conn_with_sea_orm().await;
         seed_agent(&conn, "alice");
         send_message(&conn, "m1", "alice", "2026-01-01T00:00:01Z", "text");
         let unassigned = NewTask {
@@ -1542,7 +1718,6 @@ mod tests {
         task_repository::create(&conn, unassigned).unwrap();
 
         let conn = AsyncMutex::new(conn);
-        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let feed = assemble_event_feed(
             &conn,
             "alice",
@@ -1567,12 +1742,11 @@ mod tests {
 
     #[tokio::test]
     async fn assemble_event_feed_includes_the_drain_queue() {
-        let conn = test_conn();
+        let (_dir, conn, sea_orm_db) = test_conn_with_sea_orm().await;
         seed_agent(&conn, "alice");
         let queued = event("hold_advisory", "2026-01-01T00:00:05Z");
 
         let conn = AsyncMutex::new(conn);
-        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let feed = assemble_event_feed(
             &conn,
             "alice",
@@ -1590,9 +1764,8 @@ mod tests {
 
     #[tokio::test]
     async fn assemble_event_feed_fires_scheduled_directives_only_when_fire_scheduled_is_true() {
-        let conn = test_conn();
+        let (_dir, conn, sea_orm_db) = test_conn_with_sea_orm().await;
         seed_agent(&conn, "alice");
-        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         scheduled_directive_repository::create(
             &sea_orm_db,
             "sched_1",
@@ -1641,10 +1814,9 @@ mod tests {
 
     #[tokio::test]
     async fn assemble_event_feed_urgent_pokes_sort_ahead_of_older_normal_events() {
-        let conn = test_conn();
+        let (_dir, conn, sea_orm_db) = test_conn_with_sea_orm().await;
         seed_agent(&conn, "alice");
         send_message(&conn, "m1", "alice", "2026-01-01T00:00:01Z", "text");
-        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         pending_directive_repository::create_poke(
             &sea_orm_db,
             "poke_1",
@@ -1689,7 +1861,7 @@ mod tests {
         // message backlog. A newer such event must not drag the merged
         // cursor past the message truncation boundary, or messages
         // beyond the cap would be skipped forever on the next poll.
-        let conn = test_conn();
+        let (_dir, conn, sea_orm_db) = test_conn_with_sea_orm().await;
         seed_agent(&conn, "alice");
         let total = MESSAGE_EVENT_QUERY_CAP + 100;
         for i in 0..total {
@@ -1730,7 +1902,6 @@ mod tests {
         .unwrap();
 
         let conn = AsyncMutex::new(conn);
-        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
 
         // ---- Poll 1: truncated at the cap; the task event held back.
         let poll1 = assemble_event_feed(
@@ -1811,10 +1982,9 @@ mod tests {
 
     #[tokio::test]
     async fn assemble_event_feed_empty_result_preserves_the_cursor() {
-        let conn = test_conn();
+        let (_dir, conn, sea_orm_db) = test_conn_with_sea_orm().await;
         seed_agent(&conn, "alice");
         let conn = AsyncMutex::new(conn);
-        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let feed = assemble_event_feed(
             &conn,
             "alice",
