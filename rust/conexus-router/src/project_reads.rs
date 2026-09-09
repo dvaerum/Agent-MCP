@@ -422,6 +422,24 @@ mod tests {
         c
     }
 
+    /// A file-backed router DB opened as BOTH a `rusqlite::Connection`
+    /// (for this file's own still-rusqlite gate/query functions) and a
+    /// sea-orm `DatabaseConnection` (for the now-async
+    /// `identity::create_user` fixture calls) -- see `identity.rs`'s own
+    /// `conn_with_sea_orm` for why an in-memory `:memory:` DB can't be
+    /// shared across two connection handles the way a real file can.
+    async fn conn_with_sea_orm() -> (tempfile::TempDir, Connection, sea_orm::DatabaseConnection) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("project_reads_test.db");
+        let c = Connection::open(&path).unwrap();
+        c.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        init_router_schema(&c).unwrap();
+        let db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        (dir, c, db)
+    }
+
     fn now_dt() -> DateTime<Utc> {
         "2026-01-01T00:00:00Z".parse().unwrap()
     }
@@ -557,11 +575,11 @@ mod tests {
         assert_eq!(visible, names.into_iter().collect());
     }
 
-    #[test]
-    fn visible_project_names_filters_to_resolved_membership() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn visible_project_names_filters_to_resolved_membership() {
+        let (_dir, c, db) = conn_with_sea_orm().await;
         let uid = identity::create_user(
-            &mut c,
+            &db,
             "alice",
             "correct horse battery staple",
             None,
@@ -570,6 +588,7 @@ mod tests {
             &[],
             NOW_STR,
         )
+        .await
         .unwrap();
         c.execute(
             "INSERT INTO project_membership (project_name, user_id, role) VALUES ('a', ?1, 'viewer')",
@@ -589,9 +608,9 @@ mod tests {
         assert!(visible.is_empty());
     }
 
-    #[test]
-    fn list_projects_response_filters_by_visibility_and_sorts() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn list_projects_response_filters_by_visibility_and_sorts() {
+        let (_dir, c, db) = conn_with_sea_orm().await;
         let dir = tempfile::tempdir().unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
         registry
@@ -601,7 +620,7 @@ mod tests {
             .register("alpha", "/ws/alpha", "python", now_dt())
             .unwrap();
         let uid = identity::create_user(
-            &mut c,
+            &db,
             "alice",
             "correct horse battery staple",
             None,
@@ -610,6 +629,7 @@ mod tests {
             &[],
             NOW_STR,
         )
+        .await
         .unwrap();
         c.execute(
             "INSERT INTO project_membership (project_name, user_id, role) VALUES ('alpha', ?1, 'viewer')",
@@ -770,13 +790,13 @@ mod tests {
         assert_eq!(resp.status, 404);
     }
 
-    #[test]
-    fn decide_alias_usage_closes_the_oracle_for_a_non_member() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn decide_alias_usage_closes_the_oracle_for_a_non_member() {
+        let (_dir, c, db) = conn_with_sea_orm().await;
         let dir = tempfile::tempdir().unwrap();
         let registry = registry_with(dir.path(), "proj-a", "/ws/proj-a");
         let bob = identity::create_user(
-            &mut c,
+            &db,
             "bob",
             "correct horse battery staple",
             None,
@@ -785,6 +805,7 @@ mod tests {
             &[],
             NOW_STR,
         )
+        .await
         .unwrap();
         let outcome = decide_alias_usage(
             &c,
@@ -804,11 +825,11 @@ mod tests {
 
     // -- decide_remove_alias ----------------------------------------------
 
-    #[test]
-    fn decide_remove_alias_expires_the_alias_and_lists_what_remains() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn decide_remove_alias_expires_the_alias_and_lists_what_remains() {
+        let (_dir, c, db) = conn_with_sea_orm().await;
         let uid = identity::create_user(
-            &mut c,
+            &db,
             "alice",
             "correct horse battery staple",
             None,
@@ -817,6 +838,7 @@ mod tests {
             &[],
             NOW_STR,
         )
+        .await
         .unwrap();
         let dir = tempfile::tempdir().unwrap();
         let registry = registry_with(dir.path(), "proj-a", "/ws/proj-a");
@@ -843,11 +865,11 @@ mod tests {
         assert_eq!(remaining[0]["name"], "older-name");
     }
 
-    #[test]
-    fn decide_remove_alias_is_idempotent_on_an_already_gone_alias() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn decide_remove_alias_is_idempotent_on_an_already_gone_alias() {
+        let (_dir, c, db) = conn_with_sea_orm().await;
         let uid = identity::create_user(
-            &mut c,
+            &db,
             "alice",
             "correct horse battery staple",
             None,
@@ -856,6 +878,7 @@ mod tests {
             &[],
             NOW_STR,
         )
+        .await
         .unwrap();
         let dir = tempfile::tempdir().unwrap();
         let registry = registry_with(dir.path(), "proj-a", "/ws/proj-a");
@@ -892,11 +915,11 @@ mod tests {
         assert_eq!(resp.status, 404);
     }
 
-    #[test]
-    fn decide_remove_alias_closes_the_cross_tenant_oracle_for_a_non_member() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn decide_remove_alias_closes_the_cross_tenant_oracle_for_a_non_member() {
+        let (_dir, c, db) = conn_with_sea_orm().await;
         identity::create_user(
-            &mut c,
+            &db,
             "alice",
             "correct horse battery staple",
             None,
@@ -905,9 +928,10 @@ mod tests {
             &[],
             NOW_STR,
         )
+        .await
         .unwrap();
         let bob = identity::create_user(
-            &mut c,
+            &db,
             "bob",
             "correct horse battery staple",
             None,
@@ -916,6 +940,7 @@ mod tests {
             &[],
             NOW_STR,
         )
+        .await
         .unwrap();
         let dir = tempfile::tempdir().unwrap();
         let registry = registry_with(dir.path(), "proj-a", "/ws/proj-a");
@@ -928,11 +953,11 @@ mod tests {
         assert_eq!(resp.status, 404);
     }
 
-    #[test]
-    fn decide_remove_alias_denies_a_viewer_tier_member_as_forbidden() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn decide_remove_alias_denies_a_viewer_tier_member_as_forbidden() {
+        let (_dir, c, db) = conn_with_sea_orm().await;
         identity::create_user(
-            &mut c,
+            &db,
             "alice",
             "correct horse battery staple",
             None,
@@ -941,9 +966,10 @@ mod tests {
             &[],
             NOW_STR,
         )
+        .await
         .unwrap();
         let bob = identity::create_user(
-            &mut c,
+            &db,
             "bob",
             "correct horse battery staple",
             None,
@@ -952,6 +978,7 @@ mod tests {
             &[],
             NOW_STR,
         )
+        .await
         .unwrap();
         c.execute(
             "INSERT INTO project_membership (project_name, user_id, role) VALUES ('proj-a', ?1, 'viewer')",

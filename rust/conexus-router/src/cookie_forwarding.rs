@@ -140,9 +140,9 @@ mod tests {
         (dir, c, db)
     }
 
-    fn seed_user(c: &mut Connection, username: &str) -> String {
+    async fn seed_user(db: &sea_orm::DatabaseConnection, username: &str) -> String {
         identity::create_user(
-            c,
+            db,
             username,
             "correct horse battery staple",
             None,
@@ -151,6 +151,7 @@ mod tests {
             &[],
             NOW_STR,
         )
+        .await
         .unwrap()
     }
 
@@ -187,8 +188,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_project_member_resolves_their_real_operator_role() {
-        let (_dir, mut c, db) = conn_with_sea_orm().await;
-        let user_id = seed_user(&mut c, "alice");
+        let (_dir, c, db) = conn_with_sea_orm().await;
+        let user_id = seed_user(&db, "alice").await;
         identity::add_project_membership(&db, &user_id, "proj-a")
             .await
             .unwrap();
@@ -207,8 +208,8 @@ mod tests {
         // SEC-1 parity with `forwarding_header.rs`'s own module doc:
         // signing a FIXED role would let a viewer-tier operator collect
         // the full operator capability bundle over this transport.
-        let (_dir, mut c, db) = conn_with_sea_orm().await;
-        let user_id = seed_user(&mut c, "bob");
+        let (_dir, c, db) = conn_with_sea_orm().await;
+        let user_id = seed_user(&db, "bob").await;
         identity::grant_project_membership(&db, "proj-a", Some(&user_id), None, "viewer")
             .await
             .unwrap();
@@ -220,10 +221,10 @@ mod tests {
         assert_eq!(role, ForwardedRole::Viewer);
     }
 
-    #[test]
-    fn a_non_member_resolves_to_none_even_with_a_live_session() {
-        let mut c = conn();
-        let user_id = seed_user(&mut c, "carol");
+    #[tokio::test]
+    async fn a_non_member_resolves_to_none_even_with_a_live_session() {
+        let (_dir, c, db) = conn_with_sea_orm().await;
+        let user_id = seed_user(&db, "carol").await;
         // No project_membership row for "proj-a" at all.
         let cookie = cookie_for(&c, &user_id);
 
@@ -239,8 +240,8 @@ mod tests {
         // The exact cross-tenant scenario the task brief calls out:
         // a member of "proj-a" must not be able to mint a header for
         // "proj-b" by hitting a different URL segment.
-        let (_dir, mut c, db) = conn_with_sea_orm().await;
-        let user_id = seed_user(&mut c, "dave");
+        let (_dir, c, db) = conn_with_sea_orm().await;
+        let user_id = seed_user(&db, "dave").await;
         identity::add_project_membership(&db, &user_id, "proj-a")
             .await
             .unwrap();
@@ -262,8 +263,8 @@ mod tests {
 
     #[tokio::test]
     async fn an_expired_session_resolves_to_none() {
-        let (_dir, mut c, db) = conn_with_sea_orm().await;
-        let user_id = seed_user(&mut c, "erin");
+        let (_dir, c, db) = conn_with_sea_orm().await;
+        let user_id = seed_user(&db, "erin").await;
         identity::add_project_membership(&db, &user_id, "proj-a")
             .await
             .unwrap();
@@ -287,8 +288,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_project_member_via_group_membership_resolves_a_role() {
-        let (_dir, mut c, db) = conn_with_sea_orm().await;
-        let user_id = seed_user(&mut c, "frank");
+        let (_dir, c, db) = conn_with_sea_orm().await;
+        let user_id = seed_user(&db, "frank").await;
         let group =
             conexus_db::group_membership_repository::create_group(&c, "team-a", false, NOW_STR)
                 .unwrap();

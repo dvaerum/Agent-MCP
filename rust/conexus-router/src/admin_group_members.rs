@@ -349,9 +349,9 @@ mod tests {
             .group_id
     }
 
-    fn seed_user(c: &mut Connection, username: &str) -> String {
+    async fn seed_user(db: &sea_orm::DatabaseConnection, username: &str) -> String {
         crate::identity::create_user(
-            c,
+            db,
             username,
             "correct horse battery staple",
             None,
@@ -360,16 +360,17 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap()
     }
 
     // -- list_group_members_response ------------------------------------
 
-    #[test]
-    fn lists_members_with_labels() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn lists_members_with_labels() {
+        let (_dir, c, db) = conn_with_sea_orm().await;
         let gid = seed_group(&c, "engineers");
-        let alice = seed_user(&mut c, "alice");
+        let alice = seed_user(&db, "alice").await;
         group_membership_repository::add_group_member(&c, &gid, Some(&alice), None, NOW).unwrap();
         let resp = list_group_members_response(&c, &gid).unwrap();
         let crate::mcp_handler::HandlerBody::Json(body) = resp.body else {
@@ -389,11 +390,11 @@ mod tests {
 
     // -- decide_add_group_member -----------------------------------------
 
-    #[test]
-    fn a_sysadmin_adds_a_user_member() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn a_sysadmin_adds_a_user_member() {
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
         let gid = seed_group(&c, "engineers");
-        let alice = seed_user(&mut c, "alice");
+        let alice = seed_user(&db, "alice").await;
         let outcome = decide_add_group_member(
             &mut c,
             true,
@@ -475,11 +476,11 @@ mod tests {
         assert_eq!(resp.status, 404);
     }
 
-    #[test]
-    fn rejects_a_duplicate_membership_as_conflict() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn rejects_a_duplicate_membership_as_conflict() {
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
         let gid = seed_group(&c, "engineers");
-        let alice = seed_user(&mut c, "alice");
+        let alice = seed_user(&db, "alice").await;
         group_membership_repository::add_group_member(&c, &gid, Some(&alice), None, NOW).unwrap();
         let outcome = decide_add_group_member(
             &mut c,
@@ -523,13 +524,13 @@ mod tests {
         assert_eq!(resp.status, 409);
     }
 
-    #[test]
-    fn a_non_sysadmin_cannot_add_a_member_to_a_sysadmin_group() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn a_non_sysadmin_cannot_add_a_member_to_a_sysadmin_group() {
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
         let gid = group_membership_repository::create_group(&c, "engineers", true, NOW)
             .unwrap()
             .group_id;
-        let alice = seed_user(&mut c, "alice");
+        let alice = seed_user(&db, "alice").await;
         let outcome = decide_add_group_member(
             &mut c,
             false,
@@ -584,9 +585,9 @@ mod tests {
     /// sysadmin group -- joining the parent still inherits sysadmin
     /// via the resolver's transitive closure, so it must be denied
     /// identically.
-    #[test]
-    fn a_non_sysadmin_cannot_join_a_group_that_is_transitively_sysadmin() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn a_non_sysadmin_cannot_join_a_group_that_is_transitively_sysadmin() {
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
         let top_gid = group_membership_repository::create_group(&c, "top-admins", true, NOW)
             .unwrap()
             .group_id;
@@ -594,7 +595,7 @@ mod tests {
         // mid ∈ top -- members of mid inherit sysadmin from top.
         group_membership_repository::add_group_member(&c, &top_gid, None, Some(&mid_gid), NOW)
             .unwrap();
-        let alice = seed_user(&mut c, "alice");
+        let alice = seed_user(&db, "alice").await;
         let outcome = decide_add_group_member(
             &mut c,
             false,
@@ -612,12 +613,12 @@ mod tests {
         assert_eq!(resp.status, 403);
     }
 
-    #[test]
-    fn a_non_sysadmin_cannot_add_a_member_to_a_group_with_unheld_capabilities() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn a_non_sysadmin_cannot_add_a_member_to_a_group_with_unheld_capabilities() {
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
         let gid = seed_group(&c, "engineers");
         group_capability_replace(&c, &gid, ["system.config.write"]);
-        let alice = seed_user(&mut c, "alice");
+        let alice = seed_user(&db, "alice").await;
         // No principal at all -- fails closed.
         let outcome = decide_add_group_member(
             &mut c,
@@ -681,15 +682,15 @@ mod tests {
 
     // -- AZ-2 (test_sec_r4_cap_amplification.py): join-a-high-cap-group --
 
-    #[test]
-    fn a_delegate_can_join_a_group_whose_resolved_caps_are_all_held() {
+    #[tokio::test]
+    async fn a_delegate_can_join_a_group_whose_resolved_caps_are_all_held() {
         // test_sec_r4_cap_amplification.py's
         // `test_delegated_group_manager_can_join_held_cap_group`: the
         // guard only blocks amplification, not legitimate delegation.
-        let mut c = conn();
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
         let gid = seed_group(&c, "g-lowcap");
         group_capability_replace(&c, &gid, ["system.groups.manage"]);
-        let alice = seed_user(&mut c, "alice");
+        let alice = seed_user(&db, "alice").await;
         let principal = principal_with_caps("bob", ["system.groups.manage"]);
         let outcome = decide_add_group_member(
             &mut c,
@@ -705,14 +706,14 @@ mod tests {
         assert!(matches!(outcome, AddGroupMemberOutcome::Added(_)));
     }
 
-    #[test]
-    fn a_sysadmin_can_add_a_member_to_a_high_cap_group() {
+    #[tokio::test]
+    async fn a_sysadmin_can_add_a_member_to_a_high_cap_group() {
         // test_sec_r4_cap_amplification.py's
         // `test_sysadmin_can_add_member_to_high_cap_group`.
-        let mut c = conn();
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
         let gid = seed_group(&c, "g-sys-highcap");
         group_capability_replace(&c, &gid, ["system.users.manage"]);
-        let alice = seed_user(&mut c, "alice");
+        let alice = seed_user(&db, "alice").await;
         let outcome = decide_add_group_member(
             &mut c,
             true,
@@ -740,7 +741,7 @@ mod tests {
         let (_dir, mut c, db) = conn_with_sea_orm().await;
         let gid = seed_group(&c, "r6team");
         seed_project_membership(&db, "r6victim", None, Some(&gid), "operator").await;
-        let alice = seed_user(&mut c, "alice");
+        let alice = seed_user(&db, "alice").await;
         let principal = principal_with_caps(&alice, ["system.groups.manage"]);
         let outcome = decide_add_group_member(
             &mut c,
@@ -769,7 +770,7 @@ mod tests {
         let gid = seed_group(&c, "r6team");
         seed_project_membership(&db, "r6victim", None, Some(&gid), "operator").await;
         let controlled = seed_group(&c, "g-controlled");
-        let alice = seed_user(&mut c, "alice");
+        let alice = seed_user(&db, "alice").await;
         let principal = principal_with_caps(&alice, ["system.groups.manage"]);
         let outcome = decide_add_group_member(
             &mut c,
@@ -793,7 +794,7 @@ mod tests {
         let (_dir, mut c, db) = conn_with_sea_orm().await;
         let gid = seed_group(&c, "r6team");
         seed_project_membership(&db, "r6victim", None, Some(&gid), "operator").await;
-        let newbie = seed_user(&mut c, "newbie");
+        let newbie = seed_user(&db, "newbie").await;
         let outcome = decide_add_group_member(
             &mut c,
             true,
@@ -815,11 +816,11 @@ mod tests {
         // that project -- conferring viewer is at or below their own
         // role.
         let (_dir, mut c, db) = conn_with_sea_orm().await;
-        let alice = seed_user(&mut c, "alice");
+        let alice = seed_user(&db, "alice").await;
         seed_project_membership(&db, "r6victim", Some(&alice), None, "operator").await;
         let gid = seed_group(&c, "r6viewteam");
         seed_project_membership(&db, "r6victim", None, Some(&gid), "viewer").await;
-        let newbie = seed_user(&mut c, "newbie2");
+        let newbie = seed_user(&db, "newbie2").await;
         let principal = principal_with_caps(&alice, ["system.groups.manage"]);
         let outcome = decide_add_group_member(
             &mut c,
@@ -866,15 +867,15 @@ mod tests {
 
     // -- decide_remove_group_member --------------------------------------
 
-    #[test]
-    fn a_sysadmin_removes_a_user_member() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn a_sysadmin_removes_a_user_member() {
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
         // R5-F4 fires on EVERY removal, not just from a sysadmin
         // group -- seed an unrelated real sysadmin so the global
         // invariant is genuinely satisfied and this test isolates the
         // actual mechanism under test, not the lockout.
         crate::identity::create_user(
-            &mut c,
+            &db,
             "root",
             "correct horse battery staple",
             None,
@@ -883,9 +884,10 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
         let gid = seed_group(&c, "engineers");
-        let alice = seed_user(&mut c, "alice");
+        let alice = seed_user(&db, "alice").await;
         group_membership_repository::add_group_member(&c, &gid, Some(&alice), None, NOW).unwrap();
         let outcome =
             decide_remove_group_member(&mut c, true, "admin", None, None, &gid, &alice).unwrap();
@@ -908,13 +910,13 @@ mod tests {
         assert_eq!(resp.status, 404);
     }
 
-    #[test]
-    fn a_non_sysadmin_cannot_remove_a_member_from_a_sysadmin_group() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn a_non_sysadmin_cannot_remove_a_member_from_a_sysadmin_group() {
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
         let gid = group_membership_repository::create_group(&c, "engineers", true, NOW)
             .unwrap()
             .group_id;
-        let alice = seed_user(&mut c, "alice");
+        let alice = seed_user(&db, "alice").await;
         group_membership_repository::add_group_member(&c, &gid, Some(&alice), None, NOW).unwrap();
         let outcome =
             decide_remove_group_member(&mut c, false, "bob", None, None, &gid, &alice).unwrap();
@@ -934,17 +936,17 @@ mod tests {
     // grants it -- the REMOVE path must run the SAME amplification
     // guard as ADD. -------------------------------------------------
 
-    #[test]
-    fn a_delegate_cannot_remove_a_member_from_a_cap_conferring_group() {
+    #[tokio::test]
+    async fn a_delegate_cannot_remove_a_member_from_a_cap_conferring_group() {
         // A delegate holding `system.groups.manage` but NOT
         // `system.users.manage` must not be able to remove a member
         // from a group that confers `system.users.manage` --
         // stripping a cap-conferring membership the delegate could
         // never grant.
-        let mut c = conn();
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
         let gid = seed_group(&c, "g-caps");
         group_capability_replace(&c, &gid, ["system.users.manage"]);
-        let victim = seed_user(&mut c, "victim");
+        let victim = seed_user(&db, "victim").await;
         group_membership_repository::add_group_member(&c, &gid, Some(&victim), None, NOW).unwrap();
         let principal = principal_with_caps("alice", ["system.groups.manage"]);
         let outcome = decide_remove_group_member(
@@ -976,7 +978,7 @@ mod tests {
         let (_dir, mut c, db) = conn_with_sea_orm().await;
         let gid = seed_group(&c, "g-proj");
         seed_project_membership(&db, "proj-r12", None, Some(&gid), "operator").await;
-        let victim = seed_user(&mut c, "victim");
+        let victim = seed_user(&db, "victim").await;
         group_membership_repository::add_group_member(&c, &gid, Some(&victim), None, NOW).unwrap();
         let principal = principal_with_caps("alice", ["system.groups.manage"]);
         let outcome = decide_remove_group_member(
@@ -995,18 +997,18 @@ mod tests {
         assert_eq!(resp.status, 403);
     }
 
-    #[test]
-    fn a_delegate_can_remove_a_member_from_a_group_whose_caps_are_all_held() {
+    #[tokio::test]
+    async fn a_delegate_can_remove_a_member_from_a_group_whose_caps_are_all_held() {
         // Regression: a delegate may remove a member from a group
         // whose conferred caps are all caps the delegate ALSO holds --
         // within their own authority to grant, so within their
         // authority to revoke.
-        let mut c = conn();
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
         // R5-F4 fires on EVERY removal -- seed an unrelated real
         // sysadmin so the global invariant is genuinely satisfied and
         // this test isolates the amplification-guard mechanism alone.
         crate::identity::create_user(
-            &mut c,
+            &db,
             "root",
             "correct horse battery staple",
             None,
@@ -1015,10 +1017,11 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
         let gid = seed_group(&c, "g-safe");
         group_capability_replace(&c, &gid, ["system.users.manage"]);
-        let victim = seed_user(&mut c, "victim");
+        let victim = seed_user(&db, "victim").await;
         group_membership_repository::add_group_member(&c, &gid, Some(&victim), None, NOW).unwrap();
         let principal =
             principal_with_caps("alice", ["system.groups.manage", "system.users.manage"]);
@@ -1035,14 +1038,14 @@ mod tests {
         assert!(matches!(outcome, RemoveGroupMemberOutcome::Removed(_)));
     }
 
-    #[test]
-    fn a_sysadmin_can_remove_a_member_from_a_cap_conferring_group() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn a_sysadmin_can_remove_a_member_from_a_cap_conferring_group() {
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
         // See the comment on the sibling test above -- R5-F4 needs an
         // unrelated real sysadmin seeded for a genuinely satisfied
         // global invariant.
         crate::identity::create_user(
-            &mut c,
+            &db,
             "root",
             "correct horse battery staple",
             None,
@@ -1051,23 +1054,24 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
         let gid = seed_group(&c, "g-caps");
         group_capability_replace(&c, &gid, ["system.users.manage"]);
-        let victim = seed_user(&mut c, "victim");
+        let victim = seed_user(&db, "victim").await;
         group_membership_repository::add_group_member(&c, &gid, Some(&victim), None, NOW).unwrap();
         let outcome =
             decide_remove_group_member(&mut c, true, "root", None, None, &gid, &victim).unwrap();
         assert!(matches!(outcome, RemoveGroupMemberOutcome::Removed(_)));
     }
 
-    #[test]
-    fn refuses_to_drain_the_last_sysadmin_groups_sole_member() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn refuses_to_drain_the_last_sysadmin_groups_sole_member() {
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
         let gid = group_membership_repository::create_group(&c, "engineers", true, NOW)
             .unwrap()
             .group_id;
-        let alice = seed_user(&mut c, "alice");
+        let alice = seed_user(&db, "alice").await;
         group_membership_repository::add_group_member(&c, &gid, Some(&alice), None, NOW).unwrap();
         // Sysadmin caller bypasses the amplification guard but must
         // still hit the R5-F4 global-invariant check.
@@ -1084,16 +1088,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn allows_draining_when_another_sysadmin_source_remains() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn allows_draining_when_another_sysadmin_source_remains() {
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
         let gid = group_membership_repository::create_group(&c, "engineers", true, NOW)
             .unwrap()
             .group_id;
-        let alice = seed_user(&mut c, "alice");
+        let alice = seed_user(&db, "alice").await;
         group_membership_repository::add_group_member(&c, &gid, Some(&alice), None, NOW).unwrap();
         crate::identity::create_user(
-            &mut c,
+            &db,
             "bob",
             "correct horse battery staple",
             None,
@@ -1102,6 +1106,7 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
         let outcome =
             decide_remove_group_member(&mut c, true, "admin", None, None, &gid, &alice).unwrap();

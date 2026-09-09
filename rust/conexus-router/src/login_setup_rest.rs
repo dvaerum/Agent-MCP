@@ -173,8 +173,9 @@ fn internal_error() -> Response {
 /// `hyper::Response<axum::body::Body>` is >128 bytes and this error
 /// carries no information beyond "something went wrong").
 async fn users_table_is_empty(state: &RouterState) -> Result<bool, ()> {
-    let conn = state.conn.lock().await;
-    identity::users_table_is_empty(&conn).map_err(|_| ())
+    identity::users_table_is_empty(&state.sea_orm_db)
+        .await
+        .map_err(|_| ())
 }
 
 /// Port of `identity.create_user`'s internal `_list_registered_projects()`
@@ -313,12 +314,9 @@ pub async fn login_post_handler(
 
     let now = Utc::now();
     let now_str = now.to_rfc3339();
-    let outcome = {
-        let conn = state.conn.lock().await;
-        match login::attempt_login(&conn, &username, &password) {
-            Ok(o) => o,
-            Err(_) => return internal_error(),
-        }
+    let outcome = match login::attempt_login(&state.sea_orm_db, &username, &password).await {
+        Ok(o) => o,
+        Err(_) => return internal_error(),
     };
     match outcome {
         LoginAttemptOutcome::InvalidCredentials => {
@@ -330,15 +328,24 @@ pub async fn login_post_handler(
                 let expires = (now
                     + chrono::Duration::days(identity::DEFAULT_SESSION_LIFETIME_DAYS))
                 .to_rfc3339();
-                let sid = match identity::create_session(&conn, &user.user_id, &now_str, &expires) {
+                match identity::create_session(&conn, &user.user_id, &now_str, &expires) {
                     Ok(s) => s,
                     Err(_) => return internal_error(),
-                };
-                if identity::touch_last_login(&conn, &user.user_id, &now_str).is_err() {
-                    return internal_error();
                 }
-                sid
             };
+            // `touch_last_login` (users, sea-orm) runs AFTER the
+            // `conn` mutex guard above is dropped -- `create_session`
+            // (sessions, deliberately still rusqlite) and this write
+            // to a different table/row have no ordering dependency on
+            // each other, so splitting them across the lock boundary
+            // is safe (Phase G router step 4 PR D; sessions itself
+            // stays out of scope, see `identity.rs`'s own module doc).
+            if identity::touch_last_login(&state.sea_orm_db, &user.user_id, &now_str)
+                .await
+                .is_err()
+            {
+                return internal_error();
+            }
             let target = login::safe_next(Some(&next_url), &mount_ctx.external_path("/"));
             let secure = login::cookie_secure_flag(
                 require_secure_cookies_env(),
@@ -504,19 +511,17 @@ pub async fn setup_post_handler(
     let now_str = now.to_rfc3339();
     let registered_projects = registered_project_names(&state);
 
-    let outcome = {
-        let mut conn = state.conn.lock().await;
-        login::attempt_setup(
-            &mut conn,
-            true,
-            &username,
-            &password,
-            &password_confirm,
-            email,
-            &registered_projects,
-            &now_str,
-        )
-    };
+    let outcome = login::attempt_setup(
+        &state.sea_orm_db,
+        true,
+        &username,
+        &password,
+        &password_confirm,
+        email,
+        &registered_projects,
+        &now_str,
+    )
+    .await;
 
     match outcome {
         SetupPostOutcome::AlreadySetUp => see_other("/agent-mcp/login"),
@@ -535,15 +540,21 @@ pub async fn setup_post_handler(
                 let expires = (now
                     + chrono::Duration::days(identity::DEFAULT_SESSION_LIFETIME_DAYS))
                 .to_rfc3339();
-                let sid = match identity::create_session(&conn, &user_id, &now_str, &expires) {
+                match identity::create_session(&conn, &user_id, &now_str, &expires) {
                     Ok(s) => s,
                     Err(_) => return internal_error(),
-                };
-                if identity::touch_last_login(&conn, &user_id, &now_str).is_err() {
-                    return internal_error();
                 }
-                sid
             };
+            // See `login_post_handler`'s own comment on this same
+            // split: `touch_last_login` (users, sea-orm) runs after
+            // the rusqlite `conn` guard for `create_session`
+            // (sessions, deliberately still rusqlite) is dropped.
+            if identity::touch_last_login(&state.sea_orm_db, &user_id, &now_str)
+                .await
+                .is_err()
+            {
+                return internal_error();
+            }
             let secure = login::cookie_secure_flag(
                 require_secure_cookies_env(),
                 mount_ctx
@@ -710,18 +721,29 @@ mod http_tests {
     }
 
     /// A real login/setup axum sub-router over a freshly built
-    /// in-memory `RouterState` -- no session gate / rate-limit /
+    /// file-backed `RouterState` -- no session gate / rate-limit /
     /// empty-users-redirect middleware layered on (irrelevant to the
     /// 3 findings above: `/agent-mcp/login`+`/agent-mcp/setup` are
     /// `path_policy::UNAUTH_PREFIXES`-exempt from all three in the
     /// real app anyway). `_dir` must outlive the router (the project
-    /// registry's backing file lives under it).
+    /// registry's backing file AND the shared sqlite file both live
+    /// under it). File-backed (not `:memory:`), same dual-connection
+    /// recipe as `identity.rs`'s own `conn_with_sea_orm` -- these
+    /// tests seed users through `identity::create_user`/
+    /// `create_sso_user` (sea-orm, Phase G router step 4 PR D) and the
+    /// real handlers under test read the SAME rows back through
+    /// `state.sea_orm_db`; two separate `:memory:` handles (or a
+    /// sqlx pool opening more than one physical connection to one
+    /// `:memory:` URI) would each see their own empty database.
     async fn test_app() -> (tempfile::TempDir, Arc<RouterState>, Router) {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conexus_db::schema::init_router_schema(&conn).unwrap();
         let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("login_setup_test.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conexus_db::schema::init_router_schema(&conn).unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
-        let sea_orm_db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
+        let sea_orm_db = sea_orm::Database::connect(format!("sqlite://{}", db_path.display()))
+            .await
+            .unwrap();
         let state = Arc::new(RouterState::new(
             conn,
             sea_orm_db,
@@ -841,20 +863,18 @@ mod http_tests {
     #[tokio::test]
     async fn login_post_password_only_as_a_file_part_is_401_not_500() {
         let (_dir, state, router) = test_app().await;
-        {
-            let mut conn = state.conn.lock().await;
-            identity::create_user(
-                &mut conn,
-                "bob",
-                "hunter2pw123",
-                None,
-                false,
-                true,
-                &[],
-                NOW,
-            )
-            .unwrap();
-        }
+        identity::create_user(
+            &state.sea_orm_db,
+            "bob",
+            "hunter2pw123",
+            None,
+            false,
+            true,
+            &[],
+            NOW,
+        )
+        .await
+        .unwrap();
         let body = multipart_body("XBOUNDARY", false, true);
         let (status, _headers) = post(
             &router,
@@ -885,20 +905,18 @@ mod http_tests {
     #[tokio::test]
     async fn login_post_urlencoded_credentials_still_authenticate() {
         let (_dir, state, router) = test_app().await;
-        {
-            let mut conn = state.conn.lock().await;
-            identity::create_user(
-                &mut conn,
-                "carol",
-                "hunter2pw123",
-                None,
-                false,
-                true,
-                &[],
-                NOW,
-            )
-            .unwrap();
-        }
+        identity::create_user(
+            &state.sea_orm_db,
+            "carol",
+            "hunter2pw123",
+            None,
+            false,
+            true,
+            &[],
+            NOW,
+        )
+        .await
+        .unwrap();
         let (status, headers) = post(
             &router,
             "/agent-mcp/login",
@@ -927,10 +945,12 @@ mod http_tests {
         .await;
         assert_eq!(status, StatusCode::SEE_OTHER);
         assert!(headers.get(header::SET_COOKIE).is_some());
-        let conn = state.conn.lock().await;
-        assert!(identity::get_user_by_username(&conn, "first_op")
-            .unwrap()
-            .is_some());
+        assert!(
+            identity::get_user_by_username(&state.sea_orm_db, "first_op")
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     // -- AC-R17-1 top-up: SSO/passwordless user must not 500 over HTTP --
@@ -938,11 +958,17 @@ mod http_tests {
     #[tokio::test]
     async fn login_post_sso_passwordless_user_is_401_not_500() {
         let (_dir, state, router) = test_app().await;
-        {
-            let mut conn = state.conn.lock().await;
-            identity::create_sso_user(&mut conn, "sso-victim", "sub-1", None, false, false, NOW)
-                .unwrap();
-        }
+        identity::create_sso_user(
+            &state.sea_orm_db,
+            "sso-victim",
+            "sub-1",
+            None,
+            false,
+            false,
+            NOW,
+        )
+        .await
+        .unwrap();
         let (status, headers) = post(
             &router,
             "/agent-mcp/login",
@@ -968,35 +994,34 @@ mod http_tests {
         // it's an SSO row, delete the row, then POST the identical
         // request again: both responses must be byte-identical 401s.
         let (_dir, state, router) = test_app().await;
-        {
-            let mut conn = state.conn.lock().await;
-            // A second account keeps the users table non-empty after
-            // the probe row is deleted -- login.rs's own empty-users
-            // gate is out of scope for this router-level test harness
-            // (see `test_app`'s own doc), but keeping the shape
-            // faithful to the real deployment topology costs nothing.
-            identity::create_user(
-                &mut conn,
-                "keep-nonempty",
-                "correct horse battery staple",
-                None,
-                false,
-                true,
-                &[],
-                NOW,
-            )
-            .unwrap();
-            identity::create_sso_user(
-                &mut conn,
-                "probe-user",
-                "sub-probe",
-                None,
-                false,
-                false,
-                NOW,
-            )
-            .unwrap();
-        }
+        // A second account keeps the users table non-empty after the
+        // probe row is deleted -- login.rs's own empty-users gate is
+        // out of scope for this router-level test harness (see
+        // `test_app`'s own doc), but keeping the shape faithful to the
+        // real deployment topology costs nothing.
+        identity::create_user(
+            &state.sea_orm_db,
+            "keep-nonempty",
+            "correct horse battery staple",
+            None,
+            false,
+            true,
+            &[],
+            NOW,
+        )
+        .await
+        .unwrap();
+        identity::create_sso_user(
+            &state.sea_orm_db,
+            "probe-user",
+            "sub-probe",
+            None,
+            false,
+            false,
+            NOW,
+        )
+        .await
+        .unwrap();
 
         let body = b"username=probe-user&password=guess".to_vec();
         let (status_sso, body_sso) = post_body(
@@ -1033,22 +1058,29 @@ mod http_tests {
         // Port of `test_sec_r17_sso_login_enum_oracle.py::test_sso_
         // login_status_matches_wrong_password_path`.
         let (_dir, state, router) = test_app().await;
-        {
-            let mut conn = state.conn.lock().await;
-            identity::create_user(
-                &mut conn,
-                "pw-real",
-                "rightpw12345",
-                None,
-                false,
-                true,
-                &[],
-                NOW,
-            )
-            .unwrap();
-            identity::create_sso_user(&mut conn, "sso-user", "sub-sso", None, false, false, NOW)
-                .unwrap();
-        }
+        identity::create_user(
+            &state.sea_orm_db,
+            "pw-real",
+            "rightpw12345",
+            None,
+            false,
+            true,
+            &[],
+            NOW,
+        )
+        .await
+        .unwrap();
+        identity::create_sso_user(
+            &state.sea_orm_db,
+            "sso-user",
+            "sub-sso",
+            None,
+            false,
+            false,
+            NOW,
+        )
+        .await
+        .unwrap();
 
         let (status_sso, body_sso) = post_body(
             &router,

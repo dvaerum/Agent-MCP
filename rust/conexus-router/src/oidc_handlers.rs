@@ -414,9 +414,8 @@ pub async fn handle_oidc_callback(
     let (default_is_sysadmin, bootstrap_sysadmin) = oidc_reconcile_sysadmin_flags(&cfg);
     let now = Utc::now();
     let now_str = now.to_rfc3339();
-    let mut conn = state.conn.lock().await;
     let user = match find_or_create_oidc_user(
-        &mut conn,
+        &state.sea_orm_db,
         &OidcReconcileInput {
             email,
             email_verified,
@@ -426,7 +425,9 @@ pub async fn handle_oidc_callback(
             bootstrap_sysadmin,
         },
         &now_str,
-    ) {
+    )
+    .await
+    {
         Ok(u) => u,
         // R15-F2 (Python's InvalidEmailError: an unpaired UTF-16
         // surrogate crashing the INSERT) has NO Rust equivalent to
@@ -438,30 +439,47 @@ pub async fn handle_oidc_callback(
     };
     let _ = legacy_subject; // reconciliation already applied inside find_or_create_oidc_user
 
-    if !cfg.group_mapping.is_empty() {
-        apply_group_mapping(
-            &conn,
-            &user.user_id,
-            &groups_claim,
-            &cfg.group_mapping,
-            &now_str,
-        );
-        // De-provision (round-9 AC-R9-1): revoke IdP-managed (oidc:)
-        // memberships the current claim no longer justifies. Manual
-        // local grants are out of scope and untouched.
-        reconcile_oidc_group_membership(&conn, &user.user_id, &groups_claim, &cfg.group_mapping);
-    }
-
+    // Phase G router step 4 PR D: `find_or_create_oidc_user` above is
+    // now sea-orm-backed and no longer holds `state.conn`'s rusqlite
+    // guard, so the group-mapping/session-creation rusqlite work below
+    // (still out of scope -- `group_membership`/`sessions`) takes its
+    // OWN, separately-scoped lock rather than sharing one across the
+    // whole handler.
     let expires =
         (now + chrono::Duration::days(identity::DEFAULT_SESSION_LIFETIME_DAYS)).to_rfc3339();
-    let session_id = match identity::create_session(&conn, &user.user_id, &now_str, &expires) {
-        Ok(s) => s,
-        Err(_) => return plain_text_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error"),
+    let session_id = {
+        let conn = state.conn.lock().await;
+        if !cfg.group_mapping.is_empty() {
+            apply_group_mapping(
+                &conn,
+                &user.user_id,
+                &groups_claim,
+                &cfg.group_mapping,
+                &now_str,
+            );
+            // De-provision (round-9 AC-R9-1): revoke IdP-managed (oidc:)
+            // memberships the current claim no longer justifies. Manual
+            // local grants are out of scope and untouched.
+            reconcile_oidc_group_membership(
+                &conn,
+                &user.user_id,
+                &groups_claim,
+                &cfg.group_mapping,
+            );
+        }
+        match identity::create_session(&conn, &user.user_id, &now_str, &expires) {
+            Ok(s) => s,
+            Err(_) => {
+                return plain_text_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+            }
+        }
     };
-    if identity::touch_last_login(&conn, &user.user_id, &now_str).is_err() {
+    if identity::touch_last_login(&state.sea_orm_db, &user.user_id, &now_str)
+        .await
+        .is_err()
+    {
         return plain_text_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
     }
-    drop(conn);
 
     let secure = crate::login::cookie_secure_flag(
         crate::login_setup_rest::require_secure_cookies_env(),
@@ -647,8 +665,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn oidc_reconcile_sysadmin_flags_composes_with_the_real_reconcile_function_to_never_auto_sysadmin_a_second_user(
+    #[tokio::test]
+    async fn oidc_reconcile_sysadmin_flags_composes_with_the_real_reconcile_function_to_never_auto_sysadmin_a_second_user(
     ) {
         // End-to-end proof (function-level, no live IdP needed): wire
         // this module's own derived flags into the REAL
@@ -661,11 +679,23 @@ mod tests {
         use crate::sso_subject::{SsoSubject, SsoSubjectValue};
         use conexus_db::schema::init_router_schema;
 
-        let mut c = rusqlite::Connection::open_in_memory().unwrap();
+        // File-backed (not `:memory:`) so the same DB can be opened as
+        // BOTH a rusqlite `Connection` (schema init) and a sea-orm
+        // `DatabaseConnection` (the now-async `create_user`/
+        // `find_or_create_oidc_user` calls below) -- same dual-connection
+        // recipe as `identity.rs`'s own `conn_with_sea_orm` test helper.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oidc_handlers_test.db");
+        let c = rusqlite::Connection::open(&path).unwrap();
+        c.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
         init_router_schema(&c).unwrap();
+        let db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+
         const NOW: &str = "2026-09-08T00:00:00Z";
         create_user(
-            &mut c,
+            &db,
             "existing_admin",
             "correct horse battery staple",
             None,
@@ -674,6 +704,7 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
 
         let mut cfg = oidc_settings(None);
@@ -686,7 +717,7 @@ mod tests {
         )
         .unwrap();
         let row = find_or_create_oidc_user(
-            &mut c,
+            &db,
             &OidcReconcileInput {
                 email: None,
                 email_verified: false,
@@ -697,6 +728,7 @@ mod tests {
             },
             NOW,
         )
+        .await
         .unwrap();
 
         assert!(

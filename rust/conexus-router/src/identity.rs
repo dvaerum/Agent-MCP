@@ -12,24 +12,53 @@
 //! subset of Python's fuller `insert_project_membership`/
 //! `remove_project_membership`/`is_project_member`/`list_user_projects`
 //! surface, scoped to real call sites rather than the whole API).
-//! Still deferred: SSO-subject reconciliation
-//! (`find_user_by_sso_subject`/`find_linkable_user_by_email`/
-//! `stamp_sso_subject_if_absent`/`upgrade_sso_subject` -- only needed
-//! once the SSO PRs land).
+//! SSO-subject reconciliation (`find_user_by_sso_subject`/
+//! `find_linkable_user_by_email`/`stamp_sso_subject_if_absent`/
+//! `upgrade_sso_subject`) landed once the SSO PRs did; `sessions`
+//! remains rusqlite-based (see Phase G paragraph below).
 //!
-//! **Phase G (sea-orm migration, router step 4 PR C)**: the 7
-//! `project_membership`-table functions below (`add_project_membership`/
+//! **Phase G (sea-orm migration, router step 4)**: PR C rewrote the 7
+//! `project_membership`-table functions (`add_project_membership`/
 //! `grant_project_membership`/`project_membership_role`/
 //! `update_project_membership_role`/`remove_project_membership`/
 //! `remove_project_membership_by_project`/
-//! `rename_project_membership_project`) are rewritten onto
-//! `sea_orm::DatabaseConnection` against `conexus_db::entity::
-//! project_membership`, chosen to go first in the router-step-4
-//! sequence for its small, low-fan-out real call-site surface --
-//! `users`/`sessions`/`groups` (this same module's OTHER functions)
-//! are deliberately NOT touched here, sessions last since it's the
-//! highest-risk piece (`session_gate.rs`'s hot path). Every other
-//! function in this module remains `rusqlite::Connection`-based.
+//! `rename_project_membership_project`) onto `sea_orm::DatabaseConnection`
+//! against `conexus_db::entity::project_membership`, chosen to go first
+//! for its small, low-fan-out real call-site surface. PR D rewrote the
+//! 14 `users`-table functions (`users_table_is_empty`/
+//! `get_user_by_username`/`get_user_by_id`/`find_user_by_sso_subject`/
+//! `find_linkable_user_by_email`/`stamp_sso_subject_if_absent`/
+//! `upgrade_sso_subject`/`touch_last_login`/`list_users`/
+//! `get_user_public_by_id`/`admin_create_user`/`bootstrap_first_operator`/
+//! `create_user`/`create_sso_user`) onto `sea_orm::DatabaseConnection`
+//! against `conexus_db::entity::users`, EXCEPT for the eight functions
+//! `sso.rs`'s `find_or_create_sso_user`/`extract_proxy_header_user`
+//! call (`users_table_is_empty`/`get_user_by_username`/
+//! `get_user_by_id`/`find_user_by_sso_subject`/
+//! `find_linkable_user_by_email`/`stamp_sso_subject_if_absent`/
+//! `touch_last_login`/`create_sso_user`), which keep a
+//! deliberately-still-sync `_sync`-suffixed rusqlite twin (see each
+//! twin's own doc) -- `sso.rs` is called synchronously from
+//! `session_gate.rs::evaluate_session_gate`, this migration's own
+//! declared highest-risk hot path, and forcing it async is explicitly
+//! out of scope for PR D (reserved for whichever PR converts
+//! `sessions`, deliberately last in this sequence). `sessions`/
+//! `groups`/`group_membership` (this same module's OTHER functions)
+//! remain rusqlite::Connection-based; `sessions` last since it's the
+//! highest-risk piece (`session_gate.rs`'s hot path).
+//!
+//! **`create_user`/`create_sso_user`'s `BEGIN IMMEDIATE` under
+//! sea-orm**: sea-orm 2.0.2 exposes SQLite's transaction-mode keyword
+//! natively via `TransactionTrait::begin_with_options` +
+//! `TransactionOptions.sqlite_transaction_mode` (`SqliteTransactionMode::
+//! Immediate` maps directly to `BEGIN IMMEDIATE`) -- no raw-SQL escape
+//! hatch or `Statement::from_string("BEGIN IMMEDIATE")` workaround
+//! needed, verified directly against `sea-orm-2.0.2`'s own
+//! `driver/sqlx_sqlite.rs`/`driver/rusqlite.rs`. [`create_user_row`]'s
+//! own real concurrent-racing test
+//! (`create_user_bootstrap_is_atomic_under_real_concurrent_racing`)
+//! proves the SAME dual-sysadmin race this file's rusqlite-era version
+//! already guarded against stays closed under sea-orm.
 //!
 //! **Threading, not a live connection pool**: every function here
 //! takes an explicit `&Connection` (this crate's own convention,
@@ -61,10 +90,15 @@ use argon2::password_hash::phc::PasswordHash;
 use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 use argon2::{Algorithm, Argon2, Params, Version};
 use conexus_db::entity::project_membership::{ActiveModel, Column, Entity};
+use conexus_db::entity::users::{
+    ActiveModel as UserActiveModel, Column as UserColumn, Entity as UserEntity, Model as UserModel,
+};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use sea_orm::ActiveValue::{self, Set};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, Statement,
+    ColumnTrait, ConnectionTrait, DatabaseConnection, DatabaseTransaction, EntityTrait,
+    QueryFilter, QueryOrder, QuerySelect, SqliteTransactionMode, Statement, TransactionOptions,
+    TransactionTrait,
 };
 
 /// Base class for router identity errors -- port of Python's
@@ -182,12 +216,74 @@ fn random_id(byte_len: usize) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// `true` iff `sql_err`'s portable classification identifies `e` as a
+/// UNIQUE-constraint violation -- the SAME check `admin_project_
+/// membership::finish_add_project_membership` already established for
+/// this migration (`DbErr::sql_err`'s own doc: portable across MySQL/
+/// Postgres/SQLite, unlike sniffing a backend-specific error code).
+fn is_unique_violation(e: &sea_orm::DbErr) -> bool {
+    matches!(
+        e.sql_err(),
+        Some(sea_orm::SqlErr::UniqueConstraintViolation(_))
+    )
+}
+
+fn user_row_from_model(m: UserModel) -> UserRow {
+    UserRow {
+        user_id: m.user_id,
+        username: m.username,
+        email: m.email,
+        password_hash: m.password_hash,
+        created_at: m.created_at,
+        last_login_at: m.last_login_at,
+        is_sysadmin: m.is_sysadmin,
+        sso_subject: m.sso_subject,
+    }
+}
+
+/// Row-extraction twin of [`user_row_from_model`] for the raw-SQL
+/// escape hatch [`find_linkable_user_by_email`] needs -- same reason
+/// `list_project_memberships` above has its own manual `try_get`
+/// extraction: a query shape sea-query's typed builder can't express
+/// has no `Entity`/`Model` to decode through.
+fn user_row_from_query_result(row: &sea_orm::QueryResult) -> Result<UserRow, sea_orm::DbErr> {
+    Ok(UserRow {
+        user_id: row.try_get("", "user_id")?,
+        username: row.try_get("", "username")?,
+        email: row.try_get("", "email")?,
+        password_hash: row.try_get("", "password_hash")?,
+        created_at: row.try_get("", "created_at")?,
+        last_login_at: row.try_get("", "last_login_at")?,
+        is_sysadmin: row.try_get("", "is_sysadmin")?,
+        sso_subject: row.try_get("", "sso_subject")?,
+    })
+}
+
 /// `true` iff the `users` table has zero rows. Port of
-/// `users_table_is_empty`, taking the transaction/connection the
-/// caller is already inside (Python's `conn: sqlite3.Connection |
-/// None = None` self-opening default has no analogue here -- every
-/// function in this crate takes an explicit `&Connection`).
-pub fn users_table_is_empty(conn: &Connection) -> Result<bool, IdentityError> {
+/// `users_table_is_empty`. Generic over [`ConnectionTrait`] so
+/// [`create_user_row`]'s own `BEGIN IMMEDIATE` transaction can reuse
+/// the SAME check against its `&DatabaseTransaction` (see that
+/// function's own doc) rather than duplicating this query.
+async fn users_table_is_empty_impl<C: ConnectionTrait>(conn: &C) -> Result<bool, sea_orm::DbErr> {
+    let found = UserEntity::find()
+        .select_only()
+        .column(UserColumn::UserId)
+        .limit(1)
+        .into_tuple::<String>()
+        .one(conn)
+        .await?;
+    Ok(found.is_none())
+}
+
+pub async fn users_table_is_empty(db: &DatabaseConnection) -> Result<bool, IdentityError> {
+    Ok(users_table_is_empty_impl(db).await?)
+}
+
+/// Sync rusqlite duplicate of [`users_table_is_empty`] -- kept ONLY
+/// for `sso.rs`'s `extract_proxy_header_user` (see this module's own
+/// doc: called synchronously from `session_gate.rs::
+/// evaluate_session_gate`, out of scope to force async here).
+pub(crate) fn users_table_is_empty_sync(conn: &Connection) -> Result<bool, IdentityError> {
     Ok(conn
         .query_row("SELECT 1 FROM users LIMIT 1", [], |_| Ok(()))
         .optional()?
@@ -224,7 +320,21 @@ fn row_to_user(row: &rusqlite::Row) -> rusqlite::Result<UserRow> {
     })
 }
 
-pub fn get_user_by_username(
+pub async fn get_user_by_username(
+    db: &DatabaseConnection,
+    username: &str,
+) -> Result<Option<UserRow>, IdentityError> {
+    Ok(UserEntity::find()
+        .filter(UserColumn::Username.eq(username))
+        .one(db)
+        .await?
+        .map(user_row_from_model))
+}
+
+/// Sync rusqlite duplicate of [`get_user_by_username`] -- kept ONLY
+/// for `sso.rs`'s `find_or_create_sso_user` (see this module's own
+/// doc).
+pub(crate) fn get_user_by_username_sync(
     conn: &Connection,
     username: &str,
 ) -> Result<Option<UserRow>, IdentityError> {
@@ -237,7 +347,24 @@ pub fn get_user_by_username(
         .optional()?)
 }
 
-pub fn get_user_by_id(conn: &Connection, user_id: &str) -> Result<Option<UserRow>, IdentityError> {
+pub async fn get_user_by_id(
+    db: &DatabaseConnection,
+    user_id: &str,
+) -> Result<Option<UserRow>, IdentityError> {
+    Ok(UserEntity::find_by_id(user_id)
+        .one(db)
+        .await?
+        .map(user_row_from_model))
+}
+
+/// Sync rusqlite duplicate of [`get_user_by_id`] -- kept for `sso.rs`'s
+/// `find_or_create_sso_user` (see this module's own doc) AND
+/// `login.rs::resolve_current_user`, which reads the session's owning
+/// user on the SAME `evaluate_session_gate` hot path.
+pub(crate) fn get_user_by_id_sync(
+    conn: &Connection,
+    user_id: &str,
+) -> Result<Option<UserRow>, IdentityError> {
     Ok(conn
         .query_row(
             &format!("SELECT {USER_COLUMNS} FROM users WHERE user_id = ?1"),
@@ -252,7 +379,23 @@ pub fn get_user_by_id(conn: &Connection, user_id: &str) -> Result<Option<UserRow
 /// algorithm, and what makes repeated calls with the SAME subject
 /// resolve to the SAME row (no session cookie exists in proxy-header
 /// mode, so this runs on every request).
-pub fn find_user_by_sso_subject(
+pub async fn find_user_by_sso_subject(
+    db: &DatabaseConnection,
+    subject: &str,
+) -> Result<Option<UserRow>, IdentityError> {
+    Ok(UserEntity::find()
+        .filter(UserColumn::SsoSubject.eq(subject))
+        .one(db)
+        .await?
+        .map(user_row_from_model))
+}
+
+/// Sync rusqlite duplicate of [`find_user_by_sso_subject`] -- kept
+/// ONLY for `sso.rs`'s `find_or_create_sso_user` and `oidc_reconcile.rs`'s
+/// legacy-subject self-heal path stays on the fully-async version (see
+/// this module's own doc for why only `sso.rs`'s call sites need a
+/// twin).
+pub(crate) fn find_user_by_sso_subject_sync(
     conn: &Connection,
     subject: &str,
 ) -> Result<Option<UserRow>, IdentityError> {
@@ -270,8 +413,35 @@ pub fn find_user_by_sso_subject(
 /// preference to a legacy passwordless-SSO row sharing the same
 /// address (`ORDER BY (password_hash IS NULL) ASC` -- a row WITH a
 /// password sorts first). Case-insensitive per the real column
-/// comparison Python's own query uses.
-pub fn find_linkable_user_by_email(
+/// comparison Python's own query uses. Raw-SQL escape hatch (matching
+/// `list_project_memberships`'s own precedent above): the `ORDER BY
+/// (password_hash IS NULL) ASC` expression-ordering has no sea-query
+/// typed-builder combinator.
+pub async fn find_linkable_user_by_email(
+    db: &DatabaseConnection,
+    email: &str,
+) -> Result<Option<UserRow>, IdentityError> {
+    let stmt = Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Sqlite,
+        format!(
+            "SELECT {USER_COLUMNS} FROM users \
+             WHERE LOWER(email) = LOWER(?1) AND (password_hash IS NOT NULL OR sso_subject IS NULL) \
+             ORDER BY (password_hash IS NULL) ASC \
+             LIMIT 1"
+        ),
+        [email.into()],
+    );
+    db.query_one_raw(stmt)
+        .await?
+        .map(|row| user_row_from_query_result(&row))
+        .transpose()
+        .map_err(IdentityError::from)
+}
+
+/// Sync rusqlite duplicate of [`find_linkable_user_by_email`] -- kept
+/// ONLY for `sso.rs`'s `find_or_create_sso_user` (see this module's
+/// own doc).
+pub(crate) fn find_linkable_user_by_email_sync(
     conn: &Connection,
     email: &str,
 ) -> Result<Option<UserRow>, IdentityError> {
@@ -294,7 +464,27 @@ pub fn find_linkable_user_by_email(
 /// race-safe under a concurrent double-bind attempt together with
 /// `idx_users_sso_subject` (the partial UNIQUE index in `schema.rs`)
 /// -- never simplify this to an unconditional UPDATE/upsert.
-pub fn stamp_sso_subject_if_absent(
+pub async fn stamp_sso_subject_if_absent(
+    db: &DatabaseConnection,
+    user_id: &str,
+    subject: &str,
+) -> Result<(), IdentityError> {
+    UserEntity::update_many()
+        .col_expr(
+            UserColumn::SsoSubject,
+            sea_orm::sea_query::Expr::value(subject),
+        )
+        .filter(UserColumn::UserId.eq(user_id))
+        .filter(UserColumn::SsoSubject.is_null())
+        .exec(db)
+        .await?;
+    Ok(())
+}
+
+/// Sync rusqlite duplicate of [`stamp_sso_subject_if_absent`] -- kept
+/// ONLY for `sso.rs`'s `find_or_create_sso_user` (see this module's
+/// own doc).
+pub(crate) fn stamp_sso_subject_if_absent_sync(
     conn: &Connection,
     user_id: &str,
     subject: &str,
@@ -312,22 +502,50 @@ pub fn stamp_sso_subject_if_absent(
 /// (exact match, not `IS NULL`, unlike [`stamp_sso_subject_if_absent`])
 /// means this only ever advances the SAME row that was just matched by
 /// that exact legacy string -- it can't clobber a row that has
-/// concurrently already moved on to a different subject.
-pub fn upgrade_sso_subject(
-    conn: &Connection,
+/// concurrently already moved on to a different subject. No `_sync`
+/// twin: only `oidc_reconcile.rs` (already-async) calls this.
+pub async fn upgrade_sso_subject(
+    db: &DatabaseConnection,
     user_id: &str,
     old_subject: &str,
     new_subject: &str,
 ) -> Result<(), IdentityError> {
-    conn.execute(
-        "UPDATE users SET sso_subject = ?1 WHERE user_id = ?2 AND sso_subject = ?3",
-        (new_subject, user_id, old_subject),
-    )?;
+    UserEntity::update_many()
+        .col_expr(
+            UserColumn::SsoSubject,
+            sea_orm::sea_query::Expr::value(new_subject),
+        )
+        .filter(UserColumn::UserId.eq(user_id))
+        .filter(UserColumn::SsoSubject.eq(old_subject))
+        .exec(db)
+        .await?;
     Ok(())
 }
 
 /// Port of `touch_last_login`.
-pub fn touch_last_login(conn: &Connection, user_id: &str, now: &str) -> Result<(), IdentityError> {
+pub async fn touch_last_login(
+    db: &DatabaseConnection,
+    user_id: &str,
+    now: &str,
+) -> Result<(), IdentityError> {
+    UserEntity::update_many()
+        .col_expr(
+            UserColumn::LastLoginAt,
+            sea_orm::sea_query::Expr::value(now),
+        )
+        .filter(UserColumn::UserId.eq(user_id))
+        .exec(db)
+        .await?;
+    Ok(())
+}
+
+/// Sync rusqlite duplicate of [`touch_last_login`] -- kept ONLY for
+/// `sso.rs`'s `find_or_create_sso_user` (see this module's own doc).
+pub(crate) fn touch_last_login_sync(
+    conn: &Connection,
+    user_id: &str,
+    now: &str,
+) -> Result<(), IdentityError> {
     conn.execute(
         "UPDATE users SET last_login_at = ?1 WHERE user_id = ?2",
         (now, user_id),
@@ -343,7 +561,10 @@ pub fn touch_last_login(conn: &Connection, user_id: &str, now: &str) -> Result<(
 /// fetching the full row and dropping the field at the JSON-response
 /// layer -- the same "don't even pull the secret across the boundary"
 /// posture `admin_tools.rs`'s `redact_agent_row` established for
-/// agent rows in the tool-catalogue layer.
+/// agent rows in the tool-catalogue layer. [`list_users`]/
+/// [`get_user_public_by_id`] preserve this via `select_only()` +
+/// `into_tuple()` -- the SQL text itself never names `password_hash`/
+/// `sso_subject`, not merely "fetched then dropped in Rust".
 #[derive(Debug, Clone, PartialEq)]
 pub struct UserPublicRow {
     pub user_id: String,
@@ -368,21 +589,67 @@ fn row_to_user_public(row: &rusqlite::Row) -> rusqlite::Result<UserPublicRow> {
     })
 }
 
-/// Port of `list_users_handler`: every user, public projection,
-/// ordered by username.
-pub fn list_users(conn: &Connection) -> Result<Vec<UserPublicRow>, IdentityError> {
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {USER_PUBLIC_COLUMNS} FROM users ORDER BY username"
-    ))?;
-    let rows = stmt.query_map([], row_to_user_public)?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
+type UserPublicTuple = (String, String, Option<String>, bool, String, Option<String>);
+
+fn user_public_row_from_tuple(t: UserPublicTuple) -> UserPublicRow {
+    UserPublicRow {
+        user_id: t.0,
+        username: t.1,
+        email: t.2,
+        is_sysadmin: t.3,
+        created_at: t.4,
+        last_login_at: t.5,
+    }
 }
 
-pub fn get_user_public_by_id(
-    conn: &Connection,
+fn user_public_select() -> sea_orm::Select<UserEntity> {
+    UserEntity::find()
+        .select_only()
+        .column(UserColumn::UserId)
+        .column(UserColumn::Username)
+        .column(UserColumn::Email)
+        .column(UserColumn::IsSysadmin)
+        .column(UserColumn::CreatedAt)
+        .column(UserColumn::LastLoginAt)
+}
+
+/// Port of `list_users_handler`: every user, public projection,
+/// ordered by username.
+pub async fn list_users(db: &DatabaseConnection) -> Result<Vec<UserPublicRow>, IdentityError> {
+    let rows: Vec<UserPublicTuple> = user_public_select()
+        .order_by_asc(UserColumn::Username)
+        .into_tuple()
+        .all(db)
+        .await?;
+    Ok(rows.into_iter().map(user_public_row_from_tuple).collect())
+}
+
+pub async fn get_user_public_by_id(
+    db: &DatabaseConnection,
     user_id: &str,
 ) -> Result<Option<UserPublicRow>, IdentityError> {
-    Ok(conn
+    let row: Option<UserPublicTuple> = user_public_select()
+        .filter(UserColumn::UserId.eq(user_id))
+        .into_tuple()
+        .one(db)
+        .await?;
+    Ok(row.map(user_public_row_from_tuple))
+}
+
+/// Deliberately-still-sync twin of [`get_user_public_by_id`] for
+/// `admin_users_users.rs::decide_edit_user`, which reads inside an
+/// in-flight, uncommitted `rusqlite::Transaction` shared with its own
+/// `is_sysadmin`/`email` `UPDATE`s (its own `BEGIN IMMEDIATE`
+/// last-sysadmin-demotion race guard) -- same "genuinely SEPARATE
+/// connection pool would see stale, pre-commit data" rationale as
+/// `task_repository::get_by_id_in_transaction`'s own precedent. Not
+/// deleted when `decide_edit_user` itself is eventually converted --
+/// delete this helper THEN, once nothing calls it.
+pub(crate) fn get_user_public_by_id_in_transaction(
+    tx: &rusqlite::Transaction,
+    user_id: &str,
+) -> Result<Option<UserPublicRow>, IdentityError> {
+    Ok(tx
         .query_row(
             &format!("SELECT {USER_PUBLIC_COLUMNS} FROM users WHERE user_id = ?1"),
             [user_id],
@@ -404,8 +671,8 @@ pub fn get_user_public_by_id(
 /// username/email sanitization here, matching the real Python
 /// handler exactly -- it relies solely on the shared JSON-body-decode
 /// chokepoint (PR 23's job), not a second local pass.
-pub fn admin_create_user(
-    conn: &Connection,
+pub async fn admin_create_user(
+    db: &DatabaseConnection,
     username: &str,
     password: &str,
     email: Option<&str>,
@@ -414,23 +681,27 @@ pub fn admin_create_user(
 ) -> Result<UserPublicRow, IdentityError> {
     let user_id = random_id(8);
     let password_hash = hash_password(password);
-    let insert_result = conn.execute(
-        "INSERT INTO users (user_id, username, email, password_hash, created_at, last_login_at, is_sysadmin) \
-         VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6)",
-        (&user_id, username, email, &password_hash, now, is_sysadmin),
-    );
-    if let Err(e) = insert_result {
-        if matches!(
-            &e,
-            rusqlite::Error::SqliteFailure(err, _)
-                if err.code == rusqlite::ErrorCode::ConstraintViolation
-        ) {
+    let am = UserActiveModel {
+        user_id: Set(user_id.clone()),
+        username: Set(username.to_string()),
+        email: Set(email.map(str::to_string)),
+        password_hash: Set(Some(password_hash)),
+        created_at: Set(now.to_string()),
+        last_login_at: Set(None),
+        is_sysadmin: Set(is_sysadmin),
+        sso_subject: Set(None),
+    };
+    if let Err(e) = UserEntity::insert(am).exec(db).await {
+        if is_unique_violation(&e) {
             return Err(IdentityError::UsernameAlreadyExists(username.to_string()));
         }
-        return Err(IdentityError::Db(e));
+        return Err(e.into());
     }
-    get_user_public_by_id(conn, &user_id)?
-        .ok_or_else(|| IdentityError::Db(rusqlite::Error::QueryReturnedNoRows))
+    get_user_public_by_id(db, &user_id).await?.ok_or_else(|| {
+        IdentityError::SeaOrm(sea_orm::DbErr::RecordNotFound(
+            "user just inserted is missing".to_string(),
+        ))
+    })
 }
 
 /// Apply the first-operator bootstrap invariant to `user_id` -- port
@@ -438,9 +709,14 @@ pub fn admin_create_user(
 /// security-critical rule "the first user on an otherwise-empty users
 /// table becomes sysadmin and gets membership in every registered
 /// project." Runs on the CALLER's transaction (`tx`) so it's atomic
-/// with the INSERT that created `user_id` -- see [`create_user`]'s own
-/// doc for why that atomicity matters (a real historical dual-
-/// sysadmin race).
+/// with the INSERT that created `user_id` -- see [`create_user_row`]'s
+/// own doc for why that atomicity matters (a real historical dual-
+/// sysadmin race). Takes a `&DatabaseTransaction` rather than the
+/// bare `&DatabaseConnection` every other function here uses -- this
+/// is intentionally NOT ALSO generic over [`ConnectionTrait`] like
+/// [`users_table_is_empty_impl`]: it has no standalone caller outside
+/// [`create_user_row`]'s own transaction, so there is no second
+/// concrete type it would ever need to serve.
 ///
 /// `registered_projects` is the pre-Phase-1-deployment migration story
 /// (existing single-tenant deploys upgrade smoothly because the first
@@ -449,7 +725,60 @@ pub fn admin_create_user(
 /// in this crate yet (PR 5). An empty slice is the correct, safe
 /// input until then, not a stub -- a fresh deployment has no
 /// pre-existing projects to inherit either.
-pub fn bootstrap_first_operator(
+pub async fn bootstrap_first_operator(
+    tx: &DatabaseTransaction,
+    user_id: &str,
+    grant_sysadmin: bool,
+    registered_projects: &[String],
+    now: &str,
+) -> Result<(), IdentityError> {
+    if grant_sysadmin {
+        UserEntity::update_many()
+            .col_expr(
+                UserColumn::IsSysadmin,
+                sea_orm::sea_query::Expr::value(true),
+            )
+            .filter(UserColumn::UserId.eq(user_id))
+            .exec(tx)
+            .await?;
+    }
+    for project_name in registered_projects {
+        let am = ActiveModel {
+            rowid: ActiveValue::NotSet,
+            project_name: Set(project_name.clone()),
+            user_id: Set(Some(user_id.to_string())),
+            group_id: Set(None),
+            role: ActiveValue::NotSet, // let the schema DEFAULT 'operator' apply
+        };
+        // Same `try_insert`/`OnConflict::do_nothing` idiom as
+        // `add_project_membership` above (INSERT OR IGNORE semantics
+        // -- see that function's own doc for why `.try_insert()` is
+        // load-bearing, not decorative).
+        match Entity::insert(am)
+            .on_conflict(
+                sea_orm::sea_query::OnConflict::new()
+                    .do_nothing()
+                    .to_owned(),
+            )
+            .try_insert()
+            .exec(tx)
+            .await?
+        {
+            sea_orm::TryInsertResult::Inserted(_) | sea_orm::TryInsertResult::Conflicted => {}
+            sea_orm::TryInsertResult::Empty => {
+                unreachable!("Insert::one always produces exactly one row to try")
+            }
+        }
+    }
+    let _ = now; // reserved: Python's routine only logs with it, no column write.
+    Ok(())
+}
+
+/// Sync rusqlite duplicate of [`bootstrap_first_operator`] -- kept
+/// ONLY for [`create_user_row_sync`] (`sso.rs`'s `create_sso_user_sync`
+/// call path; see this module's own doc). Unchanged from this file's
+/// pre-Phase-G implementation.
+fn bootstrap_first_operator_sync(
     tx: &rusqlite::Transaction,
     user_id: &str,
     grant_sysadmin: bool,
@@ -475,41 +804,12 @@ pub fn bootstrap_first_operator(
 
 /// Create a user; return the assigned `user_id`. Port of `create_user`,
 /// scoped to the password path (`sso_subject`/passwordless SSO rows
-/// are the follow-up SSO PR's job).
-///
-/// **The BEGIN IMMEDIATE transaction is load-bearing, not incidental**:
-/// Python's own docstring documents a real historical race --
-/// SQLite's default deferred-transaction mode lets the empty-table
-/// PROBE, the INSERT, and the sysadmin/membership bootstrap grant
-/// interleave with a concurrent `create_user` call, so two racing
-/// callers on an empty table could BOTH read `was_empty=true` and
-/// BOTH bootstrap a sysadmin (dual-sysadmin). `TransactionBehavior::
-/// Immediate` takes the write-lock up front (matching SQLite's own
-/// `BEGIN IMMEDIATE`), so a concurrent second creator blocks, then
-/// re-reads `was_empty=false` once it acquires the lock and is
-/// neither crowned nor bootstrapped.
-///
-/// `username`/`email` are sanitized through the SAME hidden-Unicode/
-/// control-byte stripper `conexus-backend`'s `/api` body-decode
-/// chokepoint uses (`conexus_core::string_sanitize::sanitize_string_leaf`)
-/// -- Python's real `create_user` reuses `_strip_control_bytes` for
-/// exactly this reason (an IdP-claim-derived `email` never passes
-/// through the REST body sanitizer). Sanitizing on the WRITE side
-/// only, deliberately: [`get_user_by_username`] (the login lookup)
-/// keeps matching EXACTLY, so a submitted `ad\u{200B}min` still fails
-/// to authenticate as the stored `admin` rather than being silently
-/// folded onto it.
-///
-/// Python's `InvalidEmailError` (raised on a `UnicodeEncodeError` at
-/// the SQLite bind site) has NO Rust equivalent to port: a Rust
-/// `&str` is a valid UTF-8 byte sequence by construction, so there is
-/// no `email: &str` value that could ever fail to bind -- the whole
-/// failure class is structurally impossible here, the same class of
-/// finding this migration already made for `json_sanitize`'s own
-/// `Cs`/surrogate case.
+/// are [`create_sso_user`]'s job). See [`create_user_row`] for the
+/// full `BEGIN IMMEDIATE`/sanitization rationale both entry points
+/// share.
 #[allow(clippy::too_many_arguments)]
-pub fn create_user(
-    conn: &mut Connection,
+pub async fn create_user(
+    db: &DatabaseConnection,
     username: &str,
     password: &str,
     email: Option<&str>,
@@ -520,7 +820,7 @@ pub fn create_user(
 ) -> Result<String, IdentityError> {
     let password_hash = hash_password(password);
     create_user_row(
-        conn,
+        db,
         username,
         Some(&password_hash),
         None,
@@ -530,6 +830,7 @@ pub fn create_user(
         registered_projects,
         now,
     )
+    .await
 }
 
 /// Create a passwordless SSO-JIT user row -- port of `find_or_create_
@@ -537,7 +838,7 @@ pub fn create_user(
 /// scoped here to the `sso_subject`-bearing half [`create_user`]
 /// above deliberately doesn't cover). A genuinely separate PUBLIC
 /// function rather than widening [`create_user`]'s own signature: the
-/// latter already has 34 call sites across this crate, and Rust has
+/// latter already has 34+ call sites across this crate, and Rust has
 /// no default-argument mechanism to add an optional `sso_subject`
 /// without touching every one of them for zero behavioral gain --
 /// both functions instead share the SAME atomicity-critical
@@ -547,8 +848,8 @@ pub fn create_user(
 /// motivation for unifying `create_user`/`_create_passwordless_user`
 /// in the first place -- see `identity.py`'s own comment on that
 /// unification).
-pub fn create_sso_user(
-    conn: &mut Connection,
+pub async fn create_sso_user(
+    db: &DatabaseConnection,
     username: &str,
     sso_subject: &str,
     email: Option<&str>,
@@ -557,6 +858,37 @@ pub fn create_sso_user(
     now: &str,
 ) -> Result<String, IdentityError> {
     create_user_row(
+        db,
+        username,
+        None,
+        Some(sso_subject),
+        email,
+        is_sysadmin,
+        bootstrap_sysadmin,
+        &[],
+        now,
+    )
+    .await
+}
+
+/// Sync rusqlite duplicate of [`create_sso_user`] -- kept ONLY for
+/// `sso.rs`'s `find_or_create_sso_user`/`extract_proxy_header_user`
+/// (see this module's own doc: called synchronously from
+/// `session_gate.rs::evaluate_session_gate`). Shares
+/// [`create_user_row_sync`]/[`bootstrap_first_operator_sync`] rather
+/// than [`create_user_row`], so the `BEGIN IMMEDIATE` dual-sysadmin
+/// race protection stays written twice total across this file (once
+/// sea-orm, once rusqlite) rather than N times.
+pub(crate) fn create_sso_user_sync(
+    conn: &mut Connection,
+    username: &str,
+    sso_subject: &str,
+    email: Option<&str>,
+    is_sysadmin: bool,
+    bootstrap_sysadmin: bool,
+    now: &str,
+) -> Result<String, IdentityError> {
+    create_user_row_sync(
         conn,
         username,
         None,
@@ -575,16 +907,20 @@ pub fn create_sso_user(
 /// this module's own trusted code, not untrusted input).
 ///
 /// **The BEGIN IMMEDIATE transaction is load-bearing, not incidental**:
-/// Python's own docstring documents a real historical race --
+/// this file's own historical rusqlite version (still alive as
+/// [`create_user_row_sync`]) already documented a real race --
 /// SQLite's default deferred-transaction mode lets the empty-table
 /// PROBE, the INSERT, and the sysadmin/membership bootstrap grant
 /// interleave with a concurrent `create_user` call, so two racing
 /// callers on an empty table could BOTH read `was_empty=true` and
-/// BOTH bootstrap a sysadmin (dual-sysadmin). `TransactionBehavior::
-/// Immediate` takes the write-lock up front (matching SQLite's own
-/// `BEGIN IMMEDIATE`), so a concurrent second creator blocks, then
-/// re-reads `was_empty=false` once it acquires the lock and is
-/// neither crowned nor bootstrapped.
+/// BOTH bootstrap a sysadmin (dual-sysadmin). `SqliteTransactionMode::
+/// Immediate` (via `TransactionTrait::begin_with_options`) takes the
+/// write-lock up front (matching SQLite's own `BEGIN IMMEDIATE`), so a
+/// concurrent second creator blocks, then re-reads `was_empty=false`
+/// once it acquires the lock and is neither crowned nor bootstrapped.
+/// Proven, not just documented, by
+/// `create_user_bootstrap_is_atomic_under_real_concurrent_racing`
+/// below (20 real-OS-thread reps).
 ///
 /// `username`/`email` are sanitized through the SAME hidden-Unicode/
 /// control-byte stripper `conexus-backend`'s `/api` body-decode
@@ -605,7 +941,65 @@ pub fn create_sso_user(
 /// finding this migration already made for `json_sanitize`'s own
 /// `Cs`/surrogate case.
 #[allow(clippy::too_many_arguments)]
-fn create_user_row(
+async fn create_user_row(
+    db: &DatabaseConnection,
+    username: &str,
+    password_hash: Option<&str>,
+    sso_subject: Option<&str>,
+    email: Option<&str>,
+    is_sysadmin: bool,
+    bootstrap_sysadmin: bool,
+    registered_projects: &[String],
+    now: &str,
+) -> Result<String, IdentityError> {
+    let username = conexus_core::string_sanitize::sanitize_string_leaf(username);
+    let email = email.map(conexus_core::string_sanitize::sanitize_string_leaf);
+    let user_id = random_id(8); // 16 hex chars, matches Python's secrets.token_hex(8)
+
+    let tx = db
+        .begin_with_options(TransactionOptions {
+            sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
+            ..Default::default()
+        })
+        .await?;
+    let was_empty = users_table_is_empty_impl(&tx).await?;
+
+    let am = UserActiveModel {
+        user_id: Set(user_id.clone()),
+        username: Set(username.clone()),
+        email: Set(email),
+        password_hash: Set(password_hash.map(str::to_string)),
+        created_at: Set(now.to_string()),
+        last_login_at: Set(None),
+        is_sysadmin: Set(is_sysadmin),
+        sso_subject: Set(sso_subject.map(str::to_string)),
+    };
+    // The transaction rolls back on Drop without an explicit
+    // ROLLBACK when this early-returns -- `DatabaseTransaction`'s own
+    // `Drop` impl does this automatically, matching rusqlite's
+    // `Transaction` behavior this file's sync twins rely on.
+    if let Err(e) = UserEntity::insert(am).exec(&tx).await {
+        // UNIQUE(username) is the only constraint that can fail here.
+        if is_unique_violation(&e) {
+            return Err(IdentityError::UsernameAlreadyExists(username));
+        }
+        return Err(e.into());
+    }
+
+    if was_empty {
+        bootstrap_first_operator(&tx, &user_id, bootstrap_sysadmin, registered_projects, now)
+            .await?;
+    }
+
+    tx.commit().await?;
+    Ok(user_id)
+}
+
+/// Sync rusqlite duplicate of [`create_user_row`] -- kept ONLY for
+/// [`create_sso_user_sync`] (`sso.rs`'s call path; see this module's
+/// own doc). Unchanged from this file's pre-Phase-G implementation.
+#[allow(clippy::too_many_arguments)]
+fn create_user_row_sync(
     conn: &mut Connection,
     username: &str,
     password_hash: Option<&str>,
@@ -621,7 +1015,7 @@ fn create_user_row(
     let user_id = random_id(8); // 16 hex chars, matches Python's secrets.token_hex(8)
 
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let was_empty = users_table_is_empty(&tx)?;
+    let was_empty = users_table_is_empty_sync(&tx)?;
 
     let insert_result = tx.execute(
         "INSERT INTO users \
@@ -653,7 +1047,7 @@ fn create_user_row(
     }
 
     if was_empty {
-        bootstrap_first_operator(&tx, &user_id, bootstrap_sysadmin, registered_projects, now)?;
+        bootstrap_first_operator_sync(&tx, &user_id, bootstrap_sysadmin, registered_projects, now)?;
     }
 
     tx.commit()?;
@@ -1085,11 +1479,11 @@ mod tests {
         assert!(validate_password_strength("exactly-twelve").is_ok());
     }
 
-    #[test]
-    fn create_user_persists_and_is_retrievable() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn create_user_persists_and_is_retrievable() {
+        let (_dir, _c, db) = conn_with_sea_orm().await;
         let uid = create_user(
-            &mut c,
+            &db,
             "alice",
             "correct horse battery staple",
             Some("alice@example.test"),
@@ -1098,72 +1492,91 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
-        let row = get_user_by_id(&c, &uid).unwrap().unwrap();
+        let row = get_user_by_id(&db, &uid).await.unwrap().unwrap();
         assert_eq!(row.username, "alice");
         assert_eq!(row.email.as_deref(), Some("alice@example.test"));
         assert!(verify_password(
             &row.password_hash.unwrap(),
             "correct horse battery staple"
         ));
-        let by_username = get_user_by_username(&c, "alice").unwrap().unwrap();
+        let by_username = get_user_by_username(&db, "alice").await.unwrap().unwrap();
         assert_eq!(by_username.user_id, uid);
     }
 
-    #[test]
-    fn create_sso_user_persists_a_passwordless_row() {
-        let mut c = conn();
-        let uid = create_sso_user(&mut c, "alice", "proxy:alice", None, false, true, NOW).unwrap();
-        let row = get_user_by_id(&c, &uid).unwrap().unwrap();
+    #[tokio::test]
+    async fn create_sso_user_persists_a_passwordless_row() {
+        let (_dir, _c, db) = conn_with_sea_orm().await;
+        let uid = create_sso_user(&db, "alice", "proxy:alice", None, false, true, NOW)
+            .await
+            .unwrap();
+        let row = get_user_by_id(&db, &uid).await.unwrap().unwrap();
         assert_eq!(row.username, "alice");
         assert!(row.password_hash.is_none());
         assert_eq!(row.sso_subject.as_deref(), Some("proxy:alice"));
     }
 
-    #[test]
-    fn create_sso_user_bootstraps_the_first_operator_as_sysadmin() {
-        let mut c = conn();
-        let uid = create_sso_user(&mut c, "alice", "proxy:alice", None, false, true, NOW).unwrap();
-        assert!(get_user_by_id(&c, &uid).unwrap().unwrap().is_sysadmin);
+    #[tokio::test]
+    async fn create_sso_user_bootstraps_the_first_operator_as_sysadmin() {
+        let (_dir, _c, db) = conn_with_sea_orm().await;
+        let uid = create_sso_user(&db, "alice", "proxy:alice", None, false, true, NOW)
+            .await
+            .unwrap();
+        assert!(
+            get_user_by_id(&db, &uid)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_sysadmin
+        );
     }
 
-    #[test]
-    fn create_sso_user_rejects_a_duplicate_username() {
-        let mut c = conn();
-        create_sso_user(&mut c, "alice", "proxy:alice", None, false, true, NOW).unwrap();
-        let err =
-            create_sso_user(&mut c, "alice", "proxy:alice2", None, false, false, NOW).unwrap_err();
+    #[tokio::test]
+    async fn create_sso_user_rejects_a_duplicate_username() {
+        let (_dir, _c, db) = conn_with_sea_orm().await;
+        create_sso_user(&db, "alice", "proxy:alice", None, false, true, NOW)
+            .await
+            .unwrap();
+        let err = create_sso_user(&db, "alice", "proxy:alice2", None, false, false, NOW)
+            .await
+            .unwrap_err();
         assert!(matches!(err, IdentityError::UsernameAlreadyExists(u) if u == "alice"));
     }
 
-    #[test]
-    fn find_user_by_sso_subject_reconciles_to_the_same_row_on_every_call() {
-        let mut c = conn();
-        let uid = create_sso_user(&mut c, "alice", "proxy:alice", None, false, true, NOW).unwrap();
-        let first = find_user_by_sso_subject(&c, "proxy:alice")
+    #[tokio::test]
+    async fn find_user_by_sso_subject_reconciles_to_the_same_row_on_every_call() {
+        let (_dir, _c, db) = conn_with_sea_orm().await;
+        let uid = create_sso_user(&db, "alice", "proxy:alice", None, false, true, NOW)
+            .await
+            .unwrap();
+        let first = find_user_by_sso_subject(&db, "proxy:alice")
+            .await
             .unwrap()
             .unwrap();
-        let second = find_user_by_sso_subject(&c, "proxy:alice")
+        let second = find_user_by_sso_subject(&db, "proxy:alice")
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(first.user_id, uid);
         assert_eq!(second.user_id, uid);
     }
 
-    #[test]
-    fn find_user_by_sso_subject_is_none_for_an_unknown_subject() {
-        let c = conn();
-        assert!(find_user_by_sso_subject(&c, "proxy:nobody")
+    #[tokio::test]
+    async fn find_user_by_sso_subject_is_none_for_an_unknown_subject() {
+        let (_dir, _c, db) = conn_with_sea_orm().await;
+        assert!(find_user_by_sso_subject(&db, "proxy:nobody")
+            .await
             .unwrap()
             .is_none());
     }
 
-    #[test]
-    fn find_linkable_user_by_email_prefers_a_password_authenticated_row() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn find_linkable_user_by_email_prefers_a_password_authenticated_row() {
+        let (_dir, _c, db) = conn_with_sea_orm().await;
         // A legacy passwordless SSO row shares the email...
         create_sso_user(
-            &mut c,
+            &db,
             "alice-sso",
             "proxy:alice-legacy",
             Some("alice@example.test"),
@@ -1171,10 +1584,11 @@ mod tests {
             true,
             NOW,
         )
+        .await
         .unwrap();
         // ...but a real password-authenticated account takes priority.
         let password_uid = create_user(
-            &mut c,
+            &db,
             "alice",
             "correct horse battery staple",
             Some("alice@example.test"),
@@ -1183,18 +1597,20 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
-        let linked = find_linkable_user_by_email(&c, "alice@example.test")
+        let linked = find_linkable_user_by_email(&db, "alice@example.test")
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(linked.user_id, password_uid);
     }
 
-    #[test]
-    fn find_linkable_user_by_email_is_case_insensitive() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn find_linkable_user_by_email_is_case_insensitive() {
+        let (_dir, _c, db) = conn_with_sea_orm().await;
         let uid = create_user(
-            &mut c,
+            &db,
             "alice",
             "correct horse battery staple",
             Some("Alice@Example.Test"),
@@ -1203,18 +1619,20 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
-        let linked = find_linkable_user_by_email(&c, "alice@example.test")
+        let linked = find_linkable_user_by_email(&db, "alice@example.test")
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(linked.user_id, uid);
     }
 
-    #[test]
-    fn stamp_sso_subject_if_absent_binds_once_and_never_overwrites() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn stamp_sso_subject_if_absent_binds_once_and_never_overwrites() {
+        let (_dir, _c, db) = conn_with_sea_orm().await;
         let uid = create_user(
-            &mut c,
+            &db,
             "alice",
             "correct horse battery staple",
             None,
@@ -1223,10 +1641,14 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
-        stamp_sso_subject_if_absent(&c, &uid, "proxy:alice").unwrap();
+        stamp_sso_subject_if_absent(&db, &uid, "proxy:alice")
+            .await
+            .unwrap();
         assert_eq!(
-            get_user_by_id(&c, &uid)
+            get_user_by_id(&db, &uid)
+                .await
                 .unwrap()
                 .unwrap()
                 .sso_subject
@@ -1235,9 +1657,12 @@ mod tests {
         );
         // A second stamp attempt with a DIFFERENT subject must not
         // overwrite the already-bound one.
-        stamp_sso_subject_if_absent(&c, &uid, "proxy:someone-else").unwrap();
+        stamp_sso_subject_if_absent(&db, &uid, "proxy:someone-else")
+            .await
+            .unwrap();
         assert_eq!(
-            get_user_by_id(&c, &uid)
+            get_user_by_id(&db, &uid)
+                .await
                 .unwrap()
                 .unwrap()
                 .sso_subject
@@ -1246,11 +1671,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn upgrade_sso_subject_advances_a_row_matched_by_the_exact_old_key() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn upgrade_sso_subject_advances_a_row_matched_by_the_exact_old_key() {
+        let (_dir, _c, db) = conn_with_sea_orm().await;
         let uid = create_user(
-            &mut c,
+            &db,
             "alice",
             "correct horse battery staple",
             None,
@@ -1259,19 +1684,24 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
-        stamp_sso_subject_if_absent(&c, &uid, "oidc:https://idp.example.test:alice-1").unwrap();
+        stamp_sso_subject_if_absent(&db, &uid, "oidc:https://idp.example.test:alice-1")
+            .await
+            .unwrap();
 
         upgrade_sso_subject(
-            &c,
+            &db,
             &uid,
             "oidc:https://idp.example.test:alice-1",
             "oidc:https://idp.example.test:str:alice-1",
         )
+        .await
         .unwrap();
 
         assert_eq!(
-            get_user_by_id(&c, &uid)
+            get_user_by_id(&db, &uid)
+                .await
                 .unwrap()
                 .unwrap()
                 .sso_subject
@@ -1280,14 +1710,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn upgrade_sso_subject_is_a_noop_when_the_row_has_already_moved_on() {
+    #[tokio::test]
+    async fn upgrade_sso_subject_is_a_noop_when_the_row_has_already_moved_on() {
         // The exact-old-value WHERE guard means a row that concurrently
         // already advanced to a DIFFERENT subject must not be clobbered
         // by a stale caller still holding the old legacy key.
-        let mut c = conn();
+        let (_dir, _c, db) = conn_with_sea_orm().await;
         let uid = create_user(
-            &mut c,
+            &db,
             "alice",
             "correct horse battery staple",
             None,
@@ -1296,20 +1726,24 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
-        stamp_sso_subject_if_absent(&c, &uid, "oidc:https://idp.example.test:already-moved-on")
+        stamp_sso_subject_if_absent(&db, &uid, "oidc:https://idp.example.test:already-moved-on")
+            .await
             .unwrap();
 
         upgrade_sso_subject(
-            &c,
+            &db,
             &uid,
             "oidc:https://idp.example.test:alice-1",
             "oidc:https://idp.example.test:str:alice-1",
         )
+        .await
         .unwrap();
 
         assert_eq!(
-            get_user_by_id(&c, &uid)
+            get_user_by_id(&db, &uid)
+                .await
                 .unwrap()
                 .unwrap()
                 .sso_subject
@@ -1318,11 +1752,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn touch_last_login_updates_the_timestamp() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn touch_last_login_updates_the_timestamp() {
+        let (_dir, _c, db) = conn_with_sea_orm().await;
         let uid = create_user(
-            &mut c,
+            &db,
             "alice",
             "correct horse battery staple",
             None,
@@ -1331,15 +1765,20 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
-        assert!(get_user_by_id(&c, &uid)
+        assert!(get_user_by_id(&db, &uid)
+            .await
             .unwrap()
             .unwrap()
             .last_login_at
             .is_none());
-        touch_last_login(&c, &uid, "2026-06-01T00:00:00.000+00:00").unwrap();
+        touch_last_login(&db, &uid, "2026-06-01T00:00:00.000+00:00")
+            .await
+            .unwrap();
         assert_eq!(
-            get_user_by_id(&c, &uid)
+            get_user_by_id(&db, &uid)
+                .await
                 .unwrap()
                 .unwrap()
                 .last_login_at
@@ -1348,12 +1787,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn create_user_sanitizes_username_and_email_on_write_only() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn create_user_sanitizes_username_and_email_on_write_only() {
+        let (_dir, _c, db) = conn_with_sea_orm().await;
         // U+200B ZERO WIDTH SPACE embedded in both fields.
         let uid = create_user(
-            &mut c,
+            &db,
             "ad\u{200B}min",
             "correct horse battery staple",
             Some("a\u{200B}dmin@example.test"),
@@ -1362,21 +1801,25 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
-        let row = get_user_by_id(&c, &uid).unwrap().unwrap();
+        let row = get_user_by_id(&db, &uid).await.unwrap().unwrap();
         assert_eq!(row.username, "admin");
         assert_eq!(row.email.as_deref(), Some("admin@example.test"));
         // The lookup side does NOT sanitize -- the unsanitized
         // spoofing variant must NOT resolve to the stored "admin" row.
-        assert!(get_user_by_username(&c, "ad\u{200B}min").unwrap().is_none());
-        assert!(get_user_by_username(&c, "admin").unwrap().is_some());
+        assert!(get_user_by_username(&db, "ad\u{200B}min")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(get_user_by_username(&db, "admin").await.unwrap().is_some());
     }
 
-    #[test]
-    fn create_user_rejects_a_duplicate_username() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn create_user_rejects_a_duplicate_username() {
+        let (_dir, _c, db) = conn_with_sea_orm().await;
         create_user(
-            &mut c,
+            &db,
             "alice",
             "correct horse battery staple",
             None,
@@ -1385,9 +1828,10 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
         let err = create_user(
-            &mut c,
+            &db,
             "alice",
             "another password entirely",
             None,
@@ -1396,16 +1840,17 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap_err();
         assert!(matches!(err, IdentityError::UsernameAlreadyExists(u) if u == "alice"));
     }
 
-    #[test]
-    fn create_user_bootstraps_the_first_operator_as_sysadmin_with_project_membership() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn create_user_bootstraps_the_first_operator_as_sysadmin_with_project_membership() {
+        let (_dir, c, db) = conn_with_sea_orm().await;
         let projects = vec!["proj-a".to_string(), "proj-b".to_string()];
         let uid = create_user(
-            &mut c,
+            &db,
             "alice",
             "correct horse battery staple",
             None,
@@ -1414,8 +1859,9 @@ mod tests {
             &projects,
             NOW,
         )
+        .await
         .unwrap();
-        let row = get_user_by_id(&c, &uid).unwrap().unwrap();
+        let row = get_user_by_id(&db, &uid).await.unwrap().unwrap();
         assert!(
             row.is_sysadmin,
             "the first user on an empty table must be promoted"
@@ -1434,11 +1880,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn create_user_does_not_bootstrap_a_second_user() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn create_user_does_not_bootstrap_a_second_user() {
+        let (_dir, c, db) = conn_with_sea_orm().await;
         create_user(
-            &mut c,
+            &db,
             "alice",
             "correct horse battery staple",
             None,
@@ -1447,9 +1893,10 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
         let uid2 = create_user(
-            &mut c,
+            &db,
             "bob",
             "correct horse battery staple",
             None,
@@ -1458,8 +1905,9 @@ mod tests {
             &["proj-a".to_string()],
             NOW,
         )
+        .await
         .unwrap();
-        let row2 = get_user_by_id(&c, &uid2).unwrap().unwrap();
+        let row2 = get_user_by_id(&db, &uid2).await.unwrap().unwrap();
         assert!(!row2.is_sysadmin, "only the FIRST user is auto-promoted");
         let count: i64 = c
             .query_row(
@@ -1474,11 +1922,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn create_user_sso_opt_out_skips_sysadmin_promotion_but_still_creates_the_first_user() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn create_user_sso_opt_out_skips_sysadmin_promotion_but_still_creates_the_first_user() {
+        let (_dir, _c, db) = conn_with_sea_orm().await;
         let uid = create_user(
-            &mut c,
+            &db,
             "alice",
             "correct horse battery staple",
             None,
@@ -1487,19 +1935,20 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
-        let row = get_user_by_id(&c, &uid).unwrap().unwrap();
+        let row = get_user_by_id(&db, &uid).await.unwrap().unwrap();
         assert!(
             !row.is_sysadmin,
             "bootstrap_sysadmin=false must not crown the first user"
         );
     }
 
-    #[test]
-    fn session_lifecycle_create_get_slides_last_used_and_delete() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn session_lifecycle_create_get_slides_last_used_and_delete() {
+        let (_dir, c, db) = conn_with_sea_orm().await;
         let uid = create_user(
-            &mut c,
+            &db,
             "alice",
             "correct horse battery staple",
             None,
@@ -1508,6 +1957,7 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
 
         let later = "2026-01-01T00:05:00.000+00:00";
@@ -1525,11 +1975,11 @@ mod tests {
         assert!(get_session(&c, &sid, later).unwrap().is_none());
     }
 
-    #[test]
-    fn get_session_refuses_an_expired_session_without_deleting_it() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn get_session_refuses_an_expired_session_without_deleting_it() {
+        let (_dir, c, db) = conn_with_sea_orm().await;
         let uid = create_user(
-            &mut c,
+            &db,
             "alice",
             "correct horse battery staple",
             None,
@@ -1538,6 +1988,7 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
         let expires = "2026-01-01T00:01:00.000+00:00";
         let after_expiry = "2026-01-01T00:02:00.000+00:00";
@@ -1555,11 +2006,11 @@ mod tests {
         assert_eq!(still_there, 1);
     }
 
-    #[test]
-    fn prune_expired_sessions_removes_only_past_expiry_rows() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn prune_expired_sessions_removes_only_past_expiry_rows() {
+        let (_dir, c, db) = conn_with_sea_orm().await;
         let uid = create_user(
-            &mut c,
+            &db,
             "alice",
             "correct horse battery staple",
             None,
@@ -1568,6 +2019,7 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
         let expired = create_session(&c, &uid, NOW, "2026-01-01T00:01:00.000+00:00").unwrap();
         let live = create_session(&c, &uid, NOW, "2027-01-01T00:00:00.000+00:00").unwrap();
@@ -1595,9 +2047,9 @@ mod tests {
 
     #[tokio::test]
     async fn add_project_membership_grants_and_is_idempotent() {
-        let (_dir, mut c, db) = conn_with_sea_orm().await;
+        let (_dir, c, db) = conn_with_sea_orm().await;
         let uid = create_user(
-            &mut c,
+            &db,
             "alice",
             "correct horse battery staple",
             None,
@@ -1606,6 +2058,7 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
         add_project_membership(&db, &uid, "proj-a").await.unwrap();
         add_project_membership(&db, &uid, "proj-a").await.unwrap(); // idempotent, no error
@@ -1617,9 +2070,9 @@ mod tests {
 
     #[tokio::test]
     async fn add_project_membership_defaults_to_the_operator_role() {
-        let (_dir, mut c, db) = conn_with_sea_orm().await;
+        let (_dir, c, db) = conn_with_sea_orm().await;
         let uid = create_user(
-            &mut c,
+            &db,
             "alice",
             "correct horse battery staple",
             None,
@@ -1628,6 +2081,7 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
         add_project_membership(&db, &uid, "proj-a").await.unwrap();
         let role: String = c
@@ -1642,9 +2096,9 @@ mod tests {
 
     #[tokio::test]
     async fn rename_project_membership_project_rekeys_every_matching_row() {
-        let (_dir, mut c, db) = conn_with_sea_orm().await;
+        let (_dir, c, db) = conn_with_sea_orm().await;
         let uid = create_user(
-            &mut c,
+            &db,
             "alice",
             "correct horse battery staple",
             None,
@@ -1653,6 +2107,7 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
         add_project_membership(&db, &uid, "old-name").await.unwrap();
         rename_project_membership_project(&db, "old-name", "new-name")
@@ -1707,9 +2162,9 @@ mod tests {
         // `test_rename_leaves_unrelated_projects_membership_untouched`:
         // renaming one project's membership rows must not touch a
         // different project's rows, even for the SAME user.
-        let (_dir, mut c, db) = conn_with_sea_orm().await;
+        let (_dir, c, db) = conn_with_sea_orm().await;
         let uid = create_user(
-            &mut c,
+            &db,
             "carol",
             "correct horse battery staple",
             None,
@@ -1718,6 +2173,7 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
         add_project_membership(&db, &uid, "moving").await.unwrap();
         add_project_membership(&db, &uid, "bystander")
@@ -1734,9 +2190,9 @@ mod tests {
 
     #[tokio::test]
     async fn remove_project_membership_by_project_drops_every_matching_row() {
-        let (_dir, mut c, db) = conn_with_sea_orm().await;
+        let (_dir, c, db) = conn_with_sea_orm().await;
         let uid = create_user(
-            &mut c,
+            &db,
             "alice",
             "correct horse battery staple",
             None,
@@ -1745,6 +2201,7 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
         add_project_membership(&db, &uid, "proj-a").await.unwrap();
         add_project_membership(&db, &uid, "proj-b").await.unwrap();
@@ -1767,9 +2224,9 @@ mod tests {
 
     #[tokio::test]
     async fn grant_project_membership_grants_a_user_an_explicit_role() {
-        let (_dir, mut c, db) = conn_with_sea_orm().await;
+        let (_dir, c, db) = conn_with_sea_orm().await;
         let uid = create_user(
-            &mut c,
+            &db,
             "alice",
             "correct horse battery staple",
             None,
@@ -1778,6 +2235,7 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
         grant_project_membership(&db, "proj-a", Some(&uid), None, "viewer")
             .await
@@ -1815,9 +2273,9 @@ mod tests {
 
     #[tokio::test]
     async fn grant_project_membership_rejects_a_duplicate() {
-        let (_dir, mut c, db) = conn_with_sea_orm().await;
+        let (_dir, _c, db) = conn_with_sea_orm().await;
         let uid = create_user(
-            &mut c,
+            &db,
             "alice",
             "correct horse battery staple",
             None,
@@ -1826,6 +2284,7 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
         grant_project_membership(&db, "proj-a", Some(&uid), None, "operator")
             .await
@@ -1838,9 +2297,9 @@ mod tests {
 
     #[tokio::test]
     async fn project_membership_role_reads_back_the_granted_role() {
-        let (_dir, mut c, db) = conn_with_sea_orm().await;
+        let (_dir, _c, db) = conn_with_sea_orm().await;
         let uid = create_user(
-            &mut c,
+            &db,
             "alice",
             "correct horse battery staple",
             None,
@@ -1849,6 +2308,7 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
         grant_project_membership(&db, "proj-a", Some(&uid), None, "viewer")
             .await
@@ -1870,9 +2330,9 @@ mod tests {
 
     #[tokio::test]
     async fn update_project_membership_role_changes_an_existing_grant() {
-        let (_dir, mut c, db) = conn_with_sea_orm().await;
+        let (_dir, _c, db) = conn_with_sea_orm().await;
         let uid = create_user(
-            &mut c,
+            &db,
             "alice",
             "correct horse battery staple",
             None,
@@ -1881,6 +2341,7 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
         grant_project_membership(&db, "proj-a", Some(&uid), None, "viewer")
             .await
@@ -1904,9 +2365,9 @@ mod tests {
 
     #[tokio::test]
     async fn remove_project_membership_deletes_a_user_row_and_reports_whether_one_existed() {
-        let (_dir, mut c, db) = conn_with_sea_orm().await;
+        let (_dir, _c, db) = conn_with_sea_orm().await;
         let uid = create_user(
-            &mut c,
+            &db,
             "alice",
             "correct horse battery staple",
             None,
@@ -1915,6 +2376,7 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
         grant_project_membership(&db, "proj-a", Some(&uid), None, "operator")
             .await
@@ -1950,9 +2412,9 @@ mod tests {
 
     #[tokio::test]
     async fn list_project_memberships_projects_both_kinds() {
-        let (_dir, mut c, db) = conn_with_sea_orm().await;
+        let (_dir, c, db) = conn_with_sea_orm().await;
         let uid = create_user(
-            &mut c,
+            &db,
             "alice",
             "correct horse battery staple",
             None,
@@ -1961,6 +2423,7 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
         let group_id =
             conexus_db::group_membership_repository::create_group(&c, "engineers", false, NOW)
@@ -2001,12 +2464,12 @@ mod tests {
             .is_empty());
     }
 
-    #[test]
-    fn users_table_is_empty_reflects_real_state() {
-        let mut c = conn();
-        assert!(users_table_is_empty(&c).unwrap());
+    #[tokio::test]
+    async fn users_table_is_empty_reflects_real_state() {
+        let (_dir, _c, db) = conn_with_sea_orm().await;
+        assert!(users_table_is_empty(&db).await.unwrap());
         create_user(
-            &mut c,
+            &db,
             "alice",
             "correct horse battery staple",
             None,
@@ -2015,22 +2478,30 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
-        assert!(!users_table_is_empty(&c).unwrap());
+        assert!(!users_table_is_empty(&db).await.unwrap());
     }
 
-    /// Proves the `BEGIN IMMEDIATE` locking documented on [`create_user`]
-    /// for real, not just by inspection: two genuinely racing OS-level
-    /// SQLite connections (an in-memory `:memory:` connection can't be
-    /// shared across threads, so this needs a real tempfile-backed DB)
-    /// both call `create_user(..., bootstrap_sysadmin: true)` against an
-    /// initially-empty `users` table at the same instant. Without the
-    /// explicit `TransactionBehavior::Immediate` lock, SQLite's default
-    /// deferred mode lets both connections read `was_empty=true` before
-    /// either commits, crowning BOTH callers sysadmin -- the exact
-    /// historical dual-sysadmin race Python's own docstring names.
-    /// Repeated 20x (a race is a timing-dependent bug, one clean run
-    /// proves nothing) to make a flake in either direction visible.
+    /// Proves the `BEGIN IMMEDIATE` locking documented on
+    /// [`create_user_row`] for real, not just by inspection: two
+    /// genuinely racing OS-level SQLite connections (an in-memory
+    /// `:memory:` connection can't be shared across threads, so this
+    /// needs a real tempfile-backed DB) both call `create_user(...,
+    /// bootstrap_sysadmin: true)` against an initially-empty `users`
+    /// table at the same instant. Without `SqliteTransactionMode::
+    /// Immediate`, SQLite's default deferred mode lets both connections
+    /// read `was_empty=true` before either commits, crowning BOTH
+    /// callers sysadmin -- the exact historical dual-sysadmin race this
+    /// module's own doc names. Each racing caller is a genuine
+    /// `std::thread::spawn` OS thread (not merely a tokio task, which
+    /// COULD be scheduled onto the same worker thread even under a
+    /// multi-thread runtime) running its own minimal single-threaded
+    /// tokio runtime to drive the async `create_user` call -- the same
+    /// "real OS thread per racing connection" shape this test used
+    /// pre-sea-orm. Repeated 20x (a race is a timing-dependent bug, one
+    /// clean run proves nothing) to make a flake in either direction
+    /// visible.
     #[test]
     fn create_user_bootstrap_is_atomic_under_real_concurrent_racing() {
         for _ in 0..20 {
@@ -2049,36 +2520,58 @@ mod tests {
             let barrier_b = barrier.clone();
 
             let handle_a = std::thread::spawn(move || {
-                let mut conn = Connection::open(&db_path_a).unwrap();
-                conn.busy_timeout(std::time::Duration::from_secs(5))
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
                     .unwrap();
-                barrier_a.wait();
-                create_user(
-                    &mut conn,
-                    "alice",
-                    "correct horse battery staple",
-                    None,
-                    false,
-                    true,
-                    &[],
-                    NOW,
-                )
+                rt.block_on(async move {
+                    // sqlx-sqlite's own default `busy_timeout` is
+                    // already 5s (`SqliteConnectOptions::default()`),
+                    // matching this test's pre-sea-orm explicit
+                    // `conn.busy_timeout(Duration::from_secs(5))` call
+                    // -- no extra config needed to get the same grace
+                    // period for the loser to acquire the write lock.
+                    let db =
+                        sea_orm::Database::connect(format!("sqlite://{}", db_path_a.display()))
+                            .await
+                            .unwrap();
+                    barrier_a.wait();
+                    create_user(
+                        &db,
+                        "alice",
+                        "correct horse battery staple",
+                        None,
+                        false,
+                        true,
+                        &[],
+                        NOW,
+                    )
+                    .await
+                })
             });
             let handle_b = std::thread::spawn(move || {
-                let mut conn = Connection::open(&db_path_b).unwrap();
-                conn.busy_timeout(std::time::Duration::from_secs(5))
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
                     .unwrap();
-                barrier_b.wait();
-                create_user(
-                    &mut conn,
-                    "bob",
-                    "correct horse battery staple",
-                    None,
-                    false,
-                    true,
-                    &[],
-                    NOW,
-                )
+                rt.block_on(async move {
+                    let db =
+                        sea_orm::Database::connect(format!("sqlite://{}", db_path_b.display()))
+                            .await
+                            .unwrap();
+                    barrier_b.wait();
+                    create_user(
+                        &db,
+                        "bob",
+                        "correct horse battery staple",
+                        None,
+                        false,
+                        true,
+                        &[],
+                        NOW,
+                    )
+                    .await
+                })
             });
 
             let result_a = handle_a.join().unwrap();

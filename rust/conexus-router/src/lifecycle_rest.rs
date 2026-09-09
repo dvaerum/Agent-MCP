@@ -947,40 +947,21 @@ mod handler_tests {
     /// `_dir` must outlive the state (the project registry's backing
     /// file, and every real workspace dir a test creates, live under
     /// it).
+    ///
+    /// `conn`/`sea_orm_db` are two HANDLES onto the SAME real,
+    /// tempfile-backed SQLite file, not two independent
+    /// `sqlite::memory:` databases -- an in-memory `:memory:` DB can't
+    /// be shared across two separate connection handles the way a real
+    /// file can (same fix `identity.rs`'s own `conn_with_sea_orm` test
+    /// helper applies). Load-bearing since Phase G (sea-orm migration,
+    /// router step 4 PR D): `seed_real_sysadmin`/
+    /// `seed_delegate_with_membership` below write the fixture user via
+    /// `identity::create_user`, now `state.sea_orm_db`-based, while
+    /// this same module's handlers and fixture helpers still read/write
+    /// the row through `state.conn` (session revalidation,
+    /// `group_membership_repository`, raw fixture `INSERT`s) -- both
+    /// must see the SAME row.
     async fn test_state() -> (tempfile::TempDir, Arc<RouterState>) {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        init_router_schema(&conn).unwrap();
-        let dir = tempfile::TempDir::new().unwrap();
-        let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
-        let sea_orm_db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
-        let state = Arc::new(RouterState::new(
-            conn,
-            sea_orm_db,
-            registry,
-            RateLimitConfig::resolve_from_process_env(),
-            EnsureConfig::from_env(|_| None),
-            test_state_config(dir.path()),
-        ));
-        (dir, state)
-    }
-
-    /// Like [`test_state`], but `conn`/`sea_orm_db` are two HANDLES
-    /// onto the SAME real, tempfile-backed SQLite file, not two
-    /// independent `sqlite::memory:` databases. `test_state`'s
-    /// in-memory `sea_orm_db` is schema-less AND disconnected from
-    /// `conn`'s own in-memory database (each `:memory:` connection
-    /// gets its own private database) -- fine for every existing test
-    /// in this module (none of them read back a `sea_orm_db` write),
-    /// but the router step-4 PR C `project_membership` conversion is
-    /// the FIRST code in this module that actually writes through
-    /// `state.sea_orm_db` for real (`decide_create_project`'s grant /
-    /// `finish_rename_project`'s rekey / `finish_delete_project`'s
-    /// purge, all fired by the handlers below) -- a test that wants to
-    /// observe one of those writes needs a `sea_orm_db` that shares
-    /// real state with `conn`, hence this second helper rather than
-    /// changing `test_state` itself (touching every existing caller's
-    /// fixture is unrelated churn this PR doesn't need).
-    async fn test_state_file_backed() -> (tempfile::TempDir, Arc<RouterState>) {
         let dir = tempfile::TempDir::new().unwrap();
         let db_path = dir.path().join("router.db");
         let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -1047,9 +1028,8 @@ mod handler_tests {
     /// tests that need a genuine end-to-end success path, not just an
     /// entry-gate denial.
     async fn seed_real_sysadmin(state: &RouterState, username: &str) -> String {
-        let mut conn = state.conn.lock().await;
         identity::create_user(
-            &mut conn,
+            &state.sea_orm_db,
             username,
             "correct horse battery staple",
             None,
@@ -1058,6 +1038,7 @@ mod handler_tests {
             &[],
             NOW_STR,
         )
+        .await
         .unwrap()
     }
 
@@ -1186,19 +1167,20 @@ mod handler_tests {
             "victim",
             &dir.path().join("workspaces").join("victim"),
         );
-        let uid = {
-            let mut conn = state.conn.lock().await;
-            let uid = identity::create_user(
-                &mut conn,
-                "alice",
-                "correct horse battery staple",
-                None,
-                false,
-                true, // first user -> sysadmin bootstrap; harmless, we override is_sysadmin below
-                &[],
-                NOW_STR,
-            )
-            .unwrap();
+        let uid = identity::create_user(
+            &state.sea_orm_db,
+            "alice",
+            "correct horse battery staple",
+            None,
+            false,
+            true, // first user -> sysadmin bootstrap; harmless, we override is_sysadmin below
+            &[],
+            NOW_STR,
+        )
+        .await
+        .unwrap();
+        {
+            let conn = state.conn.lock().await;
             conn.execute(
                 "INSERT INTO project_membership (project_name, user_id, role) VALUES ('victim', ?1, 'viewer')",
                 [&uid],
@@ -1211,8 +1193,7 @@ mod handler_tests {
                 [&uid],
             )
             .unwrap();
-            uid
-        };
+        }
         let identity = identity_for(
             &uid,
             false,
@@ -1392,13 +1373,14 @@ mod handler_tests {
         project: &str,
         role: &str,
     ) -> (String, String, GateIdentity) {
-        let mut conn = state.conn.lock().await;
-        let is_empty: i64 = conn
-            .query_row("SELECT COUNT(*) AS n FROM users", [], |r| r.get(0))
-            .unwrap();
+        let is_empty: i64 = {
+            let conn = state.conn.lock().await;
+            conn.query_row("SELECT COUNT(*) AS n FROM users", [], |r| r.get(0))
+                .unwrap()
+        };
         if is_empty == 0 {
             identity::create_user(
-                &mut conn,
+                &state.sea_orm_db,
                 "__test_first_sysadmin",
                 "ignoredsentinelpassword",
                 None,
@@ -1407,10 +1389,11 @@ mod handler_tests {
                 &[],
                 NOW_STR,
             )
+            .await
             .unwrap();
         }
         let uid = identity::create_user(
-            &mut conn,
+            &state.sea_orm_db,
             username,
             "correct horse battery staple",
             None,
@@ -1419,7 +1402,9 @@ mod handler_tests {
             &[],
             NOW_STR,
         )
+        .await
         .unwrap();
+        let conn = state.conn.lock().await;
         let group = group_membership_repository::create_group(
             &conn,
             &format!("g-{username}"),
@@ -1917,14 +1902,21 @@ mod handler_tests {
         }
     }
 
+    /// Like [`test_state`], but with a caller-chosen `EnsureConfig` --
+    /// same real-tempfile-backed `conn`/`sea_orm_db` sharing rationale
+    /// (see [`test_state`]'s own doc), needed here too since
+    /// `seed_real_sysadmin` below is a caller.
     async fn test_state_with_ensure_config(
         ensure_config: EnsureConfig,
     ) -> (tempfile::TempDir, Arc<RouterState>) {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        init_router_schema(&conn).unwrap();
         let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("router.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        init_router_schema(&conn).unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
-        let sea_orm_db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
+        let sea_orm_db = sea_orm::Database::connect(format!("sqlite://{}", db_path.display()))
+            .await
+            .unwrap();
         let state = Arc::new(RouterState::new(
             conn,
             sea_orm_db,
@@ -2263,7 +2255,7 @@ exit 0
 
     #[tokio::test]
     async fn create_project_handler_grants_the_creator_membership_via_sea_orm() {
-        let (_dir, state) = test_state_file_backed().await;
+        let (_dir, state) = test_state().await;
         let uid = seed_real_sysadmin(&state, "root").await;
         let identity = identity_for(&uid, true, HashSet::new());
 
@@ -2289,7 +2281,7 @@ exit 0
 
     #[tokio::test]
     async fn rename_project_handler_rekeys_project_membership_via_sea_orm() {
-        let (dir, state) = test_state_file_backed().await;
+        let (dir, state) = test_state().await;
         let uid = seed_real_sysadmin(&state, "root").await;
         register(
             &state,
@@ -2330,7 +2322,7 @@ exit 0
 
     #[tokio::test]
     async fn delete_project_handler_purges_project_membership_via_sea_orm() {
-        let (dir, state) = test_state_file_backed().await;
+        let (dir, state) = test_state().await;
         let uid = seed_real_sysadmin(&state, "root").await;
         register(
             &state,

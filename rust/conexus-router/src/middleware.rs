@@ -180,10 +180,9 @@ pub async fn empty_users_redirect_layer(
     next: Next,
 ) -> Response {
     let path = mount::canonical_path(req.uri().path());
-    let users_empty = {
-        let conn = state.conn.lock().await;
-        identity::users_table_is_empty(&conn).unwrap_or(false)
-    };
+    let users_empty = identity::users_table_is_empty(&state.sea_orm_db)
+        .await
+        .unwrap_or(false);
     if login::should_redirect_to_setup(&path, users_empty) {
         return HandlerResponse {
             status: 303,

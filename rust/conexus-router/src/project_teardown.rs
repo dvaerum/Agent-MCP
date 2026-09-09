@@ -300,6 +300,25 @@ mod tests {
         c
     }
 
+    /// A file-backed router DB opened as BOTH a `rusqlite::Connection`
+    /// (this file's own `project_mutation_precheck`/`c.query_row`
+    /// fixtures, still sync) and a sea-orm `DatabaseConnection` (to
+    /// seed users through the now-converted `identity::create_user`)
+    /// -- same dual-connection recipe `identity.rs`'s own tests use,
+    /// since an in-memory `:memory:` DB can't be shared across two
+    /// separate connection handles the way a real file can.
+    async fn conn_with_sea_orm() -> (tempfile::TempDir, Connection, sea_orm::DatabaseConnection) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("project_teardown_test.db");
+        let c = Connection::open(&path).unwrap();
+        c.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        init_router_schema(&c).unwrap();
+        let db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        (dir, c, db)
+    }
+
     fn now_dt() -> DateTime<Utc> {
         "2026-01-01T00:00:00Z".parse().unwrap()
     }
@@ -431,9 +450,14 @@ mod tests {
         registry
     }
 
-    fn seed_operator_member(c: &mut Connection, project: &str, role: &str) -> String {
+    async fn seed_operator_member(
+        db: &sea_orm::DatabaseConnection,
+        c: &Connection,
+        project: &str,
+        role: &str,
+    ) -> String {
         let uid = identity::create_user(
-            c,
+            db,
             "bob",
             "correct horse battery staple",
             None,
@@ -442,6 +466,7 @@ mod tests {
             &[],
             NOW_STR,
         )
+        .await
         .unwrap();
         c.execute(
             "INSERT INTO project_membership (project_name, user_id, role) VALUES (?1, ?2, ?3)",
@@ -472,11 +497,11 @@ mod tests {
         assert_eq!(body["error"], "not_found");
     }
 
-    #[test]
-    fn precheck_denies_a_non_member_as_the_same_uniform_not_found() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn precheck_denies_a_non_member_as_the_same_uniform_not_found() {
+        let (_db_dir, c, db) = conn_with_sea_orm().await;
         identity::create_user(
-            &mut c,
+            &db,
             "alice",
             "correct horse battery staple",
             None,
@@ -485,6 +510,7 @@ mod tests {
             &[],
             NOW_STR,
         )
+        .await
         .unwrap();
         let dir = tempfile::tempdir().unwrap();
         let registry = registry_with(dir.path(), "proj-a");
@@ -498,12 +524,12 @@ mod tests {
         assert_eq!(resp.status, 404);
     }
 
-    #[test]
-    fn precheck_denies_a_viewer_tier_member_as_forbidden() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn precheck_denies_a_viewer_tier_member_as_forbidden() {
+        let (_db_dir, c, db) = conn_with_sea_orm().await;
         let dir = tempfile::tempdir().unwrap();
         let registry = registry_with(dir.path(), "proj-a");
-        let uid = seed_operator_member(&mut c, "proj-a", "viewer");
+        let uid = seed_operator_member(&db, &c, "proj-a", "viewer").await;
         let store = RuntimeStore::default();
         let outcome =
             project_mutation_precheck(&c, &registry, &store, false, Some(&uid), "proj-a").unwrap();
@@ -517,12 +543,12 @@ mod tests {
         assert_eq!(body["error"], "forbidden");
     }
 
-    #[test]
-    fn precheck_denies_when_the_project_has_active_connections() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn precheck_denies_when_the_project_has_active_connections() {
+        let (_db_dir, c, db) = conn_with_sea_orm().await;
         let dir = tempfile::tempdir().unwrap();
         let registry = registry_with(dir.path(), "proj-a");
-        let uid = seed_operator_member(&mut c, "proj-a", "operator");
+        let uid = seed_operator_member(&db, &c, "proj-a", "operator").await;
         let store = RuntimeStore::default();
         store.with_runtime_mut("proj-a", |rt| rt.active_conns = 2);
 
@@ -539,12 +565,12 @@ mod tests {
         assert_eq!(body["active_connections"], 2);
     }
 
-    #[test]
-    fn precheck_proceeds_for_an_operator_member_with_no_active_connections() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn precheck_proceeds_for_an_operator_member_with_no_active_connections() {
+        let (_db_dir, c, db) = conn_with_sea_orm().await;
         let dir = tempfile::tempdir().unwrap();
         let registry = registry_with(dir.path(), "proj-a");
-        let uid = seed_operator_member(&mut c, "proj-a", "operator");
+        let uid = seed_operator_member(&db, &c, "proj-a", "operator").await;
         let store = RuntimeStore::default();
 
         let outcome =
@@ -552,13 +578,13 @@ mod tests {
         assert!(matches!(outcome, MutationPrecheck::Proceed));
     }
 
-    #[test]
-    fn precheck_proceeds_for_a_sysadmin_even_with_no_membership_row() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn precheck_proceeds_for_a_sysadmin_even_with_no_membership_row() {
+        let (_db_dir, c, db) = conn_with_sea_orm().await;
         let dir = tempfile::tempdir().unwrap();
         let registry = registry_with(dir.path(), "proj-a");
         let uid = identity::create_user(
-            &mut c,
+            &db,
             "alice",
             "correct horse battery staple",
             None,
@@ -567,6 +593,7 @@ mod tests {
             &[],
             NOW_STR,
         )
+        .await
         .unwrap();
         let store = RuntimeStore::default();
 
@@ -598,8 +625,8 @@ mod tests {
 
     // -- finish_delete_project / finish_stop_project --------------------
 
-    #[test]
-    fn finish_delete_project_unregisters_and_clears_runtime() {
+    #[tokio::test]
+    async fn finish_delete_project_unregisters_and_clears_runtime() {
         // Phase G (router step 4 PR C): the `project_membership` purge
         // this test used to assert is no longer this function's job --
         // `finish_delete_project` dropped its `conn: &Connection`
@@ -609,10 +636,10 @@ mod tests {
         // Verified end-to-end through the REAL handler in
         // `lifecycle_rest::delete_project_handler_purges_project_
         // membership_via_sea_orm`, not here.
-        let mut c = conn();
+        let (_db_dir, c, db) = conn_with_sea_orm().await;
         let dir = tempfile::tempdir().unwrap();
         let registry = registry_with(dir.path(), "proj-a");
-        let uid = seed_operator_member(&mut c, "proj-a", "operator");
+        let uid = seed_operator_member(&db, &c, "proj-a", "operator").await;
         let store = RuntimeStore::default();
         store.with_runtime_mut("proj-a", |rt| rt.active_conns = 0);
         store.ensure_lock("proj-a", "backend"); // simulate a held lock
@@ -715,12 +742,12 @@ mod tests {
         .unwrap();
     }
 
-    #[test]
-    fn finish_stop_project_clears_runtime_but_leaves_the_registry_and_membership_untouched() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn finish_stop_project_clears_runtime_but_leaves_the_registry_and_membership_untouched() {
+        let (_db_dir, c, db) = conn_with_sea_orm().await;
         let dir = tempfile::tempdir().unwrap();
         let registry = registry_with(dir.path(), "proj-a");
-        let uid = seed_operator_member(&mut c, "proj-a", "operator");
+        let uid = seed_operator_member(&db, &c, "proj-a", "operator").await;
         let store = RuntimeStore::default();
         store.with_runtime_mut("proj-a", |rt| rt.active_conns = 0);
         store.with_runtime_mut("proj-a", |rt| {

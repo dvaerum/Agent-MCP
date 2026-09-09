@@ -50,6 +50,7 @@
 use std::sync::LazyLock;
 
 use rusqlite::Connection;
+use sea_orm::DatabaseConnection;
 
 use crate::identity::{self, verify_password, IdentityError, UserRow};
 
@@ -283,7 +284,13 @@ pub fn resolve_current_user(
     let Some(session) = identity::get_session(conn, &session_id, now)? else {
         return Ok(None);
     };
-    identity::get_user_by_id(conn, &session.user_id)
+    // `_sync` twin, not the async sea-orm primary: this function's own
+    // real callers include `session_gate.rs::evaluate_session_gate`
+    // (this migration's declared highest-risk hot path) and
+    // `project_gate.rs`'s own sync decision functions -- forcing it
+    // async is out of scope for Phase G router step 4 PR D (see
+    // `identity.rs`'s own module doc).
+    identity::get_user_by_id_sync(conn, &session.user_id)
 }
 
 /// Port of `touch_session`: a bare `last_used_at` slide, independent
@@ -321,12 +328,12 @@ pub enum LoginAttemptOutcome {
 /// [`DECOY_PASSWORD_HASH`] (result discarded) otherwise -- so a
 /// nonexistent username, an SSO-only account, and a real wrong
 /// password all cost the identical argon2 work.
-pub fn attempt_login(
-    conn: &Connection,
+pub async fn attempt_login(
+    db: &DatabaseConnection,
     username: &str,
     password: &str,
 ) -> Result<LoginAttemptOutcome, IdentityError> {
-    let user = identity::get_user_by_username(conn, username)?;
+    let user = identity::get_user_by_username(db, username).await?;
     match user.as_ref().and_then(|u| u.password_hash.as_deref()) {
         Some(hash) => {
             if verify_password(hash, password) {
@@ -385,8 +392,8 @@ impl From<IdentityError> for SetupError {
 /// caller's job to source (see this module's own doc); an empty slice
 /// is the correct, safe interim value, not a stub.
 #[allow(clippy::too_many_arguments)]
-pub fn create_first_operator(
-    conn: &mut Connection,
+pub async fn create_first_operator(
+    db: &DatabaseConnection,
     username: &str,
     password: &str,
     password_confirm: &str,
@@ -405,7 +412,7 @@ pub fn create_first_operator(
     }
     identity::validate_password_strength(password)?;
     let user_id = identity::create_user(
-        conn,
+        db,
         username,
         password,
         email,
@@ -413,7 +420,8 @@ pub fn create_first_operator(
         true,
         registered_projects,
         now,
-    )?;
+    )
+    .await?;
     Ok(user_id)
 }
 
@@ -487,8 +495,8 @@ pub enum SetupPostOutcome {
 /// function starts at the users-empty precheck since same-origin
 /// rejection has nothing to do with wizard/database state.
 #[allow(clippy::too_many_arguments)]
-pub fn attempt_setup(
-    conn: &mut Connection,
+pub async fn attempt_setup(
+    db: &DatabaseConnection,
     users_table_empty: bool,
     username: &str,
     password: &str,
@@ -501,14 +509,16 @@ pub fn attempt_setup(
         return SetupPostOutcome::AlreadySetUp;
     }
     match create_first_operator(
-        conn,
+        db,
         username,
         password,
         password_confirm,
         email,
         registered_projects,
         now,
-    ) {
+    )
+    .await
+    {
         Ok(user_id) => SetupPostOutcome::Created(user_id),
         Err(SetupError::UsernameAlreadyExists) => SetupPostOutcome::AlreadySetUp,
         Err(other) => SetupPostOutcome::Invalid(other),
@@ -525,6 +535,25 @@ mod tests {
         c.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
         init_router_schema(&c).unwrap();
         c
+    }
+
+    /// A file-backed router DB opened as BOTH a `rusqlite::Connection`
+    /// (for sessions/raw-SQL fixture seeding) and a sea-orm
+    /// `DatabaseConnection` (for the now-converted `identity::` user
+    /// functions) -- same dual-connection recipe as
+    /// `identity.rs`'s own test module (see that module's doc for why
+    /// an in-memory `:memory:` DB can't be shared across two separate
+    /// connection handles the way a real file can).
+    async fn conn_with_sea_orm() -> (tempfile::TempDir, Connection, sea_orm::DatabaseConnection) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("login_test.db");
+        let c = Connection::open(&path).unwrap();
+        c.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        init_router_schema(&c).unwrap();
+        let db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        (dir, c, db)
     }
 
     const NOW: &str = "2026-01-01T00:00:00.000+00:00";
@@ -686,9 +715,9 @@ mod tests {
 
     // -- resolve_current_user / touch_session --------------------------
 
-    fn seed_user(c: &mut Connection) -> String {
+    async fn seed_user(db: &sea_orm::DatabaseConnection) -> String {
         identity::create_user(
-            c,
+            db,
             "alice",
             "correct horse battery staple",
             None,
@@ -697,6 +726,7 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap()
     }
 
@@ -715,10 +745,10 @@ mod tests {
             .is_none());
     }
 
-    #[test]
-    fn resolve_current_user_returns_the_user_for_a_valid_session_cookie() {
-        let mut c = conn();
-        let uid = seed_user(&mut c);
+    #[tokio::test]
+    async fn resolve_current_user_returns_the_user_for_a_valid_session_cookie() {
+        let (_dir, c, db) = conn_with_sea_orm().await;
+        let uid = seed_user(&db).await;
         let sid = identity::create_session(&c, &uid, NOW, "2026-02-01T00:00:00.000+00:00").unwrap();
         let header = format!("other=1; {SESSION_COOKIE_NAME}={sid}");
 
@@ -728,10 +758,10 @@ mod tests {
         assert_eq!(user.user_id, uid);
     }
 
-    #[test]
-    fn resolve_current_user_returns_none_for_an_expired_session() {
-        let mut c = conn();
-        let uid = seed_user(&mut c);
+    #[tokio::test]
+    async fn resolve_current_user_returns_none_for_an_expired_session() {
+        let (_dir, c, db) = conn_with_sea_orm().await;
+        let uid = seed_user(&db).await;
         let sid = identity::create_session(&c, &uid, NOW, "2026-01-01T00:01:00.000+00:00").unwrap();
         let header = format!("{SESSION_COOKIE_NAME}={sid}");
 
@@ -741,10 +771,10 @@ mod tests {
             .is_none());
     }
 
-    #[test]
-    fn touch_session_slides_last_used_at() {
-        let mut c = conn();
-        let uid = seed_user(&mut c);
+    #[tokio::test]
+    async fn touch_session_slides_last_used_at() {
+        let (_dir, c, db) = conn_with_sea_orm().await;
+        let uid = seed_user(&db).await;
         let sid = identity::create_session(&c, &uid, NOW, "2026-02-01T00:00:00.000+00:00").unwrap();
         let later = "2026-01-01T00:05:00.000+00:00";
 
@@ -762,32 +792,34 @@ mod tests {
 
     // -- attempt_login (the enumeration-timing defense) ------------------
 
-    #[test]
-    fn attempt_login_succeeds_with_the_right_password() {
-        let mut c = conn();
-        seed_user(&mut c);
-        let outcome = attempt_login(&c, "alice", "correct horse battery staple").unwrap();
+    #[tokio::test]
+    async fn attempt_login_succeeds_with_the_right_password() {
+        let (_dir, _c, db) = conn_with_sea_orm().await;
+        seed_user(&db).await;
+        let outcome = attempt_login(&db, "alice", "correct horse battery staple")
+            .await
+            .unwrap();
         assert!(matches!(outcome, LoginAttemptOutcome::Success(u) if u.username == "alice"));
     }
 
-    #[test]
-    fn attempt_login_rejects_a_wrong_password() {
-        let mut c = conn();
-        seed_user(&mut c);
-        let outcome = attempt_login(&c, "alice", "wrong password").unwrap();
+    #[tokio::test]
+    async fn attempt_login_rejects_a_wrong_password() {
+        let (_dir, _c, db) = conn_with_sea_orm().await;
+        seed_user(&db).await;
+        let outcome = attempt_login(&db, "alice", "wrong password").await.unwrap();
         assert!(matches!(outcome, LoginAttemptOutcome::InvalidCredentials));
     }
 
-    #[test]
-    fn attempt_login_rejects_a_nonexistent_username() {
-        let c = conn();
-        let outcome = attempt_login(&c, "nobody", "anything").unwrap();
+    #[tokio::test]
+    async fn attempt_login_rejects_a_nonexistent_username() {
+        let (_dir, _c, db) = conn_with_sea_orm().await;
+        let outcome = attempt_login(&db, "nobody", "anything").await.unwrap();
         assert!(matches!(outcome, LoginAttemptOutcome::InvalidCredentials));
     }
 
-    #[test]
-    fn attempt_login_rejects_an_sso_only_user_with_no_password_hash() {
-        let c = conn();
+    #[tokio::test]
+    async fn attempt_login_rejects_an_sso_only_user_with_no_password_hash() {
+        let (_dir, c, db) = conn_with_sea_orm().await;
         // Simulate an SSO-provisioned row: no password_hash.
         c.execute(
             "INSERT INTO users (user_id, username, email, password_hash, created_at, is_sysadmin) \
@@ -795,12 +827,12 @@ mod tests {
             [NOW],
         )
         .unwrap();
-        let outcome = attempt_login(&c, "ssouser", "anything").unwrap();
+        let outcome = attempt_login(&db, "ssouser", "anything").await.unwrap();
         assert!(matches!(outcome, LoginAttemptOutcome::InvalidCredentials));
     }
 
-    #[test]
-    fn attempt_login_runs_the_identical_argon2_work_on_every_rejection_path() {
+    #[tokio::test]
+    async fn attempt_login_runs_the_identical_argon2_work_on_every_rejection_path() {
         // Not a timing assertion (too flaky in CI) -- proves the
         // STRUCTURAL property instead: both the nonexistent-username
         // and the wrong-real-password paths verify against SOME
@@ -811,21 +843,21 @@ mod tests {
         // catch -- but the direct proof here is that both distinct
         // rejection reasons independently converge to the SAME
         // `InvalidCredentials` variant.
-        let mut c = conn();
-        seed_user(&mut c);
-        let missing = attempt_login(&c, "nobody", "x").unwrap();
-        let wrong = attempt_login(&c, "alice", "wrong").unwrap();
+        let (_dir, _c, db) = conn_with_sea_orm().await;
+        seed_user(&db).await;
+        let missing = attempt_login(&db, "nobody", "x").await.unwrap();
+        let wrong = attempt_login(&db, "alice", "wrong").await.unwrap();
         assert!(matches!(missing, LoginAttemptOutcome::InvalidCredentials));
         assert!(matches!(wrong, LoginAttemptOutcome::InvalidCredentials));
     }
 
     // -- create_first_operator (setup wizard) ------------------------------
 
-    #[test]
-    fn create_first_operator_rejects_an_empty_username() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn create_first_operator_rejects_an_empty_username() {
+        let (_dir, _c, db) = conn_with_sea_orm().await;
         let err = create_first_operator(
-            &mut c,
+            &db,
             "  ",
             "correct horse battery staple",
             "correct horse battery staple",
@@ -833,22 +865,25 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap_err();
         assert!(matches!(err, SetupError::EmptyUsername));
     }
 
-    #[test]
-    fn create_first_operator_rejects_an_empty_password() {
-        let mut c = conn();
-        let err = create_first_operator(&mut c, "alice", "", "", None, &[], NOW).unwrap_err();
+    #[tokio::test]
+    async fn create_first_operator_rejects_an_empty_password() {
+        let (_dir, _c, db) = conn_with_sea_orm().await;
+        let err = create_first_operator(&db, "alice", "", "", None, &[], NOW)
+            .await
+            .unwrap_err();
         assert!(matches!(err, SetupError::EmptyPassword));
     }
 
-    #[test]
-    fn create_first_operator_rejects_a_password_mismatch() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn create_first_operator_rejects_a_password_mismatch() {
+        let (_dir, _c, db) = conn_with_sea_orm().await;
         let err = create_first_operator(
-            &mut c,
+            &db,
             "alice",
             "correct horse battery staple",
             "different confirmation entirely",
@@ -856,23 +891,25 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap_err();
         assert!(matches!(err, SetupError::PasswordMismatch));
     }
 
-    #[test]
-    fn create_first_operator_rejects_a_weak_password() {
-        let mut c = conn();
-        let err =
-            create_first_operator(&mut c, "alice", "short", "short", None, &[], NOW).unwrap_err();
+    #[tokio::test]
+    async fn create_first_operator_rejects_a_weak_password() {
+        let (_dir, _c, db) = conn_with_sea_orm().await;
+        let err = create_first_operator(&db, "alice", "short", "short", None, &[], NOW)
+            .await
+            .unwrap_err();
         assert!(matches!(err, SetupError::WeakPassword(_)));
     }
 
-    #[test]
-    fn create_first_operator_creates_and_bootstraps_the_first_sysadmin() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn create_first_operator_creates_and_bootstraps_the_first_sysadmin() {
+        let (_dir, c, db) = conn_with_sea_orm().await;
         let uid = create_first_operator(
-            &mut c,
+            &db,
             "alice",
             "correct horse battery staple",
             "correct horse battery staple",
@@ -880,8 +917,9 @@ mod tests {
             &["proj-a".to_string()],
             NOW,
         )
+        .await
         .unwrap();
-        let row = identity::get_user_by_id(&c, &uid).unwrap().unwrap();
+        let row = identity::get_user_by_id(&db, &uid).await.unwrap().unwrap();
         assert!(row.is_sysadmin);
         let member_count: i64 = c
             .query_row(
@@ -893,11 +931,11 @@ mod tests {
         assert_eq!(member_count, 1);
     }
 
-    #[test]
-    fn create_first_operator_surfaces_the_race_as_username_already_exists() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn create_first_operator_surfaces_the_race_as_username_already_exists() {
+        let (_dir, _c, db) = conn_with_sea_orm().await;
         create_first_operator(
-            &mut c,
+            &db,
             "alice",
             "correct horse battery staple",
             "correct horse battery staple",
@@ -905,9 +943,10 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
         let err = create_first_operator(
-            &mut c,
+            &db,
             "alice",
             "another password entirely",
             "another password entirely",
@@ -915,6 +954,7 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap_err();
         assert!(matches!(err, SetupError::UsernameAlreadyExists));
     }
@@ -971,11 +1011,11 @@ mod tests {
 
     // -- attempt_setup --------------------------------------------------------
 
-    #[test]
-    fn attempt_setup_refuses_when_the_wizard_is_already_completed() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn attempt_setup_refuses_when_the_wizard_is_already_completed() {
+        let (_dir, _c, db) = conn_with_sea_orm().await;
         let outcome = attempt_setup(
-            &mut c,
+            &db,
             false,
             "alice",
             "correct horse battery staple",
@@ -983,15 +1023,16 @@ mod tests {
             None,
             &[],
             NOW,
-        );
+        )
+        .await;
         assert!(matches!(outcome, SetupPostOutcome::AlreadySetUp));
     }
 
-    #[test]
-    fn attempt_setup_creates_the_first_operator_when_the_wizard_is_open() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn attempt_setup_creates_the_first_operator_when_the_wizard_is_open() {
+        let (_dir, _c, db) = conn_with_sea_orm().await;
         let outcome = attempt_setup(
-            &mut c,
+            &db,
             true,
             "alice",
             "correct horse battery staple",
@@ -999,26 +1040,28 @@ mod tests {
             None,
             &[],
             NOW,
-        );
+        )
+        .await;
         let SetupPostOutcome::Created(uid) = outcome else {
             panic!("expected Created, got {outcome:?}");
         };
         assert!(
-            identity::get_user_by_id(&c, &uid)
+            identity::get_user_by_id(&db, &uid)
+                .await
                 .unwrap()
                 .unwrap()
                 .is_sysadmin
         );
     }
 
-    #[test]
-    fn attempt_setup_folds_the_race_carve_out_into_already_set_up() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn attempt_setup_folds_the_race_carve_out_into_already_set_up() {
+        let (_dir, _c, db) = conn_with_sea_orm().await;
         // Simulate the race: the table is no longer empty by the time
         // this call's own INSERT runs, but the caller's stale
         // `users_table_empty` snapshot still says `true`.
         create_first_operator(
-            &mut c,
+            &db,
             "bob",
             "correct horse battery staple",
             "correct horse battery staple",
@@ -1026,10 +1069,11 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
 
         let outcome = attempt_setup(
-            &mut c,
+            &db,
             true,
             "bob",
             "another password entirely",
@@ -1037,14 +1081,15 @@ mod tests {
             None,
             &[],
             NOW,
-        );
+        )
+        .await;
         assert!(matches!(outcome, SetupPostOutcome::AlreadySetUp));
     }
 
-    #[test]
-    fn attempt_setup_surfaces_validation_failures_as_invalid() {
-        let mut c = conn();
-        let outcome = attempt_setup(&mut c, true, "alice", "short", "short", None, &[], NOW);
+    #[tokio::test]
+    async fn attempt_setup_surfaces_validation_failures_as_invalid() {
+        let (_dir, _c, db) = conn_with_sea_orm().await;
+        let outcome = attempt_setup(&db, true, "alice", "short", "short", None, &[], NOW).await;
         assert!(matches!(
             outcome,
             SetupPostOutcome::Invalid(SetupError::WeakPassword(_))

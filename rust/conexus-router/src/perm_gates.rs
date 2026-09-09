@@ -240,17 +240,30 @@ mod tests {
     use crate::orchestrator::primitives::{self, SystemctlMode};
     use conexus_db::schema::init_router_schema;
 
-    fn conn() -> Connection {
-        let c = Connection::open_in_memory().unwrap();
+    /// A file-backed router DB opened as BOTH a `rusqlite::Connection`
+    /// (for `revalidate`/`project_gate`/`group_membership_repository`,
+    /// all still sync in this file) and a sea-orm `DatabaseConnection`
+    /// (for `identity::create_user`/friends, now async) -- same
+    /// dual-connection recipe `identity.rs`'s own tests use, since an
+    /// in-memory `:memory:` DB can't be shared across two separate
+    /// connection handles the way a real file can.
+    async fn conn_with_sea_orm() -> (tempfile::TempDir, Connection, sea_orm::DatabaseConnection) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("perm_gates_test.db");
+        let c = Connection::open(&path).unwrap();
         c.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
         init_router_schema(&c).unwrap();
-        c
+        let db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        (dir, c, db)
     }
+
     const NOW: &str = "2026-01-01T00:00:00.000+00:00";
 
-    fn seed_sysadmin(c: &mut Connection, username: &str) -> String {
+    async fn seed_sysadmin(db: &sea_orm::DatabaseConnection, username: &str) -> String {
         crate::identity::create_user(
-            c,
+            db,
             username,
             "correct horse battery staple",
             None,
@@ -259,15 +272,16 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap()
     }
 
     // -- read_body_and_revalidate ------------------------------------
 
-    #[test]
-    fn read_body_and_revalidate_admits_a_well_formed_body_for_a_capable_caller() {
-        let mut c = conn();
-        let uid = seed_sysadmin(&mut c, "alice");
+    #[tokio::test]
+    async fn read_body_and_revalidate_admits_a_well_formed_body_for_a_capable_caller() {
+        let (_dir, c, db) = conn_with_sea_orm().await;
+        let uid = seed_sysadmin(&db, "alice").await;
         let spec = RevalidationSpec {
             stale_user_id: &uid,
             cookie_header: None,
@@ -280,10 +294,10 @@ mod tests {
         assert_eq!(body["username"], "bob");
     }
 
-    #[test]
-    fn read_body_and_revalidate_rejects_malformed_json_before_ever_revalidating() {
-        let mut c = conn();
-        let uid = seed_sysadmin(&mut c, "alice");
+    #[tokio::test]
+    async fn read_body_and_revalidate_rejects_malformed_json_before_ever_revalidating() {
+        let (_dir, c, db) = conn_with_sea_orm().await;
+        let uid = seed_sysadmin(&db, "alice").await;
         let spec = RevalidationSpec {
             stale_user_id: &uid,
             cookie_header: None,
@@ -295,12 +309,12 @@ mod tests {
         assert_eq!(resp.status, 400);
     }
 
-    #[test]
-    fn read_body_and_revalidate_denies_a_capability_revoked_mid_flight() {
-        let mut c = conn();
-        seed_sysadmin(&mut c, "alice"); // sysadmin, irrelevant here
+    #[tokio::test]
+    async fn read_body_and_revalidate_denies_a_capability_revoked_mid_flight() {
+        let (_dir, c, db) = conn_with_sea_orm().await;
+        seed_sysadmin(&db, "alice").await; // sysadmin, irrelevant here
         let bob = crate::identity::create_user(
-            &mut c,
+            &db,
             "bob",
             "correct horse battery staple",
             None,
@@ -309,6 +323,7 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
         let spec = RevalidationSpec {
             stale_user_id: &bob,
@@ -325,9 +340,9 @@ mod tests {
 
     #[tokio::test]
     async fn revalidated_lock_admits_a_capable_caller_and_holds_the_named_lock() {
-        let mut c = conn();
-        let uid = seed_sysadmin(&mut c, "alice");
-        let db = AsyncMutex::new(c);
+        let (_dir, c, db) = conn_with_sea_orm().await;
+        let uid = seed_sysadmin(&db, "alice").await;
+        let lock = AsyncMutex::new(c);
         let store = RuntimeStore::new();
         let spec = RevalidationSpec {
             stale_user_id: &uid,
@@ -339,7 +354,7 @@ mod tests {
                 min_role: None,
             }),
         };
-        let (_guard, principal) = revalidated_lock(&store, &db, "proj-a", "backend", &spec)
+        let (_guard, principal) = revalidated_lock(&store, &lock, "proj-a", "backend", &spec)
             .await
             .unwrap();
         assert!(principal.has_capability(Capability::SystemProjectsManage));
@@ -376,10 +391,10 @@ mod tests {
     /// mapping -- see `perm_gates::not_found`'s own doc.
     #[tokio::test]
     async fn revalidated_lock_denies_a_non_member_even_while_holding_the_lock() {
-        let mut c = conn();
-        seed_sysadmin(&mut c, "alice");
+        let (_dir, c, db) = conn_with_sea_orm().await;
+        seed_sysadmin(&db, "alice").await;
         let bob = crate::identity::create_user(
-            &mut c,
+            &db,
             "bob",
             "correct horse battery staple",
             None,
@@ -388,9 +403,10 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
         grant_capability_via_group(&c, &bob, Capability::SystemProjectsManage);
-        let db = AsyncMutex::new(c);
+        let lock = AsyncMutex::new(c);
         let store = RuntimeStore::new();
         let spec = RevalidationSpec {
             stale_user_id: &bob,
@@ -402,7 +418,7 @@ mod tests {
                 min_role: Some("operator"),
             }),
         };
-        let resp = revalidated_lock(&store, &db, "proj-a", "backend", &spec)
+        let resp = revalidated_lock(&store, &lock, "proj-a", "backend", &spec)
             .await
             .unwrap_err();
         assert_eq!(resp.status, 404);
@@ -419,10 +435,10 @@ mod tests {
     /// close for him.
     #[tokio::test]
     async fn revalidated_lock_denies_an_under_ranked_member_with_403_not_404() {
-        let mut c = conn();
-        seed_sysadmin(&mut c, "alice");
+        let (_dir, c, db) = conn_with_sea_orm().await;
+        seed_sysadmin(&db, "alice").await;
         let bob = crate::identity::create_user(
-            &mut c,
+            &db,
             "bob",
             "correct horse battery staple",
             None,
@@ -431,6 +447,7 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
         grant_capability_via_group(&c, &bob, Capability::SystemProjectsManage);
         c.execute(
@@ -438,7 +455,7 @@ mod tests {
             [&bob],
         )
         .unwrap();
-        let db = AsyncMutex::new(c);
+        let lock = AsyncMutex::new(c);
         let store = RuntimeStore::new();
         let spec = RevalidationSpec {
             stale_user_id: &bob,
@@ -450,7 +467,7 @@ mod tests {
                 min_role: Some("operator"),
             }),
         };
-        let resp = revalidated_lock(&store, &db, "proj-a", "backend", &spec)
+        let resp = revalidated_lock(&store, &lock, "proj-a", "backend", &spec)
             .await
             .unwrap_err();
         assert_eq!(resp.status, 403);
@@ -458,9 +475,9 @@ mod tests {
 
     #[tokio::test]
     async fn revalidate_after_runs_the_real_awaitable_then_revalidates() {
-        let mut c = conn();
-        let uid = seed_sysadmin(&mut c, "alice");
-        let db = AsyncMutex::new(c);
+        let (_dir, c, db) = conn_with_sea_orm().await;
+        let uid = seed_sysadmin(&db, "alice").await;
+        let lock = AsyncMutex::new(c);
         let spec = RevalidationSpec {
             stale_user_id: &uid,
             cookie_header: None,
@@ -477,7 +494,7 @@ mod tests {
             "definitely-not-a-real-unit.service",
             std::time::Duration::from_millis(200),
         );
-        let (is_active_result, revalidate_result) = revalidate_after(awaitable, &db, &spec).await;
+        let (is_active_result, revalidate_result) = revalidate_after(awaitable, &lock, &spec).await;
         assert!(!is_active_result);
         assert!(revalidate_result.is_ok());
     }
@@ -502,9 +519,9 @@ mod tests {
     /// round trip through each handler.
     #[tokio::test]
     async fn revalidate_after_catches_a_revocation_that_lands_during_a_real_concurrent_await() {
-        let mut c = conn();
-        let uid = seed_sysadmin(&mut c, "alice");
-        let db = std::sync::Arc::new(AsyncMutex::new(c));
+        let (_dir, c, db) = conn_with_sea_orm().await;
+        let uid = seed_sysadmin(&db, "alice").await;
+        let lock = std::sync::Arc::new(AsyncMutex::new(c));
         let spec = RevalidationSpec {
             stale_user_id: &uid,
             cookie_header: None,
@@ -531,12 +548,12 @@ mod tests {
         // waits for entry, revokes alice's sysadmin bit (her only
         // source of `SystemProjectsManage` here) via a genuine
         // concurrent DB write, then releases the pause.
-        let db_for_revoker = db.clone();
+        let lock_for_revoker = lock.clone();
         let uid_for_revoker = uid.clone();
         let revoker = tokio::spawn(async move {
             entered.notified().await;
             {
-                let conn = db_for_revoker.lock().await;
+                let conn = lock_for_revoker.lock().await;
                 conn.execute(
                     "UPDATE users SET is_sysadmin = 0 WHERE user_id = ?1",
                     [&uid_for_revoker],
@@ -546,7 +563,7 @@ mod tests {
             release.notify_one();
         });
 
-        let (_unit, revalidate_result) = revalidate_after(awaitable, &db, &spec).await;
+        let (_unit, revalidate_result) = revalidate_after(awaitable, &lock, &spec).await;
         revoker.await.unwrap();
 
         let resp = revalidate_result.unwrap_err();
@@ -571,14 +588,14 @@ mod tests {
     #[tokio::test]
     async fn revalidate_after_catches_a_membership_revocation_that_lands_during_a_real_concurrent_await(
     ) {
-        let mut c = conn();
+        let (_dir, c, db) = conn_with_sea_orm().await;
         // A non-sysadmin operator whose ONLY source of `system.projects.
         // manage` is a group grant (capability stays untouched by the
         // race below) plus a real `operator`-tier membership row on
         // "proj-a" (what the race revokes).
-        seed_sysadmin(&mut c, "root"); // sentinel first user (bootstrap sysadmin), irrelevant otherwise
+        seed_sysadmin(&db, "root").await; // sentinel first user (bootstrap sysadmin), irrelevant otherwise
         let bob = crate::identity::create_user(
-            &mut c,
+            &db,
             "bob",
             "correct horse battery staple",
             None,
@@ -587,6 +604,7 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
         c.execute(
             "INSERT INTO groups (group_id, name, is_sysadmin, created_at) VALUES ('g1', 'g1', 0, ?1)",
@@ -609,7 +627,7 @@ mod tests {
         )
         .unwrap();
 
-        let db = std::sync::Arc::new(AsyncMutex::new(c));
+        let lock = std::sync::Arc::new(AsyncMutex::new(c));
         let spec = RevalidationSpec {
             stale_user_id: &bob,
             cookie_header: None,
@@ -630,12 +648,12 @@ mod tests {
             release_in_awaitable.notified().await;
         };
 
-        let db_for_revoker = db.clone();
+        let lock_for_revoker = lock.clone();
         let bob_for_revoker = bob.clone();
         let revoker = tokio::spawn(async move {
             entered.notified().await;
             {
-                let conn = db_for_revoker.lock().await;
+                let conn = lock_for_revoker.lock().await;
                 // Membership-ONLY strip -- the group capability grant
                 // above is left completely untouched.
                 conn.execute(
@@ -647,7 +665,7 @@ mod tests {
             release.notify_one();
         });
 
-        let (_unit, revalidate_result) = revalidate_after(awaitable, &db, &spec).await;
+        let (_unit, revalidate_result) = revalidate_after(awaitable, &lock, &spec).await;
         revoker.await.unwrap();
 
         // Found-and-fixed bug (this PR): bob's membership row is

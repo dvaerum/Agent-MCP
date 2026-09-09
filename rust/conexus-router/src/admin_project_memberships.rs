@@ -636,9 +636,9 @@ mod tests {
         registry
     }
 
-    fn seed_user(c: &mut Connection, username: &str) -> String {
+    async fn seed_user(db: &sea_orm::DatabaseConnection, username: &str) -> String {
         crate::identity::create_user(
-            c,
+            db,
             username,
             "correct horse battery staple",
             None,
@@ -647,6 +647,7 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap()
     }
 
@@ -825,8 +826,8 @@ mod tests {
     async fn a_sysadmin_lists_memberships_of_any_project() {
         let dir = TempDir::new().unwrap();
         let registry = registry_with(&dir, "proj-a");
-        let (_db_dir, mut c, db) = conn_with_sea_orm().await;
-        let alice = seed_user(&mut c, "alice");
+        let (_db_dir, c, db) = conn_with_sea_orm().await;
+        let alice = seed_user(&db, "alice").await;
         identity::grant_project_membership(&db, "proj-a", Some(&alice), None, "operator")
             .await
             .unwrap();
@@ -872,8 +873,8 @@ mod tests {
     async fn a_member_delegate_can_list_the_roster() {
         let dir = TempDir::new().unwrap();
         let registry = registry_with(&dir, "proj-a");
-        let (_db_dir, mut c, db) = conn_with_sea_orm().await;
-        let alice = seed_user(&mut c, "alice");
+        let (_db_dir, c, db) = conn_with_sea_orm().await;
+        let alice = seed_user(&db, "alice").await;
         identity::grant_project_membership(&db, "proj-a", Some(&alice), None, "viewer")
             .await
             .unwrap();
@@ -898,8 +899,8 @@ mod tests {
     async fn a_sysadmin_grants_a_user_membership() {
         let dir = TempDir::new().unwrap();
         let registry = registry_with(&dir, "proj-a");
-        let (_db_dir, mut c, db) = conn_with_sea_orm().await;
-        let alice = seed_user(&mut c, "alice");
+        let (_db_dir, c, db) = conn_with_sea_orm().await;
+        let alice = seed_user(&db, "alice").await;
         let outcome = decide_add_project_membership(
             &c,
             &db,
@@ -1053,12 +1054,12 @@ mod tests {
     async fn a_viewer_cannot_grant_operator_role() {
         let dir = TempDir::new().unwrap();
         let registry = registry_with(&dir, "proj-a");
-        let (_db_dir, mut c, db) = conn_with_sea_orm().await;
-        let bob = seed_user(&mut c, "bob");
+        let (_db_dir, c, db) = conn_with_sea_orm().await;
+        let bob = seed_user(&db, "bob").await;
         identity::grant_project_membership(&db, "proj-a", Some(&bob), None, "viewer")
             .await
             .unwrap();
-        let alice = seed_user(&mut c, "alice");
+        let alice = seed_user(&db, "alice").await;
         let outcome = decide_add_project_membership(
             &c,
             &db,
@@ -1082,8 +1083,8 @@ mod tests {
     async fn rejects_a_duplicate_membership_as_conflict() {
         let dir = TempDir::new().unwrap();
         let registry = registry_with(&dir, "proj-a");
-        let (_db_dir, mut c, db) = conn_with_sea_orm().await;
-        let alice = seed_user(&mut c, "alice");
+        let (_db_dir, c, db) = conn_with_sea_orm().await;
+        let alice = seed_user(&db, "alice").await;
         identity::grant_project_membership(&db, "proj-a", Some(&alice), None, "operator")
             .await
             .unwrap();
@@ -1112,8 +1113,8 @@ mod tests {
     async fn a_sysadmin_changes_a_role() {
         let dir = TempDir::new().unwrap();
         let registry = registry_with(&dir, "proj-a");
-        let (_db_dir, mut c, db) = conn_with_sea_orm().await;
-        let alice = seed_user(&mut c, "alice");
+        let (_db_dir, c, db) = conn_with_sea_orm().await;
+        let alice = seed_user(&db, "alice").await;
         identity::grant_project_membership(&db, "proj-a", Some(&alice), None, "viewer")
             .await
             .unwrap();
@@ -1144,8 +1145,8 @@ mod tests {
     async fn change_role_a_non_member_gets_the_uniform_404_for_an_existing_hidden_project() {
         let dir = TempDir::new().unwrap();
         let registry = registry_with(&dir, "proj-hidden");
-        let (_db_dir, mut c, db) = conn_with_sea_orm().await;
-        let victim = seed_user(&mut c, "victim");
+        let (_db_dir, c, db) = conn_with_sea_orm().await;
+        let victim = seed_user(&db, "victim").await;
         identity::grant_project_membership(&db, "proj-hidden", Some(&victim), None, "operator")
             .await
             .unwrap();
@@ -1212,12 +1213,12 @@ mod tests {
         // AZ-R12-1 guard added for the viewer-delegate case above.
         let dir = TempDir::new().unwrap();
         let registry = registry_with(&dir, "proj-a");
-        let (_db_dir, mut c, db) = conn_with_sea_orm().await;
-        let bob = seed_user(&mut c, "bob");
+        let (_db_dir, c, db) = conn_with_sea_orm().await;
+        let bob = seed_user(&db, "bob").await;
         identity::grant_project_membership(&db, "proj-a", Some(&bob), None, "operator")
             .await
             .unwrap();
-        let alice = seed_user(&mut c, "alice");
+        let alice = seed_user(&db, "alice").await;
         identity::grant_project_membership(&db, "proj-a", Some(&alice), None, "operator")
             .await
             .unwrap();
@@ -1247,8 +1248,8 @@ mod tests {
         // `test_sysadmin_can_downgrade_operator_membership`.
         let dir = TempDir::new().unwrap();
         let registry = registry_with(&dir, "proj-a");
-        let (_db_dir, mut c, db) = conn_with_sea_orm().await;
-        let alice = seed_user(&mut c, "alice");
+        let (_db_dir, c, db) = conn_with_sea_orm().await;
+        let alice = seed_user(&db, "alice").await;
         identity::grant_project_membership(&db, "proj-a", Some(&alice), None, "operator")
             .await
             .unwrap();
@@ -1278,12 +1279,12 @@ mod tests {
         // authorised, not just the new one (viewer).
         let dir = TempDir::new().unwrap();
         let registry = registry_with(&dir, "proj-a");
-        let (_db_dir, mut c, db) = conn_with_sea_orm().await;
-        let bob = seed_user(&mut c, "bob");
+        let (_db_dir, c, db) = conn_with_sea_orm().await;
+        let bob = seed_user(&db, "bob").await;
         identity::grant_project_membership(&db, "proj-a", Some(&bob), None, "viewer")
             .await
             .unwrap();
-        let alice = seed_user(&mut c, "alice");
+        let alice = seed_user(&db, "alice").await;
         identity::grant_project_membership(&db, "proj-a", Some(&alice), None, "operator")
             .await
             .unwrap();
@@ -1346,8 +1347,8 @@ mod tests {
     async fn a_sysadmin_deletes_a_membership() {
         let dir = TempDir::new().unwrap();
         let registry = registry_with(&dir, "proj-a");
-        let (_db_dir, mut c, db) = conn_with_sea_orm().await;
-        let alice = seed_user(&mut c, "alice");
+        let (_db_dir, c, db) = conn_with_sea_orm().await;
+        let alice = seed_user(&db, "alice").await;
         identity::grant_project_membership(&db, "proj-a", Some(&alice), None, "operator")
             .await
             .unwrap();
@@ -1383,8 +1384,8 @@ mod tests {
     async fn delete_a_non_member_gets_the_uniform_404_for_an_existing_hidden_project() {
         let dir = TempDir::new().unwrap();
         let registry = registry_with(&dir, "proj-hidden");
-        let (_db_dir, mut c, db) = conn_with_sea_orm().await;
-        let victim = seed_user(&mut c, "victim");
+        let (_db_dir, c, db) = conn_with_sea_orm().await;
+        let victim = seed_user(&db, "victim").await;
         identity::grant_project_membership(&db, "proj-hidden", Some(&victim), None, "operator")
             .await
             .unwrap();
@@ -1439,8 +1440,8 @@ mod tests {
         // nonexistent project would, not a 403.
         let dir = TempDir::new().unwrap();
         let registry = registry_with(&dir, "proj-a");
-        let (_db_dir, mut c, db) = conn_with_sea_orm().await;
-        let victim = seed_user(&mut c, "victim");
+        let (_db_dir, c, db) = conn_with_sea_orm().await;
+        let victim = seed_user(&db, "victim").await;
         identity::grant_project_membership(&db, "proj-a", Some(&victim), None, "operator")
             .await
             .unwrap();
@@ -1478,12 +1479,12 @@ mod tests {
         // -- a role at or below their own must still succeed.
         let dir = TempDir::new().unwrap();
         let registry = registry_with(&dir, "proj-a");
-        let (_db_dir, mut c, db) = conn_with_sea_orm().await;
-        let bob = seed_user(&mut c, "bob");
+        let (_db_dir, c, db) = conn_with_sea_orm().await;
+        let bob = seed_user(&db, "bob").await;
         identity::grant_project_membership(&db, "proj-a", Some(&bob), None, "operator")
             .await
             .unwrap();
-        let victim = seed_user(&mut c, "victim");
+        let victim = seed_user(&db, "victim").await;
         identity::grant_project_membership(&db, "proj-a", Some(&victim), None, "viewer")
             .await
             .unwrap();
@@ -1512,8 +1513,8 @@ mod tests {
         // `test_sysadmin_can_revoke_project_membership`.
         let dir = TempDir::new().unwrap();
         let registry = registry_with(&dir, "proj-a");
-        let (_db_dir, mut c, db) = conn_with_sea_orm().await;
-        let victim = seed_user(&mut c, "victim");
+        let (_db_dir, c, db) = conn_with_sea_orm().await;
+        let victim = seed_user(&db, "victim").await;
         identity::grant_project_membership(&db, "proj-a", Some(&victim), None, "operator")
             .await
             .unwrap();
@@ -1540,12 +1541,12 @@ mod tests {
     async fn a_viewer_cannot_revoke_an_operators_membership() {
         let dir = TempDir::new().unwrap();
         let registry = registry_with(&dir, "proj-a");
-        let (_db_dir, mut c, db) = conn_with_sea_orm().await;
-        let bob = seed_user(&mut c, "bob");
+        let (_db_dir, c, db) = conn_with_sea_orm().await;
+        let bob = seed_user(&db, "bob").await;
         identity::grant_project_membership(&db, "proj-a", Some(&bob), None, "viewer")
             .await
             .unwrap();
-        let alice = seed_user(&mut c, "alice");
+        let alice = seed_user(&db, "alice").await;
         identity::grant_project_membership(&db, "proj-a", Some(&alice), None, "operator")
             .await
             .unwrap();

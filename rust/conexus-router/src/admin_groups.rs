@@ -261,6 +261,26 @@ mod tests {
         init_router_schema(&c).unwrap();
         c
     }
+
+    /// A file-backed router DB opened as BOTH a `rusqlite::Connection`
+    /// (for this module's still-sync group CRUD decision functions)
+    /// and a sea-orm `DatabaseConnection` (for the now-converted
+    /// `identity::create_user` fixture helper) -- an in-memory
+    /// `:memory:` DB can't be shared across two connection handles the
+    /// way a real file can. See `identity.rs`'s own test module for
+    /// the canonical recipe.
+    async fn conn_with_sea_orm() -> (tempfile::TempDir, Connection, sea_orm::DatabaseConnection) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("admin_groups_test.db");
+        let c = Connection::open(&path).unwrap();
+        c.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        init_router_schema(&c).unwrap();
+        let db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        (dir, c, db)
+    }
+
     const NOW: &str = "2026-01-01T00:00:00.000+00:00";
 
     fn seed_sysadmin_group(c: &Connection) -> String {
@@ -436,16 +456,16 @@ mod tests {
         assert_eq!(resp.status, 404);
     }
 
-    #[test]
-    fn refuses_to_demote_the_last_sysadmin_group() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn refuses_to_demote_the_last_sysadmin_group() {
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
         // No individual sysadmin USER exists -- this sysadmin-flagged
         // GROUP, with a real member, is the sole source of sysadmin in
         // the deployment (an EMPTY sysadmin group confers sysadmin to
         // nobody, so it wouldn't actually exercise this invariant).
         let gid = seed_sysadmin_group(&c);
         let alice = crate::identity::create_user(
-            &mut c,
+            &db,
             "alice",
             "correct horse battery staple",
             None,
@@ -454,6 +474,7 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
         conexus_db::group_membership_repository::add_group_member(
             &c,
@@ -481,12 +502,12 @@ mod tests {
         assert!(row.is_sysadmin, "the demotion must have rolled back");
     }
 
-    #[test]
-    fn allows_demoting_when_a_sysadmin_user_remains() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn allows_demoting_when_a_sysadmin_user_remains() {
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
         let gid = seed_sysadmin_group(&c);
         crate::identity::create_user(
-            &mut c,
+            &db,
             "alice",
             "correct horse battery staple",
             None,
@@ -495,6 +516,7 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
         let outcome = decide_edit_group(
             &mut c,
@@ -530,15 +552,15 @@ mod tests {
 
     // -- decide_delete_group -------------------------------------------
 
-    #[test]
-    fn deletes_a_non_sysadmin_group() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn deletes_a_non_sysadmin_group() {
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
         // A real sysadmin USER, not just a sysadmin-flagged group with
         // no members -- an empty sysadmin group confers sysadmin to
         // nobody, so it wouldn't actually keep the global invariant
         // satisfied on its own.
         crate::identity::create_user(
-            &mut c,
+            &db,
             "alice",
             "correct horse battery staple",
             None,
@@ -547,6 +569,7 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
         let gid = group_membership_repository::create_group(&c, "team-a", false, NOW)
             .unwrap()
@@ -576,16 +599,16 @@ mod tests {
         assert_eq!(resp.status, 403);
     }
 
-    #[test]
-    fn a_sysadmin_can_delete_a_sysadmin_flagged_group() {
+    #[tokio::test]
+    async fn a_sysadmin_can_delete_a_sysadmin_flagged_group() {
         // test_sec_r10_delete_group_guard.py's
         // `test_sysadmin_can_delete_sysadmin_group`: the AZ-R10-1 guard
         // must not over-reject the legitimate sysadmin path. A second,
         // unrelated real sysadmin user keeps the R5-F4 global invariant
         // satisfied so this test isolates the AZ-R10-1 mechanism alone.
-        let mut c = conn();
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
         crate::identity::create_user(
-            &mut c,
+            &db,
             "root",
             "correct horse battery staple",
             None,
@@ -594,6 +617,7 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
         let gid = seed_sysadmin_group(&c);
         let outcome = decide_delete_group(&mut c, true, "root", &gid).unwrap();
@@ -603,14 +627,14 @@ mod tests {
             .is_none());
     }
 
-    #[test]
-    fn refuses_to_delete_the_last_sysadmin_group() {
-        let mut c = conn();
+    #[tokio::test]
+    async fn refuses_to_delete_the_last_sysadmin_group() {
+        let (_dir, mut c, db) = conn_with_sea_orm().await;
         // A real member, not an empty sysadmin-flagged group -- see
         // refuses_to_demote_the_last_sysadmin_group's own comment.
         let gid = seed_sysadmin_group(&c);
         let alice = crate::identity::create_user(
-            &mut c,
+            &db,
             "alice",
             "correct horse battery staple",
             None,
@@ -619,6 +643,7 @@ mod tests {
             &[],
             NOW,
         )
+        .await
         .unwrap();
         conexus_db::group_membership_repository::add_group_member(
             &c,
