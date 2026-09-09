@@ -1443,7 +1443,7 @@ impl Tool for CreateTaskTool {
                 notes: None,
                 now,
             };
-            let fresh = match task_repository::create(&tx, new_task) {
+            let fresh = match task_repository::create_in_transaction(&tx, new_task) {
                 Ok(row) => row,
                 Err(_) => {
                     return ToolResult::Failed {
@@ -2545,7 +2545,7 @@ impl Tool for DeleteTaskTool {
                     now,
                 );
                 for (descendant_id, descendant_assignee) in &descendants {
-                    if task_repository::delete(&tx, descendant_id).unwrap_or(false) {
+                    if task_repository::delete_in_transaction(&tx, descendant_id).unwrap_or(false) {
                         deleted_events.push((descendant_id.clone(), descendant_assignee.clone()));
                         cascade_operations.push(format!("Deleted child task '{descendant_id}'"));
                     }
@@ -2650,7 +2650,7 @@ impl Tool for DeleteTaskTool {
             }
             let _ = deps_to_refresh; // no in-memory cache to refresh in this port
 
-            match task_repository::delete(&tx, &task_id) {
+            match task_repository::delete_in_transaction(&tx, &task_id) {
                 Ok(true) => {}
                 Ok(false) => {
                     // The transaction drops here without a commit --
@@ -2921,7 +2921,8 @@ mod tests {
     #[test]
     fn single_root_conflict_some_when_a_root_already_exists() {
         let conn = test_conn();
-        task_repository::create(&conn, new_task("task_1", "root", None, None)).unwrap();
+        task_repository::create_in_transaction(&conn, new_task("task_1", "root", None, None))
+            .unwrap();
         let result = single_root_conflict(&conn);
         assert!(matches!(result, Some(ToolResult::Conflict { .. })));
     }
@@ -2971,9 +2972,18 @@ mod tests {
     #[test]
     fn collect_task_descendants_orders_deepest_first() {
         let conn = test_conn();
-        task_repository::create(&conn, new_task("root", "root", None, None)).unwrap();
-        task_repository::create(&conn, new_task("child", "child", Some("root"), None)).unwrap();
-        task_repository::create(&conn, new_task("grandchild", "gc", Some("child"), None)).unwrap();
+        task_repository::create_in_transaction(&conn, new_task("root", "root", None, None))
+            .unwrap();
+        task_repository::create_in_transaction(
+            &conn,
+            new_task("child", "child", Some("root"), None),
+        )
+        .unwrap();
+        task_repository::create_in_transaction(
+            &conn,
+            new_task("grandchild", "gc", Some("child"), None),
+        )
+        .unwrap();
 
         let descendants = collect_task_descendants(&conn, "root").unwrap();
         let ids: Vec<&str> = descendants.iter().map(|(id, _)| id.as_str()).collect();
@@ -2983,7 +2993,8 @@ mod tests {
     #[test]
     fn collect_task_descendants_empty_for_a_leaf_task() {
         let conn = test_conn();
-        task_repository::create(&conn, new_task("root", "root", None, None)).unwrap();
+        task_repository::create_in_transaction(&conn, new_task("root", "root", None, None))
+            .unwrap();
         assert!(collect_task_descendants(&conn, "root").unwrap().is_empty());
     }
 
@@ -2992,8 +3003,13 @@ mod tests {
         // BL-2: even if child_tasks were stale/absent, the FK-derived
         // walk still finds the real child.
         let conn = test_conn();
-        task_repository::create(&conn, new_task("root", "root", None, None)).unwrap();
-        task_repository::create(&conn, new_task("child", "child", Some("root"), None)).unwrap();
+        task_repository::create_in_transaction(&conn, new_task("root", "root", None, None))
+            .unwrap();
+        task_repository::create_in_transaction(
+            &conn,
+            new_task("child", "child", Some("root"), None),
+        )
+        .unwrap();
         // No child_tasks mirror was ever written on "root" -- the walk
         // must still find "child" via parent_task alone.
         let descendants = collect_task_descendants(&conn, "root").unwrap();
@@ -3025,7 +3041,7 @@ mod tests {
         let conn = test_conn();
         // task_2 already depends on task_1 -- proposing task_1 depends
         // on task_2 would close the loop.
-        task_repository::create(
+        task_repository::create_in_transaction(
             &conn,
             new_task("task_2", "t2", None, Some(&["task_1".to_string()])),
         )
@@ -3039,7 +3055,8 @@ mod tests {
     #[test]
     fn find_dependency_cycle_none_for_a_genuinely_acyclic_graph() {
         let conn = test_conn();
-        task_repository::create(&conn, new_task("task_2", "t2", None, None)).unwrap();
+        task_repository::create_in_transaction(&conn, new_task("task_2", "t2", None, None))
+            .unwrap();
         assert!(
             find_dependency_cycle(&conn, "task_1", &["task_2".to_string()])
                 .unwrap()
@@ -3052,8 +3069,13 @@ mod tests {
         // Applied uniformly at creation time even though today a brand
         // new id can have no existing incoming edges yet.
         let conn = test_conn();
-        task_repository::create(&conn, new_task("task_2", "t2", None, None)).unwrap();
-        task_repository::create(&conn, new_task("task_3", "t3", Some("task_2"), None)).unwrap();
+        task_repository::create_in_transaction(&conn, new_task("task_2", "t2", None, None))
+            .unwrap();
+        task_repository::create_in_transaction(
+            &conn,
+            new_task("task_3", "t3", Some("task_2"), None),
+        )
+        .unwrap();
         assert!(find_dependency_cycle(
             &conn,
             "brand_new_task",
@@ -3185,7 +3207,7 @@ impl Tool for RequestAssistanceTool {
             let child_task_id = task_repository::generate_task_id();
             let child_title = format!("Assistance for {parent_task_id}: {}", parent.title);
 
-            if let Err(_e) = task_repository::create(
+            if let Err(_e) = task_repository::create_in_transaction(
                 &tx,
                 NewTask {
                     task_id: Some(&child_task_id),
@@ -3890,7 +3912,7 @@ mod view_search_tests {
         {
             return;
         }
-        task_repository::create(
+        task_repository::create_in_transaction(
             conn,
             NewTask {
                 task_id: Some("root_anchor"),
@@ -3918,7 +3940,7 @@ mod view_search_tests {
         status: &str,
     ) {
         ensure_root(conn);
-        task_repository::create(
+        task_repository::create_in_transaction(
             conn,
             NewTask {
                 task_id: Some(id),
@@ -4331,7 +4353,7 @@ mod view_search_tests {
         {
             let guard = conn.lock().await;
             ensure_root(&guard);
-            task_repository::create(
+            task_repository::create_in_transaction(
                 &guard,
                 NewTask {
                     task_id: Some("title_hit"),
@@ -4349,7 +4371,7 @@ mod view_search_tests {
                 },
             )
             .unwrap();
-            task_repository::create(
+            task_repository::create_in_transaction(
                 &guard,
                 NewTask {
                     task_id: Some("notes_hit"),
@@ -4537,7 +4559,7 @@ mod create_task_tests {
     }
 
     fn seed_task(conn: &Connection, id: &str, parent: Option<&str>) {
-        task_repository::create(
+        task_repository::create_in_transaction(
             conn,
             NewTask {
                 task_id: Some(id),
@@ -4826,7 +4848,7 @@ mod create_task_tests {
         seed_agent(&conn, "carol").await;
         let busy_id = {
             let guard = conn.lock().await;
-            let busy = task_repository::create(
+            let busy = task_repository::create_in_transaction(
                 &guard,
                 NewTask {
                     task_id: None,
@@ -5090,7 +5112,7 @@ mod update_task_status_tests {
         assigned_to: Option<&str>,
         parent: Option<&str>,
     ) {
-        task_repository::create(
+        task_repository::create_in_transaction(
             conn,
             NewTask {
                 task_id: Some(id),
@@ -5621,7 +5643,7 @@ mod update_task_tests {
     }
 
     fn seed_task(conn: &Connection, id: &str, status: &str, assigned_to: Option<&str>) {
-        task_repository::create(
+        task_repository::create_in_transaction(
             conn,
             NewTask {
                 task_id: Some(id),
@@ -6074,7 +6096,7 @@ mod update_task_tests {
         seed_agent(&conn, "carol").await;
         let guard = conn.lock().await;
         seed_task(&guard, "t1", "pending", None);
-        task_repository::create(
+        task_repository::create_in_transaction(
             &guard,
             NewTask {
                 task_id: Some("carols-own"),
@@ -6132,7 +6154,7 @@ mod update_task_tests {
         seed_agent(&conn, "bob").await;
         let guard = conn.lock().await;
         seed_task(&guard, "t1", "pending", Some("alice"));
-        task_repository::create(
+        task_repository::create_in_transaction(
             &guard,
             NewTask {
                 task_id: Some("alices-other"),
@@ -6503,7 +6525,7 @@ mod delete_task_tests {
         parent: Option<&str>,
         deps: Option<&[String]>,
     ) {
-        task_repository::create(
+        task_repository::create_in_transaction(
             conn,
             NewTask {
                 task_id: Some(id),
@@ -7005,7 +7027,7 @@ mod request_assistance_tests {
     }
 
     fn seed_task(conn: &Connection, id: &str, assigned_to: Option<&str>, created_by: &str) {
-        task_repository::create(
+        task_repository::create_in_transaction(
             conn,
             NewTask {
                 task_id: Some(id),
@@ -7257,7 +7279,7 @@ mod bulk_task_operations_tests {
         assigned_to: Option<&str>,
         created_by: &str,
     ) {
-        task_repository::create(
+        task_repository::create_in_transaction(
             conn,
             NewTask {
                 task_id: Some(id),
@@ -7613,7 +7635,7 @@ mod bulk_task_operations_tests {
         {
             let guard = conn.lock().await;
             seed_task(&guard, "terminal", "completed", Some("bob"), "alice");
-            task_repository::create(
+            task_repository::create_in_transaction(
                 &guard,
                 NewTask {
                     task_id: Some("live"),
@@ -7863,7 +7885,7 @@ mod bulk_task_operations_tests {
             let guard = conn.lock().await;
             seed_agent(&guard, "bob");
             seed_task(&guard, "terminal", "completed", Some("alice"), "alice");
-            task_repository::create(
+            task_repository::create_in_transaction(
                 &guard,
                 NewTask {
                     task_id: Some("live"),
@@ -7926,7 +7948,7 @@ mod bulk_task_operations_tests {
         {
             let guard = conn.lock().await;
             seed_task(&guard, "blocker", "in_progress", Some("bob"), "alice");
-            task_repository::create(
+            task_repository::create_in_transaction(
                 &guard,
                 NewTask {
                     task_id: Some("dependent"),
@@ -7986,7 +8008,7 @@ mod bulk_task_operations_tests {
             let guard = conn.lock().await;
             seed_agent(&guard, "carol");
             seed_task(&guard, "blocker", "in_progress", Some("bob"), "alice");
-            task_repository::create(
+            task_repository::create_in_transaction(
                 &guard,
                 NewTask {
                     task_id: Some("dependent"),
@@ -8056,7 +8078,7 @@ mod bulk_task_operations_tests {
         {
             let guard = conn.lock().await;
             seed_task(&guard, "t1", "pending", Some("bob"), "alice");
-            task_repository::create(
+            task_repository::create_in_transaction(
                 &guard,
                 NewTask {
                     task_id: Some("t2"),

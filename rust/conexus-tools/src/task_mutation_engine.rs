@@ -484,7 +484,7 @@ mod tests {
         parent: Option<&str>,
         deps: Option<&[String]>,
     ) {
-        task_repository::create(
+        task_repository::create_in_transaction(
             conn,
             NewTask {
                 task_id: Some(id),

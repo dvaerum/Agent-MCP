@@ -35,10 +35,11 @@
 //!   in this crate, the caller is NOT required to supply `task_id` —
 //!   see [`NewTask::task_id`]'s doc for why this is the one deliberate
 //!   exception to that pattern.
-//! - **`create()` does NOT swallow a duplicate-id conflict** — it
-//!   propagates the real `rusqlite::Error` uncaught, matching Python's
-//!   explicit choice (documented rationale: "silently returning the
-//!   existing row would mask write conflicts").
+//! - **`create()`/`create_in_transaction()` do NOT swallow a
+//!   duplicate-id conflict** — the real `DbErr`/`rusqlite::Error`
+//!   propagates uncaught, matching Python's explicit choice
+//!   (documented rationale: "silently returning the existing row
+//!   would mask write conflicts").
 //! - **Single-root-task expression index** (`idx_tasks_single_root`,
 //!   in `schema.rs`) is a SCHEMA-level invariant, not an app-level
 //!   check — it must exist in the DDL, not just be re-verified in
@@ -385,9 +386,65 @@ pub struct NewTask<'a> {
 /// INSERT a task, minting a [`generate_task_id`] id if
 /// `task.task_id` is `None`. A duplicate id (caller-supplied or, in
 /// the astronomically unlikely collision case, minted) surfaces as a
-/// real `rusqlite::Error` — deliberately NOT swallowed or wrapped,
-/// matching Python's explicit choice.
-pub fn create(conn: &Connection, task: NewTask) -> Result<TaskRow> {
+/// real `DbErr` — deliberately NOT swallowed or wrapped, matching
+/// Python's explicit choice. Built via sea-orm's typed `Entity::insert`,
+/// then re-read via the async [`get_by_id`] ("async calls async" —
+/// unlike `scheduled_directive_repository::create`, which builds its
+/// returned row straight from its INSERT params, this mirrors the
+/// re-`SELECT` [`create_in_transaction`] already did).
+pub async fn create(db: &DatabaseConnection, task: NewTask<'_>) -> Result<TaskRow, DbErr> {
+    let minted;
+    let task_id = match task.task_id {
+        Some(id) => id,
+        None => {
+            minted = generate_task_id();
+            &minted
+        }
+    };
+
+    let child_json = task
+        .child_tasks
+        .map(|v| serde_json::to_string(v).expect("Vec<String> always serializes"));
+    let depends_json = task
+        .depends_on_tasks
+        .map(|v| serde_json::to_string(v).expect("Vec<String> always serializes"));
+    let notes_json = task
+        .notes
+        .map(|v| serde_json::to_string(v).expect("Vec<TaskNote> always serializes"));
+
+    let am = task::ActiveModel {
+        task_id: Set(task_id.to_string()),
+        title: Set(task.title.to_string()),
+        description: Set(task.description.map(String::from)),
+        assigned_to: Set(task.assigned_to.map(String::from)),
+        created_by: Set(task.created_by.to_string()),
+        status: Set(task.status.to_string()),
+        priority: Set(task.priority.to_string()),
+        created_at: Set(task.now.to_string()),
+        updated_at: Set(task.now.to_string()),
+        parent_task: Set(task.parent_task.map(String::from)),
+        child_tasks: Set(child_json),
+        depends_on_tasks: Set(depends_json),
+        notes: Set(notes_json),
+    };
+
+    Entity::insert(am).exec(db).await?;
+
+    Ok(get_by_id(db, task_id)
+        .await?
+        .expect("row was just written under this same connection"))
+}
+
+/// Deliberately-still-sync twin of [`create`] for every caller that
+/// writes inside an in-flight, uncommitted `rusqlite::Transaction`
+/// shared with the caller's own other writes -- same rationale as
+/// [`update_fields_in_transaction`]'s own doc: a write through
+/// `sea_orm_db`'s separate connection pool here would land OUTSIDE the
+/// caller's atomic transaction boundary entirely, not inside it. Not
+/// deleted when every remaining caller is itself eventually converted
+/// to a sea-orm transaction -- delete this helper THEN, once nothing
+/// calls it.
+pub fn create_in_transaction(conn: &Connection, task: NewTask) -> Result<TaskRow> {
     let minted;
     let task_id = match task.task_id {
         Some(id) => id,
@@ -769,7 +826,23 @@ pub async fn bulk_update_fields(
 /// choreography lives one layer up (Python: `app.routes`/
 /// `task_tools.py`; Rust: a future `conexus-tools` composition using
 /// this function plus `AgentRepository::clear_current_task_for`).
-pub fn delete(conn: &Connection, task_id: &str) -> Result<bool> {
+/// Built via sea-orm's typed `Entity::delete_by_id`, same idiom as
+/// this module's other single-row operations.
+pub async fn delete(db: &DatabaseConnection, task_id: &str) -> Result<bool, DbErr> {
+    let result = Entity::delete_by_id(task_id).exec(db).await?;
+    Ok(result.rows_affected > 0)
+}
+
+/// Deliberately-still-sync twin of [`delete`] for every caller that
+/// writes inside an in-flight, uncommitted `rusqlite::Transaction`
+/// shared with the caller's own other writes -- same rationale as
+/// [`update_fields_in_transaction`]'s own doc: a write through
+/// `sea_orm_db`'s separate connection pool here would land OUTSIDE the
+/// caller's atomic transaction boundary entirely, not inside it. Not
+/// deleted when every remaining caller is itself eventually converted
+/// to a sea-orm transaction -- delete this helper THEN, once nothing
+/// calls it.
+pub fn delete_in_transaction(conn: &Connection, task_id: &str) -> Result<bool> {
     let changed = conn.execute("DELETE FROM tasks WHERE task_id = ?1", [task_id])?;
     Ok(changed > 0)
 }
@@ -779,15 +852,9 @@ mod tests {
     use super::*;
     use crate::schema::init_schema;
 
-    fn test_conn() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        init_schema(&conn).unwrap();
-        conn
-    }
-
     /// A file-backed DB opened as BOTH a `rusqlite::Connection` (to
-    /// seed rows through the still-sync [`create`]) and a sea-orm
-    /// `DatabaseConnection` (to exercise the now-converted
+    /// seed rows through the still-sync [`create_in_transaction`]) and
+    /// a sea-orm `DatabaseConnection` (to exercise the now-converted
     /// [`count_by_status`]/[`count_active_by_assignee`]) -- the same
     /// dual-connection recipe `pending_directive_repository`/
     /// `scheduled_directive_repository`'s own tests use, since an
@@ -836,31 +903,35 @@ mod tests {
         assert_eq!(ids.len(), 1000, "1000 rapid calls must not collide");
     }
 
-    #[test]
-    fn create_mints_a_task_id_when_omitted() {
-        let conn = test_conn();
-        let row = create(&conn, new_task(None, "untitled")).unwrap();
+    #[tokio::test]
+    async fn create_mints_a_task_id_when_omitted() {
+        let (_dir, _conn, db) = test_conn_with_sea_orm().await;
+        let row = create(&db, new_task(None, "untitled")).await.unwrap();
         assert!(row.task_id.starts_with("task_"));
     }
 
-    #[test]
-    fn create_uses_the_caller_supplied_task_id_when_given() {
-        let conn = test_conn();
-        let row = create(&conn, new_task(Some("task_explicit"), "titled")).unwrap();
+    #[tokio::test]
+    async fn create_uses_the_caller_supplied_task_id_when_given() {
+        let (_dir, _conn, db) = test_conn_with_sea_orm().await;
+        let row = create(&db, new_task(Some("task_explicit"), "titled"))
+            .await
+            .unwrap();
         assert_eq!(row.task_id, "task_explicit");
     }
 
-    #[test]
-    fn create_duplicate_id_is_a_real_propagated_error() {
-        let conn = test_conn();
-        create(&conn, new_task(Some("task_dup"), "first")).unwrap();
-        let err = create(&conn, new_task(Some("task_dup"), "second"));
+    #[tokio::test]
+    async fn create_duplicate_id_is_a_real_propagated_error() {
+        let (_dir, _conn, db) = test_conn_with_sea_orm().await;
+        create(&db, new_task(Some("task_dup"), "first"))
+            .await
+            .unwrap();
+        let err = create(&db, new_task(Some("task_dup"), "second")).await;
         assert!(err.is_err());
     }
 
-    #[test]
-    fn create_round_trips_json_list_fields() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn create_round_trips_json_list_fields() {
+        let (_dir, _conn, db) = test_conn_with_sea_orm().await;
         let children = vec!["task_a".to_string(), "task_b".to_string()];
         let deps = vec!["task_c".to_string()];
         let notes = vec![TaskNote {
@@ -873,7 +944,7 @@ mod tests {
         task.depends_on_tasks = Some(&deps);
         task.notes = Some(&notes);
 
-        let row = create(&conn, task).unwrap();
+        let row = create(&db, task).await.unwrap();
         assert_eq!(row.child_tasks, Some(children));
         assert_eq!(row.depends_on_tasks, Some(deps));
         assert_eq!(row.notes, Some(notes));
@@ -890,14 +961,14 @@ mod tests {
         let (_dir, conn, db) = test_conn_with_sea_orm().await;
         let mut t1 = new_task(Some("task_1"), "first");
         t1.now = "2026-01-01T00:00:00Z";
-        create(&conn, t1).unwrap();
+        create_in_transaction(&conn, t1).unwrap();
         // Only one root task is allowed (idx_tasks_single_root) --
         // t2 is a child of t1 so this test can seed 2 sibling rows
         // without tripping that unrelated invariant.
         let mut t2 = new_task(Some("task_2"), "second");
         t2.now = "2026-01-02T00:00:00Z";
         t2.parent_task = Some("task_1");
-        create(&conn, t2).unwrap();
+        create_in_transaction(&conn, t2).unwrap();
 
         let all = list_all(&db, None).await.unwrap();
         assert_eq!(
@@ -915,17 +986,17 @@ mod tests {
         let (_dir, conn, db) = test_conn_with_sea_orm().await;
         let mut t1 = new_task(Some("task_1"), "a");
         t1.status = "pending";
-        create(&conn, t1).unwrap();
+        create_in_transaction(&conn, t1).unwrap();
         // t2/t3 are children of t1 -- only one root task is allowed
         // (idx_tasks_single_root), unrelated to what this test checks.
         let mut t2 = new_task(Some("task_2"), "b");
         t2.status = "pending";
         t2.parent_task = Some("task_1");
-        create(&conn, t2).unwrap();
+        create_in_transaction(&conn, t2).unwrap();
         let mut t3 = new_task(Some("task_3"), "c");
         t3.status = "completed";
         t3.parent_task = Some("task_1");
-        create(&conn, t3).unwrap();
+        create_in_transaction(&conn, t3).unwrap();
 
         let counts = count_by_status(&db).await.unwrap();
         assert_eq!(counts.get("pending"), Some(&2));
@@ -938,18 +1009,18 @@ mod tests {
         let mut t1 = new_task(Some("task_1"), "a");
         t1.assigned_to = Some("alice");
         t1.status = "pending";
-        create(&conn, t1).unwrap();
+        create_in_transaction(&conn, t1).unwrap();
         // t2/t3 are children of t1 -- only one root task is allowed
         // (idx_tasks_single_root), unrelated to what this test checks.
         let mut t2 = new_task(Some("task_2"), "b");
         t2.assigned_to = Some("alice");
         t2.status = "completed";
         t2.parent_task = Some("task_1");
-        create(&conn, t2).unwrap();
+        create_in_transaction(&conn, t2).unwrap();
         let mut t3 = new_task(Some("task_3"), "c");
         t3.assigned_to = Some("bob");
         t3.parent_task = Some("task_1");
-        create(&conn, t3).unwrap();
+        create_in_transaction(&conn, t3).unwrap();
 
         let for_alice = list_by_agent(&db, "alice", None, None).await.unwrap();
         assert_eq!(for_alice.len(), 2);
@@ -972,7 +1043,7 @@ mod tests {
     #[tokio::test]
     async fn update_fields_always_bumps_updated_at() {
         let (_dir, conn, db) = test_conn_with_sea_orm().await;
-        create(&conn, new_task(Some("task_1"), "a")).unwrap();
+        create_in_transaction(&conn, new_task(Some("task_1"), "a")).unwrap();
 
         let row = update_fields(
             &db,
@@ -989,7 +1060,7 @@ mod tests {
     #[tokio::test]
     async fn update_fields_can_change_title_status_priority() {
         let (_dir, conn, db) = test_conn_with_sea_orm().await;
-        create(&conn, new_task(Some("task_1"), "old title")).unwrap();
+        create_in_transaction(&conn, new_task(Some("task_1"), "old title")).unwrap();
 
         let row = update_fields(
             &db,
@@ -1015,7 +1086,7 @@ mod tests {
         let (_dir, conn, db) = test_conn_with_sea_orm().await;
         let mut task = new_task(Some("task_1"), "a");
         task.assigned_to = Some("alice");
-        create(&conn, task).unwrap();
+        create_in_transaction(&conn, task).unwrap();
 
         let cleared = update_fields(
             &db,
@@ -1049,7 +1120,7 @@ mod tests {
     #[tokio::test]
     async fn update_fields_child_tasks_json_round_trips() {
         let (_dir, conn, db) = test_conn_with_sea_orm().await;
-        create(&conn, new_task(Some("task_1"), "a")).unwrap();
+        create_in_transaction(&conn, new_task(Some("task_1"), "a")).unwrap();
 
         let children = vec!["task_2".to_string(), "task_3".to_string()];
         let row = update_fields(
@@ -1070,23 +1141,25 @@ mod tests {
     #[tokio::test]
     async fn delete_removes_row_and_returns_true() {
         let (_dir, conn, db) = test_conn_with_sea_orm().await;
-        create(&conn, new_task(Some("task_1"), "a")).unwrap();
-        assert!(delete(&conn, "task_1").unwrap());
+        create_in_transaction(&conn, new_task(Some("task_1"), "a")).unwrap();
+        assert!(delete(&db, "task_1").await.unwrap());
         assert_eq!(get_by_id(&db, "task_1").await.unwrap(), None);
     }
 
-    #[test]
-    fn delete_missing_task_returns_false() {
-        let conn = test_conn();
-        assert!(!delete(&conn, "nope").unwrap());
+    #[tokio::test]
+    async fn delete_missing_task_returns_false() {
+        let (_dir, _conn, db) = test_conn_with_sea_orm().await;
+        assert!(!delete(&db, "nope").await.unwrap());
     }
 
-    #[test]
-    fn single_root_task_index_rejects_a_second_root() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn single_root_task_index_rejects_a_second_root() {
+        let (_dir, _conn, db) = test_conn_with_sea_orm().await;
         // Both tasks have parent_task = NULL -> both are "roots".
-        create(&conn, new_task(Some("task_1"), "first root")).unwrap();
-        let err = create(&conn, new_task(Some("task_2"), "second root"));
+        create(&db, new_task(Some("task_1"), "first root"))
+            .await
+            .unwrap();
+        let err = create(&db, new_task(Some("task_2"), "second root")).await;
         assert!(
             err.is_err(),
             "the schema-level expression index must reject a second root task"
@@ -1096,15 +1169,15 @@ mod tests {
     #[tokio::test]
     async fn non_root_tasks_are_unconstrained_by_the_single_root_index() {
         let (_dir, conn, db) = test_conn_with_sea_orm().await;
-        create(&conn, new_task(Some("task_root"), "root")).unwrap();
+        create_in_transaction(&conn, new_task(Some("task_root"), "root")).unwrap();
 
         let mut child1 = new_task(Some("task_child1"), "child 1");
         child1.parent_task = Some("task_root");
-        create(&conn, child1).unwrap();
+        create_in_transaction(&conn, child1).unwrap();
 
         let mut child2 = new_task(Some("task_child2"), "child 2");
         child2.parent_task = Some("task_root");
-        create(&conn, child2).unwrap();
+        create_in_transaction(&conn, child2).unwrap();
 
         // Two non-root tasks with parent_task set must NOT collide.
         assert!(get_by_id(&db, "task_child1").await.unwrap().is_some());
@@ -1122,7 +1195,7 @@ mod tests {
         let mut t = new_task(Some(task_id), "will complete");
         t.status = "in_progress";
         t.parent_task = parent;
-        create(conn, t).unwrap();
+        create_in_transaction(conn, t).unwrap();
         update_fields(
             db,
             task_id,
@@ -1170,7 +1243,7 @@ mod tests {
     #[tokio::test]
     async fn terminal_task_rejects_priority_title_description_notes_changes() {
         let (_dir, conn, db) = test_conn_with_sea_orm().await;
-        create(&conn, new_task(Some("task_shared_root"), "root")).unwrap();
+        create_in_transaction(&conn, new_task(Some("task_shared_root"), "root")).unwrap();
         for (label, fields) in [
             (
                 "priority",
@@ -1235,7 +1308,7 @@ mod tests {
         let mut t = new_task(Some("task_1"), "will complete");
         t.status = "in_progress";
         t.assigned_to = Some("alice");
-        create(&conn, t).unwrap();
+        create_in_transaction(&conn, t).unwrap();
         update_fields(
             &db,
             "task_1",
@@ -1272,7 +1345,7 @@ mod tests {
         terminal_task(&conn, &db, "task_1").await;
         let mut other = new_task(Some("task_other"), "sibling");
         other.parent_task = Some("task_1");
-        create(&conn, other).unwrap();
+        create_in_transaction(&conn, other).unwrap();
 
         let children = vec!["task_x".to_string()];
         let row = update_fields(
@@ -1297,7 +1370,7 @@ mod tests {
     #[tokio::test]
     async fn non_terminal_task_is_fully_mutable_as_before() {
         let (_dir, conn, db) = test_conn_with_sea_orm().await;
-        create(&conn, new_task(Some("task_1"), "still open")).unwrap();
+        create_in_transaction(&conn, new_task(Some("task_1"), "still open")).unwrap();
 
         let row = update_fields(
             &db,
@@ -1319,10 +1392,10 @@ mod tests {
     #[tokio::test]
     async fn bulk_update_fields_updates_every_existing_id_and_skips_unknown_ones() {
         let (_dir, conn, db) = test_conn_with_sea_orm().await;
-        create(&conn, new_task(Some("task_1"), "a")).unwrap();
+        create_in_transaction(&conn, new_task(Some("task_1"), "a")).unwrap();
         let mut t2 = new_task(Some("task_2"), "b");
         t2.parent_task = Some("task_1");
-        create(&conn, t2).unwrap();
+        create_in_transaction(&conn, t2).unwrap();
 
         let updated = bulk_update_fields(
             &db,
@@ -1350,7 +1423,7 @@ mod tests {
         terminal_task(&conn, &db, "task_1").await;
         let mut t2 = new_task(Some("task_2"), "b");
         t2.parent_task = Some("task_1");
-        create(&conn, t2).unwrap();
+        create_in_transaction(&conn, t2).unwrap();
 
         let result = bulk_update_fields(
             &db,
@@ -1383,7 +1456,7 @@ mod tests {
         let (_dir, conn, db) = test_conn_with_sea_orm().await;
         let mut t = new_task(Some("task_1"), "a");
         t.assigned_to = Some("alice");
-        create(&conn, t).unwrap();
+        create_in_transaction(&conn, t).unwrap();
         set_updated_at(&conn, "task_1", "2026-01-01T00:00:00Z");
 
         assert!(
@@ -1404,7 +1477,7 @@ mod tests {
         let (_dir, conn, db) = test_conn_with_sea_orm().await;
         let mut t = new_task(Some("task_1"), "a");
         t.assigned_to = Some("bob");
-        create(&conn, t).unwrap();
+        create_in_transaction(&conn, t).unwrap();
         set_updated_at(&conn, "task_1", "2026-01-01T00:00:01Z");
 
         assert!(
@@ -1420,11 +1493,11 @@ mod tests {
         let (_dir, conn, db) = test_conn_with_sea_orm().await;
         let mut t1 = new_task(Some("task_1"), "first");
         t1.assigned_to = Some("alice");
-        create(&conn, t1).unwrap();
+        create_in_transaction(&conn, t1).unwrap();
         let mut t2 = new_task(Some("task_2"), "second");
         t2.assigned_to = Some("alice");
         t2.parent_task = Some("task_1");
-        create(&conn, t2).unwrap();
+        create_in_transaction(&conn, t2).unwrap();
         set_updated_at(&conn, "task_1", "2026-01-01T00:00:02Z");
         set_updated_at(&conn, "task_2", "2026-01-01T00:00:01Z");
 
@@ -1442,7 +1515,7 @@ mod tests {
         let (_dir, conn, db) = test_conn_with_sea_orm().await;
         let mut t = new_task(Some("task_1"), "a");
         t.assigned_to = Some("alice");
-        create(&conn, t).unwrap();
+        create_in_transaction(&conn, t).unwrap();
         set_updated_at(&conn, "task_1", "2026-01-01T00:00:00Z");
 
         assert!(list_unassigned_active_updated_since(
@@ -1460,7 +1533,7 @@ mod tests {
         let (_dir, conn, db) = test_conn_with_sea_orm().await;
         let mut t = new_task(Some("task_1"), "done");
         t.status = "completed";
-        create(&conn, t).unwrap();
+        create_in_transaction(&conn, t).unwrap();
         set_updated_at(&conn, "task_1", "2026-01-01T00:00:00Z");
 
         assert!(list_unassigned_active_updated_since(
@@ -1477,7 +1550,7 @@ mod tests {
     async fn list_unassigned_active_updated_since_returns_claimable_tasks() {
         let (_dir, conn, db) = test_conn_with_sea_orm().await;
         let t = new_task(Some("task_1"), "up for grabs");
-        create(&conn, t).unwrap();
+        create_in_transaction(&conn, t).unwrap();
         set_updated_at(&conn, "task_1", "2026-01-01T00:00:00Z");
 
         let rows = list_unassigned_active_updated_since(
@@ -1498,11 +1571,11 @@ mod tests {
         let (_dir, conn, db) = test_conn_with_sea_orm().await;
         let mut t1 = new_task(Some("task_1"), "active for alice");
         t1.assigned_to = Some("alice");
-        create(&conn, t1).unwrap();
+        create_in_transaction(&conn, t1).unwrap();
         let mut t2 = new_task(Some("task_2"), "active for bob");
         t2.assigned_to = Some("bob");
         t2.parent_task = Some("task_1");
-        create(&conn, t2).unwrap();
+        create_in_transaction(&conn, t2).unwrap();
 
         assert_eq!(
             count_active_by_assignee(&db, "alice", &["completed", "cancelled", "failed"])
@@ -1518,7 +1591,7 @@ mod tests {
         let mut t = new_task(Some("task_1"), "done");
         t.assigned_to = Some("alice");
         t.status = "completed";
-        create(&conn, t).unwrap();
+        create_in_transaction(&conn, t).unwrap();
 
         assert_eq!(
             count_active_by_assignee(&db, "alice", &["completed", "cancelled", "failed"])
@@ -1546,7 +1619,7 @@ mod tests {
         // transition-to-unassigned time) crosses the cursor.
         let (_dir, conn, db) = test_conn_with_sea_orm().await;
         let t = new_task(Some("task_1"), "orphaned");
-        create(&conn, t).unwrap();
+        create_in_transaction(&conn, t).unwrap();
         // created_at is "2026-01-01T00:00:00Z" (from new_task's `now`);
         // simulate a later unassign event bumping only updated_at.
         set_updated_at(&conn, "task_1", "2026-06-01T00:00:00Z");
