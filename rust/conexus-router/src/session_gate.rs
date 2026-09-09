@@ -521,9 +521,10 @@ mod tests {
         .unwrap()
     }
 
-    fn cookie_for(c: &Connection, user_id: &str) -> String {
-        let sid =
-            identity::create_session(c, user_id, NOW, "2026-02-01T00:00:00.000+00:00").unwrap();
+    async fn cookie_for(db: &sea_orm::DatabaseConnection, user_id: &str) -> String {
+        let sid = identity::create_session(db, user_id, NOW, "2026-02-01T00:00:00.000+00:00")
+            .await
+            .unwrap();
         format!("{}={}", login::SESSION_COOKIE_NAME, sid)
     }
 
@@ -675,7 +676,7 @@ mod tests {
         let (_db_dir, mut c, db) = conn_with_sea_orm().await;
         let dir = tempfile::tempdir().unwrap();
         let uid = seed_operator(&db, "alice", true).await;
-        let cookie = cookie_for(&c, &uid);
+        let cookie = cookie_for(&db, &uid).await;
         let registry = registry_with(dir.path(), "proj-a", now_dt());
         let cfg = SessionGateConfig::default();
         let req = base_req("/agent-mcp/api/proj-a/tasks", Some(&cookie));
@@ -698,7 +699,7 @@ mod tests {
         let (_db_dir, mut c, db) = conn_with_sea_orm().await;
         let dir = tempfile::tempdir().unwrap();
         let uid = seed_operator(&db, "alice", true).await;
-        let cookie = cookie_for(&c, &uid);
+        let cookie = cookie_for(&db, &uid).await;
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
         let cfg = SessionGateConfig::default();
         let req = base_req("/agent-mcp/api/router/agents", Some(&cookie));
@@ -733,7 +734,7 @@ mod tests {
         .await
         .unwrap();
         let _ = uid;
-        let cookie = cookie_for(&c, &uid2);
+        let cookie = cookie_for(&db, &uid2).await;
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
         let cfg = SessionGateConfig::default();
         let req = base_req("/agent-mcp/api/does-not-exist/tasks", Some(&cookie));
@@ -762,7 +763,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let cookie = cookie_for(&c, &bob);
+        let cookie = cookie_for(&db, &bob).await;
         let registry = registry_with(dir.path(), "proj-a", now_dt());
         let cfg = SessionGateConfig::default();
         let req = base_req("/agent-mcp/app/proj-a/", Some(&cookie));
@@ -804,7 +805,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let cookie = cookie_for(&c, &bob);
+        let cookie = cookie_for(&db, &bob).await;
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
         let cfg = SessionGateConfig::default();
         let req = base_req("/agent-mcp/app/ghost-tenant-proj/", Some(&cookie));
@@ -870,7 +871,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let cookie = cookie_for(&c, &bob);
+        let cookie = cookie_for(&db, &bob).await;
         let registry = registry_with(dir.path(), "proj-a", now_dt());
         let cfg = SessionGateConfig::default();
         let mut req = base_req("/agent-mcp/api/proj-a/tasks", Some(&cookie));
@@ -900,7 +901,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let cookie = cookie_for(&c, &bob);
+        let cookie = cookie_for(&db, &bob).await;
         let registry = registry_with(dir.path(), "proj-a", now_dt());
         let cfg = SessionGateConfig::default();
         let req = base_req("/agent-mcp/api/proj-a/tasks", Some(&cookie));
@@ -934,7 +935,7 @@ mod tests {
             [&bob],
         )
         .unwrap();
-        let cookie = cookie_for(&c, &bob);
+        let cookie = cookie_for(&db, &bob).await;
         let registry = registry_with(dir.path(), "proj-a", now_dt());
         let cfg = SessionGateConfig::default();
 
@@ -980,7 +981,7 @@ mod tests {
             [&bob],
         )
         .unwrap();
-        let cookie = cookie_for(&c, &bob);
+        let cookie = cookie_for(&db, &bob).await;
         let registry = registry_with(dir.path(), "proj-a", now_dt());
         let cfg = SessionGateConfig::default();
 
@@ -1148,7 +1149,7 @@ mod tests {
     async fn cookie_identity_is_preferred_over_a_trusted_proxy_header_when_both_are_present() {
         let (_db_dir, mut c, db) = conn_with_sea_orm().await;
         let alice = seed_operator(&db, "alice", true).await;
-        let cookie = cookie_for(&c, &alice);
+        let cookie = cookie_for(&db, &alice).await;
         let dir = tempfile::tempdir().unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
         let cfg = SessionGateConfig::default();

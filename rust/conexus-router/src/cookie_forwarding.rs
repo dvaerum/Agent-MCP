@@ -155,9 +155,10 @@ mod tests {
         .unwrap()
     }
 
-    fn cookie_for(c: &Connection, user_id: &str) -> String {
-        let sid =
-            identity::create_session(c, user_id, NOW_STR, "2026-02-01T00:00:00.000+00:00").unwrap();
+    async fn cookie_for(db: &sea_orm::DatabaseConnection, user_id: &str) -> String {
+        let sid = identity::create_session(db, user_id, NOW_STR, "2026-02-01T00:00:00.000+00:00")
+            .await
+            .unwrap();
         format!("{}={}", login::SESSION_COOKIE_NAME, sid)
     }
 
@@ -193,7 +194,7 @@ mod tests {
         identity::add_project_membership(&db, &user_id, "proj-a")
             .await
             .unwrap();
-        let cookie = cookie_for(&c, &user_id);
+        let cookie = cookie_for(&db, &user_id).await;
 
         let (resolved_id, role) =
             resolve_cookie_project_role(&c, Some(&cookie), "proj-a", now_dt())
@@ -213,7 +214,7 @@ mod tests {
         identity::grant_project_membership(&db, "proj-a", Some(&user_id), None, "viewer")
             .await
             .unwrap();
-        let cookie = cookie_for(&c, &user_id);
+        let cookie = cookie_for(&db, &user_id).await;
 
         let (_id, role) = resolve_cookie_project_role(&c, Some(&cookie), "proj-a", now_dt())
             .unwrap()
@@ -226,7 +227,7 @@ mod tests {
         let (_dir, c, db) = conn_with_sea_orm().await;
         let user_id = seed_user(&db, "carol").await;
         // No project_membership row for "proj-a" at all.
-        let cookie = cookie_for(&c, &user_id);
+        let cookie = cookie_for(&db, &user_id).await;
 
         let result = resolve_cookie_project_role(&c, Some(&cookie), "proj-a", now_dt()).unwrap();
         assert!(
@@ -245,7 +246,7 @@ mod tests {
         identity::add_project_membership(&db, &user_id, "proj-a")
             .await
             .unwrap();
-        let cookie = cookie_for(&c, &user_id);
+        let cookie = cookie_for(&db, &user_id).await;
 
         assert!(
             resolve_cookie_project_role(&c, Some(&cookie), "proj-b", now_dt())
@@ -269,11 +270,12 @@ mod tests {
             .await
             .unwrap();
         let sid = identity::create_session(
-            &c,
+            &db,
             &user_id,
             NOW_STR,
             "2026-01-01T00:00:01.000+00:00", // expires 1s after NOW_STR
         )
+        .await
         .unwrap();
         let cookie = format!("{}={}", login::SESSION_COOKIE_NAME, sid);
 
@@ -306,7 +308,7 @@ mod tests {
         identity::grant_project_membership(&db, "proj-a", None, Some(&group.group_id), "operator")
             .await
             .unwrap();
-        let cookie = cookie_for(&c, &user_id);
+        let cookie = cookie_for(&db, &user_id).await;
 
         let (_id, role) = resolve_cookie_project_role(&c, Some(&cookie), "proj-a", now_dt())
             .unwrap()

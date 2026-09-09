@@ -469,14 +469,16 @@ pub async fn handle_oidc_callback(
         )
         .await;
     }
-    let session_id = {
-        let conn = state.conn.lock().await;
-        match identity::create_session(&conn, &user.user_id, &now_str, &expires) {
-            Ok(s) => s,
-            Err(_) => {
-                return plain_text_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
-            }
-        }
+    let session_id = match identity::create_session(
+        &state.sea_orm_db,
+        &user.user_id,
+        &now_str,
+        &expires,
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(_) => return plain_text_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error"),
     };
     if identity::touch_last_login(&state.sea_orm_db, &user.user_id, &now_str)
         .await

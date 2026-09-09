@@ -806,7 +806,8 @@ mod tests {
         let (_dir, c, db) = conn_with_sea_orm().await;
         let uid = seed_user(&db, "alice").await; // first user -> sysadmin
         let sid =
-            crate::identity::create_session(&c, &uid, NOW_STR, "2026-02-01T00:00:00.000+00:00")
+            crate::identity::create_session(&db, &uid, NOW_STR, "2026-02-01T00:00:00.000+00:00")
+                .await
                 .unwrap();
         let cookie = format!("{}={}", login::SESSION_COOKIE_NAME, sid);
         let outcome = revalidate_capability_and_membership(
@@ -884,7 +885,8 @@ mod tests {
         let (_dir, c, db) = conn_with_sea_orm().await;
         let uid = seed_user(&db, "alice").await; // first user -> sysadmin
         let sid =
-            crate::identity::create_session(&c, &uid, NOW_STR, "2026-02-01T00:00:00.000+00:00")
+            crate::identity::create_session(&db, &uid, NOW_STR, "2026-02-01T00:00:00.000+00:00")
+                .await
                 .unwrap();
         let cookie = format!("{}={}", login::SESSION_COOKIE_NAME, sid);
         let outcome = revalidate_capability(
