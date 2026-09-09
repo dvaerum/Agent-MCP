@@ -1365,7 +1365,7 @@ impl Tool for TerminateAgentTool {
             };
             for task_id in &reassigned {
                 let _ = conexus_db::task_repository::update_fields(
-                    &guard,
+                    ctx.sea_orm_db,
                     task_id,
                     &conexus_db::task_repository::TaskFields {
                         assigned_to:
@@ -1374,7 +1374,8 @@ impl Tool for TerminateAgentTool {
                         ..Default::default()
                     },
                     now,
-                );
+                )
+                .await;
             }
 
             // Found, documented (not silently reconciled): Python's DB
@@ -1710,17 +1711,18 @@ impl Tool for PurgeAgentTool {
             for task in &assigned_tasks {
                 if TERMINAL_TASK_STATUSES.contains(&task.status.as_str()) {
                     let _ = task_repository::update_fields(
-                        &guard,
+                        ctx.sea_orm_db,
                         &task.task_id,
                         &TaskFields {
                             assigned_to: NullableUpdate::Clear,
                             ..Default::default()
                         },
                         now,
-                    );
+                    )
+                    .await;
                 } else {
                     let _ = task_repository::update_fields(
-                        &guard,
+                        ctx.sea_orm_db,
                         &task.task_id,
                         &TaskFields {
                             assigned_to: NullableUpdate::Clear,
@@ -1728,7 +1730,8 @@ impl Tool for PurgeAgentTool {
                             ..Default::default()
                         },
                         now,
-                    );
+                    )
+                    .await;
                     reassigned_tasks.push(task.task_id.clone());
                 }
             }
@@ -3703,13 +3706,14 @@ mod tests {
         )
         .await;
         assert!(matches!(result, ToolResult::Ok { .. }));
-        let guard = conn.lock().await;
-        let active = conexus_db::task_repository::get_by_id(&guard, "task-active")
+        let active = conexus_db::task_repository::get_by_id(&sea_orm_db, "task-active")
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(active.status, "unassigned");
         assert_eq!(active.assigned_to, None);
-        let done = conexus_db::task_repository::get_by_id(&guard, "task-done")
+        let done = conexus_db::task_repository::get_by_id(&sea_orm_db, "task-done")
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(done.status, "completed");
@@ -3961,13 +3965,14 @@ mod tests {
         )
         .await;
         assert!(matches!(result, ToolResult::Ok { .. }));
-        let guard = conn.lock().await;
-        let active = conexus_db::task_repository::get_by_id(&guard, "task-active")
+        let active = conexus_db::task_repository::get_by_id(&sea_orm_db, "task-active")
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(active.status, "unassigned");
         assert_eq!(active.assigned_to, None);
-        let done = conexus_db::task_repository::get_by_id(&guard, "task-done")
+        let done = conexus_db::task_repository::get_by_id(&sea_orm_db, "task-done")
+            .await
             .unwrap()
             .unwrap();
         // Terminal: assigned_to cleared (FK-safe for the DELETE) but
@@ -4006,11 +4011,12 @@ mod tests {
         )
         .await;
         assert!(matches!(result, ToolResult::Ok { .. }));
-        let guard = conn.lock().await;
-        let task = conexus_db::task_repository::get_by_id(&guard, "task-1")
+        let task = conexus_db::task_repository::get_by_id(&sea_orm_db, "task-1")
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(task.created_by, "[deleted-alice]");
+        let guard = conn.lock().await;
         let old_action_agent: String = guard
             .query_row(
                 "SELECT agent_id FROM agent_actions WHERE action_type = 'did_something'",

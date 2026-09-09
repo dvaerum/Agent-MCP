@@ -575,7 +575,9 @@ mod tests {
             ),
         )
         .unwrap();
-        let row = task_repository::get_by_id(&conn, "t1").unwrap().unwrap();
+        let row = task_repository::get_by_id_in_transaction(&conn, "t1")
+            .unwrap()
+            .unwrap();
         assert!(is_claimable_task(&row));
     }
 
@@ -596,7 +598,9 @@ mod tests {
             ),
         )
         .unwrap();
-        let row = task_repository::get_by_id(&conn, "t1").unwrap().unwrap();
+        let row = task_repository::get_by_id_in_transaction(&conn, "t1")
+            .unwrap()
+            .unwrap();
         assert!(!is_claimable_task(&row));
     }
 
@@ -617,7 +621,9 @@ mod tests {
             ),
         )
         .unwrap();
-        let row = task_repository::get_by_id(&conn, "t1").unwrap().unwrap();
+        let row = task_repository::get_by_id_in_transaction(&conn, "t1")
+            .unwrap()
+            .unwrap();
         assert!(!is_claimable_task(&row));
     }
 

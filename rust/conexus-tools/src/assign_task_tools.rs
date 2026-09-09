@@ -309,17 +309,18 @@ fn create_unassigned_tasks(
             }
         };
         for parent_id in parent_ids.into_iter().flatten() {
-            let owns = task_repository::get_by_id(tx, &parent_id)?.is_some_and(|p| {
-                can_access_task(
-                    p.assigned_to.as_deref(),
-                    Some(p.created_by.as_str()),
-                    Some(worker_id),
-                    false,
-                    false,
-                    false,
-                    false,
-                )
-            });
+            let owns =
+                task_repository::get_by_id_in_transaction(tx, &parent_id)?.is_some_and(|p| {
+                    can_access_task(
+                        p.assigned_to.as_deref(),
+                        Some(p.created_by.as_str()),
+                        Some(worker_id),
+                        false,
+                        false,
+                        false,
+                        false,
+                    )
+                });
             if !owns {
                 return Ok(ToolResult::NotFound {
                     resource: "task".to_string(),
@@ -472,7 +473,7 @@ fn assign_to_existing_tasks(
 
     let mut found: Vec<TaskRow> = Vec::new();
     for tid in task_ids {
-        if let Some(row) = task_repository::get_by_id(tx, tid)? {
+        if let Some(row) = task_repository::get_by_id_in_transaction(tx, tid)? {
             found.push(row);
         }
     }
@@ -584,7 +585,7 @@ fn assign_to_existing_tasks(
     }
 
     for task_id in task_ids {
-        let _ = task_repository::update_fields(
+        let _ = task_repository::update_fields_in_transaction(
             tx,
             task_id,
             &task_repository::TaskFields {
@@ -1368,7 +1369,7 @@ impl Tool for CreateSelfTaskTool {
             let is_privileged = principal.has_capability(Capability::TasksAssign);
             if !is_privileged {
                 if let Some(parent_id) = &actual_parent_task_id {
-                    let owns = task_repository::get_by_id(&tx, parent_id)
+                    let owns = task_repository::get_by_id_in_transaction(&tx, parent_id)
                         .ok()
                         .flatten()
                         .is_some_and(|p| {
@@ -1391,7 +1392,7 @@ impl Tool for CreateSelfTaskTool {
                     }
                 }
                 for dep_id in &depends_on_tasks {
-                    let owns = task_repository::get_by_id(&tx, dep_id)
+                    let owns = task_repository::get_by_id_in_transaction(&tx, dep_id)
                         .ok()
                         .flatten()
                         .is_some_and(|d| {
@@ -1813,7 +1814,7 @@ mod tests {
         .await;
         assert!(matches!(result, ToolResult::Ok { .. }));
         let guard = conn.lock().await;
-        let parent = task_repository::get_by_id(&guard, "bob_parent")
+        let parent = task_repository::get_by_id_in_transaction(&guard, "bob_parent")
             .unwrap()
             .unwrap();
         assert_eq!(parent.child_tasks.unwrap_or_default().len(), 1);
@@ -1996,7 +1997,9 @@ mod tests {
         .await;
         assert!(matches!(result, ToolResult::Ok { .. }));
         let guard = conn.lock().await;
-        let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+        let row = task_repository::get_by_id_in_transaction(&guard, "t1")
+            .unwrap()
+            .unwrap();
         assert_eq!(row.assigned_to.as_deref(), Some("bob"));
         // OBS-R17-AZ (ported from `tests/test_sec_r17_request_assist_
         // oracle.py::test_mode3_self_claim_audit_actor_is_worker`): the
@@ -2122,7 +2125,9 @@ mod tests {
         .await;
         assert!(matches!(result, ToolResult::NotFound { .. }));
         let guard = conn.lock().await;
-        let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+        let row = task_repository::get_by_id_in_transaction(&guard, "t1")
+            .unwrap()
+            .unwrap();
         assert_eq!(row.assigned_to, None);
         assert_eq!(row.status, "completed");
     }
@@ -2194,7 +2199,9 @@ mod tests {
             other => panic!("expected an informative terminal Conflict, got {other:?}"),
         }
         let guard = conn.lock().await;
-        let row = task_repository::get_by_id(&guard, "t1").unwrap().unwrap();
+        let row = task_repository::get_by_id_in_transaction(&guard, "t1")
+            .unwrap()
+            .unwrap();
         assert_eq!(row.assigned_to, None);
         assert_eq!(row.status, "completed");
     }
@@ -2219,7 +2226,7 @@ mod tests {
         )
         .await;
         let guard = conn.lock().await;
-        let row = task_repository::get_by_id(&guard, "orphan")
+        let row = task_repository::get_by_id_in_transaction(&guard, "orphan")
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -2452,7 +2459,7 @@ mod tests {
             let guard = conn.lock().await;
             seed_task(&guard, "root", "pending", None, "alice", None);
             seed_task(&guard, "dep", "pending", None, "alice", Some("root"));
-            task_repository::update_fields(
+            task_repository::update_fields_in_transaction(
                 &guard,
                 "dep",
                 &task_repository::TaskFields {

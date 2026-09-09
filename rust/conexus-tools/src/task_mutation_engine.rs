@@ -185,7 +185,7 @@ pub fn update_single_task(
     edit: &TaskEdit,
     now: &str,
 ) -> rusqlite::Result<UpdateSingleTaskOutcome> {
-    let Some(row) = task_repository::get_by_id(conn, task_id)? else {
+    let Some(row) = task_repository::get_by_id_in_transaction(conn, task_id)? else {
         return Ok(UpdateSingleTaskOutcome::NotFound);
     };
 
@@ -260,7 +260,8 @@ pub fn update_single_task(
             row.depends_on_tasks.as_deref().unwrap_or(&[])
         };
         for dep_id in effective_deps {
-            let dep_status = task_repository::get_by_id(conn, dep_id)?.map(|d| d.status);
+            let dep_status =
+                task_repository::get_by_id_in_transaction(conn, dep_id)?.map(|d| d.status);
             if dep_status.as_deref() != Some("completed") {
                 return Ok(UpdateSingleTaskOutcome::DependencyIncomplete(format!(
                     "Cannot complete task '{task_id}': dependency '{dep_id}' is not yet \
@@ -306,7 +307,7 @@ pub fn update_single_task(
         }
     }
 
-    match task_repository::update_fields(conn, task_id, &fields, now) {
+    match task_repository::update_fields_in_transaction(conn, task_id, &fields, now) {
         Ok(_) => {}
         Err(task_repository::UpdateTaskError::TerminalTaskWriteBlocked(_)) => {
             // OBS-R12-2 defense-in-depth: the transition check above
@@ -346,7 +347,7 @@ pub fn update_single_task(
     // blocked on.
     if TERMINAL_TASK_STATUSES.contains(&new_status) {
         if let Some(parent_id) = &row.parent_task {
-            if let Some(parent) = task_repository::get_by_id(conn, parent_id)? {
+            if let Some(parent) = task_repository::get_by_id_in_transaction(conn, parent_id)? {
                 if !TERMINAL_TASK_STATUSES.contains(&parent.status.as_str()) {
                     let mut parent_notes = parent.notes.unwrap_or_default();
                     parent_notes.push(TaskNote {
@@ -361,7 +362,12 @@ pub fn update_single_task(
                         notes: NullableUpdate::Set(parent_notes),
                         ..Default::default()
                     };
-                    match task_repository::update_fields(conn, parent_id, &parent_fields, now) {
+                    match task_repository::update_fields_in_transaction(
+                        conn,
+                        parent_id,
+                        &parent_fields,
+                        now,
+                    ) {
                         Ok(_)
                         | Err(task_repository::UpdateTaskError::TerminalTaskWriteBlocked(_)) => {}
                         Err(task_repository::UpdateTaskError::Db(e)) => return Err(e),
@@ -562,7 +568,9 @@ mod tests {
             update_single_task(&conn, "t1", "in_progress", "bob", false, &plain_edit(), NOW)
                 .unwrap();
         assert!(matches!(outcome, UpdateSingleTaskOutcome::Applied(_)));
-        let row = task_repository::get_by_id(&conn, "t1").unwrap().unwrap();
+        let row = task_repository::get_by_id_in_transaction(&conn, "t1")
+            .unwrap()
+            .unwrap();
         assert_eq!(row.status, "in_progress");
     }
 
@@ -602,7 +610,7 @@ mod tests {
         seed_task(&conn, "t1", "pending", None, "alice", None, None);
         seed_task(&conn, "t2", "pending", None, "alice", Some("t1"), None);
         // t2 already depends on t1; wiring t1 -> t2 would cycle.
-        task_repository::update_fields(
+        task_repository::update_fields_in_transaction(
             &conn,
             "t2",
             &TaskFields {
@@ -677,7 +685,9 @@ mod tests {
             ..Default::default()
         };
         update_single_task(&conn, "t1", "in_progress", "bob", false, &edit, NOW).unwrap();
-        let row = task_repository::get_by_id(&conn, "t1").unwrap().unwrap();
+        let row = task_repository::get_by_id_in_transaction(&conn, "t1")
+            .unwrap()
+            .unwrap();
         let notes = row.notes.unwrap();
         assert_eq!(notes.len(), 1);
         assert_eq!(notes[0].content, "progress update");
@@ -694,7 +704,9 @@ mod tests {
             ..Default::default()
         };
         update_single_task(&conn, "t1", "in_progress", "bob", false, &edit, NOW).unwrap();
-        let row = task_repository::get_by_id(&conn, "t1").unwrap().unwrap();
+        let row = task_repository::get_by_id_in_transaction(&conn, "t1")
+            .unwrap()
+            .unwrap();
         assert_eq!(row.title, "Task t1");
     }
 
@@ -754,7 +766,9 @@ mod tests {
             NOW,
         )
         .unwrap();
-        let parent = task_repository::get_by_id(&conn, "root1").unwrap().unwrap();
+        let parent = task_repository::get_by_id_in_transaction(&conn, "root1")
+            .unwrap()
+            .unwrap();
         let notes = parent.notes.unwrap();
         assert_eq!(notes.len(), 1);
         assert!(notes[0].content.contains("child1"));
@@ -785,7 +799,9 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(outcome, UpdateSingleTaskOutcome::Applied(_)));
-        let parent = task_repository::get_by_id(&conn, "root1").unwrap().unwrap();
+        let parent = task_repository::get_by_id_in_transaction(&conn, "root1")
+            .unwrap()
+            .unwrap();
         assert_eq!(parent.notes, None);
     }
 
@@ -806,7 +822,7 @@ mod tests {
             advance_dependents_after_completion(&conn, "dep", "alice", true, NOW).unwrap();
         assert_eq!(advanced.len(), 1);
         assert_eq!(advanced[0].task_id, "dependent");
-        let row = task_repository::get_by_id(&conn, "dependent")
+        let row = task_repository::get_by_id_in_transaction(&conn, "dependent")
             .unwrap()
             .unwrap();
         assert_eq!(row.status, "in_progress");
@@ -837,7 +853,7 @@ mod tests {
         let advanced =
             advance_dependents_after_completion(&conn, "dep_a", "alice", true, NOW).unwrap();
         assert!(advanced.is_empty());
-        let row = task_repository::get_by_id(&conn, "dependent")
+        let row = task_repository::get_by_id_in_transaction(&conn, "dependent")
             .unwrap()
             .unwrap();
         assert_eq!(row.status, "pending");

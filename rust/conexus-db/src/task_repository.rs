@@ -46,8 +46,8 @@
 
 use rusqlite::{Connection, OptionalExtension, Result, Row, ToSql};
 use sea_orm::{
-    ColumnTrait, DatabaseConnection, DbErr, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
-    QuerySelect,
+    ActiveValue::Set, ColumnTrait, DatabaseConnection, DbErr, EntityTrait, PaginatorTrait,
+    QueryFilter, QueryOrder, QuerySelect,
 };
 use std::collections::HashMap;
 
@@ -144,7 +144,23 @@ pub fn generate_task_id() -> String {
     format!("task_{hex}")
 }
 
-pub fn get_by_id(conn: &Connection, task_id: &str) -> Result<Option<TaskRow>> {
+/// Single task by id, or `None`. Built via sea-orm's typed
+/// `find_by_id`, same idiom as this module's other single-row reads.
+pub async fn get_by_id(db: &DatabaseConnection, task_id: &str) -> Result<Option<TaskRow>, DbErr> {
+    let row = Entity::find_by_id(task_id).one(db).await?;
+    Ok(row.map(task_row_from_model))
+}
+
+/// Deliberately-still-sync twin of [`get_by_id`] for every caller that
+/// reads inside an in-flight, uncommitted `rusqlite::Transaction`
+/// shared with the caller's own writes -- same rationale as
+/// [`list_all_in_transaction`]'s own doc: `sea_orm_db` is a genuinely
+/// SEPARATE connection pool from the legacy rusqlite connection, so a
+/// read through it here would see pre-transaction (stale) data, not
+/// this transaction's own not-yet-committed rows. Not deleted when
+/// every remaining caller is itself eventually converted to a sea-orm
+/// transaction -- delete this helper THEN, once nothing calls it.
+pub fn get_by_id_in_transaction(conn: &Connection, task_id: &str) -> Result<Option<TaskRow>> {
     conn.query_row(
         &format!("SELECT {COLUMNS} FROM tasks WHERE task_id = ?1"),
         [task_id],
@@ -411,7 +427,8 @@ pub fn create(conn: &Connection, task: NewTask) -> Result<TaskRow> {
         ),
     )?;
 
-    Ok(get_by_id(conn, task_id)?.expect("row was just written under this same connection"))
+    Ok(get_by_id_in_transaction(conn, task_id)?
+        .expect("row was just written under this same connection"))
 }
 
 /// The allowlisted columns [`update_fields`] may touch — a closed
@@ -464,14 +481,21 @@ impl std::fmt::Display for TerminalTaskWriteBlocked {
 
 impl std::error::Error for TerminalTaskWriteBlocked {}
 
-/// Failure modes of [`update_fields`]/[`bulk_update_fields`].
+/// Failure modes of [`update_fields`]/[`bulk_update_fields`] and their
+/// `_in_transaction` twins. Generic over the underlying DB error type
+/// (`E`, defaulting to `rusqlite::Error` so every existing sync
+/// call/match site keeps compiling unchanged) rather than two
+/// separately-named enums, since [`update_fields_in_transaction`] and
+/// [`update_fields`] classify the identical
+/// `trg_tasks_terminal_state_guard` refusal, just against a different
+/// backend's error type (`rusqlite::Error` vs sea-orm's `DbErr`).
 #[derive(Debug)]
-pub enum UpdateTaskError {
+pub enum UpdateTaskError<E = rusqlite::Error> {
     TerminalTaskWriteBlocked(TerminalTaskWriteBlocked),
-    Db(rusqlite::Error),
+    Db(E),
 }
 
-impl std::fmt::Display for UpdateTaskError {
+impl<E: std::fmt::Display> std::fmt::Display for UpdateTaskError<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             UpdateTaskError::TerminalTaskWriteBlocked(e) => write!(f, "{e}"),
@@ -480,7 +504,7 @@ impl std::fmt::Display for UpdateTaskError {
     }
 }
 
-impl std::error::Error for UpdateTaskError {}
+impl<E: std::fmt::Debug + std::fmt::Display> std::error::Error for UpdateTaskError<E> {}
 
 /// Classifies a failed `UPDATE tasks` as either the guard trigger
 /// firing (checked via [`GUARD_MARKER`] substring-matching the
@@ -501,20 +525,130 @@ fn classify_update_error(task_id: &str, e: rusqlite::Error) -> UpdateTaskError {
     UpdateTaskError::Db(e)
 }
 
+/// Async/sea-orm counterpart of [`classify_update_error`] -- same
+/// GUARD_MARKER substring classification, matched against `DbErr`'s
+/// own `Display` text rather than a raw `rusqlite::Error`'s
+/// `SqliteFailure` message. The marker text is proven to survive
+/// sea-orm's `DbErr` wrapping intact (`task_comments_repository`'s own
+/// PR2 precedent, verified against the real trigger).
+fn classify_update_error_orm(task_id: &str, e: DbErr) -> UpdateTaskError<DbErr> {
+    let msg = e.to_string();
+    if msg.contains(GUARD_MARKER) {
+        return UpdateTaskError::TerminalTaskWriteBlocked(TerminalTaskWriteBlocked {
+            task_id: task_id.to_string(),
+            message: msg,
+        });
+    }
+    UpdateTaskError::Db(e)
+}
+
 /// Partial UPDATE of the allowed columns; always refreshes
 /// `updated_at` regardless of whether any other field changed
 /// (matching every other `update_fields` in this crate). `Ok(None)`
 /// if `task_id` doesn't exist; `Err(UpdateTaskError::
 /// TerminalTaskWriteBlocked)` if the write touches a column the
 /// `trg_tasks_terminal_state_guard` trigger protects on a terminal
-/// task (see that struct's doc for exactly which columns).
-pub fn update_fields(
+/// task (see that struct's doc for exactly which columns). Built as a
+/// partial `ActiveModel` (`Set` for a changed column, `NotSet` for an
+/// untouched one), same idiom as
+/// `scheduled_directive_repository::update_fields`.
+pub async fn update_fields(
+    db: &DatabaseConnection,
+    task_id: &str,
+    fields: &TaskFields<'_>,
+    now: &str,
+) -> std::result::Result<Option<TaskRow>, UpdateTaskError<DbErr>> {
+    if get_by_id(db, task_id)
+        .await
+        .map_err(UpdateTaskError::Db)?
+        .is_none()
+    {
+        return Ok(None);
+    }
+
+    let mut am = task::ActiveModel {
+        task_id: Set(task_id.to_string()),
+        ..Default::default()
+    };
+
+    if let Some(v) = fields.title {
+        am.title = Set(v.to_string());
+    }
+    match &fields.description {
+        NullableUpdate::Unchanged => {}
+        NullableUpdate::Clear => am.description = Set(None),
+        NullableUpdate::Set(v) => am.description = Set(Some(v.clone())),
+    }
+    match &fields.assigned_to {
+        NullableUpdate::Unchanged => {}
+        NullableUpdate::Clear => am.assigned_to = Set(None),
+        NullableUpdate::Set(v) => am.assigned_to = Set(Some(v.clone())),
+    }
+    if let Some(v) = fields.status {
+        am.status = Set(v.to_string());
+    }
+    if let Some(v) = fields.priority {
+        am.priority = Set(v.to_string());
+    }
+    match &fields.parent_task {
+        NullableUpdate::Unchanged => {}
+        NullableUpdate::Clear => am.parent_task = Set(None),
+        NullableUpdate::Set(v) => am.parent_task = Set(Some(v.clone())),
+    }
+    match &fields.child_tasks {
+        NullableUpdate::Unchanged => {}
+        NullableUpdate::Clear => am.child_tasks = Set(None),
+        NullableUpdate::Set(v) => {
+            am.child_tasks = Set(Some(
+                serde_json::to_string(v).expect("Vec<String> always serializes"),
+            ));
+        }
+    }
+    match &fields.depends_on_tasks {
+        NullableUpdate::Unchanged => {}
+        NullableUpdate::Clear => am.depends_on_tasks = Set(None),
+        NullableUpdate::Set(v) => {
+            am.depends_on_tasks = Set(Some(
+                serde_json::to_string(v).expect("Vec<String> always serializes"),
+            ));
+        }
+    }
+    match &fields.notes {
+        NullableUpdate::Unchanged => {}
+        NullableUpdate::Clear => am.notes = Set(None),
+        NullableUpdate::Set(v) => {
+            am.notes = Set(Some(
+                serde_json::to_string(v).expect("Vec<TaskNote> always serializes"),
+            ));
+        }
+    }
+
+    am.updated_at = Set(now.to_string());
+
+    let model = task::Entity::update(am)
+        .exec(db)
+        .await
+        .map_err(|e| classify_update_error_orm(task_id, e))?;
+
+    Ok(Some(task_row_from_model(model)))
+}
+
+/// Deliberately-still-sync twin of [`update_fields`] for every caller
+/// that writes inside an in-flight, uncommitted `rusqlite::Transaction`
+/// shared with the caller's own other writes -- same rationale as
+/// [`get_by_id_in_transaction`]'s own doc: a write through
+/// `sea_orm_db`'s separate connection pool here would land OUTSIDE the
+/// caller's atomic transaction boundary entirely, not inside it. Not
+/// deleted when every remaining caller is itself eventually converted
+/// to a sea-orm transaction -- delete this helper THEN, once nothing
+/// calls it.
+pub fn update_fields_in_transaction(
     conn: &Connection,
     task_id: &str,
     fields: &TaskFields,
     now: &str,
 ) -> std::result::Result<Option<TaskRow>, UpdateTaskError> {
-    if get_by_id(conn, task_id)
+    if get_by_id_in_transaction(conn, task_id)
         .map_err(UpdateTaskError::Db)?
         .is_none()
     {
@@ -603,7 +737,7 @@ pub fn update_fields(
     conn.execute(&sql, param_refs.as_slice())
         .map_err(|e| classify_update_error(task_id, e))?;
 
-    get_by_id(conn, task_id).map_err(UpdateTaskError::Db)
+    get_by_id_in_transaction(conn, task_id).map_err(UpdateTaskError::Db)
 }
 
 /// Applies the SAME field-set update across N task ids in a loop —
@@ -615,15 +749,15 @@ pub fn update_fields(
 /// terminal-task-guard refusal) rather than silently skipping it —
 /// the safest interpretation absent an explicit "continue past
 /// per-row failures" contract from Python for this specific case.
-pub fn bulk_update_fields(
-    conn: &Connection,
+pub async fn bulk_update_fields(
+    db: &DatabaseConnection,
     task_ids: &[&str],
-    fields: &TaskFields,
+    fields: &TaskFields<'_>,
     now: &str,
-) -> std::result::Result<Vec<TaskRow>, UpdateTaskError> {
+) -> std::result::Result<Vec<TaskRow>, UpdateTaskError<DbErr>> {
     let mut updated = Vec::new();
     for task_id in task_ids {
-        if let Some(row) = update_fields(conn, task_id, fields, now)? {
+        if let Some(row) = update_fields(db, task_id, fields, now).await? {
             updated.push(row);
         }
     }
@@ -745,10 +879,10 @@ mod tests {
         assert_eq!(row.notes, Some(notes));
     }
 
-    #[test]
-    fn get_by_id_returns_none_for_unknown_task() {
-        let conn = test_conn();
-        assert_eq!(get_by_id(&conn, "nope").unwrap(), None);
+    #[tokio::test]
+    async fn get_by_id_returns_none_for_unknown_task() {
+        let (_dir, _conn, db) = test_conn_with_sea_orm().await;
+        assert_eq!(get_by_id(&db, "nope").await.unwrap(), None);
     }
 
     #[tokio::test]
@@ -827,41 +961,38 @@ mod tests {
         assert_eq!(alice_pending[0].task_id, "task_1");
     }
 
-    #[test]
-    fn update_fields_unknown_task_returns_none() {
-        let conn = test_conn();
-        let result = update_fields(
-            &conn,
-            "nope",
-            &TaskFields::default(),
-            "2026-01-01T00:00:00Z",
-        );
+    #[tokio::test]
+    async fn update_fields_unknown_task_returns_none() {
+        let (_dir, _conn, db) = test_conn_with_sea_orm().await;
+        let result =
+            update_fields(&db, "nope", &TaskFields::default(), "2026-01-01T00:00:00Z").await;
         assert_eq!(result.unwrap(), None);
     }
 
-    #[test]
-    fn update_fields_always_bumps_updated_at() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn update_fields_always_bumps_updated_at() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         create(&conn, new_task(Some("task_1"), "a")).unwrap();
 
         let row = update_fields(
-            &conn,
+            &db,
             "task_1",
             &TaskFields::default(),
             "2026-01-02T00:00:00Z",
         )
+        .await
         .unwrap()
         .unwrap();
         assert_eq!(row.updated_at, "2026-01-02T00:00:00Z");
     }
 
-    #[test]
-    fn update_fields_can_change_title_status_priority() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn update_fields_can_change_title_status_priority() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         create(&conn, new_task(Some("task_1"), "old title")).unwrap();
 
         let row = update_fields(
-            &conn,
+            &db,
             "task_1",
             &TaskFields {
                 title: Some("new title"),
@@ -871,6 +1002,7 @@ mod tests {
             },
             "2026-01-02T00:00:00Z",
         )
+        .await
         .unwrap()
         .unwrap();
         assert_eq!(row.title, "new title");
@@ -878,15 +1010,15 @@ mod tests {
         assert_eq!(row.priority, "high");
     }
 
-    #[test]
-    fn update_fields_nullable_update_can_clear_and_set_assigned_to() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn update_fields_nullable_update_can_clear_and_set_assigned_to() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         let mut task = new_task(Some("task_1"), "a");
         task.assigned_to = Some("alice");
         create(&conn, task).unwrap();
 
         let cleared = update_fields(
-            &conn,
+            &db,
             "task_1",
             &TaskFields {
                 assigned_to: NullableUpdate::Clear,
@@ -894,12 +1026,13 @@ mod tests {
             },
             "2026-01-02T00:00:00Z",
         )
+        .await
         .unwrap()
         .unwrap();
         assert_eq!(cleared.assigned_to, None);
 
         let reassigned = update_fields(
-            &conn,
+            &db,
             "task_1",
             &TaskFields {
                 assigned_to: NullableUpdate::Set("bob".to_string()),
@@ -907,19 +1040,20 @@ mod tests {
             },
             "2026-01-03T00:00:00Z",
         )
+        .await
         .unwrap()
         .unwrap();
         assert_eq!(reassigned.assigned_to.as_deref(), Some("bob"));
     }
 
-    #[test]
-    fn update_fields_child_tasks_json_round_trips() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn update_fields_child_tasks_json_round_trips() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         create(&conn, new_task(Some("task_1"), "a")).unwrap();
 
         let children = vec!["task_2".to_string(), "task_3".to_string()];
         let row = update_fields(
-            &conn,
+            &db,
             "task_1",
             &TaskFields {
                 child_tasks: NullableUpdate::Set(children.clone()),
@@ -927,17 +1061,18 @@ mod tests {
             },
             "2026-01-02T00:00:00Z",
         )
+        .await
         .unwrap()
         .unwrap();
         assert_eq!(row.child_tasks, Some(children));
     }
 
-    #[test]
-    fn delete_removes_row_and_returns_true() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn delete_removes_row_and_returns_true() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         create(&conn, new_task(Some("task_1"), "a")).unwrap();
         assert!(delete(&conn, "task_1").unwrap());
-        assert_eq!(get_by_id(&conn, "task_1").unwrap(), None);
+        assert_eq!(get_by_id(&db, "task_1").await.unwrap(), None);
     }
 
     #[test]
@@ -958,9 +1093,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn non_root_tasks_are_unconstrained_by_the_single_root_index() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn non_root_tasks_are_unconstrained_by_the_single_root_index() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         create(&conn, new_task(Some("task_root"), "root")).unwrap();
 
         let mut child1 = new_task(Some("task_child1"), "child 1");
@@ -972,19 +1107,24 @@ mod tests {
         create(&conn, child2).unwrap();
 
         // Two non-root tasks with parent_task set must NOT collide.
-        assert!(get_by_id(&conn, "task_child1").unwrap().is_some());
-        assert!(get_by_id(&conn, "task_child2").unwrap().is_some());
+        assert!(get_by_id(&db, "task_child1").await.unwrap().is_some());
+        assert!(get_by_id(&db, "task_child2").await.unwrap().is_some());
     }
 
     /// `parent` avoids tripping `idx_tasks_single_root` when a test
     /// needs more than one task and only the FIRST should be a root.
-    fn terminal_task_with_parent(conn: &Connection, task_id: &str, parent: Option<&str>) {
+    async fn terminal_task_with_parent(
+        conn: &Connection,
+        db: &DatabaseConnection,
+        task_id: &str,
+        parent: Option<&str>,
+    ) {
         let mut t = new_task(Some(task_id), "will complete");
         t.status = "in_progress";
         t.parent_task = parent;
         create(conn, t).unwrap();
         update_fields(
-            conn,
+            db,
             task_id,
             &TaskFields {
                 status: Some("completed"),
@@ -992,15 +1132,16 @@ mod tests {
             },
             "2026-01-02T00:00:00Z",
         )
+        .await
         .unwrap();
     }
 
-    fn terminal_task(conn: &Connection, task_id: &str) {
-        terminal_task_with_parent(conn, task_id, None);
+    async fn terminal_task(conn: &Connection, db: &DatabaseConnection, task_id: &str) {
+        terminal_task_with_parent(conn, db, task_id, None).await;
     }
 
-    fn assert_blocked(
-        result: std::result::Result<Option<TaskRow>, UpdateTaskError>,
+    fn assert_blocked<E: std::fmt::Debug>(
+        result: std::result::Result<Option<TaskRow>, UpdateTaskError<E>>,
         task_id: &str,
     ) {
         match result {
@@ -1009,25 +1150,26 @@ mod tests {
         }
     }
 
-    #[test]
-    fn terminal_task_rejects_status_change() {
-        let conn = test_conn();
-        terminal_task(&conn, "task_1");
+    #[tokio::test]
+    async fn terminal_task_rejects_status_change() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
+        terminal_task(&conn, &db, "task_1").await;
         let result = update_fields(
-            &conn,
+            &db,
             "task_1",
             &TaskFields {
                 status: Some("in_progress"),
                 ..Default::default()
             },
             "2026-01-03T00:00:00Z",
-        );
+        )
+        .await;
         assert_blocked(result, "task_1");
     }
 
-    #[test]
-    fn terminal_task_rejects_priority_title_description_notes_changes() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn terminal_task_rejects_priority_title_description_notes_changes() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         create(&conn, new_task(Some("task_shared_root"), "root")).unwrap();
         for (label, fields) in [
             (
@@ -1063,39 +1205,39 @@ mod tests {
                 },
             ),
         ] {
-            let conn2 = &conn;
             let task_id = format!("task_{label}");
-            terminal_task_with_parent(conn2, &task_id, Some("task_shared_root"));
-            let result = update_fields(conn2, &task_id, &fields, "2026-01-03T00:00:00Z");
+            terminal_task_with_parent(&conn, &db, &task_id, Some("task_shared_root")).await;
+            let result = update_fields(&db, &task_id, &fields, "2026-01-03T00:00:00Z").await;
             assert_blocked(result, &task_id);
         }
     }
 
-    #[test]
-    fn terminal_task_rejects_reassigning_to_a_new_agent() {
-        let conn = test_conn();
-        terminal_task(&conn, "task_1");
+    #[tokio::test]
+    async fn terminal_task_rejects_reassigning_to_a_new_agent() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
+        terminal_task(&conn, &db, "task_1").await;
         let result = update_fields(
-            &conn,
+            &db,
             "task_1",
             &TaskFields {
                 assigned_to: NullableUpdate::Set("bob".to_string()),
                 ..Default::default()
             },
             "2026-01-03T00:00:00Z",
-        );
+        )
+        .await;
         assert_blocked(result, "task_1");
     }
 
-    #[test]
-    fn terminal_task_allows_clearing_assigned_to() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn terminal_task_allows_clearing_assigned_to() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         let mut t = new_task(Some("task_1"), "will complete");
         t.status = "in_progress";
         t.assigned_to = Some("alice");
         create(&conn, t).unwrap();
         update_fields(
-            &conn,
+            &db,
             "task_1",
             &TaskFields {
                 status: Some("completed"),
@@ -1103,10 +1245,11 @@ mod tests {
             },
             "2026-01-02T00:00:00Z",
         )
+        .await
         .unwrap();
 
         let row = update_fields(
-            &conn,
+            &db,
             "task_1",
             &TaskFields {
                 assigned_to: NullableUpdate::Clear,
@@ -1114,6 +1257,7 @@ mod tests {
             },
             "2026-01-03T00:00:00Z",
         )
+        .await
         .unwrap()
         .unwrap();
         assert_eq!(
@@ -1122,17 +1266,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn terminal_task_allows_child_tasks_depends_on_and_parent_task_changes() {
-        let conn = test_conn();
-        terminal_task(&conn, "task_1");
+    #[tokio::test]
+    async fn terminal_task_allows_child_tasks_depends_on_and_parent_task_changes() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
+        terminal_task(&conn, &db, "task_1").await;
         let mut other = new_task(Some("task_other"), "sibling");
         other.parent_task = Some("task_1");
         create(&conn, other).unwrap();
 
         let children = vec!["task_x".to_string()];
         let row = update_fields(
-            &conn,
+            &db,
             "task_1",
             &TaskFields {
                 child_tasks: NullableUpdate::Set(children.clone()),
@@ -1140,6 +1284,7 @@ mod tests {
             },
             "2026-01-03T00:00:00Z",
         )
+        .await
         .unwrap()
         .unwrap();
         assert_eq!(
@@ -1149,13 +1294,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn non_terminal_task_is_fully_mutable_as_before() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn non_terminal_task_is_fully_mutable_as_before() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         create(&conn, new_task(Some("task_1"), "still open")).unwrap();
 
         let row = update_fields(
-            &conn,
+            &db,
             "task_1",
             &TaskFields {
                 status: Some("in_progress"),
@@ -1164,22 +1309,23 @@ mod tests {
             },
             "2026-01-02T00:00:00Z",
         )
+        .await
         .unwrap()
         .unwrap();
         assert_eq!(row.status, "in_progress");
         assert_eq!(row.title, "renamed");
     }
 
-    #[test]
-    fn bulk_update_fields_updates_every_existing_id_and_skips_unknown_ones() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn bulk_update_fields_updates_every_existing_id_and_skips_unknown_ones() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         create(&conn, new_task(Some("task_1"), "a")).unwrap();
         let mut t2 = new_task(Some("task_2"), "b");
         t2.parent_task = Some("task_1");
         create(&conn, t2).unwrap();
 
         let updated = bulk_update_fields(
-            &conn,
+            &db,
             &["task_1", "task_2", "task_missing"],
             &TaskFields {
                 status: Some("in_progress"),
@@ -1187,6 +1333,7 @@ mod tests {
             },
             "2026-01-02T00:00:00Z",
         )
+        .await
         .unwrap();
 
         assert_eq!(
@@ -1197,23 +1344,24 @@ mod tests {
         assert!(updated.iter().all(|t| t.status == "in_progress"));
     }
 
-    #[test]
-    fn bulk_update_fields_stops_on_the_first_terminal_task_guard_refusal() {
-        let conn = test_conn();
-        terminal_task(&conn, "task_1");
+    #[tokio::test]
+    async fn bulk_update_fields_stops_on_the_first_terminal_task_guard_refusal() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
+        terminal_task(&conn, &db, "task_1").await;
         let mut t2 = new_task(Some("task_2"), "b");
         t2.parent_task = Some("task_1");
         create(&conn, t2).unwrap();
 
         let result = bulk_update_fields(
-            &conn,
+            &db,
             &["task_1", "task_2"],
             &TaskFields {
                 status: Some("cancelled"),
                 ..Default::default()
             },
             "2026-01-03T00:00:00Z",
-        );
+        )
+        .await;
         assert!(matches!(
             result,
             Err(UpdateTaskError::TerminalTaskWriteBlocked(_))
