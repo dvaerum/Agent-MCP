@@ -324,9 +324,16 @@ fn drop_unowned_task_chunks(
 /// captured across those awaits would make this async fn's own
 /// generated future `!Send` (same root cause as `conexus_auth::tool`'s
 /// `BoxFuture` doc). The `MutexGuard` obtained here is `Send` (only
-/// needs `Connection: Send`), so holding IT across the awaits is fine.
+/// needs `Connection: Send`), so holding IT across the awaits is fine
+/// -- including across the NEW sea-orm awaits below (Phase G):
+/// `fetch_live_tasks`/`config_allow_worker_view_foreign_tasks`/
+/// `drop_unowned_task_chunks` stay on the legacy guard (task-table
+/// reads, not yet converted), while `get_last_indexed`/
+/// `fetch_recent_context`/`embeddings_table_exists`/`search_similar`
+/// now read through `sea_orm_db` instead.
 async fn query_rag_system(
     conn: &AsyncMutex<Connection>,
+    sea_orm_db: &sea_orm::DatabaseConnection,
     query_text: &str,
     requesting_agent_id: Option<&str>,
     can_view_all_tasks: bool,
@@ -335,12 +342,14 @@ async fn query_rag_system(
     let include_foreign = config_allow_worker_view_foreign_tasks(&conn);
 
     // --- 1. Live context ---
-    let last_indexed = rag_repository::get_last_indexed(&conn, "context")
+    let last_indexed = rag_repository::get_last_indexed(sea_orm_db, "context")
+        .await
         .ok()
         .flatten()
         .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
-    let live_context =
-        rag_repository::fetch_recent_context(&conn, &last_indexed, Some(5)).unwrap_or_default();
+    let live_context = rag_repository::fetch_recent_context(sea_orm_db, &last_indexed, Some(5))
+        .await
+        .unwrap_or_default();
 
     // --- 2. Live tasks (keyword search) ---
     let live_tasks = fetch_live_tasks(
@@ -356,12 +365,15 @@ async fn query_rag_system(
     // entirely when RAG isn't set up, mirroring Python's
     // `is_vss_loadable()` pre-check).
     let mut vector_results: Vec<RagSearchResult> = Vec::new();
-    if rag_repository::embeddings_table_exists(&conn).unwrap_or(false) {
+    if rag_repository::embeddings_table_exists(sea_orm_db)
+        .await
+        .unwrap_or(false)
+    {
         let client = embedding_client::resolve_from_process_env();
         if let Ok(mut vectors) = client.embed(&[query_text.to_string()]).await {
             if let Some(query_embedding) = vectors.pop() {
                 if let Ok(results) =
-                    rag_repository::search_similar(&conn, &query_embedding, 13, None)
+                    rag_repository::search_similar(sea_orm_db, &query_embedding, 13, None).await
                 {
                     vector_results = drop_unowned_task_chunks(
                         &conn,
@@ -516,7 +528,7 @@ impl Tool for AskProjectRagTool {
         arguments: &'a Value,
         conn: &'a AsyncMutex<Connection>,
         _now: &'a str,
-        _ctx: &'a conexus_auth::ToolCallContext<'a>,
+        ctx: &'a conexus_auth::ToolCallContext<'a>,
     ) -> BoxFuture<'a, ToolResult> {
         Box::pin(async move {
             let query_text = match arguments.get("query").and_then(Value::as_str) {
@@ -536,7 +548,14 @@ impl Tool for AskProjectRagTool {
             let can_view_all_tasks =
                 principal.is_some_and(|p| p.has_capability(Capability::TasksAssign));
 
-            match query_rag_system(conn, query_text, requesting_agent_id, can_view_all_tasks).await
+            match query_rag_system(
+                conn,
+                ctx.sea_orm_db,
+                query_text,
+                requesting_agent_id,
+                can_view_all_tasks,
+            )
+            .await
             {
                 Ok(answer_text) => ToolResult::Ok {
                     data: Some(serde_json::json!({"answer": answer_text})),
@@ -743,7 +762,8 @@ mod tests {
     #[tokio::test]
     async fn empty_project_returns_the_no_relevant_information_answer_without_calling_completion() {
         let conn = test_conn();
-        let result = query_rag_system(&conn, "anything", Some("a1"), false).await;
+        let sea_orm_db = test_sea_orm_db().await;
+        let result = query_rag_system(&conn, &sea_orm_db, "anything", Some("a1"), false).await;
         assert_eq!(
             result.unwrap(),
             "No relevant information found in the project knowledge base or live data for your \
