@@ -178,15 +178,73 @@ pub async fn render_inbox(
     Ok(json!({"events": assembled.events, "next_cursor": assembled.next_cursor}).to_string())
 }
 
+/// Either half of [`render_status`]/[`read`]'s DB work failing --
+/// `count_unread` is still legacy `rusqlite` (`message_repository` not
+/// yet converted), `count_active_by_assignee` is now sea-orm (Phase G,
+/// `task_repository` PR 1/5) -- same two-source-error-enum shape
+/// `scheduled_directive_repository::CollectDueError` already
+/// established for merging a `DbErr` with a second failure mode.
+#[derive(Debug)]
+pub enum ReadError {
+    Sqlite(rusqlite::Error),
+    SeaOrm(sea_orm::DbErr),
+}
+
+impl From<rusqlite::Error> for ReadError {
+    fn from(e: rusqlite::Error) -> Self {
+        ReadError::Sqlite(e)
+    }
+}
+
+impl From<sea_orm::DbErr> for ReadError {
+    fn from(e: sea_orm::DbErr) -> Self {
+        ReadError::SeaOrm(e)
+    }
+}
+
+impl std::fmt::Display for ReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReadError::Sqlite(e) => write!(f, "sqlite error: {e}"),
+            ReadError::SeaOrm(e) => write!(f, "database error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for ReadError {}
+
 /// Render `agent_id`'s ambient status counters. Port of
-/// `resources/status.py::render_status`.
-pub fn render_status(conn: &Connection, agent_id: &str) -> rusqlite::Result<String> {
-    let unread_messages = message_repository::count_unread(conn, agent_id)?;
+/// `resources/status.py::render_status`. `async` (Phase G,
+/// `task_repository` PR 1/5) for `count_active_by_assignee`'s sea-orm
+/// call -- `count_unread` stays the legacy call it always was
+/// (`agent_action_repository`/`message_repository` not yet converted),
+/// matching this migration's established "keep legacy alive for a
+/// not-yet-converted call in the same function body" pattern.
+///
+/// `conn` is `&AsyncMutex<Connection>`, not a bare `&Connection`, for
+/// the same reason [`render_inbox`] takes one: a bare `&Connection`
+/// parameter on an `async fn` poisons the returned future's `Send`ness
+/// regardless of whether it's held across the internal `.await`
+/// (`Connection: Send` but NOT `Sync`, so `&Connection: !Send`) -- see
+/// `conexus_wakeloop::event_feed::collect_scheduled_directive_events_for`'s
+/// own doc for the identical rule. The lock is scoped to the sync
+/// `count_unread` call and dropped before the `count_active_by_assignee`
+/// await, not held live across it.
+pub async fn render_status(
+    conn: &AsyncMutex<Connection>,
+    agent_id: &str,
+    sea_orm_db: &sea_orm::DatabaseConnection,
+) -> Result<String, ReadError> {
+    let unread_messages = {
+        let guard = conn.lock().await;
+        message_repository::count_unread(&guard, agent_id)?
+    };
     let unfinished_tasks = task_repository::count_active_by_assignee(
-        conn,
+        sea_orm_db,
         agent_id,
         &UNASSIGNED_TASK_TERMINAL_STATUSES,
-    )?;
+    )
+    .await?;
     Ok(json!({
         "agent_id": agent_id,
         "unread_messages": unread_messages,
@@ -207,7 +265,7 @@ pub async fn read(
     principal: Option<&Principal>,
     now_iso: &str,
     sea_orm_db: &sea_orm::DatabaseConnection,
-) -> Result<ReadOutcome, rusqlite::Error> {
+) -> Result<ReadOutcome, ReadError> {
     let Some((kind, uri_agent_id)) = match_uri(uri) else {
         return Ok(ReadOutcome::UnknownUri);
     };
@@ -219,10 +277,10 @@ pub async fn read(
             render_inbox(conn, uri_agent_id, None, now_iso, sea_orm_db).await?,
             "application/json",
         ),
-        "status" => {
-            let guard = conn.lock().await;
-            (render_status(&guard, uri_agent_id)?, "application/json")
-        }
+        "status" => (
+            render_status(conn, uri_agent_id, sea_orm_db).await?,
+            "application/json",
+        ),
         _ => unreachable!("match_uri only ever returns a kind this match covers"),
     };
     Ok(ReadOutcome::Ok { body, mime_type })
@@ -242,11 +300,45 @@ mod tests {
         conn
     }
 
-    /// A throwaway sea-orm connection -- `read`/`render_inbox` don't
-    /// read from or write to it in this PR (see `event_feed::
-    /// assemble_event_feed`'s own doc), so `sqlite::memory:` is fine.
-    async fn test_sea_orm_db() -> sea_orm::DatabaseConnection {
-        sea_orm::Database::connect("sqlite::memory:").await.unwrap()
+    /// A schema-initialized, throwaway sea-orm connection for tests
+    /// that never seed task rows -- `render_status`'s
+    /// `count_active_by_assignee` still issues a real `SELECT` against
+    /// the `tasks` table even with none seeded, so the schema must
+    /// exist (a bare `sqlite::memory:` DB has no tables at all and
+    /// would fail that query with "no such table"). File-backed, not
+    /// `:memory:`, for the same reason [`test_conn_with_sea_orm`]
+    /// is -- the `TempDir` must be kept alive for as long as the
+    /// connection.
+    async fn test_sea_orm_db() -> (tempfile::TempDir, sea_orm::DatabaseConnection) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        {
+            let c = Connection::open(&path).unwrap();
+            init_schema(&c).unwrap();
+        }
+        let db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        (dir, db)
+    }
+
+    /// A file-backed DB opened as BOTH a `rusqlite::Connection` (to
+    /// seed task rows through the still-sync `task_repository::create`)
+    /// and a sea-orm `DatabaseConnection` (for `render_status`'s
+    /// `count_active_by_assignee` to see them) -- the dual-connection
+    /// recipe every Phase G test needing both needs, since an
+    /// in-memory `:memory:` DB can't be shared across two separate
+    /// connection handles the way a real file can.
+    async fn test_conn_with_sea_orm() -> (tempfile::TempDir, Connection, sea_orm::DatabaseConnection)
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn).unwrap();
+        let db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        (dir, conn, db)
     }
 
     fn worker(agent_id: &str) -> Principal {
@@ -297,7 +389,7 @@ mod tests {
     #[tokio::test]
     async fn an_unrecognized_uri_is_unknown() {
         let conn = AsyncMutex::new(test_conn());
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_dir, sea_orm_db) = test_sea_orm_db().await;
         let outcome = read(
             &conn,
             "agent-mcp://bogus/x",
@@ -370,9 +462,9 @@ mod tests {
 
     // -- render_status --------------------------------------------------
 
-    #[test]
-    fn render_status_counts_unread_messages_and_unfinished_tasks() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn render_status_counts_unread_messages_and_unfinished_tasks() {
+        let (_dir, conn, sea_orm_db) = test_conn_with_sea_orm().await;
         conn.execute(
             "INSERT INTO agents (token, agent_id, created_at, status, working_directory, agent_role) \
              VALUES ('t1', 'worker-1', '2026-01-01T00:00:00Z', 'active', '/tmp', 'worker')",
@@ -422,17 +514,19 @@ mod tests {
         )
         .unwrap();
 
-        let body = render_status(&conn, "worker-1").unwrap();
+        let conn = AsyncMutex::new(conn);
+        let body = render_status(&conn, "worker-1", &sea_orm_db).await.unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["agent_id"], "worker-1");
         assert_eq!(parsed["unread_messages"], 1);
         assert_eq!(parsed["unfinished_tasks"], 1);
     }
 
-    #[test]
-    fn render_status_is_zero_for_an_agent_with_no_activity() {
-        let conn = test_conn();
-        let body = render_status(&conn, "nobody").unwrap();
+    #[tokio::test]
+    async fn render_status_is_zero_for_an_agent_with_no_activity() {
+        let conn = AsyncMutex::new(test_conn());
+        let (_dir, sea_orm_db) = test_sea_orm_db().await;
+        let body = render_status(&conn, "nobody", &sea_orm_db).await.unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["unread_messages"], 0);
         assert_eq!(parsed["unfinished_tasks"], 0);
@@ -443,7 +537,7 @@ mod tests {
     #[tokio::test]
     async fn render_inbox_returns_a_well_formed_empty_envelope_with_no_activity() {
         let conn = AsyncMutex::new(test_conn());
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_dir, sea_orm_db) = test_sea_orm_db().await;
         let body = render_inbox(&conn, "worker-1", None, "2026-01-01T00:00:00Z", &sea_orm_db)
             .await
             .unwrap();
@@ -457,7 +551,7 @@ mod tests {
     #[tokio::test]
     async fn read_denies_a_foreign_workers_status_resource() {
         let conn = AsyncMutex::new(test_conn());
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_dir, sea_orm_db) = test_sea_orm_db().await;
         let p = worker("worker-2");
         let outcome = read(
             &conn,
@@ -477,7 +571,7 @@ mod tests {
     #[tokio::test]
     async fn read_serves_a_workers_own_status_resource() {
         let conn = AsyncMutex::new(test_conn());
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_dir, sea_orm_db) = test_sea_orm_db().await;
         let p = worker("worker-1");
         let outcome = read(
             &conn,
@@ -500,7 +594,7 @@ mod tests {
     #[tokio::test]
     async fn read_serves_an_admins_cross_agent_inbox_read() {
         let conn = AsyncMutex::new(test_conn());
-        let sea_orm_db = test_sea_orm_db().await;
+        let (_dir, sea_orm_db) = test_sea_orm_db().await;
         let p = admin();
         let outcome = read(
             &conn,
