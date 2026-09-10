@@ -19,6 +19,33 @@
 //! ownership and transaction-joining are an app-layer concern in this
 //! design, not a repository one.
 //!
+//! Phase G (sea-orm migration): converted across 5 PRs. PR 1/5
+//! converted the background/maintenance triad: `prune_read_before`/
+//! `fetch_null_subject_roots`/`set_message_subject`. PR 2/5 converted
+//! the tool-surface group: `mark_read_by_ids`/`list_recent_for_agent`/
+//! `rename_participant`. PR 3/5 converted the remaining query surface:
+//! `list_participants`/`fetch_thread` (the latter's `WITH RECURSIVE`
+//! descendant walk stays a raw-SQL escape hatch — sea-orm's typed
+//! query builder has no vocabulary for a recursive CTE). Every other
+//! function here, including `get_by_id`/`count_unread`/
+//! `recipient_exists`/`parent_message_exists`/`send`/`mark_delivered`/
+//! `mark_read`/`mark_read_for_recipient`/`delete`/`bulk_send`/
+//! [`MessageRepository::query`]/[`MessageRepository::count_query`], is
+//! DELIBERATELY, PERMANENTLY staying rusqlite-only: `send` and its
+//! read-before-write siblings (`get_by_id`/`recipient_exists`/
+//! `parent_message_exists`/`count_unread`) sit on the hot path of
+//! every real message-send/read/wake-loop-backlog call site across
+//! `conexus-tools`/`conexus-wakeloop`/`conexus-backend`;
+//! `mark_delivered`/`mark_read`/`delete`/`bulk_send` are always called
+//! against an in-flight `rusqlite::Transaction` shared with sibling
+//! writes in the same atomic unit; `MessageRepository::query`/
+//! `count_query` are the dashboard's own `StableOrderCache`-backed
+//! pagination read, called against the plain legacy guard with no
+//! sea-orm-side pagination-cache sibling built yet — mirroring
+//! `agent_repository`/`resolve_capabilities`/`group_membership_repository`'s
+//! own established "one sync implementation, never duplicated across a
+//! sync/async split" precedent (PR #990).
+//!
 //! ## Load-bearing invariants preserved from Python
 //! - **PF-R32-1**: `parent_message_id` existence is validated BEFORE
 //!   the INSERT, never inferred from catching an FK violation — a
