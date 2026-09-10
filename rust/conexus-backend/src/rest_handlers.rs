@@ -1295,10 +1295,9 @@ pub async fn delete_setting(
 /// correctness.
 pub async fn simple_status(State(shared): State<Arc<SharedState>>) -> Response {
     let task_counts = conexus_db::task_repository::count_by_status(&shared.sea_orm_db).await;
-    let guard = shared.conn.lock().await;
     let agent_counts =
-        conexus_db::agent_repository::AgentRepository::count_active_by_status(&guard);
-    drop(guard);
+        conexus_db::agent_repository::AgentRepository::count_active_by_status(&shared.sea_orm_db)
+            .await;
     let (task_counts, agent_counts) = match (task_counts, agent_counts) {
         (Ok(t), Ok(a)) => (t, a),
         _ => {
@@ -1653,9 +1652,11 @@ pub async fn all_data(
     // real query has no WHERE clause at all) via a bounded, newest-first
     // read matching the SQL Python actually runs here.
     let agent_rows = match conexus_db::agent_repository::AgentRepository::list_all_bounded(
-        &guard,
+        &shared.sea_orm_db,
         section_limit,
-    ) {
+    )
+    .await
+    {
         Ok(rows) => rows,
         Err(_) => {
             drop(guard);
@@ -2775,13 +2776,12 @@ pub async fn list_agents_dashboard(
         true,
     )
     .await;
-    let guard = shared.conn.lock().await;
     let rows = conexus_db::agent_repository::AgentRepository::list_for_dashboard(
-        &guard,
+        &shared.sea_orm_db,
         status_filter,
         limit,
-    );
-    drop(guard);
+    )
+    .await;
 
     let rows = match rows {
         Ok(r) => r,

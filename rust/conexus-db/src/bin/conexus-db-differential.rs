@@ -297,7 +297,8 @@ async fn apply(
             agent_id,
             cursor_value,
             now,
-        } => AgentRepository::advance_event_cursor(conn, &agent_id, &cursor_value, &now)
+        } => AgentRepository::advance_event_cursor(sea_orm_db, &agent_id, &cursor_value, &now)
+            .await
             .map(|_| ())
             .map_err(|e| e.to_string()),
 
@@ -360,12 +361,13 @@ async fn run() -> Result<String, String> {
 
     let conn = Connection::open(&request.db_path)
         .map_err(|e| format!("failed to open {}: {e}", request.db_path))?;
-    // project_context_repository is sea-orm-backed (Phase G); every
-    // other repository this binary drives (AgentRepository) is not
-    // yet, so both connections stay open against the SAME file for
-    // the life of this run -- matching every other Phase G call
-    // site's "legacy connection stays alive for not-yet-converted
-    // calls" pattern.
+    // project_context_repository and most of AgentRepository are
+    // sea-orm-backed (Phase G); `AgentRepository::update_field` (the
+    // only op this binary still drives through `conn`, via
+    // `AgentUpdateField`) stays rusqlite-only permanently, so both
+    // connections stay open against the SAME file for the life of
+    // this run -- matching every other Phase G call site's "legacy
+    // connection stays alive for not-yet-converted calls" pattern.
     let sea_orm_db = sea_orm::Database::connect(format!("sqlite://{}", request.db_path))
         .await
         .map_err(|e| format!("failed to open {} via sea-orm: {e}", request.db_path))?;
@@ -376,8 +378,9 @@ async fn run() -> Result<String, String> {
             .map_err(|e| format!("operation failed: {e}"))?;
     }
 
-    let agents =
-        AgentRepository::dump_all(&conn).map_err(|e| format!("failed to dump agents: {e}"))?;
+    let agents = AgentRepository::dump_all(&sea_orm_db)
+        .await
+        .map_err(|e| format!("failed to dump agents: {e}"))?;
     let project_context = project_context_repository::list_all(&sea_orm_db)
         .await
         .map_err(|e| format!("failed to dump project_context: {e}"))?;
