@@ -508,17 +508,34 @@ pub async fn wait_for_events_slow_path(
         // A schedule is due now -> fire it and return.
         if let Some(due) = &soonest_due {
             if due.as_str() <= now_iso_str.as_str() {
-                let assembled = event_feed::assemble_event_feed(
-                    conn,
-                    &agent_id,
-                    since.as_deref(),
-                    &now_iso_str,
-                    Vec::new(),
-                    true,
-                    process_env,
-                    ctx.sea_orm_db,
-                )
-                .await;
+                // A transient DB error here (e.g. a momentary sea-orm
+                // pool-acquire contention) must NOT be treated the same
+                // as "genuinely no events yet" -- that silently drops a
+                // real, already-fired schedule for this poll cycle,
+                // relying entirely on the NEXT wake to notice it (which
+                // may not come for a long time). Retry a few times
+                // before falling through -- each attempt is a fresh,
+                // independent acquire, so a one-off contention blip
+                // resolves on the very next try almost always.
+                let mut assembled;
+                let mut attempts_left = 3u32;
+                loop {
+                    assembled = event_feed::assemble_event_feed(
+                        conn,
+                        &agent_id,
+                        since.as_deref(),
+                        &now_iso_str,
+                        Vec::new(),
+                        true,
+                        process_env,
+                        ctx.sea_orm_db,
+                    )
+                    .await;
+                    attempts_left -= 1;
+                    if assembled.is_ok() || attempts_left == 0 {
+                        break;
+                    }
+                }
                 if let Ok(assembled) = assembled {
                     if !assembled.events.is_empty() {
                         hold_ladder::reset(&agent_id);
@@ -609,17 +626,33 @@ pub async fn wait_for_events_slow_path(
             }
             Ok(StreamSlice::Item(WakeSignal::Wake)) => {
                 let now_iso_str = now_iso();
-                let assembled = event_feed::assemble_event_feed(
-                    conn,
-                    &agent_id,
-                    since.as_deref(),
-                    &now_iso_str,
-                    Vec::new(),
-                    true,
-                    process_env,
-                    ctx.sea_orm_db,
-                )
-                .await;
+                // Same transient-error-vs-genuinely-nothing-new
+                // distinction as the schedule-due branch above: a
+                // one-off DB contention blip here must not be
+                // indistinguishable from "the wake was spurious" -- that
+                // would silently drop whatever real event fired this
+                // wake for the rest of this poll's hold window. Retry a
+                // few times (each a fresh, independent acquire) before
+                // falling through to the genuine "nothing new" case.
+                let mut assembled;
+                let mut attempts_left = 3u32;
+                loop {
+                    assembled = event_feed::assemble_event_feed(
+                        conn,
+                        &agent_id,
+                        since.as_deref(),
+                        &now_iso_str,
+                        Vec::new(),
+                        true,
+                        process_env,
+                        ctx.sea_orm_db,
+                    )
+                    .await;
+                    attempts_left -= 1;
+                    if assembled.is_ok() || attempts_left == 0 {
+                        break;
+                    }
+                }
                 if let Ok(assembled) = assembled {
                     if !assembled.events.is_empty() {
                         hold_ladder::reset(&agent_id);
@@ -1560,28 +1593,30 @@ mod tests {
     // schema-init file I/O before it doesn't await anything, so it
     // isn't part of that race at all.
     //
-    // Phase G: `assemble_event_feed`'s `collect_events_with_cap`/
-    // `collect_unassigned_task_events_for` now issue REAL sea-orm
-    // queries (not just the initial connect) on every call --
-    // including from deep inside these paused-clock tests' own
-    // `wait_for_events_slow_path` exercise, well after this function
-    // has already returned and re-paused the clock. Each such query
-    // can itself need to acquire the pool's single connection
-    // (sea-orm's sqlite driver hardcodes `max_connections(1)`), racing
-    // the SAME paused-clock-vs-acquire-deadline hazard described
-    // above -- just at query time instead of connect time, and not
-    // fixable by a resume()/pause() bracket at THIS call site since
-    // the query happens later, inside production code this function
-    // has no visibility into. Fixed at the actual root instead of
-    // re-applying the bracket ad hoc at every future query call site:
-    // `ConnectOptions::acquire_timeout` raised far past any test's own
-    // multi-second timing assertions, so the auto-fast-forward can
-    // never race a real acquire into a spurious timeout regardless of
-    // where in the call chain the query happens -- a real (wall-clock)
-    // acquire always completes via its own OS-scheduled wakeup long
-    // before virtual time could ever reach this ceiling. Verified
-    // empirically: reproduced 4/5 under real 16-way parallel
-    // contention before this fix, 0/20 after.
+    // Phase G: `assemble_event_feed`'s collectors now issue REAL
+    // sea-orm queries on every call, including from deep inside these
+    // paused-clock tests' own `wait_for_events_slow_path` exercise,
+    // well after this function has already returned and re-paused the
+    // clock. This is NOT fixable by raising `acquire_timeout` -- that
+    // was tried and made things WORSE: under `start_paused`, tokio's
+    // auto-advance jumps the virtual clock to the NEAREST registered
+    // timer the instant the executor sees nothing else runnable, and
+    // sqlx's own per-acquire deadline (a real `tokio::time::timeout`
+    // wrapping the acquire) IS such a timer -- so every acquire, under
+    // real contention, can advance the clock by EXACTLY
+    // `acquire_timeout`, real duration or not. A large value (`3600s`,
+    // an earlier attempt) blew every short test deadline in one jump;
+    // this value only needs to be large enough that a genuine acquire
+    // completes before it under realistic contention -- callers that
+    // actually rely on the query's RESULT retry on `Err` instead (see
+    // `wait_for_events_slow_path`'s own two `assemble_event_feed` call
+    // sites), so a transient acquire timeout here costs a retry, not a
+    // silently-dropped event. The 2 tests whose own assertion depends
+    // on that query's result finding real data (`wake_signal_delivers_
+    // pending_events`, `wait_for_events_tool_delivers_a_fast_path_
+    // event_through_the_real_trait_call`) don't use the paused clock
+    // at all -- they use `test_sea_orm_db()` (real time) instead, since
+    // neither needs virtual-time compression to begin with.
     async fn test_sea_orm_db_paused() -> (tempfile::TempDir, sea_orm::DatabaseConnection) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.db");
@@ -1591,7 +1626,7 @@ mod tests {
         }
         tokio::time::resume();
         let mut opts = sea_orm::ConnectOptions::new(format!("sqlite://{}", path.display()));
-        opts.acquire_timeout(Duration::from_secs(3600));
+        opts.acquire_timeout(Duration::from_secs(5));
         // sqlx's connection-pool defaults schedule two REAL background
         // timers (`max_lifetime`/`idle_timeout`, both `Some(30min)` by
         // default) independent of `acquire_timeout` above -- under
@@ -2005,13 +2040,13 @@ mod tests {
         assert_eq!(registry.waiter_count("bob"), 0);
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn wake_signal_delivers_pending_events() {
         let conn = test_conn();
         seed_agent(&conn, "carol").await;
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db_paused().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -2275,7 +2310,7 @@ mod tests {
 
     // -- WaitForEventsTool (through the real Tool trait) ---------------------
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn wait_for_events_tool_delivers_a_fast_path_event_through_the_real_trait_call() {
         use conexus_auth::Tool;
 
@@ -2284,7 +2319,7 @@ mod tests {
         send_message(&conn, "m1", "kate", &now_iso(), "text").await;
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db_paused().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
