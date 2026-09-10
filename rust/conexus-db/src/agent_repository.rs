@@ -20,13 +20,39 @@
 //! clock, and the actual "what clock, what format" policy is owned
 //! by exactly one place upstream (Phase D's app layer) rather than
 //! scattered across every write method.
+//!
+//! Phase G (sea-orm migration): [`AgentRepository::query`] alone is
+//! now sea-orm-backed (`async`, takes `&sea_orm::DatabaseConnection`)
+//! — PR 1/4 of this repository's own conversion sequence. Every other
+//! method here, including `get_by_token`/`is_live`/`get_by_id`/
+//! `update_field`/`reconcile_current_task_on_reassign`/
+//! `clear_current_task_for`/`clear_current_task_for_many`/
+//! `list_active`/`list_profile_changes_since`, is DELIBERATELY,
+//! PERMANENTLY staying rusqlite-only: they're hot-path (every `/mcp`/
+//! `/api` request resolves its bearer through `get_by_token`+
+//! `is_live`), transaction-bound, or wake-loop-collector-bound —
+//! mirroring `resolve_capabilities`/`group_membership_repository`'s
+//! own established "one sync implementation, never duplicated across
+//! a sync/async split" precedent (PR #990). See
+//! `conexus_backend::principal_resolve`/`conexus_auth::
+//! wake_loop_eligibility`/`conexus_wakeloop::event_feed`'s own doc
+//! comments for the specific reasoning per call site — those already
+//! say "AgentRepository is not a Phase G target," which remains true
+//! for the methods they call; it was never true for the whole
+//! repository, and `query` above is the first of this repository's
+//! own reads to actually convert.
 
 use crate::pagination_cache::StableOrderCache;
-use crate::sql_util::{in_placeholders, to_sql_refs};
 use regex::Regex;
 use rusqlite::{Connection, OptionalExtension, Result, Row};
+use sea_orm::{
+    ColumnTrait, DatabaseConnection, DbErr, EntityTrait, Order as SeaOrmOrder, PaginatorTrait,
+    QueryFilter, QueryOrder, QuerySelect,
+};
 use std::collections::HashMap;
 use std::sync::LazyLock;
+
+use crate::entity::agent;
 
 /// The `agent_id` shape Python's `_AGENT_ID_RE` enforces, ported
 /// verbatim rather than hand-rolled: `^[a-z][a-z0-9@_-]*[a-z0-9]$|
@@ -95,6 +121,33 @@ fn row_to_agent(row: &Row) -> rusqlite::Result<AgentRow> {
 const AGENT_COLUMNS: &str = "token, agent_id, created_at, status, current_task, working_directory, \
      color, terminated_at, updated_at, aoe_session_id, auto_event_loop, last_event_seen_at, \
      last_activity_at, agent_role, profile, profile_updated_at, profile_reviewed_at, profile_updated_by";
+
+/// `agent::Model` -> `AgentRow`, used by [`AgentRepository::query`]'s
+/// sea-orm read path. A field-for-field move, not a lossy translation
+/// — `entity::agent::Model`'s columns match `AgentRow`'s one-for-one
+/// by construction (see that Entity's own module doc).
+fn agent_row_from_model(m: agent::Model) -> AgentRow {
+    AgentRow {
+        token: m.token,
+        agent_id: m.agent_id,
+        created_at: m.created_at,
+        status: m.status,
+        current_task: m.current_task,
+        working_directory: m.working_directory,
+        color: m.color,
+        terminated_at: m.terminated_at,
+        updated_at: m.updated_at,
+        aoe_session_id: m.aoe_session_id,
+        auto_event_loop: m.auto_event_loop,
+        last_event_seen_at: m.last_event_seen_at,
+        last_activity_at: m.last_activity_at,
+        agent_role: m.agent_role,
+        profile: m.profile,
+        profile_updated_at: m.profile_updated_at,
+        profile_reviewed_at: m.profile_reviewed_at,
+        profile_updated_by: m.profile_updated_by,
+    }
+}
 
 /// One row of the `wait_for_events` peer-profile-change catch-up feed —
 /// see [`AgentRepository::list_profile_changes_since`].
@@ -658,11 +711,18 @@ impl AgentRepository {
     /// Diverges from Python in one place: real DB errors propagate as
     /// `Err`, they are not swallowed into `(vec![], 0)` — consistent
     /// with every other method in this crate.
-    pub fn query(
+    ///
+    /// Phase G: sea-orm-backed (`async`, `db: &sea_orm::
+    /// DatabaseConnection`) — see this module's own doc for why this
+    /// is the one method of `AgentRepository` that converts. The
+    /// filter/sort/pagination semantics above are unchanged; only the
+    /// query-building mechanism is (sea-orm's typed builder, not raw
+    /// SQL strings).
+    pub async fn query(
         &self,
-        conn: &Connection,
-        filters: AgentQueryFilters,
-    ) -> Result<(Vec<AgentRow>, i64)> {
+        db: &DatabaseConnection,
+        filters: AgentQueryFilters<'_>,
+    ) -> std::result::Result<(Vec<AgentRow>, i64), DbErr> {
         // Never "0 rows" or "before the start" — matches Python's
         // clamp exactly (a limit of 0 is not "everything", it's 1).
         let limit = filters.limit.max(1);
@@ -686,10 +746,11 @@ impl AgentRepository {
             sort_order,
         };
 
-        let ordered_ids: Vec<String> =
-            self.pagination_cache.get_or_anchor(cache_key, offset, || {
+        let ordered_ids: Vec<String> = self
+            .pagination_cache
+            .get_or_anchor_async(cache_key, offset, || {
                 Self::compute_ordered_ids(
-                    conn,
+                    db,
                     status.as_deref(),
                     pattern.as_deref(),
                     include_terminated,
@@ -698,7 +759,8 @@ impl AgentRepository {
                     sort_by,
                     sort_order,
                 )
-            })?;
+            })
+            .await?;
 
         if ordered_ids.is_empty() {
             return Ok((Vec::new(), 0));
@@ -706,20 +768,17 @@ impl AgentRepository {
 
         // total = the anchored ids, reconciled against rows that
         // still exist right now (NOT a fresh unconditional COUNT).
-        let total: i64 = {
-            let sql = format!(
-                "SELECT COUNT(*) FROM agents WHERE agent_id IN ({})",
-                in_placeholders(ordered_ids.len())
-            );
-            let params = to_sql_refs(&ordered_ids);
-            conn.query_row(&sql, params.as_slice(), |row| row.get(0))?
-        };
+        let total: i64 = agent::Entity::find()
+            .filter(agent::Column::AgentId.is_in(ordered_ids.iter().cloned()))
+            .count(db)
+            .await? as i64;
 
         let offset_usize = offset as usize;
-        let window_ids: Vec<&String> = if offset_usize < ordered_ids.len() {
+        let window_ids: Vec<String> = if offset_usize < ordered_ids.len() {
             ordered_ids[offset_usize..]
                 .iter()
                 .take(limit as usize)
+                .cloned()
                 .collect()
         } else {
             Vec::new()
@@ -729,16 +788,12 @@ impl AgentRepository {
             return Ok((Vec::new(), total));
         }
 
-        let sql = format!(
-            "SELECT {AGENT_COLUMNS} FROM agents WHERE agent_id IN ({})",
-            in_placeholders(window_ids.len())
-        );
-        let params = to_sql_refs(&window_ids);
-        let mut stmt = conn.prepare(&sql)?;
-        let rows_by_id: HashMap<String, AgentRow> = stmt
-            .query_map(params.as_slice(), row_to_agent)?
-            .collect::<Result<Vec<_>>>()?
+        let rows_by_id: HashMap<String, AgentRow> = agent::Entity::find()
+            .filter(agent::Column::AgentId.is_in(window_ids.iter().cloned()))
+            .all(db)
+            .await?
             .into_iter()
+            .map(agent_row_from_model)
             .map(|row| (row.agent_id.clone(), row))
             .collect();
 
@@ -747,7 +802,7 @@ impl AgentRepository {
         // `if aid in rows_by_id` guard exactly.
         let ordered_rows = window_ids
             .into_iter()
-            .filter_map(|id| rows_by_id.get(id).cloned())
+            .filter_map(|id| rows_by_id.get(&id).cloned())
             .collect();
 
         Ok((ordered_rows, total))
@@ -815,9 +870,20 @@ impl AgentRepository {
         rows.collect()
     }
 
+    /// The `agent_id`-only ordered id list [`Self::query`] anchors via
+    /// [`StableOrderCache::get_or_anchor_async`]. `tombstone` rows are
+    /// excluded unconditionally, before any caller filter — same
+    /// BL-R31-3 rule [`Self::query`]'s own doc describes. Built via
+    /// sea-orm's typed query builder (`select_only` + `column` +
+    /// `order_by`, the same idiom `task_repository::count_by_status`/
+    /// `conexus_router::identity::users_table_is_empty_impl` already
+    /// establish for a single-column projection) rather than a raw
+    /// SQL string — every filter/sort clause here is expressible
+    /// through `ColumnTrait`/`QueryOrder`, so there's no need for this
+    /// crate's `Statement::from_sql_and_values` raw-SQL escape hatch.
     #[allow(clippy::too_many_arguments)]
-    fn compute_ordered_ids(
-        conn: &Connection,
+    async fn compute_ordered_ids(
+        db: &DatabaseConnection,
         status: Option<&str>,
         pattern: Option<&str>,
         include_terminated: bool,
@@ -825,44 +891,49 @@ impl AgentRepository {
         created_before: Option<&str>,
         sort_by: AgentSortBy,
         sort_order: SortOrder,
-    ) -> Result<Vec<String>> {
-        let mut sql = String::from("SELECT agent_id FROM agents WHERE status != 'tombstone'");
-        let mut owned_params: Vec<String> = Vec::new();
+    ) -> std::result::Result<Vec<String>, DbErr> {
+        let mut query = agent::Entity::find().filter(agent::Column::Status.ne("tombstone"));
 
         if let Some(s) = status {
-            sql.push_str(" AND status = ?");
-            owned_params.push(s.to_string());
+            query = query.filter(agent::Column::Status.eq(s));
         }
         if let Some(p) = pattern {
-            sql.push_str(" AND agent_id LIKE ?");
-            owned_params.push(p.to_string());
+            query = query.filter(agent::Column::AgentId.like(p));
         }
         if !include_terminated {
-            sql.push_str(" AND status != 'terminated'");
+            query = query.filter(agent::Column::Status.ne("terminated"));
         }
         if let Some(a) = created_after {
-            sql.push_str(" AND created_at >= ?");
-            owned_params.push(a.to_string());
+            query = query.filter(agent::Column::CreatedAt.gte(a));
         }
         if let Some(b) = created_before {
-            sql.push_str(" AND created_at <= ?");
-            owned_params.push(b.to_string());
+            query = query.filter(agent::Column::CreatedAt.lte(b));
         }
+
+        let sort_column = match sort_by {
+            AgentSortBy::AgentId => agent::Column::AgentId,
+            AgentSortBy::Status => agent::Column::Status,
+            AgentSortBy::CreatedAt => agent::Column::CreatedAt,
+            AgentSortBy::TerminatedAt => agent::Column::TerminatedAt,
+        };
+        let order = match sort_order {
+            SortOrder::Asc => SeaOrmOrder::Asc,
+            SortOrder::Desc => SeaOrmOrder::Desc,
+        };
+
         // Fixed `agent_id ASC` tiebreaker guarantees a fully
         // deterministic total order even when the sort column has
         // duplicate values — essential for offset pagination
         // correctness (two agents created in the same second must
         // still sort identically on every page).
-        sql.push_str(&format!(
-            " ORDER BY {} {}, agent_id ASC",
-            sort_by.column(),
-            sort_order.sql()
-        ));
-
-        let mut stmt = conn.prepare(&sql)?;
-        let params = to_sql_refs(&owned_params);
-        let rows = stmt.query_map(params.as_slice(), |row| row.get::<_, String>(0))?;
-        rows.collect()
+        query
+            .select_only()
+            .column(agent::Column::AgentId)
+            .order_by(sort_column, order)
+            .order_by(agent::Column::AgentId, SeaOrmOrder::Asc)
+            .into_tuple()
+            .all(db)
+            .await
     }
 }
 
@@ -878,17 +949,6 @@ pub enum AgentSortBy {
     Status,
     CreatedAt,
     TerminatedAt,
-}
-
-impl AgentSortBy {
-    fn column(self) -> &'static str {
-        match self {
-            AgentSortBy::AgentId => "agent_id",
-            AgentSortBy::Status => "status",
-            AgentSortBy::CreatedAt => "created_at",
-            AgentSortBy::TerminatedAt => "terminated_at",
-        }
-    }
 }
 
 /// Matches Python's `sort_by` allowlist-with-fallback exactly: any
@@ -911,15 +971,6 @@ pub fn parse_agent_sort_by(s: &str) -> AgentSortBy {
 pub enum SortOrder {
     Asc,
     Desc,
-}
-
-impl SortOrder {
-    fn sql(self) -> &'static str {
-        match self {
-            SortOrder::Asc => "ASC",
-            SortOrder::Desc => "DESC",
-        }
-    }
 }
 
 /// Matches Python's `sort_order` allowlist-with-fallback: only an
@@ -1779,66 +1830,87 @@ mod tests {
         rows.iter().map(|r| r.agent_id.as_str()).collect()
     }
 
-    #[test]
-    fn query_default_sort_is_created_at_desc_with_agent_id_tiebreaker() {
-        let conn = test_conn();
+    /// A file-backed DB opened as BOTH a `rusqlite::Connection` (to
+    /// seed/mutate rows through the still-sync rest of this
+    /// repository) and a sea-orm `DatabaseConnection` (to exercise the
+    /// now-converted [`AgentRepository::query`]) -- the same
+    /// dual-connection recipe `task_repository::tests::
+    /// test_conn_with_sea_orm` uses, since an in-memory `:memory:` DB
+    /// can't be shared across two separate connection handles the way
+    /// a real file can.
+    async fn test_conn_with_sea_orm() -> (tempfile::TempDir, Connection, DatabaseConnection) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent_query_test.db");
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn).unwrap();
+        let db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        (dir, conn, db)
+    }
+
+    #[tokio::test]
+    async fn query_default_sort_is_created_at_desc_with_agent_id_tiebreaker() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         seed_with_timestamp(&conn, "z", "t1", "active", "2026-01-01T00:00:00Z");
         seed_with_timestamp(&conn, "a", "t2", "active", "2026-01-01T00:00:00Z"); // same timestamp
         seed_with_timestamp(&conn, "m", "t3", "active", "2026-01-02T00:00:00Z");
 
         let repo = AgentRepository::new();
-        let (rows, total) = repo.query(&conn, AgentQueryFilters::default()).unwrap();
+        let (rows, total) = repo.query(&db, AgentQueryFilters::default()).await.unwrap();
         assert_eq!(total, 3);
         // "m" is newest -> first. "z"/"a" tie on created_at -> broken by agent_id ASC.
         assert_eq!(ids(&rows), vec!["m", "a", "z"]);
     }
 
-    #[test]
-    fn query_excludes_tombstones_unconditionally() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn query_excludes_tombstones_unconditionally() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         seed_with_timestamp(&conn, "live", "t1", "active", "2026-01-01T00:00:00Z");
         AgentRepository::insert_tombstone(&conn, "t2", "tomb", "2026-01-01T00:00:00Z").unwrap();
 
         let repo = AgentRepository::new();
-        let (rows, total) = repo.query(&conn, AgentQueryFilters::default()).unwrap();
+        let (rows, total) = repo.query(&db, AgentQueryFilters::default()).await.unwrap();
         assert_eq!(total, 1);
         assert_eq!(ids(&rows), vec!["live"]);
     }
 
-    #[test]
-    fn query_explicit_tombstone_status_filter_is_self_contradictory_and_returns_empty() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn query_explicit_tombstone_status_filter_is_self_contradictory_and_returns_empty() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         seed_with_timestamp(&conn, "live", "t1", "active", "2026-01-01T00:00:00Z");
         AgentRepository::insert_tombstone(&conn, "t2", "tomb", "2026-01-01T00:00:00Z").unwrap();
 
         let repo = AgentRepository::new();
         let (rows, total) = repo
             .query(
-                &conn,
+                &db,
                 AgentQueryFilters {
                     status: Some("tombstone"),
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
         assert_eq!((rows.len(), total), (0, 0));
     }
 
-    #[test]
-    fn query_offset_beyond_total_returns_empty_rows_but_real_total() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn query_offset_beyond_total_returns_empty_rows_but_real_total() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         seed_with_timestamp(&conn, "a1", "t1", "active", "2026-01-01T00:00:00Z");
         seed_with_timestamp(&conn, "a2", "t2", "active", "2026-01-02T00:00:00Z");
 
         let repo = AgentRepository::new();
         let (rows, total) = repo
             .query(
-                &conn,
+                &db,
                 AgentQueryFilters {
                     offset: 100,
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
         assert_eq!(rows.len(), 0);
         assert_eq!(
@@ -1847,22 +1919,23 @@ mod tests {
         );
     }
 
-    #[test]
-    fn query_limit_and_offset_are_clamped_like_python() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn query_limit_and_offset_are_clamped_like_python() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         seed_with_timestamp(&conn, "a1", "t1", "active", "2026-01-01T00:00:00Z");
 
         let repo = AgentRepository::new();
         // limit=0 clamps to 1, not "everything"; offset=-5 clamps to 0.
         let (rows, _) = repo
             .query(
-                &conn,
+                &db,
                 AgentQueryFilters {
                     limit: 0,
                     offset: -5,
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
         assert_eq!(rows.len(), 1);
     }
@@ -1884,9 +1957,9 @@ mod tests {
 
     /// Port of Python's
     /// `test_query_offset_pagination_survives_concurrent_status_change`.
-    #[test]
-    fn query_offset_pagination_survives_concurrent_status_change() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn query_offset_pagination_survives_concurrent_status_change() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         for i in 1..=5 {
             seed_with_timestamp(
                 &conn,
@@ -1908,12 +1981,13 @@ mod tests {
         // that full ordering under this filter shape.
         let (page1, _) = repo
             .query(
-                &conn,
+                &db,
                 AgentQueryFilters {
                     offset: 0,
                     ..filters()
                 },
             )
+            .await
             .unwrap();
         assert_eq!(ids(&page1), vec!["pg-a5", "pg-a4"]);
 
@@ -1928,12 +2002,13 @@ mod tests {
         // the ORIGINAL 5-element ordering.
         let (page2, _) = repo
             .query(
-                &conn,
+                &db,
                 AgentQueryFilters {
                     offset: 2,
                     ..filters()
                 },
             )
+            .await
             .unwrap();
         assert_eq!(ids(&page2), vec!["pg-a3", "pg-a2"]);
 
@@ -1944,9 +2019,9 @@ mod tests {
     }
 
     /// Port of Python's `test_query_total_excludes_agent_deleted_mid_sweep`.
-    #[test]
-    fn query_total_excludes_agent_deleted_mid_sweep() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn query_total_excludes_agent_deleted_mid_sweep() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         for i in 1..=7 {
             seed_with_timestamp(
                 &conn,
@@ -1966,7 +2041,7 @@ mod tests {
         };
 
         // Newest-first: tc-a7..tc-a1. Anchors the 7-element ordering.
-        let (page1, total1) = repo.query(&conn, filters(0)).unwrap();
+        let (page1, total1) = repo.query(&db, filters(0)).await.unwrap();
         assert_eq!(total1, 7);
         let mut delivered = page1.len();
 
@@ -1975,7 +2050,7 @@ mod tests {
         assert!(AgentRepository::delete(&conn, "tc-a5").unwrap());
 
         for offset in [2, 4, 6] {
-            let (page, total) = repo.query(&conn, filters(offset)).unwrap();
+            let (page, total) = repo.query(&db, filters(offset)).await.unwrap();
             assert_eq!(
                 total, 6,
                 "total must reconcile the anchor against currently-existing rows"
@@ -1988,9 +2063,9 @@ mod tests {
         assert_eq!(delivered, 6);
     }
 
-    #[test]
-    fn query_pagination_cache_is_per_repository_instance_not_global() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn query_pagination_cache_is_per_repository_instance_not_global() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         seed_with_timestamp(&conn, "a1", "t1", "active", "2026-01-01T00:00:00Z");
         seed_with_timestamp(&conn, "a2", "t2", "active", "2026-01-02T00:00:00Z");
 
@@ -1998,13 +2073,14 @@ mod tests {
         let repo_b = AgentRepository::new();
         repo_a
             .query(
-                &conn,
+                &db,
                 AgentQueryFilters {
                     offset: 0,
                     limit: 1,
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
 
         // A fresh repository instance has no anchor for this shape,
@@ -2012,13 +2088,14 @@ mod tests {
         // panicking or seeing repo_a's private cache state.
         let (page, _) = repo_b
             .query(
-                &conn,
+                &db,
                 AgentQueryFilters {
                     offset: 1,
                     limit: 1,
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
         assert_eq!(page.len(), 1);
     }

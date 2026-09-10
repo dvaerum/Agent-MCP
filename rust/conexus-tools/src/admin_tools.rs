@@ -401,7 +401,7 @@ impl Tool for GetAgentTokensTool {
     fn call<'a>(
         principal: Option<&'a Principal>,
         arguments: &'a Value,
-        conn: &'a AsyncMutex<Connection>,
+        _conn: &'a AsyncMutex<Connection>,
         now: &'a str,
         ctx: &'a conexus_auth::ToolCallContext<'a>,
     ) -> conexus_auth::BoxFuture<'a, ToolResult> {
@@ -444,21 +444,23 @@ impl Tool for GetAgentTokensTool {
             let effective_sort_by = effective_agent_sort_by(sort_by_raw);
             let effective_sort_order = effective_sort_order(sort_order_raw);
 
-            let guard = conn.lock().await;
-            let (rows, total_count) = match GET_AGENT_TOKENS_REPO.query(
-                &guard,
-                AgentQueryFilters {
-                    status: filter_status,
-                    agent_id_pattern: filter_agent_id_pattern,
-                    include_terminated,
-                    created_after: filter_created_after,
-                    created_before: filter_created_before,
-                    sort_by: parse_agent_sort_by(sort_by_raw),
-                    sort_order: parse_sort_order(sort_order_raw),
-                    limit,
-                    offset,
-                },
-            ) {
+            let (rows, total_count) = match GET_AGENT_TOKENS_REPO
+                .query(
+                    ctx.sea_orm_db,
+                    AgentQueryFilters {
+                        status: filter_status,
+                        agent_id_pattern: filter_agent_id_pattern,
+                        include_terminated,
+                        created_after: filter_created_after,
+                        created_before: filter_created_before,
+                        sort_by: parse_agent_sort_by(sort_by_raw),
+                        sort_order: parse_sort_order(sort_order_raw),
+                        limit,
+                        offset,
+                    },
+                )
+                .await
+            {
                 Ok(result) => result,
                 Err(_e) => {
                     return ToolResult::Failed {
@@ -468,7 +470,6 @@ impl Tool for GetAgentTokensTool {
                     }
                 }
             };
-            drop(guard);
 
             // SECURITY (FINDING 2): plaintext tokens surface ONLY when
             // the caller both explicitly opted in AND is confirmed

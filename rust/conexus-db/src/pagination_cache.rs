@@ -116,6 +116,36 @@ impl<K: Eq + Hash + Clone, T: Clone> StableOrderCache<K, T> {
     pub fn clear(&self) {
         self.lock().clear();
     }
+
+    /// `async` twin of [`Self::get_or_anchor`] — identical anchor/replay
+    /// logic (reuses the same private `replay_or_none`/`anchor` helpers),
+    /// just accepting an async `compute` for a sea-orm-backed caller
+    /// (`AgentRepository::query`, Phase G) instead of a sync rusqlite
+    /// one. Added as a sibling method rather than making
+    /// `get_or_anchor` itself async, so `MessageRepository::query`'s
+    /// still-sync rusqlite callers are unaffected.
+    pub async fn get_or_anchor_async<E, F, Fut>(
+        &self,
+        key: K,
+        offset: i64,
+        compute: F,
+    ) -> Result<Vec<T>, E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<Vec<T>, E>>,
+    {
+        if offset == 0 {
+            let ids = compute().await?;
+            self.anchor(key, ids.clone());
+            return Ok(ids);
+        }
+        if let Some(ids) = self.replay_or_none(&key) {
+            return Ok(ids);
+        }
+        let ids = compute().await?;
+        self.anchor(key, ids.clone());
+        Ok(ids)
+    }
 }
 
 impl<K: Eq + Hash + Clone, T: Clone> Default for StableOrderCache<K, T> {
@@ -254,6 +284,83 @@ mod tests {
         // Nothing was anchored, so a later call still needs to compute.
         let result: Result<Vec<String>, &str> =
             cache.get_or_anchor("k", 1, || Ok(vec!["computed".to_string()]));
+        assert_eq!(result, Ok(vec!["computed".to_string()]));
+    }
+
+    // -- get_or_anchor_async: same contract, async `compute` -------------
+
+    async fn ok_async(ids: &[&str]) -> Result<Vec<String>, std::convert::Infallible> {
+        Ok(ids.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[tokio::test]
+    async fn async_offset_zero_always_recomputes_even_with_a_live_anchor() {
+        let cache: StableOrderCache<&str, String> = StableOrderCache::default();
+        let first = cache
+            .get_or_anchor_async("k", 0, || ok_async(&["a", "b"]))
+            .await
+            .unwrap();
+        assert_eq!(first, vec!["a", "b"]);
+
+        let second = cache
+            .get_or_anchor_async("k", 0, || ok_async(&["x", "y", "z"]))
+            .await
+            .unwrap();
+        assert_eq!(
+            second,
+            vec!["x", "y", "z"],
+            "offset=0 must never replay a stale anchor"
+        );
+    }
+
+    #[tokio::test]
+    async fn async_offset_positive_replays_the_anchor_instead_of_recomputing() {
+        let cache: StableOrderCache<&str, String> = StableOrderCache::default();
+        cache
+            .get_or_anchor_async("k", 0, || ok_async(&["a", "b", "c"]))
+            .await
+            .unwrap();
+
+        // A later call with a DIFFERENT compute must be ignored --
+        // proves the anchored ordering, not a fresh one, is returned.
+        let replayed = cache
+            .get_or_anchor_async("k", 2, || ok_async(&["should", "not", "run"]))
+            .await
+            .unwrap();
+        assert_eq!(replayed, vec!["a", "b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn async_offset_positive_with_no_anchor_computes_and_anchors() {
+        let cache: StableOrderCache<&str, String> = StableOrderCache::default();
+        let result = cache
+            .get_or_anchor_async("k", 5, || ok_async(&["fresh"]))
+            .await
+            .unwrap();
+        assert_eq!(result, vec!["fresh"]);
+
+        // Subsequent offset>0 calls now replay THIS anchor.
+        let replayed = cache
+            .get_or_anchor_async("k", 10, || ok_async(&["different"]))
+            .await
+            .unwrap();
+        assert_eq!(replayed, vec!["fresh"]);
+    }
+
+    #[tokio::test]
+    async fn async_compute_error_propagates_and_does_not_anchor() {
+        let cache: StableOrderCache<&str, String> = StableOrderCache::default();
+        async fn boom() -> Result<Vec<String>, &'static str> {
+            Err("boom")
+        }
+        async fn computed() -> Result<Vec<String>, &'static str> {
+            Ok(vec!["computed".to_string()])
+        }
+        let err: Result<Vec<String>, &str> = cache.get_or_anchor_async("k", 0, boom).await;
+        assert_eq!(err, Err("boom"));
+
+        // Nothing was anchored, so a later call still needs to compute.
+        let result: Result<Vec<String>, &str> = cache.get_or_anchor_async("k", 1, computed).await;
         assert_eq!(result, Ok(vec!["computed".to_string()]));
     }
 }
