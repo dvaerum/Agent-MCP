@@ -24,10 +24,26 @@
 //! than hidden inside the repository matches this crate's convention
 //! of never silently swallowing an error two layers away from the
 //! decision that makes it safe to ignore.
+//!
+//! Phase G (sea-orm migration): converted onto the [`entity::agent_action`]
+//! `Entity`, which already existed (defined ahead of this repository's
+//! own rewrite). [`log_agent_action`] is a plain `ActiveModel::insert`
+//! — a pure append against an autoincrement PK needs no
+//! `.on_conflict()`. [`list_recent`]'s "last N, oldest-of-the-batch
+//! first" shape doesn't fit sea-orm's query builder directly (it can't
+//! express an inner `ORDER BY ... LIMIT` re-sorted by an outer
+//! `ORDER BY` in one chain), so it uses this crate's established raw-
+//! SQL escape hatch (`sea_orm::Statement` + `query_all_raw`, the same
+//! idiom `task_comments_repository::task_status` and
+//! `rag_repository`/`group_membership_repository` already use) rather
+//! than bend the builder to fit.
 
-use rusqlite::Result;
-use rusqlite::{params_from_iter, Connection};
+use sea_orm::{
+    ActiveModelTrait, ActiveValue::Set, ConnectionTrait, DatabaseConnection, DbErr, Statement,
+};
 use serde_json::Value;
+
+use crate::entity::agent_action::ActiveModel;
 
 /// One `agent_actions` row, as read back by [`list_recent`].
 #[derive(Debug, Clone, PartialEq)]
@@ -45,20 +61,24 @@ pub struct AgentActionRow {
 /// stores a SQL NULL, matching an action with no extra detail.
 /// `now` is an explicit ISO-8601 timestamp — this crate's "never read
 /// a hidden wall clock" convention.
-pub fn log_agent_action(
-    conn: &Connection,
+pub async fn log_agent_action(
+    db: &DatabaseConnection,
     agent_id: &str,
     action_type: &str,
     task_id: Option<&str>,
     details: Option<&Value>,
     now: &str,
-) -> Result<()> {
+) -> Result<(), DbErr> {
     let details_json = details.map(|d| d.to_string());
-    conn.execute(
-        "INSERT INTO agent_actions (agent_id, action_type, task_id, timestamp, details) \
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        (agent_id, action_type, task_id, now, details_json),
-    )?;
+    let am = ActiveModel {
+        agent_id: Set(agent_id.to_string()),
+        action_type: Set(action_type.to_string()),
+        task_id: Set(task_id.map(str::to_string)),
+        timestamp: Set(now.to_string()),
+        details: Set(details_json),
+        ..Default::default()
+    };
+    am.insert(db).await?;
     Ok(())
 }
 
@@ -70,153 +90,155 @@ pub fn log_agent_action(
 /// behavior to preserve, not "newest first" (a plausible but wrong
 /// re-derivation). Implemented as an inner DESC-ordered LIMIT
 /// (cheapest way to pick "the last N") wrapped in an outer ASC
-/// re-sort.
-pub fn list_recent(
-    conn: &Connection,
+/// re-sort, via this crate's raw-SQL escape hatch (see this module's
+/// own doc comment for why sea-orm's query builder can't express this
+/// shape directly).
+pub async fn list_recent(
+    db: &DatabaseConnection,
     agent_id_filter: Option<&str>,
     action_type_filter: Option<&str>,
     limit: i64,
-) -> Result<Vec<AgentActionRow>> {
+) -> Result<Vec<AgentActionRow>, DbErr> {
     let mut clauses = Vec::new();
-    let mut params: Vec<&dyn rusqlite::ToSql> = Vec::new();
-    if let Some(agent_id) = &agent_id_filter {
+    let mut params: Vec<sea_orm::Value> = Vec::new();
+    if let Some(agent_id) = agent_id_filter {
         clauses.push("agent_id = ?");
-        params.push(agent_id);
+        params.push(agent_id.into());
     }
-    if let Some(action_type) = &action_type_filter {
+    if let Some(action_type) = action_type_filter {
         clauses.push("action_type = ?");
-        params.push(action_type);
+        params.push(action_type.into());
     }
     let where_clause = if clauses.is_empty() {
         String::new()
     } else {
         format!("WHERE {}", clauses.join(" AND "))
     };
-    params.push(&limit);
+    params.push(limit.into());
     let sql = format!(
         "SELECT action_id, agent_id, action_type, task_id, timestamp, details FROM ( \
              SELECT action_id, agent_id, action_type, task_id, timestamp, details \
              FROM agent_actions {where_clause} ORDER BY action_id DESC LIMIT ? \
          ) ORDER BY action_id ASC"
     );
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt
-        .query_map(params_from_iter(params), |row| {
-            let details_raw: Option<String> = row.get(5)?;
+    let stmt = Statement::from_sql_and_values(sea_orm::DatabaseBackend::Sqlite, &sql, params);
+    let rows = db.query_all_raw(stmt).await?;
+    rows.into_iter()
+        .map(|row| {
+            let details_raw: Option<String> = row.try_get("", "details")?;
             Ok(AgentActionRow {
-                action_id: row.get(0)?,
-                agent_id: row.get(1)?,
-                action_type: row.get(2)?,
-                task_id: row.get(3)?,
-                timestamp: row.get(4)?,
+                action_id: row.try_get("", "action_id")?,
+                agent_id: row.try_get("", "agent_id")?,
+                action_type: row.try_get("", "action_type")?,
+                task_id: row.try_get("", "task_id")?,
+                timestamp: row.try_get("", "timestamp")?,
                 details: details_raw.and_then(|s| serde_json::from_str(&s).ok()),
             })
-        })?
-        .collect::<Result<Vec<_>>>()?;
-    Ok(rows)
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::schema::init_schema;
+    use sea_orm::Database;
 
-    fn test_conn() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        init_schema(&conn).unwrap();
-        conn
+    async fn test_conn() -> (tempfile::TempDir, DatabaseConnection) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        {
+            let c = rusqlite::Connection::open(&path).unwrap();
+            init_schema(&c).unwrap();
+        }
+        let db = Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        (dir, db)
     }
 
-    #[test]
-    fn logs_a_row_with_no_details() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn logs_a_row_with_no_details() {
+        let (_dir, db) = test_conn().await;
         log_agent_action(
-            &conn,
+            &db,
             "alice",
             "updated_setting",
             None,
             None,
             "2026-01-01T00:00:00Z",
         )
+        .await
         .unwrap();
 
-        let (agent_id, action_type, task_id, details): (
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-        ) = conn
-            .query_row(
-                "SELECT agent_id, action_type, task_id, details FROM agent_actions",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )
-            .unwrap();
-        assert_eq!(agent_id, "alice");
-        assert_eq!(action_type, "updated_setting");
-        assert_eq!(task_id, None);
-        assert_eq!(details, None);
+        let rows = list_recent(&db, None, None, 50).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].agent_id, "alice");
+        assert_eq!(rows[0].action_type, "updated_setting");
+        assert_eq!(rows[0].task_id, None);
+        assert_eq!(rows[0].details, None);
     }
 
-    #[test]
-    fn logs_a_row_with_json_serialized_details() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn logs_a_row_with_json_serialized_details() {
+        let (_dir, db) = test_conn().await;
         let details = serde_json::json!({"context_key": "config_x", "created": true});
         log_agent_action(
-            &conn,
+            &db,
             "alice",
             "updated_setting",
             None,
             Some(&details),
             "2026-01-01T00:00:00Z",
         )
+        .await
         .unwrap();
 
-        let stored: String = conn
-            .query_row("SELECT details FROM agent_actions", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(serde_json::from_str::<Value>(&stored).unwrap(), details);
+        let rows = list_recent(&db, None, None, 50).await.unwrap();
+        assert_eq!(rows[0].details, Some(details));
     }
 
-    #[test]
-    fn multiple_actions_accumulate_distinct_autoincrement_ids() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn multiple_actions_accumulate_distinct_autoincrement_ids() {
+        let (_dir, db) = test_conn().await;
         for i in 0..3 {
             log_agent_action(
-                &conn,
+                &db,
                 "alice",
                 "updated_setting",
                 None,
                 None,
                 &format!("2026-01-01T00:00:0{i}Z"),
             )
+            .await
             .unwrap();
         }
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM agent_actions", [], |r| r.get(0))
+        let rows = list_recent(&db, None, None, 50).await.unwrap();
+        assert_eq!(rows.len(), 3);
+    }
+
+    async fn seed(db: &DatabaseConnection, agent_id: &str, action_type: &str, ts: &str) {
+        log_agent_action(db, agent_id, action_type, None, None, ts)
+            .await
             .unwrap();
-        assert_eq!(count, 3);
     }
 
-    fn seed(conn: &Connection, agent_id: &str, action_type: &str, ts: &str) {
-        log_agent_action(conn, agent_id, action_type, None, None, ts).unwrap();
-    }
-
-    #[test]
-    fn list_recent_returns_the_last_n_in_ascending_order_not_reversed() {
+    #[tokio::test]
+    async fn list_recent_returns_the_last_n_in_ascending_order_not_reversed() {
         // Matches Python's `filtered_log_entries[-limit:]` -- the last
         // N entries, still oldest-of-the-batch first (NOT re-sorted
         // newest-first, a plausible but wrong re-derivation).
-        let conn = test_conn();
+        let (_dir, db) = test_conn().await;
         for i in 0..5 {
             seed(
-                &conn,
+                &db,
                 "alice",
                 "did_thing",
                 &format!("2026-01-01T00:00:0{i}Z"),
-            );
+            )
+            .await;
         }
-        let rows = list_recent(&conn, None, None, 3).unwrap();
+        let rows = list_recent(&db, None, None, 3).await.unwrap();
         let timestamps: Vec<&str> = rows.iter().map(|r| r.timestamp.as_str()).collect();
         assert_eq!(
             timestamps,
@@ -228,58 +250,63 @@ mod tests {
         );
     }
 
-    #[test]
-    fn list_recent_filters_by_agent_id() {
-        let conn = test_conn();
-        seed(&conn, "alice", "did_thing", "2026-01-01T00:00:00Z");
-        seed(&conn, "bob", "did_thing", "2026-01-01T00:00:01Z");
-        let rows = list_recent(&conn, Some("bob"), None, 50).unwrap();
+    #[tokio::test]
+    async fn list_recent_filters_by_agent_id() {
+        let (_dir, db) = test_conn().await;
+        seed(&db, "alice", "did_thing", "2026-01-01T00:00:00Z").await;
+        seed(&db, "bob", "did_thing", "2026-01-01T00:00:01Z").await;
+        let rows = list_recent(&db, Some("bob"), None, 50).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].agent_id, "bob");
     }
 
-    #[test]
-    fn list_recent_filters_by_action_type() {
-        let conn = test_conn();
-        seed(&conn, "alice", "created_task", "2026-01-01T00:00:00Z");
-        seed(&conn, "alice", "deleted_task", "2026-01-01T00:00:01Z");
-        let rows = list_recent(&conn, None, Some("deleted_task"), 50).unwrap();
+    #[tokio::test]
+    async fn list_recent_filters_by_action_type() {
+        let (_dir, db) = test_conn().await;
+        seed(&db, "alice", "created_task", "2026-01-01T00:00:00Z").await;
+        seed(&db, "alice", "deleted_task", "2026-01-01T00:00:01Z").await;
+        let rows = list_recent(&db, None, Some("deleted_task"), 50)
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].action_type, "deleted_task");
     }
 
-    #[test]
-    fn list_recent_combines_both_filters() {
-        let conn = test_conn();
-        seed(&conn, "alice", "created_task", "2026-01-01T00:00:00Z");
-        seed(&conn, "alice", "deleted_task", "2026-01-01T00:00:01Z");
-        seed(&conn, "bob", "deleted_task", "2026-01-01T00:00:02Z");
-        let rows = list_recent(&conn, Some("alice"), Some("deleted_task"), 50).unwrap();
+    #[tokio::test]
+    async fn list_recent_combines_both_filters() {
+        let (_dir, db) = test_conn().await;
+        seed(&db, "alice", "created_task", "2026-01-01T00:00:00Z").await;
+        seed(&db, "alice", "deleted_task", "2026-01-01T00:00:01Z").await;
+        seed(&db, "bob", "deleted_task", "2026-01-01T00:00:02Z").await;
+        let rows = list_recent(&db, Some("alice"), Some("deleted_task"), 50)
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].agent_id, "alice");
         assert_eq!(rows[0].action_type, "deleted_task");
     }
 
-    #[test]
-    fn list_recent_on_an_empty_table_is_empty() {
-        let conn = test_conn();
-        assert_eq!(list_recent(&conn, None, None, 50).unwrap(), vec![]);
+    #[tokio::test]
+    async fn list_recent_on_an_empty_table_is_empty() {
+        let (_dir, db) = test_conn().await;
+        assert_eq!(list_recent(&db, None, None, 50).await.unwrap(), vec![]);
     }
 
-    #[test]
-    fn list_recent_parses_details_json() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn list_recent_parses_details_json() {
+        let (_dir, db) = test_conn().await;
         let details = serde_json::json!({"key": "value"});
         log_agent_action(
-            &conn,
+            &db,
             "alice",
             "did_thing",
             None,
             Some(&details),
             "2026-01-01T00:00:00Z",
         )
+        .await
         .unwrap();
-        let rows = list_recent(&conn, None, None, 50).unwrap();
+        let rows = list_recent(&db, None, None, 50).await.unwrap();
         assert_eq!(rows[0].details, Some(details));
     }
 }

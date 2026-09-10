@@ -328,15 +328,15 @@ mod claude_session_monitor {
                     "parent_pid": int_field(data, "parent_pid"),
                     "working_directory": str_field(data, "working_directory"),
                 });
-                let conn = shared.conn.lock().await;
                 let _ = conexus_db::agent_action_repository::log_agent_action(
-                    &conn,
+                    &shared.sea_orm_db,
                     "system",
                     "claude_session_detected",
                     None,
                     Some(&details),
                     &now,
-                );
+                )
+                .await;
             }
         }
         for id in &stale {

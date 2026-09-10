@@ -234,10 +234,10 @@ impl Tool for UpdateFileMetadataTool {
 
             let metadata_json = metadata_to_set.to_string();
 
-            // `file_metadata_repository` is sea-orm-backed (Phase G);
-            // `agent_action_repository` below is not yet -- `guard`
-            // (the legacy connection) stays alive across both calls
-            // since the audit-log write still needs it.
+            // `file_metadata_repository` AND `agent_action_repository`
+            // are both sea-orm-backed now (Phase G) -- `guard` (the
+            // legacy connection) is dropped before either write.
+            drop(guard);
             match file_metadata_repository::upsert(
                 ctx.sea_orm_db,
                 &normalized,
@@ -249,13 +249,14 @@ impl Tool for UpdateFileMetadataTool {
             {
                 Ok(()) => {
                     let _ = agent_action_repository::log_agent_action(
-                        &guard,
+                        ctx.sea_orm_db,
                         requesting_admin_id,
                         "updated_file_metadata",
                         None,
                         Some(&serde_json::json!({"filepath": normalized, "action": "set/update"})),
                         now,
-                    );
+                    )
+                    .await;
                     ToolResult::Ok {
                         data: Some(serde_json::json!({
                             "filepath": normalized,

@@ -483,7 +483,7 @@ impl Tool for ViewTasksTool {
     fn call<'a>(
         principal: Option<&'a Principal>,
         arguments: &'a Value,
-        conn: &'a AsyncMutex<Connection>,
+        _conn: &'a AsyncMutex<Connection>,
         now: &'a str,
         ctx: &'a conexus_auth::ToolCallContext<'a>,
     ) -> conexus_auth::BoxFuture<'a, ToolResult> {
@@ -517,19 +517,12 @@ impl Tool for ViewTasksTool {
                 .or_else(|| principal.user_id.clone())
                 .unwrap_or_else(|| "admin".to_string());
 
-            // Phase G: resolved via sea-orm before `conn` is locked
-            // below -- see `conexus_backend::principal_resolve::
-            // resolve_principal`'s own doc comment for why a bare
-            // `&Connection` reference can't coexist with an internal
-            // `.await` inside this function.
             let allow_worker_view_foreign_tasks = project_settings_repository::get_bool(
                 ctx.sea_orm_db,
                 "config_allow_worker_view_foreign_tasks",
                 true,
             )
             .await;
-
-            let conn = conn.lock().await;
 
             let mut target_agent_id_for_filter = filter_agent_id.clone();
             if !is_admin_request && !allow_worker_view_foreign_tasks {
@@ -805,7 +798,7 @@ impl Tool for ViewTasksTool {
             };
 
             if let Err(_e) = agent_action_repository::log_agent_action(
-                &conn,
+                ctx.sea_orm_db,
                 &requesting_agent_id,
                 "view_tasks",
                 None,
@@ -814,7 +807,9 @@ impl Tool for ViewTasksTool {
                     "filter_status": filter_status,
                 })),
                 now,
-            ) {
+            )
+            .await
+            {
                 // Best-effort audit log -- matches Python's own
                 // fire-and-forget log_audit semantics (never fails the
                 // primary read for an audit-log write error).
@@ -859,7 +854,7 @@ impl Tool for SearchTasksTool {
     fn call<'a>(
         principal: Option<&'a Principal>,
         arguments: &'a Value,
-        conn: &'a AsyncMutex<Connection>,
+        _conn: &'a AsyncMutex<Connection>,
         now: &'a str,
         ctx: &'a conexus_auth::ToolCallContext<'a>,
     ) -> conexus_auth::BoxFuture<'a, ToolResult> {
@@ -924,7 +919,6 @@ impl Tool for SearchTasksTool {
                 };
             }
 
-            let conn = conn.lock().await;
             let allow_foreign = project_settings_repository::get_bool(
                 ctx.sea_orm_db,
                 "config_allow_worker_view_foreign_tasks",
@@ -1031,7 +1025,7 @@ impl Tool for SearchTasksTool {
                 response_parts.push("• Use max_results to control response size".to_string());
 
                 if let Err(_e) = agent_action_repository::log_agent_action(
-                    &conn,
+                    ctx.sea_orm_db,
                     &requesting_agent_id,
                     "search_tasks",
                     None,
@@ -1041,7 +1035,9 @@ impl Tool for SearchTasksTool {
                         "results": truncated.len(),
                     })),
                     now,
-                ) {
+                )
+                .await
+                {
                     // Best-effort audit log, same rationale as
                     // view_tasks above.
                 }
@@ -1189,7 +1185,7 @@ impl Tool for SearchTasksTool {
                 response_parts.push("• Use max_results to control response size".to_string());
 
                 if let Err(_e) = agent_action_repository::log_agent_action(
-                    &conn,
+                    ctx.sea_orm_db,
                     &requesting_agent_id,
                     "search_tasks",
                     None,
@@ -1198,7 +1194,9 @@ impl Tool for SearchTasksTool {
                         "results": scored.len(),
                     })),
                     now,
-                ) {
+                )
+                .await
+                {
                     // Best-effort audit log, same rationale as above.
                 }
 
@@ -1383,87 +1381,92 @@ impl Tool for CreateTaskTool {
             };
 
             let conn = conn.lock().await;
-            let tx = match conn.unchecked_transaction() {
-                Ok(tx) => tx,
-                Err(_) => {
-                    return ToolResult::Failed {
-                        message: "Database error creating task".to_string(),
+            // Scoped in its own block so `tx` (a `rusqlite::Transaction`,
+            // not `Send`) is lexically dropped -- not merely logically
+            // consumed by `commit()` -- before the `.await` below; see
+            // the identical rationale on `UpdateTaskStatusTool::call`.
+            let task_id = {
+                let tx = match conn.unchecked_transaction() {
+                    Ok(tx) => tx,
+                    Err(_) => {
+                        return ToolResult::Failed {
+                            message: "Database error creating task".to_string(),
+                        }
+                    }
+                };
+
+                // PF-R32-1b: pre-validate parent existence BEFORE the
+                // INSERT -- a well-formed but nonexistent parent would
+                // otherwise trip the self-FK at INSERT.
+                if let Some(parent_id) = &parent_task {
+                    let exists: bool = tx
+                        .query_row(
+                            "SELECT 1 FROM tasks WHERE task_id = ?1",
+                            [parent_id.as_str()],
+                            |_| Ok(true),
+                        )
+                        .optional()
+                        .unwrap_or(None)
+                        .unwrap_or(false);
+                    if !exists {
+                        return ToolResult::NotFound {
+                            resource: "task".to_string(),
+                            identifier: parent_id.clone(),
+                            hint: None,
+                        };
                     }
                 }
-            };
 
-            // PF-R32-1b: pre-validate parent existence BEFORE the
-            // INSERT -- a well-formed but nonexistent parent would
-            // otherwise trip the self-FK at INSERT.
-            if let Some(parent_id) = &parent_task {
-                let exists: bool = tx
-                    .query_row(
-                        "SELECT 1 FROM tasks WHERE task_id = ?1",
-                        [parent_id.as_str()],
-                        |_| Ok(true),
-                    )
-                    .optional()
-                    .unwrap_or(None)
-                    .unwrap_or(false);
-                if !exists {
-                    return ToolResult::NotFound {
-                        resource: "task".to_string(),
-                        identifier: parent_id.clone(),
-                        hint: None,
-                    };
-                }
-            }
-
-            // BL-R13-1: a directly-assigned task must target a LIVE
-            // agent.
-            if let Some(assignee) = &assigned_to {
-                if !agent_assignable(&tx, assignee) {
-                    return ToolResult::Invalid {
-                        field: None,
-                        message: format!(
-                            "Cannot assign task to '{assignee}': agent does not exist or is \
+                // BL-R13-1: a directly-assigned task must target a LIVE
+                // agent.
+                if let Some(assignee) = &assigned_to {
+                    if !agent_assignable(&tx, assignee) {
+                        return ToolResult::Invalid {
+                            field: None,
+                            message: format!(
+                                "Cannot assign task to '{assignee}': agent does not exist or is \
                              terminated."
-                        ),
-                    };
-                }
-            }
-
-            // R15-BL-1: single-root-task invariant, same guard every
-            // other create path in this module runs.
-            if parent_task.is_none() {
-                if let Some(conflict) = single_root_conflict(&tx) {
-                    return conflict;
-                }
-            }
-
-            let new_task = conexus_db::task_repository::NewTask {
-                task_id: None,
-                title,
-                description: Some(&description),
-                assigned_to: assigned_to.as_deref(),
-                created_by: &requesting_admin_id,
-                status,
-                priority: &priority,
-                parent_task: parent_task.as_deref(),
-                child_tasks: None,
-                depends_on_tasks: None,
-                notes: None,
-                now,
-            };
-            let fresh = match task_repository::create_in_transaction(&tx, new_task) {
-                Ok(row) => row,
-                Err(_) => {
-                    return ToolResult::Failed {
-                        message: "Database error creating task".to_string(),
+                            ),
+                        };
                     }
                 }
-            };
-            let task_id = fresh.task_id.clone();
 
-            // BL-R30-1: set the gaining agent's `current_task` on a
-            // create-with-assignee (prior=None -> SETs only when idle).
-            if let Some(assignee) = &assigned_to {
-                if conexus_db::agent_repository::AgentRepository::reconcile_current_task_on_reassign(
+                // R15-BL-1: single-root-task invariant, same guard every
+                // other create path in this module runs.
+                if parent_task.is_none() {
+                    if let Some(conflict) = single_root_conflict(&tx) {
+                        return conflict;
+                    }
+                }
+
+                let new_task = conexus_db::task_repository::NewTask {
+                    task_id: None,
+                    title,
+                    description: Some(&description),
+                    assigned_to: assigned_to.as_deref(),
+                    created_by: &requesting_admin_id,
+                    status,
+                    priority: &priority,
+                    parent_task: parent_task.as_deref(),
+                    child_tasks: None,
+                    depends_on_tasks: None,
+                    notes: None,
+                    now,
+                };
+                let fresh = match task_repository::create_in_transaction(&tx, new_task) {
+                    Ok(row) => row,
+                    Err(_) => {
+                        return ToolResult::Failed {
+                            message: "Database error creating task".to_string(),
+                        }
+                    }
+                };
+                let task_id = fresh.task_id.clone();
+
+                // BL-R30-1: set the gaining agent's `current_task` on a
+                // create-with-assignee (prior=None -> SETs only when idle).
+                if let Some(assignee) = &assigned_to {
+                    if conexus_db::agent_repository::AgentRepository::reconcile_current_task_on_reassign(
                     &tx,
                     &task_id,
                     None,
@@ -1476,31 +1479,45 @@ impl Tool for CreateTaskTool {
                         message: "Database error creating task".to_string(),
                     };
                 }
-            }
+                }
 
+                if link_child_to_parent(&tx, parent_task.as_deref(), &task_id, now).is_err() {
+                    return ToolResult::Failed {
+                        message: "Database error creating task".to_string(),
+                    };
+                }
+
+                if tx.commit().is_err() {
+                    return ToolResult::Failed {
+                        message: "Database error creating task".to_string(),
+                    };
+                }
+
+                task_id
+            };
+
+            // Phase G: `agent_action_repository` is sea-orm-backed now,
+            // so the audit-log write is a SEPARATE, non-atomic write
+            // AFTER the transaction above has already durably
+            // committed -- it can no longer run ON `tx` itself. Same
+            // established tradeoff as every other converted
+            // `agent_action_repository` call site in this migration
+            // (see `project_settings_tools.rs`'s own doc comment for
+            // the precedent). Best-effort as before: an audit-log
+            // failure must not fail the primary write.
             if let Err(_e) = agent_action_repository::log_agent_action(
-                &tx,
+                ctx.sea_orm_db,
                 &requesting_admin_id,
                 "created_task",
                 Some(&task_id),
                 Some(&serde_json::json!({"title": title, "assigned_to": assigned_to})),
                 now,
-            ) {
+            )
+            .await
+            {
                 // Best-effort audit log -- matches Python's own
                 // fire-and-forget semantics, same rationale as
                 // view_tasks/search_tasks above.
-            }
-
-            if link_child_to_parent(&tx, parent_task.as_deref(), &task_id, now).is_err() {
-                return ToolResult::Failed {
-                    message: "Database error creating task".to_string(),
-                };
-            }
-
-            if tx.commit().is_err() {
-                return ToolResult::Failed {
-                    message: "Database error creating task".to_string(),
-                };
             }
 
             // Emit-iff-commit: the wake fires only after the write is
@@ -1695,6 +1712,16 @@ impl Tool for UpdateTaskStatusTool {
             // below; otherwise the compiler keeps its slot live across
             // the yield point and the whole `Tool::call` future stops
             // being `Send`.
+            // Phase G: `agent_action_repository` is sea-orm-backed now,
+            // so the per-task audit-log writes below can no longer run
+            // ON `tx` (a bare rusqlite `Transaction`, not `Send`,
+            // dropped before any `.await`). Their details are collected
+            // here during the loop and the actual writes happen AFTER
+            // `tx.commit()`, non-atomic with it -- same established
+            // tradeoff as every other converted `agent_action_repository`
+            // call site in this migration (see `project_settings_tools.rs`'s
+            // own doc comment for the precedent).
+            let mut audit_log_entries: Vec<(String, serde_json::Value)> = Vec::new();
             let (results, cascade_results, dependency_updates) = {
                 let tx = match conn.unchecked_transaction() {
                     Ok(tx) => tx,
@@ -1747,17 +1774,7 @@ impl Tool for UpdateTaskStatusTool {
                             if notes_content.is_some() {
                                 log_details["notes_added"] = serde_json::json!(true);
                             }
-                            if let Err(_e) = agent_action_repository::log_agent_action(
-                                &tx,
-                                &requesting_agent_id,
-                                "update_task_status",
-                                Some(task_id),
-                                Some(&log_details),
-                                now,
-                            ) {
-                                // Best-effort audit log -- same rationale as
-                                // every other mutating tool in this module.
-                            }
+                            audit_log_entries.push((task_id.clone(), log_details));
                             results.push(SingleTaskResult {
                                 task_id: task_id.clone(),
                                 applied: Some(applied),
@@ -1852,6 +1869,22 @@ impl Tool for UpdateTaskStatusTool {
 
                 (results, cascade_results, dependency_updates)
             };
+
+            for (task_id, log_details) in &audit_log_entries {
+                if let Err(_e) = agent_action_repository::log_agent_action(
+                    ctx.sea_orm_db,
+                    &requesting_agent_id,
+                    "update_task_status",
+                    Some(task_id),
+                    Some(log_details),
+                    now,
+                )
+                .await
+                {
+                    // Best-effort audit log -- same rationale as every
+                    // other mutating tool in this module.
+                }
+            }
 
             // Post-commit: wake every mutated task's CURRENT assignee.
             let mut mutated_ids: Vec<String> = results
@@ -2054,148 +2087,157 @@ impl Tool for UpdateTaskTool {
                 || reassign_target.is_some();
 
             let conn = conn.lock().await;
-            let tx = match conn.unchecked_transaction() {
-                Ok(tx) => tx,
-                Err(_) => {
-                    return ToolResult::Failed {
-                        message: "Database error updating task".to_string(),
-                    }
-                }
-            };
-
-            let Some(prior) = (match task_repository::get_by_id_in_transaction(&tx, &task_id) {
-                Ok(row) => row,
-                Err(_) => {
-                    return ToolResult::Failed {
-                        message: "Database error updating task".to_string(),
-                    }
-                }
-            }) else {
-                return ToolResult::NotFound {
-                    resource: "task".to_string(),
-                    identifier: task_id,
-                    hint: None,
-                };
-            };
-            let prior_status = prior.status.clone();
-            let prior_assignee = prior.assigned_to.clone();
-
-            let mut log_details = serde_json::json!({});
-            let mut changed_fields: Vec<&str> = Vec::new();
-
-            if admin_fields_requested {
-                // No explicit status -> thread the CURRENT status
-                // through unchanged so the terminal-sink guard still
-                // gates every other admin field.
-                let final_status = explicit_status.clone().unwrap_or(prior_status.clone());
-                let edit = TaskEdit {
-                    notes_content: notes_content.as_deref(),
-                    new_title,
-                    new_description,
-                    new_priority: new_priority.as_deref(),
-                    new_assigned_to: reassign_target.as_deref(),
-                    new_depends_on_tasks: None,
-                    system_transition: false,
-                    validate_dependencies: true,
-                };
-                let outcome = match update_single_task(
-                    &tx,
-                    &task_id,
-                    &final_status,
-                    &requesting_agent_id,
-                    true,
-                    &edit,
-                    now,
-                ) {
-                    Ok(o) => o,
+            // Scoped in its own block so `tx` (a `rusqlite::Transaction`,
+            // not `Send`) is lexically dropped -- not merely logically
+            // consumed by `commit()` -- before the `.await` below; see
+            // the identical rationale on `UpdateTaskStatusTool::call`.
+            let (task_id, log_details, clearing_fanout_needed, prior_assignee) = {
+                let tx = match conn.unchecked_transaction() {
+                    Ok(tx) => tx,
                     Err(_) => {
                         return ToolResult::Failed {
                             message: "Database error updating task".to_string(),
                         }
                     }
                 };
-                match outcome {
-                    UpdateSingleTaskOutcome::Applied(_) => {}
-                    UpdateSingleTaskOutcome::NotFound => {
-                        return ToolResult::NotFound {
-                            resource: "task".to_string(),
-                            identifier: task_id,
-                            hint: None,
-                        };
+
+                let Some(prior) = (match task_repository::get_by_id_in_transaction(&tx, &task_id) {
+                    Ok(row) => row,
+                    Err(_) => {
+                        return ToolResult::Failed {
+                            message: "Database error updating task".to_string(),
+                        }
                     }
-                    UpdateSingleTaskOutcome::InvalidTransition(msg) => {
-                        return ToolResult::Conflict { reason: msg };
+                }) else {
+                    return ToolResult::NotFound {
+                        resource: "task".to_string(),
+                        identifier: task_id,
+                        hint: None,
+                    };
+                };
+                let prior_status = prior.status.clone();
+                let prior_assignee = prior.assigned_to.clone();
+
+                let mut log_details = serde_json::json!({});
+                let mut changed_fields: Vec<&str> = Vec::new();
+
+                if admin_fields_requested {
+                    // No explicit status -> thread the CURRENT status
+                    // through unchanged so the terminal-sink guard still
+                    // gates every other admin field.
+                    let final_status = explicit_status.clone().unwrap_or(prior_status.clone());
+                    let edit = TaskEdit {
+                        notes_content: notes_content.as_deref(),
+                        new_title,
+                        new_description,
+                        new_priority: new_priority.as_deref(),
+                        new_assigned_to: reassign_target.as_deref(),
+                        new_depends_on_tasks: None,
+                        system_transition: false,
+                        validate_dependencies: true,
+                    };
+                    let outcome = match update_single_task(
+                        &tx,
+                        &task_id,
+                        &final_status,
+                        &requesting_agent_id,
+                        true,
+                        &edit,
+                        now,
+                    ) {
+                        Ok(o) => o,
+                        Err(_) => {
+                            return ToolResult::Failed {
+                                message: "Database error updating task".to_string(),
+                            }
+                        }
+                    };
+                    match outcome {
+                        UpdateSingleTaskOutcome::Applied(_) => {}
+                        UpdateSingleTaskOutcome::NotFound => {
+                            return ToolResult::NotFound {
+                                resource: "task".to_string(),
+                                identifier: task_id,
+                                hint: None,
+                            };
+                        }
+                        UpdateSingleTaskOutcome::InvalidTransition(msg) => {
+                            return ToolResult::Conflict { reason: msg };
+                        }
+                        UpdateSingleTaskOutcome::AssigneeInvalid(msg) => {
+                            return ToolResult::Invalid {
+                                field: Some("assigned_to".to_string()),
+                                message: msg,
+                            };
+                        }
+                        UpdateSingleTaskOutcome::Unauthorized(msg)
+                        | UpdateSingleTaskOutcome::DependencyCycle(msg)
+                        | UpdateSingleTaskOutcome::DependencyIncomplete(msg) => {
+                            return ToolResult::Failed { message: msg };
+                        }
                     }
-                    UpdateSingleTaskOutcome::AssigneeInvalid(msg) => {
-                        return ToolResult::Invalid {
-                            field: Some("assigned_to".to_string()),
-                            message: msg,
-                        };
+
+                    if let Some(status) = &explicit_status {
+                        log_details["status_updated_to"] = serde_json::json!(status);
+                        changed_fields.push("status");
                     }
-                    UpdateSingleTaskOutcome::Unauthorized(msg)
-                    | UpdateSingleTaskOutcome::DependencyCycle(msg)
-                    | UpdateSingleTaskOutcome::DependencyIncomplete(msg) => {
-                        return ToolResult::Failed { message: msg };
+                    if new_title.is_some() {
+                        log_details["title_changed"] = serde_json::json!(true);
+                        changed_fields.push("title");
+                    }
+                    if new_description.is_some() {
+                        log_details["description_changed"] = serde_json::json!(true);
+                        changed_fields.push("description");
+                    }
+                    if new_priority.is_some() {
+                        log_details["priority_changed"] = serde_json::json!(true);
+                        changed_fields.push("priority");
+                    }
+                    if notes_content.is_some() {
+                        log_details["notes_added"] = serde_json::json!(true);
+                        changed_fields.push("notes");
+                    }
+                    if let Some(target) = &reassign_target {
+                        log_details["assigned_to_changed"] = serde_json::json!(target);
+                        changed_fields.push("assigned_to");
                     }
                 }
 
-                if let Some(status) = &explicit_status {
-                    log_details["status_updated_to"] = serde_json::json!(status);
-                    changed_fields.push("status");
-                }
-                if new_title.is_some() {
-                    log_details["title_changed"] = serde_json::json!(true);
-                    changed_fields.push("title");
-                }
-                if new_description.is_some() {
-                    log_details["description_changed"] = serde_json::json!(true);
-                    changed_fields.push("description");
-                }
-                if new_priority.is_some() {
-                    log_details["priority_changed"] = serde_json::json!(true);
-                    changed_fields.push("priority");
-                }
-                if notes_content.is_some() {
-                    log_details["notes_added"] = serde_json::json!(true);
-                    changed_fields.push("notes");
-                }
-                if let Some(target) = &reassign_target {
-                    log_details["assigned_to_changed"] = serde_json::json!(target);
-                    changed_fields.push("assigned_to");
-                }
-            }
-
-            let mut clearing_fanout_needed = false;
-            if clearing {
-                // SECURITY (R12-F5): a bare `assigned_to: null` clear
-                // never routes through `update_single_task` above
-                // (admin_fields_requested is false for a clear-only
-                // call), so it needs the SAME terminal-sink guard
-                // applied explicitly here.
-                if TERMINAL_TASK_STATUSES.contains(&prior_status.as_str()) {
-                    return ToolResult::Conflict {
-                        reason: format!(
-                            "Cannot clear assignment for task '{task_id}': status \
+                let mut clearing_fanout_needed = false;
+                if clearing {
+                    // SECURITY (R12-F5): a bare `assigned_to: null` clear
+                    // never routes through `update_single_task` above
+                    // (admin_fields_requested is false for a clear-only
+                    // call), so it needs the SAME terminal-sink guard
+                    // applied explicitly here.
+                    if TERMINAL_TASK_STATUSES.contains(&prior_status.as_str()) {
+                        return ToolResult::Conflict {
+                            reason: format!(
+                                "Cannot clear assignment for task '{task_id}': status \
                              '{prior_status}' is terminal (completed/cancelled/failed) and \
                              its assignment is frozen."
-                        ),
-                    };
-                }
-                let effective_status = explicit_status.clone().unwrap_or(prior_status.clone());
-                let mut clear_fields = conexus_db::task_repository::TaskFields {
-                    assigned_to: conexus_db::scheduled_directive_repository::NullableUpdate::Clear,
-                    ..Default::default()
-                };
-                if !TERMINAL_TASK_STATUSES.contains(&effective_status.as_str()) {
-                    clearing_fanout_needed = true;
-                    if explicit_status.is_none() {
-                        clear_fields.status = Some("unassigned");
+                            ),
+                        };
                     }
-                }
-                if let Err(e) =
-                    task_repository::update_fields_in_transaction(&tx, &task_id, &clear_fields, now)
-                {
-                    return match e {
+                    let effective_status = explicit_status.clone().unwrap_or(prior_status.clone());
+                    let mut clear_fields = conexus_db::task_repository::TaskFields {
+                        assigned_to:
+                            conexus_db::scheduled_directive_repository::NullableUpdate::Clear,
+                        ..Default::default()
+                    };
+                    if !TERMINAL_TASK_STATUSES.contains(&effective_status.as_str()) {
+                        clearing_fanout_needed = true;
+                        if explicit_status.is_none() {
+                            clear_fields.status = Some("unassigned");
+                        }
+                    }
+                    if let Err(e) = task_repository::update_fields_in_transaction(
+                        &tx,
+                        &task_id,
+                        &clear_fields,
+                        now,
+                    ) {
+                        return match e {
                         conexus_db::task_repository::UpdateTaskError::TerminalTaskWriteBlocked(
                             _,
                         ) => ToolResult::Conflict {
@@ -2209,10 +2251,10 @@ impl Tool for UpdateTaskTool {
                             message: "Database error updating task".to_string(),
                         },
                     };
-                }
-                // BL-R30-1: `update_single_task` only reconciles on the
-                // REASSIGN branch; clearing never reaches it.
-                if let Err(_e) =
+                    }
+                    // BL-R30-1: `update_single_task` only reconciles on the
+                    // REASSIGN branch; clearing never reaches it.
+                    if let Err(_e) =
                     conexus_db::agent_repository::AgentRepository::reconcile_current_task_on_reassign(
                         &tx,
                         &task_id,
@@ -2225,40 +2267,47 @@ impl Tool for UpdateTaskTool {
                         message: "Database error updating task".to_string(),
                     };
                 }
-                log_details["assigned_to_changed"] = serde_json::Value::Null;
-                changed_fields.push("assigned_to");
-            }
+                    log_details["assigned_to_changed"] = serde_json::Value::Null;
+                    changed_fields.push("assigned_to");
+                }
 
-            // Mirror the pre-refactor route: audit unconditionally
-            // (even a request whose only supplied field was itself a
-            // no-op), then only register write-observable effects when
-            // something actually landed.
-            if let Err(_e) = agent_action_repository::log_agent_action(
-                &tx,
-                &requesting_agent_id,
-                "updated_task_dashboard",
-                Some(&task_id),
-                Some(&log_details),
-                now,
-            ) {
-                // Best-effort audit log, same rationale as above.
-            }
-
-            if !(admin_fields_requested || clearing) {
                 if tx.commit().is_err() {
                     return ToolResult::Failed {
                         message: "Database error updating task".to_string(),
                     };
                 }
+
+                (task_id, log_details, clearing_fanout_needed, prior_assignee)
+            };
+
+            // Phase G: `agent_action_repository` is sea-orm-backed now,
+            // so the audit-log write is a SEPARATE, non-atomic write
+            // AFTER the transaction above has already durably
+            // committed -- it can no longer run ON `tx` itself (dropped
+            // before any `.await`, above). Same established tradeoff as
+            // every other converted `agent_action_repository` call site
+            // in this migration (see `project_settings_tools.rs`'s own
+            // doc comment for the precedent). Mirror the pre-refactor
+            // route: audit unconditionally (even a request whose only
+            // supplied field was itself a no-op), then only register
+            // write-observable effects when something actually landed.
+            if let Err(_e) = agent_action_repository::log_agent_action(
+                ctx.sea_orm_db,
+                &requesting_agent_id,
+                "updated_task_dashboard",
+                Some(&task_id),
+                Some(&log_details),
+                now,
+            )
+            .await
+            {
+                // Best-effort audit log, same rationale as above.
+            }
+
+            if !(admin_fields_requested || clearing) {
                 return ToolResult::Ok {
                     data: None,
                     message: Some("Task updated successfully.".to_string()),
-                };
-            }
-
-            if tx.commit().is_err() {
-                return ToolResult::Failed {
-                    message: "Database error updating task".to_string(),
                 };
             }
 
@@ -2393,123 +2442,129 @@ impl Tool for DeleteTaskTool {
                 .unwrap_or(false);
 
             let conn = conn.lock().await;
-            let tx = match conn.unchecked_transaction() {
-                Ok(tx) => tx,
-                Err(_) => {
-                    return ToolResult::Failed {
-                        message: "Database error deleting task".to_string(),
+            // Scoped in its own block so `tx` (a `rusqlite::Transaction`,
+            // not `Send`) is lexically dropped -- not merely logically
+            // consumed by `commit()` -- before the `.await` below; see
+            // the identical rationale on `UpdateTaskStatusTool::call`.
+            let (task_title, cascade_operations, deleted_events) = {
+                let tx = match conn.unchecked_transaction() {
+                    Ok(tx) => tx,
+                    Err(_) => {
+                        return ToolResult::Failed {
+                            message: "Database error deleting task".to_string(),
+                        }
                     }
-                }
-            };
-
-            let task_data = match task_repository::get_by_id_in_transaction(&tx, &task_id) {
-                Ok(Some(row)) => row,
-                Ok(None) => {
-                    return ToolResult::NotFound {
-                        resource: "task".to_string(),
-                        identifier: task_id,
-                        hint: None,
-                    }
-                }
-                Err(_) => {
-                    return ToolResult::Failed {
-                        message: "Database error deleting task".to_string(),
-                    }
-                }
-            };
-
-            // BL-2: enumerate children authoritatively from the
-            // `parent_task` FK column -- the source of truth, not the
-            // `child_tasks` JSON mirror (which can drift).
-            let direct_child_ids: Vec<String> = match tx
-                .prepare("SELECT task_id FROM tasks WHERE parent_task = ?1")
-                .and_then(|mut stmt| {
-                    stmt.query_map([task_id.as_str()], |row| row.get(0))?
-                        .collect()
-                }) {
-                Ok(ids) => ids,
-                Err(_) => {
-                    return ToolResult::Failed {
-                        message: "Database error deleting task".to_string(),
-                    }
-                }
-            };
-            if !direct_child_ids.is_empty() && !force_delete {
-                return ToolResult::Conflict {
-                    reason: format!(
-                        "Task '{task_id}' has {} child tasks: {direct_child_ids:?}. Use \
-                         force_delete=true to cascade delete.",
-                        direct_child_ids.len()
-                    ),
                 };
-            }
 
-            let dependent_tasks = match dependents_of(&tx, &task_id) {
-                Ok(rows) => rows,
-                Err(_) => {
-                    return ToolResult::Failed {
-                        message: "Database error deleting task".to_string(),
+                let task_data = match task_repository::get_by_id_in_transaction(&tx, &task_id) {
+                    Ok(Some(row)) => row,
+                    Ok(None) => {
+                        return ToolResult::NotFound {
+                            resource: "task".to_string(),
+                            identifier: task_id,
+                            hint: None,
+                        }
                     }
-                }
-            };
-            if !dependent_tasks.is_empty() && !force_delete {
-                let dependent_list: Vec<String> = dependent_tasks
-                    .iter()
-                    .map(|(id, _)| {
-                        let title = task_repository::get_by_id_in_transaction(&tx, id)
-                            .ok()
-                            .flatten()
-                            .map(|t| t.title)
-                            .unwrap_or_default();
-                        format!("{id} ({title})")
-                    })
-                    .collect();
-                return ToolResult::Conflict {
-                    reason: format!(
-                        "{} tasks depend on '{task_id}': {dependent_list:?}. Use \
-                         force_delete=true to cascade delete.",
-                        dependent_tasks.len()
-                    ),
+                    Err(_) => {
+                        return ToolResult::Failed {
+                            message: "Database error deleting task".to_string(),
+                        }
+                    }
                 };
-            }
 
-            // BL-3: the `agents.current_task -> tasks.task_id` FK.
-            let agents_on_task: Vec<String> = match tx
-                .prepare("SELECT agent_id FROM agents WHERE current_task = ?1")
-                .and_then(|mut stmt| {
-                    stmt.query_map([task_id.as_str()], |row| row.get(0))?
-                        .collect()
-                }) {
-                Ok(ids) => ids,
-                Err(_) => {
-                    return ToolResult::Failed {
-                        message: "Database error deleting task".to_string(),
+                // BL-2: enumerate children authoritatively from the
+                // `parent_task` FK column -- the source of truth, not the
+                // `child_tasks` JSON mirror (which can drift).
+                let direct_child_ids: Vec<String> = match tx
+                    .prepare("SELECT task_id FROM tasks WHERE parent_task = ?1")
+                    .and_then(|mut stmt| {
+                        stmt.query_map([task_id.as_str()], |row| row.get(0))?
+                            .collect()
+                    }) {
+                    Ok(ids) => ids,
+                    Err(_) => {
+                        return ToolResult::Failed {
+                            message: "Database error deleting task".to_string(),
+                        }
                     }
+                };
+                if !direct_child_ids.is_empty() && !force_delete {
+                    return ToolResult::Conflict {
+                        reason: format!(
+                            "Task '{task_id}' has {} child tasks: {direct_child_ids:?}. Use \
+                         force_delete=true to cascade delete.",
+                            direct_child_ids.len()
+                        ),
+                    };
                 }
-            };
-            if !agents_on_task.is_empty() && !force_delete {
-                return ToolResult::Conflict {
-                    reason: format!(
-                        "Task '{task_id}' is the current task of {} agent(s): \
+
+                let dependent_tasks = match dependents_of(&tx, &task_id) {
+                    Ok(rows) => rows,
+                    Err(_) => {
+                        return ToolResult::Failed {
+                            message: "Database error deleting task".to_string(),
+                        }
+                    }
+                };
+                if !dependent_tasks.is_empty() && !force_delete {
+                    let dependent_list: Vec<String> = dependent_tasks
+                        .iter()
+                        .map(|(id, _)| {
+                            let title = task_repository::get_by_id_in_transaction(&tx, id)
+                                .ok()
+                                .flatten()
+                                .map(|t| t.title)
+                                .unwrap_or_default();
+                            format!("{id} ({title})")
+                        })
+                        .collect();
+                    return ToolResult::Conflict {
+                        reason: format!(
+                            "{} tasks depend on '{task_id}': {dependent_list:?}. Use \
+                         force_delete=true to cascade delete.",
+                            dependent_tasks.len()
+                        ),
+                    };
+                }
+
+                // BL-3: the `agents.current_task -> tasks.task_id` FK.
+                let agents_on_task: Vec<String> = match tx
+                    .prepare("SELECT agent_id FROM agents WHERE current_task = ?1")
+                    .and_then(|mut stmt| {
+                        stmt.query_map([task_id.as_str()], |row| row.get(0))?
+                            .collect()
+                    }) {
+                    Ok(ids) => ids,
+                    Err(_) => {
+                        return ToolResult::Failed {
+                            message: "Database error deleting task".to_string(),
+                        }
+                    }
+                };
+                if !agents_on_task.is_empty() && !force_delete {
+                    return ToolResult::Conflict {
+                        reason: format!(
+                            "Task '{task_id}' is the current task of {} agent(s): \
                          {agents_on_task:?}. Use force_delete=true to clear it and cascade \
                          delete.",
-                        agents_on_task.len()
-                    ),
-                };
-            }
+                            agents_on_task.len()
+                        ),
+                    };
+                }
 
-            let mut cascade_operations: Vec<String> = Vec::new();
-            let mut deleted_events: Vec<(String, Option<String>)> =
-                vec![(task_id.clone(), task_data.assigned_to.clone())];
+                let mut cascade_operations: Vec<String> = Vec::new();
+                let mut deleted_events: Vec<(String, Option<String>)> =
+                    vec![(task_id.clone(), task_data.assigned_to.clone())];
 
-            // Parent mirror upkeep.
-            if let Some(parent_id) = &task_data.parent_task {
-                if let Ok(Some(parent)) = task_repository::get_by_id_in_transaction(&tx, parent_id)
-                {
-                    let mut children = parent.child_tasks.unwrap_or_default();
-                    if let Some(pos) = children.iter().position(|c| c == &task_id) {
-                        children.remove(pos);
-                        let _ = task_repository::update_fields_in_transaction(
+                // Parent mirror upkeep.
+                if let Some(parent_id) = &task_data.parent_task {
+                    if let Ok(Some(parent)) =
+                        task_repository::get_by_id_in_transaction(&tx, parent_id)
+                    {
+                        let mut children = parent.child_tasks.unwrap_or_default();
+                        if let Some(pos) = children.iter().position(|c| c == &task_id) {
+                            children.remove(pos);
+                            let _ = task_repository::update_fields_in_transaction(
                             &tx,
                             parent_id,
                             &conexus_db::task_repository::TaskFields {
@@ -2521,80 +2576,85 @@ impl Tool for DeleteTaskTool {
                             },
                             now,
                         );
-                        cascade_operations.push(format!(
-                            "Updated parent task '{parent_id}' to remove child reference"
-                        ));
-                    }
-                }
-            }
-
-            // Force-cascade the whole subtree, deepest descendant
-            // first (the authoritative FK order).
-            let mut delete_set_ids: Vec<String> = vec![task_id.clone()];
-            if force_delete {
-                let descendants = match collect_task_descendants(&tx, &task_id) {
-                    Ok(d) => d,
-                    Err(_) => {
-                        return ToolResult::Failed {
-                            message: "Database error deleting task".to_string(),
+                            cascade_operations.push(format!(
+                                "Updated parent task '{parent_id}' to remove child reference"
+                            ));
                         }
                     }
-                };
-                delete_set_ids.extend(descendants.iter().map(|(id, _)| id.clone()));
-                let delete_set_refs: Vec<&str> =
-                    delete_set_ids.iter().map(String::as_str).collect();
-                // BL-3: NULL every agent's current_task pointer anywhere
-                // in the delete set BEFORE the DELETEs, or the FK aborts
-                // the DELETE and force_delete fails to force.
-                let _ = conexus_db::agent_repository::AgentRepository::clear_current_task_for_many(
-                    &tx,
-                    &delete_set_refs,
-                    now,
-                );
-                for (descendant_id, descendant_assignee) in &descendants {
-                    if task_repository::delete_in_transaction(&tx, descendant_id).unwrap_or(false) {
-                        deleted_events.push((descendant_id.clone(), descendant_assignee.clone()));
-                        cascade_operations.push(format!("Deleted child task '{descendant_id}'"));
-                    }
                 }
-            }
 
-            // BL-R19-1: reconcile dangling depends_on_tasks references
-            // across the WHOLE deleted set (root + every cascade-deleted
-            // descendant) -- not just the root, or an OUTSIDE task
-            // depending on a cascade-deleted descendant keeps a
-            // reference to a now-absent id and stalls forever.
-            let mut deps_to_refresh: HashSet<String> = HashSet::new();
-            if force_delete {
-                let deleted_id_set: HashSet<&str> =
-                    delete_set_ids.iter().map(String::as_str).collect();
-                let mut affected_deps: std::collections::HashMap<String, Vec<String>> =
-                    std::collections::HashMap::new();
-                for deleted_id in &delete_set_ids {
-                    let rows = match dependents_of(&tx, deleted_id) {
-                        Ok(r) => r,
+                // Force-cascade the whole subtree, deepest descendant
+                // first (the authoritative FK order).
+                let mut delete_set_ids: Vec<String> = vec![task_id.clone()];
+                if force_delete {
+                    let descendants = match collect_task_descendants(&tx, &task_id) {
+                        Ok(d) => d,
                         Err(_) => {
                             return ToolResult::Failed {
                                 message: "Database error deleting task".to_string(),
                             }
                         }
                     };
-                    for (dep_id, deps) in rows {
-                        if deleted_id_set.contains(dep_id.as_str()) {
-                            continue;
+                    delete_set_ids.extend(descendants.iter().map(|(id, _)| id.clone()));
+                    let delete_set_refs: Vec<&str> =
+                        delete_set_ids.iter().map(String::as_str).collect();
+                    // BL-3: NULL every agent's current_task pointer anywhere
+                    // in the delete set BEFORE the DELETEs, or the FK aborts
+                    // the DELETE and force_delete fails to force.
+                    let _ =
+                        conexus_db::agent_repository::AgentRepository::clear_current_task_for_many(
+                            &tx,
+                            &delete_set_refs,
+                            now,
+                        );
+                    for (descendant_id, descendant_assignee) in &descendants {
+                        if task_repository::delete_in_transaction(&tx, descendant_id)
+                            .unwrap_or(false)
+                        {
+                            deleted_events
+                                .push((descendant_id.clone(), descendant_assignee.clone()));
+                            cascade_operations
+                                .push(format!("Deleted child task '{descendant_id}'"));
                         }
-                        affected_deps.entry(dep_id).or_insert(deps);
                     }
                 }
-                let mut reeval_candidates: HashSet<String> = HashSet::new();
-                for (dep_id, dep_dependencies) in &affected_deps {
-                    let pruned: Vec<String> = dep_dependencies
-                        .iter()
-                        .filter(|d| !deleted_id_set.contains(d.as_str()))
-                        .cloned()
-                        .collect();
-                    if &pruned != dep_dependencies {
-                        let _ = task_repository::update_fields_in_transaction(
+
+                // BL-R19-1: reconcile dangling depends_on_tasks references
+                // across the WHOLE deleted set (root + every cascade-deleted
+                // descendant) -- not just the root, or an OUTSIDE task
+                // depending on a cascade-deleted descendant keeps a
+                // reference to a now-absent id and stalls forever.
+                let mut deps_to_refresh: HashSet<String> = HashSet::new();
+                if force_delete {
+                    let deleted_id_set: HashSet<&str> =
+                        delete_set_ids.iter().map(String::as_str).collect();
+                    let mut affected_deps: std::collections::HashMap<String, Vec<String>> =
+                        std::collections::HashMap::new();
+                    for deleted_id in &delete_set_ids {
+                        let rows = match dependents_of(&tx, deleted_id) {
+                            Ok(r) => r,
+                            Err(_) => {
+                                return ToolResult::Failed {
+                                    message: "Database error deleting task".to_string(),
+                                }
+                            }
+                        };
+                        for (dep_id, deps) in rows {
+                            if deleted_id_set.contains(dep_id.as_str()) {
+                                continue;
+                            }
+                            affected_deps.entry(dep_id).or_insert(deps);
+                        }
+                    }
+                    let mut reeval_candidates: HashSet<String> = HashSet::new();
+                    for (dep_id, dep_dependencies) in &affected_deps {
+                        let pruned: Vec<String> = dep_dependencies
+                            .iter()
+                            .filter(|d| !deleted_id_set.contains(d.as_str()))
+                            .cloned()
+                            .collect();
+                        if &pruned != dep_dependencies {
+                            let _ = task_repository::update_fields_in_transaction(
                             &tx,
                             dep_id,
                             &conexus_db::task_repository::TaskFields {
@@ -2606,101 +2666,113 @@ impl Tool for DeleteTaskTool {
                             },
                             now,
                         );
-                        deps_to_refresh.insert(dep_id.clone());
-                        reeval_candidates.insert(dep_id.clone());
-                        cascade_operations.push(format!(
-                            "Updated task '{dep_id}' to remove dependency on deleted task(s) \
-                             in the '{task_id}' cascade"
-                        ));
-                    }
-                }
-
-                // BL-R19-1: re-evaluate each unblocked task -- deletion,
-                // unlike completion, never triggers the auto-advance,
-                // so a task whose last blocking dependency was deleted
-                // would otherwise never progress on its own.
-                for dep_id in &reeval_candidates {
-                    let Ok(Some(row)) = task_repository::get_by_id_in_transaction(&tx, dep_id)
-                    else {
-                        continue;
-                    };
-                    if row.status != "pending" {
-                        continue;
-                    }
-                    let remaining = row.depends_on_tasks.unwrap_or_default();
-                    let all_completed = remaining.iter().all(|rid| {
-                        task_repository::get_by_id_in_transaction(&tx, rid)
-                            .ok()
-                            .flatten()
-                            .is_some_and(|r| r.status == "completed")
-                    });
-                    if all_completed {
-                        let edit = TaskEdit::status_only(Some(
-                            "Auto-advanced: blocking dependency deleted",
-                        ));
-                        if let Ok(UpdateSingleTaskOutcome::Applied(_)) = update_single_task(
-                            &tx,
-                            dep_id,
-                            "in_progress",
-                            "admin",
-                            true,
-                            &edit,
-                            now,
-                        ) {
+                            deps_to_refresh.insert(dep_id.clone());
+                            reeval_candidates.insert(dep_id.clone());
                             cascade_operations.push(format!(
-                                "Auto-advanced task '{dep_id}' to in_progress (blocking \
-                                 dependency deleted)"
+                                "Updated task '{dep_id}' to remove dependency on deleted task(s) \
+                             in the '{task_id}' cascade"
                             ));
                         }
                     }
-                }
-            }
-            let _ = deps_to_refresh; // no in-memory cache to refresh in this port
 
-            match task_repository::delete_in_transaction(&tx, &task_id) {
-                Ok(true) => {}
-                Ok(false) => {
-                    // The transaction drops here without a commit --
-                    // every cascade write above rolls back with it.
-                    return ToolResult::Failed {
-                        message: format!("Failed to delete task '{task_id}'"),
-                    };
-                }
-                Err(_) => {
-                    return ToolResult::Failed {
-                        message: "Database error deleting task".to_string(),
+                    // BL-R19-1: re-evaluate each unblocked task -- deletion,
+                    // unlike completion, never triggers the auto-advance,
+                    // so a task whose last blocking dependency was deleted
+                    // would otherwise never progress on its own.
+                    for dep_id in &reeval_candidates {
+                        let Ok(Some(row)) = task_repository::get_by_id_in_transaction(&tx, dep_id)
+                        else {
+                            continue;
+                        };
+                        if row.status != "pending" {
+                            continue;
+                        }
+                        let remaining = row.depends_on_tasks.unwrap_or_default();
+                        let all_completed = remaining.iter().all(|rid| {
+                            task_repository::get_by_id_in_transaction(&tx, rid)
+                                .ok()
+                                .flatten()
+                                .is_some_and(|r| r.status == "completed")
+                        });
+                        if all_completed {
+                            let edit = TaskEdit::status_only(Some(
+                                "Auto-advanced: blocking dependency deleted",
+                            ));
+                            if let Ok(UpdateSingleTaskOutcome::Applied(_)) = update_single_task(
+                                &tx,
+                                dep_id,
+                                "in_progress",
+                                "admin",
+                                true,
+                                &edit,
+                                now,
+                            ) {
+                                cascade_operations.push(format!(
+                                    "Auto-advanced task '{dep_id}' to in_progress (blocking \
+                                 dependency deleted)"
+                                ));
+                            }
+                        }
                     }
                 }
-            }
+                let _ = deps_to_refresh; // no in-memory cache to refresh in this port
 
-            // BL-R4-1: prune each deleted task's RAG chunk in the SAME
-            // transaction as the row delete -- the incremental indexer
-            // never sweeps orphans, so a deleted task's chunk would
-            // otherwise stay queryable via ask_project_rag forever.
-            for (deleted_id, _) in &deleted_events {
-                let _ = conexus_db::rag_repository::purge_source(&tx, "task", deleted_id);
-            }
+                match task_repository::delete_in_transaction(&tx, &task_id) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        // The transaction drops here without a commit --
+                        // every cascade write above rolls back with it.
+                        return ToolResult::Failed {
+                            message: format!("Failed to delete task '{task_id}'"),
+                        };
+                    }
+                    Err(_) => {
+                        return ToolResult::Failed {
+                            message: "Database error deleting task".to_string(),
+                        }
+                    }
+                }
 
+                // BL-R4-1: prune each deleted task's RAG chunk in the SAME
+                // transaction as the row delete -- the incremental indexer
+                // never sweeps orphans, so a deleted task's chunk would
+                // otherwise stay queryable via ask_project_rag forever.
+                for (deleted_id, _) in &deleted_events {
+                    let _ = conexus_db::rag_repository::purge_source(&tx, "task", deleted_id);
+                }
+
+                if tx.commit().is_err() {
+                    return ToolResult::Failed {
+                        message: "Database error deleting task".to_string(),
+                    };
+                }
+
+                (task_data.title, cascade_operations, deleted_events)
+            };
+
+            // Phase G: `agent_action_repository` is sea-orm-backed now,
+            // so the audit-log write is a SEPARATE, non-atomic write
+            // AFTER the transaction above has already durably
+            // committed -- same established tradeoff as every other
+            // converted `agent_action_repository` call site in this
+            // migration (see `project_settings_tools.rs`'s own doc
+            // comment for the precedent).
             if let Err(_e) = agent_action_repository::log_agent_action(
-                &tx,
+                ctx.sea_orm_db,
                 "admin",
                 "deleted_task",
                 Some(&task_id),
                 Some(&serde_json::json!({
-                    "task_title": task_data.title,
+                    "task_title": task_title,
                     "force_delete": force_delete,
                     "cascade_operations": cascade_operations,
                 })),
                 now,
-            ) {
+            )
+            .await
+            {
                 // Best-effort audit log, same rationale as every other
                 // mutating tool in this module.
-            }
-
-            if tx.commit().is_err() {
-                return ToolResult::Failed {
-                    message: "Database error deleting task".to_string(),
-                };
             }
 
             // Post-commit: wake every deleted task's assignee.
@@ -2712,7 +2784,7 @@ impl Tool for DeleteTaskTool {
 
             let mut response_parts = vec![format!(
                 "Task '{task_id}' ({}) deleted successfully.",
-                task_data.title
+                task_title
             )];
             if !cascade_operations.is_empty() {
                 response_parts.push("\nCascade Operations:".to_string());
@@ -3166,121 +3238,170 @@ impl Tool for RequestAssistanceTool {
             .await;
 
             let conn = conn.lock().await;
-            let tx = match conn.unchecked_transaction() {
-                Ok(tx) => tx,
-                Err(_) => {
-                    return ToolResult::Failed {
-                        message: "Database error requesting assistance".to_string(),
-                    }
-                }
-            };
-
-            let parent = match task_repository::get_by_id_in_transaction(&tx, &parent_task_id) {
-                Ok(Some(row)) => row,
-                Ok(None) => {
-                    return ToolResult::NotFound {
-                        resource: "task".to_string(),
-                        identifier: parent_task_id,
-                        hint: None,
-                    }
-                }
-                Err(_) => {
-                    return ToolResult::Failed {
-                        message: "Database error requesting assistance".to_string(),
-                    }
-                }
-            };
-
-            // AZ-R17-1: a FOREIGN-owned task collapses to the same
-            // phantom NotFound a nonexistent task returns; an
-            // UNASSIGNED task (no owner to hide) gets the actionable
-            // claim-it-first guidance instead.
-            if !can_access_task(
-                parent.assigned_to.as_deref(),
-                Some(parent.created_by.as_str()),
-                Some(requesting_agent_id.as_str()),
-                is_admin_request,
-                false,
-                false,
-                false,
-            ) {
-                return if is_unassigned_owner(parent.assigned_to.as_deref()) {
-                    ToolResult::PermissionDenied {
-                        reason: worker_ownership_deny(
-                            &parent_task_id,
-                            parent.assigned_to.as_deref(),
-                            "request assistance on it",
-                        )
-                        .strip_prefix("Unauthorized: ")
-                        .unwrap_or_default()
-                        .to_string(),
-                    }
-                } else {
-                    ToolResult::NotFound {
-                        resource: "task".to_string(),
-                        identifier: parent_task_id,
-                        hint: None,
+            // Scoped in its own block so `tx` (a `rusqlite::Transaction`,
+            // not `Send`) is lexically dropped -- not merely logically
+            // consumed by `commit()` -- before the `.await` below; see
+            // the identical rationale on `UpdateTaskStatusTool::call`.
+            let (child_task_id, message_sent) = {
+                let tx = match conn.unchecked_transaction() {
+                    Ok(tx) => tx,
+                    Err(_) => {
+                        return ToolResult::Failed {
+                            message: "Database error requesting assistance".to_string(),
+                        }
                     }
                 };
-            }
 
-            let child_task_id = task_repository::generate_task_id();
-            let child_title = format!("Assistance for {parent_task_id}: {}", parent.title);
-
-            if let Err(_e) = task_repository::create_in_transaction(
-                &tx,
-                NewTask {
-                    task_id: Some(&child_task_id),
-                    title: &child_title,
-                    description: Some(&description),
-                    assigned_to: None,
-                    created_by: &requesting_agent_id,
-                    status: "pending",
-                    priority: "high",
-                    parent_task: Some(&parent_task_id),
-                    child_tasks: None,
-                    depends_on_tasks: None,
-                    notes: None,
-                    now,
-                },
-            ) {
-                return ToolResult::Failed {
-                    message: "Database error requesting assistance".to_string(),
+                let parent = match task_repository::get_by_id_in_transaction(&tx, &parent_task_id) {
+                    Ok(Some(row)) => row,
+                    Ok(None) => {
+                        return ToolResult::NotFound {
+                            resource: "task".to_string(),
+                            identifier: parent_task_id,
+                            hint: None,
+                        }
+                    }
+                    Err(_) => {
+                        return ToolResult::Failed {
+                            message: "Database error requesting assistance".to_string(),
+                        }
+                    }
                 };
-            }
 
-            let mut parent_children = parent.child_tasks.clone().unwrap_or_default();
-            parent_children.push(child_task_id.clone());
-            let mut parent_notes = parent.notes.clone().unwrap_or_default();
-            parent_notes.push(conexus_db::task_repository::TaskNote {
-                timestamp: now.to_string(),
-                author: Some(requesting_agent_id.clone()),
-                content: format!(
-                    "Requested assistance: {description}. Assistance task created: \
+                // AZ-R17-1: a FOREIGN-owned task collapses to the same
+                // phantom NotFound a nonexistent task returns; an
+                // UNASSIGNED task (no owner to hide) gets the actionable
+                // claim-it-first guidance instead.
+                if !can_access_task(
+                    parent.assigned_to.as_deref(),
+                    Some(parent.created_by.as_str()),
+                    Some(requesting_agent_id.as_str()),
+                    is_admin_request,
+                    false,
+                    false,
+                    false,
+                ) {
+                    return if is_unassigned_owner(parent.assigned_to.as_deref()) {
+                        ToolResult::PermissionDenied {
+                            reason: worker_ownership_deny(
+                                &parent_task_id,
+                                parent.assigned_to.as_deref(),
+                                "request assistance on it",
+                            )
+                            .strip_prefix("Unauthorized: ")
+                            .unwrap_or_default()
+                            .to_string(),
+                        }
+                    } else {
+                        ToolResult::NotFound {
+                            resource: "task".to_string(),
+                            identifier: parent_task_id,
+                            hint: None,
+                        }
+                    };
+                }
+
+                let child_task_id = task_repository::generate_task_id();
+                let child_title = format!("Assistance for {parent_task_id}: {}", parent.title);
+
+                if let Err(_e) = task_repository::create_in_transaction(
+                    &tx,
+                    NewTask {
+                        task_id: Some(&child_task_id),
+                        title: &child_title,
+                        description: Some(&description),
+                        assigned_to: None,
+                        created_by: &requesting_agent_id,
+                        status: "pending",
+                        priority: "high",
+                        parent_task: Some(&parent_task_id),
+                        child_tasks: None,
+                        depends_on_tasks: None,
+                        notes: None,
+                        now,
+                    },
+                ) {
+                    return ToolResult::Failed {
+                        message: "Database error requesting assistance".to_string(),
+                    };
+                }
+
+                let mut parent_children = parent.child_tasks.clone().unwrap_or_default();
+                parent_children.push(child_task_id.clone());
+                let mut parent_notes = parent.notes.clone().unwrap_or_default();
+                parent_notes.push(conexus_db::task_repository::TaskNote {
+                    timestamp: now.to_string(),
+                    author: Some(requesting_agent_id.clone()),
+                    content: format!(
+                        "Requested assistance: {description}. Assistance task created: \
                      {child_task_id}"
-                ),
-            });
-            if let Err(_e) = task_repository::update_fields_in_transaction(
-                &tx,
-                &parent_task_id,
-                &conexus_db::task_repository::TaskFields {
-                    child_tasks: conexus_db::scheduled_directive_repository::NullableUpdate::Set(
-                        parent_children,
                     ),
-                    notes: conexus_db::scheduled_directive_repository::NullableUpdate::Set(
-                        parent_notes,
-                    ),
-                    ..Default::default()
-                },
-                now,
-            ) {
-                return ToolResult::Failed {
-                    message: "Database error requesting assistance".to_string(),
-                };
-            }
+                });
+                if let Err(_e) = task_repository::update_fields_in_transaction(
+                    &tx,
+                    &parent_task_id,
+                    &conexus_db::task_repository::TaskFields {
+                        child_tasks:
+                            conexus_db::scheduled_directive_repository::NullableUpdate::Set(
+                                parent_children,
+                            ),
+                        notes: conexus_db::scheduled_directive_repository::NullableUpdate::Set(
+                            parent_notes,
+                        ),
+                        ..Default::default()
+                    },
+                    now,
+                ) {
+                    return ToolResult::Failed {
+                        message: "Database error requesting assistance".to_string(),
+                    };
+                }
 
+                // Notify admin via the internal messaging seam. Best-effort
+                // -- matches Python's own try/except around this call
+                // ("Don't fail the entire operation if messaging fails").
+                let admin_message = format!(
+                    "\u{1F6A8} Assistance Request from {requesting_agent_id}\n\nTask: \
+                 {parent_task_id} - {}\nDescription: {description}\n\nChild assistance task \
+                 created: {child_task_id}",
+                    parent.title
+                );
+                let message_sent = matches!(
+                    crate::agent_messaging::send_agent_message(
+                        &tx,
+                        principal,
+                        crate::agent_messaging::SendMessageArgs {
+                            recipient_id: "admin",
+                            message_content: &admin_message,
+                            message_type: "assistance_request",
+                            priority: "high",
+                            subject: None,
+                            parent_message_id: None,
+                            now,
+                        },
+                        allow_worker_to_worker,
+                    ),
+                    Ok(crate::agent_messaging::SendOutcome::Sent { .. })
+                );
+
+                if tx.commit().is_err() {
+                    return ToolResult::Failed {
+                        message: "Database error requesting assistance".to_string(),
+                    };
+                }
+
+                (child_task_id, message_sent)
+            };
+
+            // Phase G: `agent_action_repository` is sea-orm-backed now,
+            // so the audit-log write is a SEPARATE, non-atomic write
+            // AFTER the transaction above has already durably
+            // committed -- same established tradeoff as every other
+            // converted `agent_action_repository` call site in this
+            // migration (see `project_settings_tools.rs`'s own doc
+            // comment for the precedent).
             if let Err(_e) = agent_action_repository::log_agent_action(
-                &tx,
+                ctx.sea_orm_db,
                 &requesting_agent_id,
                 "request_assistance",
                 Some(&parent_task_id),
@@ -3289,42 +3410,12 @@ impl Tool for RequestAssistanceTool {
                     "child_task_id": child_task_id,
                 })),
                 now,
-            ) {
+            )
+            .await
+            {
                 // Best-effort audit log, same rationale as elsewhere.
             }
 
-            // Notify admin via the internal messaging seam. Best-effort
-            // -- matches Python's own try/except around this call
-            // ("Don't fail the entire operation if messaging fails").
-            let admin_message = format!(
-                "\u{1F6A8} Assistance Request from {requesting_agent_id}\n\nTask: \
-                 {parent_task_id} - {}\nDescription: {description}\n\nChild assistance task \
-                 created: {child_task_id}",
-                parent.title
-            );
-            let message_sent = matches!(
-                crate::agent_messaging::send_agent_message(
-                    &tx,
-                    principal,
-                    crate::agent_messaging::SendMessageArgs {
-                        recipient_id: "admin",
-                        message_content: &admin_message,
-                        message_type: "assistance_request",
-                        priority: "high",
-                        subject: None,
-                        parent_message_id: None,
-                        now,
-                    },
-                    allow_worker_to_worker,
-                ),
-                Ok(crate::agent_messaging::SendOutcome::Sent { .. })
-            );
-
-            if tx.commit().is_err() {
-                return ToolResult::Failed {
-                    message: "Database error requesting assistance".to_string(),
-                };
-            }
             if message_sent {
                 ctx.waiter_registry.notify("admin");
             }
@@ -3456,7 +3547,7 @@ impl Tool for BulkTaskOperationsTool {
             // not `Send`) is lexically dropped -- not merely logically
             // consumed by `commit()` -- before the `.await` below; see
             // the identical rationale on `UpdateTaskStatusTool::call`.
-            let (outcomes, mut mutated_task_ids) = {
+            let (outcomes, mut mutated_task_ids, success_count) = {
                 let tx = match conn.unchecked_transaction() {
                     Ok(tx) => tx,
                     Err(_) => {
@@ -3814,19 +3905,6 @@ impl Tool for BulkTaskOperationsTool {
                     .iter()
                     .filter(|o| !o.line.contains("Error"))
                     .count();
-                if let Err(_e) = agent_action_repository::log_agent_action(
-                    &tx,
-                    &requesting_agent_id,
-                    "bulk_task_operations",
-                    None,
-                    Some(&serde_json::json!({
-                        "operations_count": operations.len(),
-                        "success_count": success_count,
-                    })),
-                    now,
-                ) {
-                    // Best-effort audit log, same rationale as elsewhere.
-                }
 
                 if tx.commit().is_err() {
                     return ToolResult::Failed {
@@ -3834,8 +3912,31 @@ impl Tool for BulkTaskOperationsTool {
                     };
                 }
 
-                (outcomes, mutated_task_ids)
+                (outcomes, mutated_task_ids, success_count)
             };
+
+            // Phase G: `agent_action_repository` is sea-orm-backed now,
+            // so the audit-log write is a SEPARATE, non-atomic write
+            // AFTER the transaction above has already durably
+            // committed -- same established tradeoff as every other
+            // converted `agent_action_repository` call site in this
+            // migration (see `project_settings_tools.rs`'s own doc
+            // comment for the precedent).
+            if let Err(_e) = agent_action_repository::log_agent_action(
+                ctx.sea_orm_db,
+                &requesting_agent_id,
+                "bulk_task_operations",
+                None,
+                Some(&serde_json::json!({
+                    "operations_count": operations.len(),
+                    "success_count": success_count,
+                })),
+                now,
+            )
+            .await
+            {
+                // Best-effort audit log, same rationale as elsewhere.
+            }
 
             mutated_task_ids.sort();
             mutated_task_ids.dedup();
@@ -4542,6 +4643,30 @@ mod create_task_tests {
         AsyncMutex::new(conn)
     }
 
+    // `test_sea_orm_db`'s `:memory:` connection is a throwaway,
+    // discarded once the call returns -- unreachable for a POST-call
+    // `agent_action_repository` assertion (Phase G: its audit-log
+    // write now goes through sea-orm too). A test that needs to verify
+    // the audit row landed uses a real-temp-file-backed `conn` +
+    // `sea_orm_db` pair instead, both pointed at the same path.
+    fn test_conn_file() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        AsyncMutex<Connection>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn).unwrap();
+        (dir, path, AsyncMutex::new(conn))
+    }
+
+    async fn reconnect_sea_orm(path: &std::path::Path) -> sea_orm::DatabaseConnection {
+        sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap()
+    }
+
     fn worker(agent_id: &str) -> Principal {
         Principal {
             kind: PrincipalKind::AgentBearer,
@@ -4975,10 +5100,15 @@ mod create_task_tests {
 
     #[tokio::test]
     async fn create_task_writes_a_durable_audit_row() {
-        let conn = test_conn();
+        // Real-temp-file-backed `conn`/`sea_orm_db` pair (not the
+        // plain in-memory `test_conn()`/`test_sea_orm_db()`) --
+        // Phase G's `agent_action_repository` audit write goes through
+        // `sea_orm_db`, which the post-call assertion below reads back
+        // from; see `test_conn_file`'s own doc.
+        let (_dir, db_path, conn) = test_conn_file();
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
+        let sea_orm_db = reconnect_sea_orm(&db_path).await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -4994,15 +5124,17 @@ mod create_task_tests {
         )
         .await;
         let task_id = task_id_of(&result);
-        let guard = conn.lock().await;
-        let count: i64 = guard
-            .query_row(
-                "SELECT COUNT(*) FROM agent_actions WHERE action_type = 'created_task' AND \
-                 task_id = ?1",
-                [task_id.as_str()],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let count = conexus_db::agent_action_repository::list_recent(
+            &sea_orm_db,
+            None,
+            Some("created_task"),
+            50,
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.task_id.as_deref() == Some(task_id.as_str()))
+        .count();
         assert_eq!(count, 1);
     }
 
@@ -5643,6 +5775,31 @@ mod update_task_tests {
         AsyncMutex::new(conn)
     }
 
+    // `test_sea_orm_db`'s `:memory:` connection is a throwaway,
+    // discarded once the call returns -- unreachable for a POST-call
+    // `agent_action_repository` assertion (Phase G: its audit-log
+    // write now goes through sea-orm too). A test that needs to verify
+    // the audit row landed uses a real-temp-file-backed `conn` +
+    // `sea_orm_db` pair instead, both pointed at the same path (see
+    // `call_with_sea_orm`).
+    fn test_conn_file() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        AsyncMutex<Connection>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn).unwrap();
+        (dir, path, AsyncMutex::new(conn))
+    }
+
+    async fn reconnect_sea_orm(path: &std::path::Path) -> sea_orm::DatabaseConnection {
+        sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap()
+    }
+
     fn admin(agent_id: &str) -> Principal {
         Principal {
             kind: PrincipalKind::AgentBearer,
@@ -5697,14 +5854,22 @@ mod update_task_tests {
     }
 
     async fn call(args: Value, conn: &AsyncMutex<Connection>) -> ToolResult {
+        let sea_orm_db = test_sea_orm_db().await;
+        call_with_sea_orm(args, conn, &sea_orm_db).await
+    }
+
+    async fn call_with_sea_orm(
+        args: Value,
+        conn: &AsyncMutex<Connection>,
+        sea_orm_db: &sea_orm::DatabaseConnection,
+    ) -> ToolResult {
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
-            &sea_orm_db,
+            sea_orm_db,
         );
         UpdateTaskTool::call(Some(&admin("alice")), &args, conn, NOW, &ctx).await
     }
@@ -6373,17 +6538,23 @@ mod update_task_tests {
 
     #[tokio::test]
     async fn a_call_with_nothing_to_change_is_a_no_op() {
-        let conn = test_conn();
+        // Real-temp-file-backed `conn`/`sea_orm_db` pair -- Phase G's
+        // `agent_action_repository` audit write goes through
+        // `sea_orm_db`, which the post-call assertion below reads back
+        // from; see `test_conn_file`'s own doc.
+        let (_dir, db_path, conn) = test_conn_file();
         {
             let guard = conn.lock().await;
             seed_task(&guard, "t1", "pending", None);
         }
-        let result = call(serde_json::json!({"task_id": "t1"}), &conn).await;
+        let sea_orm_db = reconnect_sea_orm(&db_path).await;
+        let result =
+            call_with_sea_orm(serde_json::json!({"task_id": "t1"}), &conn, &sea_orm_db).await;
         assert_eq!(message_of(&result), "Task updated successfully.");
-        let guard = conn.lock().await;
-        let count: i64 = guard
-            .query_row("SELECT COUNT(*) FROM agent_actions", [], |row| row.get(0))
-            .unwrap();
+        let count = conexus_db::agent_action_repository::list_recent(&sea_orm_db, None, None, 50)
+            .await
+            .unwrap()
+            .len();
         assert_eq!(
             count, 1,
             "still audited unconditionally, per the pre-refactor route"
@@ -6531,6 +6702,31 @@ mod delete_task_tests {
         AsyncMutex::new(conn)
     }
 
+    // `test_sea_orm_db`'s `:memory:` connection is a throwaway,
+    // discarded once the call returns -- unreachable for a POST-call
+    // `agent_action_repository` assertion (Phase G: its audit-log
+    // write now goes through sea-orm too). A test that needs to verify
+    // the audit row landed uses a real-temp-file-backed `conn` +
+    // `sea_orm_db` pair instead, both pointed at the same path (see
+    // `call_with_sea_orm`).
+    fn test_conn_file() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        AsyncMutex<Connection>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn).unwrap();
+        (dir, path, AsyncMutex::new(conn))
+    }
+
+    async fn reconnect_sea_orm(path: &std::path::Path) -> sea_orm::DatabaseConnection {
+        sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap()
+    }
+
     async fn seed_agent(conn: &AsyncMutex<Connection>, agent_id: &str) {
         let guard = conn.lock().await;
         AgentRepository::create(
@@ -6579,14 +6775,22 @@ mod delete_task_tests {
     }
 
     async fn call(args: Value, conn: &AsyncMutex<Connection>) -> ToolResult {
+        let sea_orm_db = test_sea_orm_db().await;
+        call_with_sea_orm(args, conn, &sea_orm_db).await
+    }
+
+    async fn call_with_sea_orm(
+        args: Value,
+        conn: &AsyncMutex<Connection>,
+        sea_orm_db: &sea_orm::DatabaseConnection,
+    ) -> ToolResult {
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
-            &sea_orm_db,
+            sea_orm_db,
         );
         DeleteTaskTool::call(None, &args, conn, NOW, &ctx).await
     }
@@ -6951,21 +7155,28 @@ mod delete_task_tests {
 
     #[tokio::test]
     async fn writes_a_durable_audit_row() {
-        let conn = test_conn();
+        // Real-temp-file-backed `conn`/`sea_orm_db` pair -- Phase G's
+        // `agent_action_repository` audit write goes through
+        // `sea_orm_db`, which the post-call assertion below reads back
+        // from; see `test_conn_file`'s own doc.
+        let (_dir, db_path, conn) = test_conn_file();
         {
             let guard = conn.lock().await;
             seed_task(&guard, "t1", "pending", None, None, None);
         }
-        call(serde_json::json!({"task_id": "t1"}), &conn).await;
-        let guard = conn.lock().await;
-        let count: i64 = guard
-            .query_row(
-                "SELECT COUNT(*) FROM agent_actions WHERE action_type = 'deleted_task' AND \
-                 task_id = 't1'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let sea_orm_db = reconnect_sea_orm(&db_path).await;
+        call_with_sea_orm(serde_json::json!({"task_id": "t1"}), &conn, &sea_orm_db).await;
+        let count = conexus_db::agent_action_repository::list_recent(
+            &sea_orm_db,
+            None,
+            Some("deleted_task"),
+            50,
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.task_id.as_deref() == Some("t1"))
+        .count();
         assert_eq!(count, 1);
     }
 
@@ -7028,6 +7239,31 @@ mod request_assistance_tests {
         AsyncMutex::new(conn)
     }
 
+    // `test_sea_orm_db`'s `:memory:` connection is a throwaway,
+    // discarded once the call returns -- unreachable for a POST-call
+    // `agent_action_repository` assertion (Phase G: its audit-log
+    // write now goes through sea-orm too). A test that needs to verify
+    // the audit row landed uses a real-temp-file-backed `conn` +
+    // `sea_orm_db` pair instead, both pointed at the same path (see
+    // `call_with_sea_orm`).
+    fn test_conn_file() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        AsyncMutex<Connection>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn).unwrap();
+        (dir, path, AsyncMutex::new(conn))
+    }
+
+    async fn reconnect_sea_orm(path: &std::path::Path) -> sea_orm::DatabaseConnection {
+        sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap()
+    }
+
     fn worker(agent_id: &str) -> Principal {
         Principal {
             kind: PrincipalKind::AgentBearer,
@@ -7081,14 +7317,23 @@ mod request_assistance_tests {
     }
 
     async fn call(args: Value, principal: &Principal, conn: &AsyncMutex<Connection>) -> ToolResult {
+        let sea_orm_db = test_sea_orm_db().await;
+        call_with_sea_orm(args, principal, conn, &sea_orm_db).await
+    }
+
+    async fn call_with_sea_orm(
+        args: Value,
+        principal: &Principal,
+        conn: &AsyncMutex<Connection>,
+        sea_orm_db: &sea_orm::DatabaseConnection,
+    ) -> ToolResult {
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
-            &sea_orm_db,
+            sea_orm_db,
         );
         RequestAssistanceTool::call(Some(principal), &args, conn, NOW, &ctx).await
     }
@@ -7181,25 +7426,32 @@ mod request_assistance_tests {
 
     #[tokio::test]
     async fn writes_a_durable_audit_row() {
-        let conn = test_conn();
+        // Real-temp-file-backed `conn`/`sea_orm_db` pair -- Phase G's
+        // `agent_action_repository` audit write goes through
+        // `sea_orm_db`, which the post-call assertion below reads back
+        // from; see `test_conn_file`'s own doc.
+        let (_dir, db_path, conn) = test_conn_file();
         {
             let guard = conn.lock().await;
             seed_task(&guard, "t1", Some("bob"), "alice");
         }
-        call(
+        let sea_orm_db = reconnect_sea_orm(&db_path).await;
+        call_with_sea_orm(
             serde_json::json!({"task_id": "t1", "description": "help"}),
             &worker("bob"),
             &conn,
+            &sea_orm_db,
         )
         .await;
-        let guard = conn.lock().await;
-        let count: i64 = guard
-            .query_row(
-                "SELECT COUNT(*) FROM agent_actions WHERE action_type = 'request_assistance'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let count = conexus_db::agent_action_repository::list_recent(
+            &sea_orm_db,
+            None,
+            Some("request_assistance"),
+            50,
+        )
+        .await
+        .unwrap()
+        .len();
         assert_eq!(count, 1);
     }
 
