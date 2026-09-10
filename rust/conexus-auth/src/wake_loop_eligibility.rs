@@ -31,9 +31,12 @@ use rusqlite::Connection;
 ///
 /// Phase G: `project_settings_repository` is sea-orm-backed now, so
 /// the global-flag read goes through `sea_orm_db` and happens BEFORE
-/// `conn` (the legacy `AgentRepository` connection, still rusqlite --
-/// `AgentRepository` is not a Phase G target) is ever locked. This
-/// ordering isn't cosmetic: `conn: &tokio::sync::Mutex<Connection>`
+/// `conn` (the legacy connection this function's own `AgentRepository::
+/// get_by_id` call still needs -- `get_by_id` is one of several
+/// `AgentRepository` methods staying PERMANENTLY rusqlite-only, per
+/// `conexus_db::agent_repository`'s own module doc; `AgentRepository`
+/// as a WHOLE is no longer un-converted since Phase G's own PRs 1-3)
+/// is ever locked. This ordering isn't cosmetic: `conn: &tokio::sync::Mutex<Connection>`
 /// locked AFTER the only `.await` in this function means the resulting
 /// `MutexGuard` never has to coexist with a suspension point, so
 /// there's no `!Send`-future hazard to reason about at all (see

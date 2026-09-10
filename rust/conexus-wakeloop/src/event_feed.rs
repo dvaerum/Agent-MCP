@@ -547,7 +547,11 @@ pub fn collect_agent_profile_events_for(
 ///
 /// Phase G: `project_settings_repository` is sea-orm-backed now, so
 /// the global-flag read goes through `sea_orm_db` FIRST -- `conn`
-/// (still legacy rusqlite, `AgentRepository` is not a Phase G target)
+/// (still legacy rusqlite, needed for this function's own
+/// `AgentRepository::get_by_id` call -- one of several
+/// `AgentRepository` methods staying PERMANENTLY rusqlite-only, per
+/// `conexus_db::agent_repository`'s own module doc; `AgentRepository`
+/// as a WHOLE is no longer un-converted since Phase G's own PRs 1-3)
 /// is locked only afterward, in its own confined scope, per this
 /// module's own doc comment on why a bare `&Connection` parameter
 /// can't coexist with an internal `.await` here.
