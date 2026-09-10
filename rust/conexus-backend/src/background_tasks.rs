@@ -19,8 +19,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rusqlite::Connection;
-
 use crate::server::SharedState;
 
 /// Port of `agent_mcp/features/message_retention.py`. The
@@ -61,32 +59,25 @@ mod message_retention {
     /// never touching the table) when retention is disabled -- same
     /// contract as Python's `prune_old_messages()`.
     ///
-    /// Phase G: `conn` is `&tokio::sync::Mutex<Connection>`, not a
-    /// bare `&Connection` -- this is `async fn` now (the retention-
-    /// window read goes through sea-orm), and a bare `&Connection`
-    /// parameter would poison this function's returned future's
-    /// `Send`-ness the moment it's referenced anywhere in the body
-    /// (see `conexus_backend::principal_resolve::resolve_principal`'s
-    /// own doc comment for the fully-worked-out rule). The sea-orm
-    /// read happens first, before `conn` is ever locked.
+    /// Phase G: fully sea-orm now -- `message_repository::
+    /// prune_read_before` was converted in this repository's own PR
+    /// 1/5, so this no longer needs the legacy `&tokio::sync::
+    /// Mutex<Connection>` handle (or its lock) at all.
     pub async fn prune_old_messages(
-        conn: &tokio::sync::Mutex<Connection>,
         sea_orm_db: &sea_orm::DatabaseConnection,
         now: chrono::DateTime<chrono::Utc>,
-    ) -> rusqlite::Result<i64> {
+    ) -> anyhow::Result<i64> {
         let days = read_retention_days(sea_orm_db).await;
         if days <= 0 {
             return Ok(0);
         }
         let cutoff = (now - chrono::Duration::days(days)).to_rfc3339();
-        let guard = conn.lock().await;
-        conexus_db::message_repository::prune_read_before(&guard, &cutoff)
+        Ok(conexus_db::message_repository::prune_read_before(sea_orm_db, &cutoff).await?)
     }
 
     pub async fn run_periodically(shared: Arc<SharedState>, interval: Duration) {
         loop {
-            let result =
-                prune_old_messages(&shared.conn, &shared.sea_orm_db, chrono::Utc::now()).await;
+            let result = prune_old_messages(&shared.sea_orm_db, chrono::Utc::now()).await;
             match result {
                 Ok(0) => {}
                 Ok(deleted) => {
@@ -126,23 +117,29 @@ mod subject_backfill {
     /// configured local model. Returns the number titled this sweep;
     /// `0` when the model is unconfigured or there's nothing to do.
     ///
-    /// The DB fetch/write run under `shared.conn`'s lock; the
-    /// `suggest_subject` HTTP call to the local model runs OUTSIDE it
-    /// (released between fetch and write) -- a slow/unavailable model
-    /// must never stall every other tool call/agent's DB access.
+    /// The `suggest_subject` HTTP call to the local model runs between
+    /// the fetch and the write-back, with no lock held across it (a
+    /// slow/unavailable model must never stall every other tool call/
+    /// agent's DB access) -- previously enforced by explicitly
+    /// releasing `shared.conn`'s mutex guard between the two rusqlite
+    /// calls; now implicit, since `message_repository::
+    /// fetch_null_subject_roots`/`set_message_subject` are sea-orm-
+    /// backed (Phase G, this repository's own PR 1/5) and
+    /// `sea_orm::DatabaseConnection` needs no external lock at all.
     pub async fn backfill_null_subjects(
         shared: &Arc<SharedState>,
         get_env: impl Fn(&str) -> Option<String> + Clone,
         batch_limit: i64,
-    ) -> rusqlite::Result<i64> {
+    ) -> anyhow::Result<i64> {
         if !message_suggestions::subject_model_configured(&get_env) {
             return Ok(0);
         }
 
-        let roots = {
-            let conn = shared.conn.lock().await;
-            conexus_db::message_repository::fetch_null_subject_roots(&conn, batch_limit)?
-        };
+        let roots = conexus_db::message_repository::fetch_null_subject_roots(
+            &shared.sea_orm_db,
+            batch_limit,
+        )
+        .await?;
         if roots.is_empty() {
             return Ok(0);
         }
@@ -157,14 +154,12 @@ mod subject_backfill {
                 // on a dead model.
                 continue;
             };
-            let ok = {
-                let conn = shared.conn.lock().await;
-                conexus_db::message_repository::set_message_subject(
-                    &conn,
-                    &root.message_id,
-                    &subject,
-                )?
-            };
+            let ok = conexus_db::message_repository::set_message_subject(
+                &shared.sea_orm_db,
+                &root.message_id,
+                &subject,
+            )
+            .await?;
             if ok {
                 titled += 1;
                 // Release any held skinny message event: the message
@@ -389,31 +384,24 @@ mod tests {
     use conexus_db::message_repository::{self, NewMessage};
     use conexus_db::schema::init_schema;
     use rusqlite::Connection;
-    use tokio::sync::Mutex as AsyncMutex;
 
-    fn test_conn() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        init_schema(&conn).unwrap();
-        conn
-    }
-
-    /// A real temp-file-backed sea-orm connection for `prune_old_
-    /// messages`'s own `project_settings` reads. A SEPARATE temp file
-    /// from `test_conn`'s `:memory:` rusqlite connection is fine --
-    /// `agent_messages` (rusqlite) and `project_settings` (sea-orm)
-    /// are disjoint tables here, so nothing in these tests needs the
-    /// two sides to observe each other's data.
-    async fn test_sea_orm_db() -> (tempfile::TempDir, sea_orm::DatabaseConnection) {
+    /// A real temp-file DB opened as BOTH a rusqlite `Connection` (for
+    /// seeding/reading `agent_messages` via `message_repository`'s
+    /// still-sync helpers) and a sea-orm `DatabaseConnection` (for
+    /// `prune_old_messages`, fully sea-orm now -- Phase G,
+    /// `message_repository`'s own PR 1/5). An in-memory `:memory:` DB
+    /// can't be shared across two separate connection handles the way
+    /// a real file can; mirrors `message_repository::tests::
+    /// test_conn_with_sea_orm`.
+    async fn test_db() -> (tempfile::TempDir, Connection, sea_orm::DatabaseConnection) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.db");
-        {
-            let c = Connection::open(&path).unwrap();
-            init_schema(&c).unwrap();
-        }
-        let db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn).unwrap();
+        let sea_orm_db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
             .await
             .unwrap();
-        (dir, db)
+        (dir, conn, sea_orm_db)
     }
 
     async fn set_retention_days(db: &sea_orm::DatabaseConnection, days: i64) {
@@ -455,15 +443,12 @@ mod tests {
 
     #[tokio::test]
     async fn disabled_by_default_prunes_nothing() {
-        let conn = test_conn();
+        let (_dir, conn, sea_orm_db) = test_db().await;
         seed_message(&conn, "m1", "2020-01-01T00:00:00Z", true);
-        let conn = AsyncMutex::new(conn);
-        let (_dir, sea_orm_db) = test_sea_orm_db().await;
-        let deleted = prune_old_messages(&conn, &sea_orm_db, chrono::Utc::now())
+        let deleted = prune_old_messages(&sea_orm_db, chrono::Utc::now())
             .await
             .unwrap();
         assert_eq!(deleted, 0);
-        let conn = conn.into_inner();
         assert!(message_repository::get_by_id(&conn, "m1")
             .unwrap()
             .is_some());
@@ -471,19 +456,16 @@ mod tests {
 
     #[tokio::test]
     async fn prunes_only_read_messages_past_the_configured_window() {
-        let conn = test_conn();
+        let (_dir, conn, sea_orm_db) = test_db().await;
         let now: chrono::DateTime<chrono::Utc> = "2026-06-01T00:00:00Z".parse().unwrap();
         seed_message(&conn, "old-read", "2026-01-01T00:00:00Z", true);
         seed_message(&conn, "old-unread", "2026-01-01T00:00:00Z", false);
         seed_message(&conn, "recent-read", "2026-05-30T00:00:00Z", true);
-        let conn = AsyncMutex::new(conn);
-        let (_dir, sea_orm_db) = test_sea_orm_db().await;
         set_retention_days(&sea_orm_db, 30).await;
 
-        let deleted = prune_old_messages(&conn, &sea_orm_db, now).await.unwrap();
+        let deleted = prune_old_messages(&sea_orm_db, now).await.unwrap();
 
         assert_eq!(deleted, 1);
-        let conn = conn.into_inner();
         assert!(message_repository::get_by_id(&conn, "old-read")
             .unwrap()
             .is_none());
@@ -508,14 +490,12 @@ mod tests {
         // the wall clock, unlike an earlier draft that used
         // `chrono::Utc::now()` and silently stopped pruning once real
         // time passed 10 years past the seeded date.
-        let conn = test_conn();
+        let (_dir, conn, sea_orm_db) = test_db().await;
         let now: chrono::DateTime<chrono::Utc> = "2026-01-01T00:00:00Z".parse().unwrap();
         seed_message(&conn, "m1", "2000-01-01T00:00:00Z", true);
-        let conn = AsyncMutex::new(conn);
-        let (_dir, sea_orm_db) = test_sea_orm_db().await;
         set_retention_days(&sea_orm_db, 999_999_999_999).await;
         // Must not panic.
-        let deleted = prune_old_messages(&conn, &sea_orm_db, now).await.unwrap();
+        let deleted = prune_old_messages(&sea_orm_db, now).await.unwrap();
         assert_eq!(deleted, 1);
     }
 }
@@ -531,11 +511,22 @@ mod subject_backfill_tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    async fn test_shared() -> Arc<SharedState> {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
+    /// `shared.conn` (rusqlite) and `shared.sea_orm_db` must point at
+    /// the SAME real temp-file DB, not two separate `:memory:`
+    /// databases -- `backfill_null_subjects` reads/writes
+    /// `agent_messages` exclusively through `shared.sea_orm_db` now
+    /// (Phase G, `message_repository`'s own PR 1/5), while these tests
+    /// still seed fixture rows through `shared.conn`'s still-sync
+    /// `message_repository::send`.
+    async fn test_shared() -> (tempfile::TempDir, Arc<SharedState>) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
         init_schema(&conn).unwrap();
-        let sea_orm_db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
-        Arc::new(SharedState {
+        let sea_orm_db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        let shared = Arc::new(SharedState {
             conn: tokio::sync::Mutex::new(conn),
             forwarding_hmac_key: None,
             waiter_registry: WaiterRegistry::new(),
@@ -544,7 +535,8 @@ mod subject_backfill_tests {
             operator_events: crate::operator_events::OperatorEventsHub::new(),
             delivery_transport: crate::delivery_transport::DeliveryTransportHub::new(),
             sea_orm_db,
-        })
+        });
+        (dir, shared)
     }
 
     fn seed_root(conn: &rusqlite::Connection, id: &str, recipient_id: &str, content: &str) {
@@ -577,7 +569,7 @@ mod subject_backfill_tests {
 
     #[tokio::test]
     async fn model_unconfigured_is_a_no_op() {
-        let shared = test_shared().await;
+        let (_dir, shared) = test_shared().await;
         {
             let conn = shared.conn.lock().await;
             seed_root(&conn, "m1", "admin", "hello there");
@@ -588,7 +580,7 @@ mod subject_backfill_tests {
 
     #[tokio::test]
     async fn nothing_to_backfill_is_a_no_op() {
-        let shared = test_shared().await;
+        let (_dir, shared) = test_shared().await;
         let titled = backfill_null_subjects(
             &shared,
             env(&[("AGENT_MCP_SUBJECT_MODEL", "qwen2.5:3b-instruct")]),
@@ -605,7 +597,7 @@ mod subject_backfill_tests {
         // endpoint -- every suggest_subject call must degrade to None
         // rather than propagate an error, matching Python's own
         // per-row `continue` on a dead model.
-        let shared = test_shared().await;
+        let (_dir, shared) = test_shared().await;
         {
             let conn = shared.conn.lock().await;
             seed_root(&conn, "m1", "admin", "hello there");
@@ -650,14 +642,14 @@ mod subject_backfill_tests {
             let _ = socket.shutdown().await;
         });
 
-        let shared = test_shared().await;
+        let (_dir, shared) = test_shared().await;
         {
             let conn = shared.conn.lock().await;
             // Fixture data only (this test doesn't assert on `create()`
-            // itself) -- a raw insert rather than the sea-orm-backed
-            // `AgentRepository::create` so the row lands in `shared.conn`
-            // without needing a `DatabaseConnection` sharing its storage
-            // (`shared.sea_orm_db` is a separate `:memory:` DB here).
+            // itself) -- a raw insert through `shared.conn` rather than
+            // the sea-orm-backed `AgentRepository::create`; both land
+            // in the same real temp-file DB `shared.sea_orm_db` also
+            // points at.
             conn.execute(
                 "INSERT INTO agents (token, agent_id, created_at, status, current_task, working_directory, color, agent_role) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
