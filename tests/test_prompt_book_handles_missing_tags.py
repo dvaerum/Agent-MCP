@@ -3,9 +3,15 @@
 On 2026-06-17 a Firefox-MCP click-through on the Prompt Book tab
 surfaced ``TypeError: s.tags is undefined`` inside
 ``fetchPromptsCatalog``'s consumer code. Root cause: one of the 12
-shipped prompts in ``agent_mcp/prompts/catalog.json``
-(``event-loop``) lacked the ``tags`` key entirely
-while the dashboard read-sites dereferenced ``prompt.tags`` directly.
+shipped prompts in ``catalog.json`` (``event-loop``) lacked the
+``tags`` key entirely while the dashboard read-sites dereferenced
+``prompt.tags`` directly.
+
+The catalog's canonical source moved to
+``rust/conexus-tools/prompts/catalog.json`` in Phase F (the Python
+copy at ``agent_mcp/prompts/catalog.json`` this test originally read
+is deleted); this test now reads the Rust-side copy the dashboard's
+real ``GET /api/prompts/catalog`` route actually serves.
 
 The fix is three layers of defense:
 
@@ -30,7 +36,7 @@ from pathlib import Path
 
 _REPO = Path(__file__).resolve().parents[1]
 _DASHBOARD = _REPO / "agent_mcp" / "dashboard"
-_CATALOG = _REPO / "agent_mcp" / "prompts" / "catalog.json"
+_CATALOG = _REPO / "rust" / "conexus-tools" / "prompts" / "catalog.json"
 
 
 def _read(rel: str) -> str:
@@ -47,7 +53,7 @@ def test_catalog_every_prompt_has_tags_key() -> None:
     catalog = json.loads(_CATALOG.read_text(encoding="utf-8"))
     missing = [p.get("id", "<no-id>") for p in catalog["prompts"] if "tags" not in p]
     assert missing == [], (
-        "agent_mcp/prompts/catalog.json has prompts without a `tags` "
+        "rust/conexus-tools/prompts/catalog.json has prompts without a `tags` "
         f"key: {missing}. Every entry must have `\"tags\": [...]` "
         "(possibly empty) so the dashboard can render without "
         "tripping `TypeError: s.tags is undefined`."
@@ -65,7 +71,7 @@ def test_catalog_tags_is_always_a_list() -> None:
         if not isinstance(p.get("tags"), list)
     ]
     assert bad == [], (
-        "agent_mcp/prompts/catalog.json has prompts whose `tags` is "
+        "rust/conexus-tools/prompts/catalog.json has prompts whose `tags` is "
         f"not a JSON array: {bad}."
     )
 
