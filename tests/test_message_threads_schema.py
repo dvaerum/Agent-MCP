@@ -1,8 +1,7 @@
 """Schema test for `feat/message-threads-and-subjects` (v5.0.22).
 
-This is the **RED** test for behavior block 1: the `agent_messages`
-table gains two new columns and an FK so that root + reply messages
-can be modelled as an email-style thread:
+Pins behavior block 1: the `agent_messages` table carries two columns
+so root + reply messages can be modelled as an email-style thread:
 
 * ``subject TEXT NULL`` — root-only summary line.
 * ``parent_message_id TEXT NULL`` — FK to ``agent_messages(message_id)``
@@ -12,7 +11,7 @@ can be modelled as an email-style thread:
 
 Test surface:
 
-* Migration applies cleanly on a fresh DB (lifespan startup runs it).
+* Migration applies cleanly on a fresh DB.
 * Both new columns exist with the expected NULLability.
 * INSERT with subject + parent_message_id succeeds when the parent
   is a real row.
@@ -21,19 +20,46 @@ Test surface:
 * Deleting the parent row NULLs out children's ``parent_message_id``
   rather than cascading the DELETE (ON DELETE SET NULL).
 * The supporting index is present.
+
+Phase F (prancy-napping-pie): rewritten to boot the DB layer +
+Alembic chain directly instead of the now-retired
+tests.harness.mcp_session/full app stack -- every test here is pure
+schema/migration coverage. `subject`/`parent_message_id` are declared
+on the SQLAlchemy model (create_all() reproduces them for a fresh
+DB), but the FK itself (ON DELETE SET NULL) is declared ONLY in
+migration 0012 -- see agent_mcp/db/models/agent_message.py's own
+module doc -- so the real Alembic chain must run, not just
+init_database()'s create_all() (same finding as
+test_db_foreign_keys.py's own bootstrap doc).
 """
 
 from __future__ import annotations
 
+import os
 import secrets
 import sqlite3
 from datetime import datetime
 
 import pytest
 
-from tests.harness import mcp_session
 
-pytestmark = pytest.mark.asyncio
+def _bootstrap_fresh_db(tmp_path) -> None:
+    """Point the ORM engine at a fresh per-tmpdir DB, run
+    init_database(), then run the real Alembic chain -- see this
+    module's own doc for why the migration chain is required here."""
+    project_dir = str(tmp_path)
+    agent_dir = tmp_path / ".agent"
+    agent_dir.mkdir()
+    os.environ["MCP_PROJECT_DIR"] = project_dir
+
+    from agent_mcp.db import engine as _engine
+    _engine._engine = None  # type: ignore[attr-defined]
+
+    from agent_mcp.db.schema import init_database
+    init_database()
+
+    from agent_mcp.db.migrations_runner import run_migrations_upgrade
+    run_migrations_upgrade()
 
 
 def _columns(conn: sqlite3.Connection, table: str) -> dict[str, tuple]:
@@ -78,136 +104,136 @@ def _insert_root_message(conn: sqlite3.Connection, **overrides) -> str:
     return msg_id
 
 
-async def test_subject_and_parent_columns_exist(tmp_path) -> None:
+def test_subject_and_parent_columns_exist(tmp_path) -> None:
+    _bootstrap_fresh_db(tmp_path)
     from agent_mcp.core.config import get_db_path
 
-    async with mcp_session(tmp_path):
-        conn = sqlite3.connect(str(get_db_path()))
-        try:
-            cols = _columns(conn, "agent_messages")
-            assert "subject" in cols, f"missing subject column; have {list(cols)}"
-            assert "parent_message_id" in cols, (
-                f"missing parent_message_id column; have {list(cols)}"
-            )
-            # Both should be nullable (NOT NULL flag = False).
-            assert cols["subject"][1] is False, "subject should be nullable"
-            assert cols["parent_message_id"][1] is False, (
-                "parent_message_id should be nullable"
-            )
-        finally:
-            conn.close()
+    conn = sqlite3.connect(str(get_db_path()))
+    try:
+        cols = _columns(conn, "agent_messages")
+        assert "subject" in cols, f"missing subject column; have {list(cols)}"
+        assert "parent_message_id" in cols, (
+            f"missing parent_message_id column; have {list(cols)}"
+        )
+        # Both should be nullable (NOT NULL flag = False).
+        assert cols["subject"][1] is False, "subject should be nullable"
+        assert cols["parent_message_id"][1] is False, (
+            "parent_message_id should be nullable"
+        )
+    finally:
+        conn.close()
 
 
-async def test_parent_fk_declared_with_set_null(tmp_path) -> None:
+def test_parent_fk_declared_with_set_null(tmp_path) -> None:
+    _bootstrap_fresh_db(tmp_path)
     from agent_mcp.core.config import get_db_path
 
-    async with mcp_session(tmp_path):
-        conn = sqlite3.connect(str(get_db_path()))
-        try:
-            fks = _fk_list(conn, "agent_messages")
-            # Find the self-referential FK for parent_message_id.
-            parent_fk = [
-                fk
-                for fk in fks
-                if fk[0] == "parent_message_id" and fk[1] == "agent_messages"
-            ]
-            assert parent_fk, (
-                f"parent_message_id FK missing from agent_messages; have {fks}"
-            )
-            # ON DELETE behaviour should be SET NULL (index 4 in our tuple).
-            _from_col, _ref_table, ref_col, _on_update, on_delete = parent_fk[0]
-            assert ref_col == "message_id", parent_fk
-            assert on_delete.upper() == "SET NULL", (
-                f"parent_message_id FK should be ON DELETE SET NULL; "
-                f"got on_delete={on_delete!r}"
-            )
-        finally:
-            conn.close()
+    conn = sqlite3.connect(str(get_db_path()))
+    try:
+        fks = _fk_list(conn, "agent_messages")
+        # Find the self-referential FK for parent_message_id.
+        parent_fk = [
+            fk
+            for fk in fks
+            if fk[0] == "parent_message_id" and fk[1] == "agent_messages"
+        ]
+        assert parent_fk, (
+            f"parent_message_id FK missing from agent_messages; have {fks}"
+        )
+        # ON DELETE behaviour should be SET NULL (index 4 in our tuple).
+        _from_col, _ref_table, ref_col, _on_update, on_delete = parent_fk[0]
+        assert ref_col == "message_id", parent_fk
+        assert on_delete.upper() == "SET NULL", (
+            f"parent_message_id FK should be ON DELETE SET NULL; "
+            f"got on_delete={on_delete!r}"
+        )
+    finally:
+        conn.close()
 
 
-async def test_parent_index_present(tmp_path) -> None:
+def test_parent_index_present(tmp_path) -> None:
+    _bootstrap_fresh_db(tmp_path)
     from agent_mcp.core.config import get_db_path
 
-    async with mcp_session(tmp_path):
-        conn = sqlite3.connect(str(get_db_path()))
-        try:
-            idx = _indexes(conn, "agent_messages")
-            assert "idx_agent_messages_parent" in idx, (
-                f"idx_agent_messages_parent missing; have {idx}"
-            )
-        finally:
-            conn.close()
+    conn = sqlite3.connect(str(get_db_path()))
+    try:
+        idx = _indexes(conn, "agent_messages")
+        assert "idx_agent_messages_parent" in idx, (
+            f"idx_agent_messages_parent missing; have {idx}"
+        )
+    finally:
+        conn.close()
 
 
-async def test_insert_with_subject_and_parent_succeeds(tmp_path) -> None:
+def test_insert_with_subject_and_parent_succeeds(tmp_path) -> None:
+    _bootstrap_fresh_db(tmp_path)
     from agent_mcp.core.config import get_db_path
 
-    async with mcp_session(tmp_path):
-        conn = sqlite3.connect(str(get_db_path()))
-        conn.execute("PRAGMA foreign_keys=ON")
-        try:
-            root_id = _insert_root_message(
+    conn = sqlite3.connect(str(get_db_path()))
+    conn.execute("PRAGMA foreign_keys=ON")
+    try:
+        root_id = _insert_root_message(
+            conn,
+            subject="Initial topic",
+        )
+        reply_id = _insert_root_message(
+            conn,
+            parent_message_id=root_id,
+            subject=None,  # replies have no subject
+        )
+        row = conn.execute(
+            "SELECT subject, parent_message_id FROM agent_messages "
+            "WHERE message_id = ?",
+            (reply_id,),
+        ).fetchone()
+        assert row is not None
+        assert row[0] is None, "reply subject should be NULL"
+        assert row[1] == root_id, "reply parent_message_id should match root"
+    finally:
+        conn.close()
+
+
+def test_insert_with_dangling_parent_rejected(tmp_path) -> None:
+    _bootstrap_fresh_db(tmp_path)
+    from agent_mcp.core.config import get_db_path
+
+    conn = sqlite3.connect(str(get_db_path()))
+    conn.execute("PRAGMA foreign_keys=ON")
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_root_message(
                 conn,
-                subject="Initial topic",
+                parent_message_id="msg_does_not_exist",
             )
-            reply_id = _insert_root_message(
-                conn,
-                parent_message_id=root_id,
-                subject=None,  # replies have no subject
-            )
-            row = conn.execute(
-                "SELECT subject, parent_message_id FROM agent_messages "
-                "WHERE message_id = ?",
-                (reply_id,),
-            ).fetchone()
-            assert row is not None
-            assert row[0] is None, "reply subject should be NULL"
-            assert row[1] == root_id, "reply parent_message_id should match root"
-        finally:
-            conn.close()
+    finally:
+        conn.close()
 
 
-async def test_insert_with_dangling_parent_rejected(tmp_path) -> None:
+def test_parent_delete_sets_child_to_null(tmp_path) -> None:
+    _bootstrap_fresh_db(tmp_path)
     from agent_mcp.core.config import get_db_path
 
-    async with mcp_session(tmp_path):
-        conn = sqlite3.connect(str(get_db_path()))
-        conn.execute("PRAGMA foreign_keys=ON")
-        try:
-            with pytest.raises(sqlite3.IntegrityError):
-                _insert_root_message(
-                    conn,
-                    parent_message_id="msg_does_not_exist",
-                )
-        finally:
-            conn.close()
+    conn = sqlite3.connect(str(get_db_path()))
+    conn.execute("PRAGMA foreign_keys=ON")
+    try:
+        root_id = _insert_root_message(conn, subject="Root")
+        reply_id = _insert_root_message(conn, parent_message_id=root_id)
 
+        conn.execute(
+            "DELETE FROM agent_messages WHERE message_id = ?",
+            (root_id,),
+        )
+        conn.commit()
 
-async def test_parent_delete_sets_child_to_null(tmp_path) -> None:
-    from agent_mcp.core.config import get_db_path
-
-    async with mcp_session(tmp_path):
-        conn = sqlite3.connect(str(get_db_path()))
-        conn.execute("PRAGMA foreign_keys=ON")
-        try:
-            root_id = _insert_root_message(conn, subject="Root")
-            reply_id = _insert_root_message(conn, parent_message_id=root_id)
-
-            conn.execute(
-                "DELETE FROM agent_messages WHERE message_id = ?",
-                (root_id,),
-            )
-            conn.commit()
-
-            row = conn.execute(
-                "SELECT parent_message_id FROM agent_messages "
-                "WHERE message_id = ?",
-                (reply_id,),
-            ).fetchone()
-            assert row is not None, "child row should still exist after parent delete"
-            assert row[0] is None, (
-                f"child parent_message_id should be NULLed by ON DELETE SET NULL; "
-                f"got {row[0]!r}"
-            )
-        finally:
-            conn.close()
+        row = conn.execute(
+            "SELECT parent_message_id FROM agent_messages "
+            "WHERE message_id = ?",
+            (reply_id,),
+        ).fetchone()
+        assert row is not None, "child row should still exist after parent delete"
+        assert row[0] is None, (
+            f"child parent_message_id should be NULLed by ON DELETE SET NULL; "
+            f"got {row[0]!r}"
+        )
+    finally:
+        conn.close()

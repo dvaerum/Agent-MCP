@@ -24,7 +24,7 @@ declared post-Wave-4 — they have nothing to do with the admin
 pseudo-agent.
 
 Tests cover:
-- The two surviving FKs are declared after lifespan startup.
+- The two surviving FKs are declared after DB bootstrap.
 - The five Wave-4-dropped FKs are NOT declared (regression guard
   against accidentally re-adding them).
 - Insert that violates a surviving FK is rejected when
@@ -36,6 +36,11 @@ Tests cover:
   `AGENT_MCP_FK_BYPASS_ORPHAN_CLEANUP=1` env var (safety hatch for
   operators who want to inspect orphans first); follow-on FK
   creation then fails loudly so the operator notices.
+
+Phase F (prancy-napping-pie): rewritten to boot the DB layer directly
+(the same init_database() bootstrap tests/test_migration_*.py already
+uses) instead of the now-retired tests.harness.mcp_session/full app
+stack -- every test here was already pure schema/migration coverage.
 """
 
 from __future__ import annotations
@@ -48,11 +53,34 @@ from pathlib import Path
 
 import pytest
 
-from tests.harness import mcp_session
 
-# Default to asyncio for the async tests; the two synchronous
-# orphan-cleanup tests at the bottom override via their own decorators.
-pytestmark = pytest.mark.asyncio
+def _bootstrap_fresh_db(tmp_path) -> None:
+    """Point the ORM engine at a fresh per-tmpdir DB, run
+    init_database(), then run the real Alembic chain.
+
+    Unlike most tables, the two surviving FKs this file pins
+    (``agents.current_task``/``tasks.parent_task``) are declared ONLY
+    by migration 0007's raw DDL, never in the SQLAlchemy model itself
+    (confirmed directly against agent_mcp/db/models/{agent,task}.py --
+    neither column carries a ``ForeignKey()``) -- so ``init_database()``
+    alone is NOT sufficient here, unlike the pure-ORM-parity tests in
+    tests/test_sqlalchemy_*.py. Running the real migration chain is
+    the only way these FKs actually land, matching what a real
+    project DB gets in production.
+    """
+    project_dir = str(tmp_path)
+    agent_dir = tmp_path / ".agent"
+    agent_dir.mkdir()
+    os.environ["MCP_PROJECT_DIR"] = project_dir
+
+    from agent_mcp.db import engine as _engine
+    _engine._engine = None  # type: ignore[attr-defined]
+
+    from agent_mcp.db.schema import init_database
+    init_database()
+
+    from agent_mcp.db.migrations_runner import run_migrations_upgrade
+    run_migrations_upgrade()
 
 
 # (table, column, referenced_table, referenced_column) — the FKs
@@ -86,24 +114,24 @@ def _fk_list(conn: sqlite3.Connection, table: str) -> list[tuple]:
     return [(r[3], r[2], r[4]) for r in rows]
 
 
-async def test_shipped_fk_constraints_declared(tmp_path) -> None:
-    """Each shipped FK must be present in DDL after lifespan startup."""
+def test_shipped_fk_constraints_declared(tmp_path) -> None:
+    """Each shipped FK must be present in DDL after DB bootstrap."""
+    _bootstrap_fresh_db(tmp_path)
     from agent_mcp.core.config import get_db_path
 
-    async with mcp_session(tmp_path):
-        conn = sqlite3.connect(str(get_db_path()))
-        try:
-            for table, col, ref_table, ref_col in _REQUIRED_FKS:
-                fks = _fk_list(conn, table)
-                assert (col, ref_table, ref_col) in fks, (
-                    f"missing FK {table}.{col} -> {ref_table}.{ref_col}; "
-                    f"have {fks}"
-                )
-        finally:
-            conn.close()
+    conn = sqlite3.connect(str(get_db_path()))
+    try:
+        for table, col, ref_table, ref_col in _REQUIRED_FKS:
+            fks = _fk_list(conn, table)
+            assert (col, ref_table, ref_col) in fks, (
+                f"missing FK {table}.{col} -> {ref_table}.{ref_col}; "
+                f"have {fks}"
+            )
+    finally:
+        conn.close()
 
 
-async def test_wave4_dropped_fks_are_gone(tmp_path) -> None:
+def test_wave4_dropped_fks_are_gone(tmp_path) -> None:
     """The five FKs that targeted ``agents.agent_id`` and required the
     admin pseudo-agent are gone after migration 0014.
 
@@ -114,23 +142,23 @@ async def test_wave4_dropped_fks_are_gone(tmp_path) -> None:
     Detailed coverage of the post-drop write paths lives in
     ``test_db_admin_pseudo_agent.py``.
     """
+    _bootstrap_fresh_db(tmp_path)
     from agent_mcp.core.config import get_db_path
 
-    async with mcp_session(tmp_path):
-        conn = sqlite3.connect(str(get_db_path()))
-        try:
-            for table, col, ref_table, ref_col in _DROPPED_FKS:
-                fks = _fk_list(conn, table)
-                assert (col, ref_table, ref_col) not in fks, (
-                    f"FK {table}.{col} -> {ref_table}.{ref_col} should "
-                    f"have been dropped by Wave 4 migration 0014; "
-                    f"still present in {fks}"
-                )
-        finally:
-            conn.close()
+    conn = sqlite3.connect(str(get_db_path()))
+    try:
+        for table, col, ref_table, ref_col in _DROPPED_FKS:
+            fks = _fk_list(conn, table)
+            assert (col, ref_table, ref_col) not in fks, (
+                f"FK {table}.{col} -> {ref_table}.{ref_col} should "
+                f"have been dropped by Wave 4 migration 0014; "
+                f"still present in {fks}"
+            )
+    finally:
+        conn.close()
 
 
-async def test_fk_violation_is_rejected(tmp_path) -> None:
+def test_fk_violation_is_rejected(tmp_path) -> None:
     """With `foreign_keys=ON`, an orphan insert into a surviving FK
     column must fail.
 
@@ -140,21 +168,21 @@ async def test_fk_violation_is_rejected(tmp_path) -> None:
     ``tasks.parent_task -> tasks.task_id`` FK instead: a task that
     points at a nonexistent parent must be rejected at INSERT time.
     """
+    _bootstrap_fresh_db(tmp_path)
     from agent_mcp.db.connection import get_db_connection
 
-    async with mcp_session(tmp_path):
-        conn = get_db_connection()
-        try:
-            with pytest.raises(sqlite3.IntegrityError):
-                conn.execute(
-                    "INSERT INTO tasks "
-                    "(task_id, title, created_by, status, priority, "
-                    " created_at, updated_at, parent_task) "
-                    "VALUES ('t-orphan', 'x', 'admin', 'pending', "
-                    " 'low', 't', 't', 'no-such-parent')"
-                )
-        finally:
-            conn.close()
+    conn = get_db_connection()
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO tasks "
+                "(task_id, title, created_by, status, priority, "
+                " created_at, updated_at, parent_task) "
+                "VALUES ('t-orphan', 'x', 'admin', 'pending', "
+                " 'low', 't', 't', 'no-such-parent')"
+            )
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -355,7 +383,7 @@ def _run_migration_to_head(db_path: Path, env: dict[str, str]) -> tuple[int, str
     return proc.returncode, proc.stdout, proc.stderr
 
 
-async def test_migration_cleans_up_orphans_by_default(tmp_path) -> None:
+def test_migration_cleans_up_orphans_by_default(tmp_path) -> None:
     """Without the bypass env var, the migration deletes orphan rows.
 
     Smoke-tested via an out-of-process `alembic upgrade head` against
@@ -470,7 +498,7 @@ async def test_migration_cleans_up_orphans_by_default(tmp_path) -> None:
         conn.close()
 
 
-async def test_migration_bypass_orphan_cleanup_fails_loudly(tmp_path) -> None:
+def test_migration_bypass_orphan_cleanup_fails_loudly(tmp_path) -> None:
     """With the bypass env var set, orphans aren't cleaned up.
 
     SQLite's batch_alter_table copies rows through a temp table; with
