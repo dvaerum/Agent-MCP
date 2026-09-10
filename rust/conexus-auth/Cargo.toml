@@ -45,3 +45,7 @@ sea-orm = { version = "2", default-features = false, features = [
 # beyond the bare Mutex type already in [dependencies]. `rt` alone
 # covers `#[tokio::test]`; nothing here needs a multi-threaded runtime.
 tokio = { version = "1", features = ["rt", "macros"] }
+# `wake_loop_eligibility`'s tests need a real temp-file-backed sea-orm
+# connection (Phase G) for `project_settings_repository` reads --
+# matching every other Phase G test fixture in this workspace.
+tempfile = "3"

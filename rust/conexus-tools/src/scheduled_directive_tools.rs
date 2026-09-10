@@ -79,14 +79,6 @@ fn generate_directive_id() -> String {
     format!("sd_{:016x}", rand_u64())
 }
 
-fn floor_seconds(conn: &Connection) -> i64 {
-    project_settings_repository::get_int(conn, "config_min_schedule_interval_seconds", 60)
-}
-
-fn max_per_agent(conn: &Connection) -> i64 {
-    project_settings_repository::get_int(conn, "config_max_schedules_per_agent", 10)
-}
-
 /// Format a `DateTime<Utc>` the same way
 /// `scheduled_directive_repository`'s own internal `add_seconds_iso`
 /// does, so a freshly-created row's timestamp shape matches what that
@@ -97,10 +89,26 @@ fn format_utc(dt: DateTime<Utc>) -> String {
 }
 
 /// Three-tier write authorization (see module doc). `None` = proceed.
+///
+/// Phase G: `allow_worker_self_schedule`/`allow_manager_curate_
+/// schedules` are plain `bool`s, resolved via sea-orm by every real
+/// caller BEFORE its own rusqlite guard/transaction is taken --
+/// matches this migration's established "hoist the sea-orm read out
+/// of a function whose own connection is already committed to
+/// synchronous-only work" pattern (see `conexus_tools::agent_
+/// messaging::can_agents_communicate`'s own doc comment for the fully
+/// worked example). This function still does real, conditional
+/// synchronous rusqlite work (`AgentRepository::get_by_id`) AFTER
+/// either flag would have been read, so it can't just take `conn: &
+/// tokio::sync::Mutex<Connection>>` and lock fresh post-await either
+/// -- both flags are needed up front to decide which branch even
+/// runs.
 fn authorize_target_write(
     conn: &Connection,
     principal: &Principal,
     target_agent_id: &str,
+    allow_worker_self_schedule: bool,
+    allow_manager_curate_schedules: bool,
 ) -> Option<ToolResult> {
     if is_operator_tier(principal) {
         return None;
@@ -114,7 +122,7 @@ fn authorize_target_write(
     };
 
     if target_agent_id == caller_id {
-        if !project_settings_repository::get_bool(conn, "config_allow_worker_self_schedule", true) {
+        if !allow_worker_self_schedule {
             return Some(ToolResult::PermissionDenied {
                 reason: "Self-scheduling is disabled by the operator \
                     (config_allow_worker_self_schedule). Ask a manager or admin to create the \
@@ -137,7 +145,7 @@ fn authorize_target_write(
                 .to_string(),
         });
     }
-    if !project_settings_repository::get_bool(conn, "config_allow_manager_curate_schedules", true) {
+    if !allow_manager_curate_schedules {
         return Some(ToolResult::PermissionDenied {
             reason: "Manager schedule-curation is disabled by the operator \
                 (config_allow_manager_curate_schedules)."
@@ -176,8 +184,16 @@ fn authorize_existing_or_notfound(
     principal: &Principal,
     existing: &ScheduledDirectiveRow,
     directive_id: &str,
+    allow_worker_self_schedule: bool,
+    allow_manager_curate_schedules: bool,
 ) -> Option<ToolResult> {
-    let denial = authorize_target_write(conn, principal, &existing.agent_id)?;
+    let denial = authorize_target_write(
+        conn,
+        principal,
+        &existing.agent_id,
+        allow_worker_self_schedule,
+        allow_manager_curate_schedules,
+    )?;
     let caller_id = (principal.kind == PrincipalKind::AgentBearer)
         .then_some(principal.agent_id.as_deref())
         .flatten();
@@ -386,25 +402,45 @@ impl Tool for CreateScheduledDirectiveTool {
                 }
             };
 
-            // Phase G: `scheduled_directive_repository` is sea-orm-backed
-            // now; the legacy `guard` is only needed for the still-legacy
-            // `project_settings_repository`/`authorize_target_write` reads
-            // below, so it's scoped narrowly and dropped before any
-            // `ctx.sea_orm_db` `.await` -- holding a `MutexGuard<Connection>`
-            // (`!Sync`) live across an `.await` would make this function's
+            // Phase G: `project_settings_repository` is sea-orm-backed
+            // now too -- every read it backs (`floor_seconds`'s old body,
+            // both `authorize_target_write` policy flags) is resolved
+            // via `ctx.sea_orm_db` BEFORE the legacy `guard` below is
+            // taken, so the guard's own scope (needed only for the
+            // still-legacy `AgentRepository::get_by_id` inside
+            // `authorize_target_write`'s manager-curation branch) never
+            // spans an `.await` -- holding a `MutexGuard<Connection>`
+            // (`!Sync`) live across one would make this function's
             // generated future `!Send`, which `Tool::call`'s `BoxFuture`
             // bound forbids (see `conexus_tools::project_context_tools::
-            // single_update_project_context`'s own doc comment for the same
-            // rule spelled out in full).
+            // single_update_project_context`'s own doc comment for the
+            // same rule spelled out in full).
+            let floor_seconds = project_settings_repository::get_int(
+                ctx.sea_orm_db,
+                "config_min_schedule_interval_seconds",
+                60,
+            )
+            .await;
+            let allow_worker_self_schedule = project_settings_repository::get_bool(
+                ctx.sea_orm_db,
+                "config_allow_worker_self_schedule",
+                true,
+            )
+            .await;
+            let allow_manager_curate_schedules = project_settings_repository::get_bool(
+                ctx.sea_orm_db,
+                "config_allow_manager_curate_schedules",
+                true,
+            )
+            .await;
+
             let (interval, until_iso, max_runs, target_agent_id) = {
                 let guard = conn.lock().await;
-                let interval = match validate_interval(
-                    arguments.get("interval_seconds"),
-                    floor_seconds(&guard),
-                ) {
-                    Ok(v) => v,
-                    Err(e) => return e,
-                };
+                let interval =
+                    match validate_interval(arguments.get("interval_seconds"), floor_seconds) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
                 let until_iso = match validate_until(arguments.get("until"), now_dt) {
                     Ok(v) => v,
                     Err(e) => return e,
@@ -429,7 +465,13 @@ impl Tool for CreateScheduledDirectiveTool {
                     }
                 };
 
-                if let Some(denial) = authorize_target_write(&guard, principal, &target_agent_id) {
+                if let Some(denial) = authorize_target_write(
+                    &guard,
+                    principal,
+                    &target_agent_id,
+                    allow_worker_self_schedule,
+                    allow_manager_curate_schedules,
+                ) {
                     return denial;
                 }
 
@@ -460,10 +502,12 @@ impl Tool for CreateScheduledDirectiveTool {
                     }
                 }
             };
-            let cap = {
-                let guard = conn.lock().await;
-                max_per_agent(&guard)
-            };
+            let cap = project_settings_repository::get_int(
+                ctx.sea_orm_db,
+                "config_max_schedules_per_agent",
+                10,
+            )
+            .await;
             if active >= cap {
                 return ToolResult::Invalid {
                     field: Some("interval_seconds".to_string()),
@@ -583,8 +627,29 @@ impl Tool for ListScheduledDirectivesTool {
             };
 
             if Some(target_agent_id.as_str()) != caller_id {
+                // Phase G: resolved via sea-orm before `conn` is locked
+                // below -- see `CreateScheduledDirectiveTool::call`'s
+                // own comment on this exact ordering, above.
+                let allow_worker_self_schedule = project_settings_repository::get_bool(
+                    ctx.sea_orm_db,
+                    "config_allow_worker_self_schedule",
+                    true,
+                )
+                .await;
+                let allow_manager_curate_schedules = project_settings_repository::get_bool(
+                    ctx.sea_orm_db,
+                    "config_allow_manager_curate_schedules",
+                    true,
+                )
+                .await;
                 let guard = conn.lock().await;
-                if let Some(denial) = authorize_target_write(&guard, principal, &target_agent_id) {
+                if let Some(denial) = authorize_target_write(
+                    &guard,
+                    principal,
+                    &target_agent_id,
+                    allow_worker_self_schedule,
+                    allow_manager_curate_schedules,
+                ) {
                     return denial;
                 }
             }
@@ -682,9 +747,31 @@ impl Tool for UpdateScheduledDirectiveTool {
                     }
                 }
             };
+            // Phase G: resolved via sea-orm before `conn` is locked
+            // below -- see `CreateScheduledDirectiveTool::call`'s own
+            // comment on this exact ordering.
+            let allow_worker_self_schedule = project_settings_repository::get_bool(
+                ctx.sea_orm_db,
+                "config_allow_worker_self_schedule",
+                true,
+            )
+            .await;
+            let allow_manager_curate_schedules = project_settings_repository::get_bool(
+                ctx.sea_orm_db,
+                "config_allow_manager_curate_schedules",
+                true,
+            )
+            .await;
             let denial = {
                 let guard = conn.lock().await;
-                authorize_existing_or_notfound(&guard, principal, &existing, &directive_id)
+                authorize_existing_or_notfound(
+                    &guard,
+                    principal,
+                    &existing,
+                    &directive_id,
+                    allow_worker_self_schedule,
+                    allow_manager_curate_schedules,
+                )
             };
             if let Some(denial) = denial {
                 return denial;
@@ -715,10 +802,12 @@ impl Tool for UpdateScheduledDirectiveTool {
             let mut new_interval = existing.interval_seconds;
             if let Some(v) = arguments.get("interval_seconds") {
                 if !v.is_null() {
-                    let floor = {
-                        let guard = conn.lock().await;
-                        floor_seconds(&guard)
-                    };
+                    let floor = project_settings_repository::get_int(
+                        ctx.sea_orm_db,
+                        "config_min_schedule_interval_seconds",
+                        60,
+                    )
+                    .await;
                     new_interval = match validate_interval(Some(v), floor) {
                         Ok(v) => v,
                         Err(e) => return e,
@@ -770,10 +859,12 @@ impl Tool for UpdateScheduledDirectiveTool {
                                     }
                                 }
                             };
-                            let cap = {
-                                let guard = conn.lock().await;
-                                max_per_agent(&guard)
-                            };
+                            let cap = project_settings_repository::get_int(
+                                ctx.sea_orm_db,
+                                "config_max_schedules_per_agent",
+                                10,
+                            )
+                            .await;
                             if active >= cap {
                                 return ToolResult::Invalid {
                                     field: Some("enabled".to_string()),
@@ -901,9 +992,31 @@ impl Tool for DeleteScheduledDirectiveTool {
                     }
                 }
             };
+            // Phase G: resolved via sea-orm before `conn` is locked
+            // below -- see `CreateScheduledDirectiveTool::call`'s own
+            // comment on this exact ordering.
+            let allow_worker_self_schedule = project_settings_repository::get_bool(
+                ctx.sea_orm_db,
+                "config_allow_worker_self_schedule",
+                true,
+            )
+            .await;
+            let allow_manager_curate_schedules = project_settings_repository::get_bool(
+                ctx.sea_orm_db,
+                "config_allow_manager_curate_schedules",
+                true,
+            )
+            .await;
             let denial = {
                 let guard = conn.lock().await;
-                authorize_existing_or_notfound(&guard, principal, &existing, &directive_id)
+                authorize_existing_or_notfound(
+                    &guard,
+                    principal,
+                    &existing,
+                    &directive_id,
+                    allow_worker_self_schedule,
+                    allow_manager_curate_schedules,
+                )
             };
             if let Some(denial) = denial {
                 return denial;
@@ -1022,13 +1135,14 @@ mod tests {
         ToolCallContext::off_wire(registry, file_map, std::path::Path::new("/tmp"), sea_orm_db)
     }
 
-    // Phase G (sea-orm migration): `scheduled_directive_repository` is
-    // sea-orm-backed now, so this needs a real, schema-initialized
-    // temp-file-backed connection, not a schema-less `sqlite::memory:`.
-    // A SEPARATE temp file from `setup()`'s legacy `conn` is fine --
-    // nothing in this module's tests needs the rusqlite and sea-orm
-    // sides to see each other's data (agents/settings stay on the
-    // legacy connection; `scheduled_directive` reads/writes go
+    // Phase G (sea-orm migration): `scheduled_directive_repository` AND
+    // `project_settings_repository` are both sea-orm-backed now, so
+    // this needs a real, schema-initialized temp-file-backed
+    // connection, not a schema-less `sqlite::memory:`. A SEPARATE temp
+    // file from `setup()`'s legacy `conn` is fine -- nothing in this
+    // module's tests needs the rusqlite and sea-orm sides to see each
+    // other's data (`agents` stays on the legacy connection;
+    // `project_settings`/`scheduled_directive` reads/writes go
     // exclusively through `sea_orm_db` now). The returned `TempDir`
     // must be kept alive by the caller for as long as `sea_orm_db` is
     // used.
@@ -1290,17 +1404,25 @@ mod tests {
         {
             let c = conn.lock().await;
             seed_agent(&c, "alice", "worker");
-            c.execute(
-                "INSERT INTO project_settings (context_key, value, updated_at, updated_by) \
-                 VALUES ('config_max_schedules_per_agent', '1', ?1, 'test')",
-                [NOW],
-            )
-            .unwrap();
         }
         let alice = worker("alice");
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
         let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
+        // Phase G: `project_settings_repository` reads through
+        // `sea_orm_db` now, not the legacy `conn` above -- see
+        // `test_sea_orm_db`'s own doc comment.
+        project_settings_repository::upsert(
+            &sea_orm_db,
+            "config_max_schedules_per_agent",
+            "1",
+            None,
+            false,
+            "test",
+            NOW,
+        )
+        .await
+        .unwrap();
         let c = ctx(&registry, &file_map, &sea_orm_db);
         let first = CreateScheduledDirectiveTool::call(
             Some(&alice),

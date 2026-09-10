@@ -59,15 +59,22 @@ pub async fn require_identity(
         .map(str::to_string);
 
     let now_unix = chrono::Utc::now().timestamp() as u64;
-    let conn = shared.conn.lock().await;
+    // Phase G: `resolve_principal` is `async fn` now (it needs to
+    // `.await` a sea-orm `project_settings` read for wake-loop
+    // eligibility) and does its OWN internal locking of `shared.conn`
+    // in a confined scope -- passing the un-locked `&AsyncMutex<..>`
+    // handle straight through here, rather than pre-locking a guard
+    // and handing that in, is what keeps its generated future `Send`
+    // (see `resolve_principal`'s own doc comment for the full rule).
     let resolved = resolve_principal(
-        &conn,
+        &shared.conn,
+        &shared.sea_orm_db,
         authorization.as_deref(),
         forwarding_header_value.as_deref(),
         shared.forwarding_hmac_key.as_deref(),
         now_unix,
-    );
-    drop(conn);
+    )
+    .await;
 
     match resolved {
         Ok(principal) => {

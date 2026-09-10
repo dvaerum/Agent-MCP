@@ -31,7 +31,7 @@ use conexus_auth::{Requirement, ToolDescriptor};
 use conexus_core::capability::{agent_role_bundle, AgentRole, Capability};
 use conexus_core::principal::CatalogRole;
 use conexus_db::project_settings_repository;
-use rusqlite::Connection;
+use sea_orm::DatabaseConnection;
 
 /// A tool's `tools/list` visibility tier. Port of Python's access-level
 /// strings (`"operator"`, `"worker"`, `"any"`,
@@ -127,14 +127,26 @@ pub fn access_tier(descriptor: &ToolDescriptor) -> AccessTier {
 
 /// True iff `role` should see a tool at `tier` in `tools/list`. Port
 /// of `is_visible_to_role`, narrowed to the 3 reachable roles (see
-/// module doc for why "manager" never appears). `conn` resolves a
+/// module doc for why "manager" never appears). `db` resolves a
 /// `WorkerIfToggled` key's live `project_settings` override, falling
 /// back to the tier's own carried default (the SAME default the
 /// call-time `Requirement::Policy` gate uses -- one source, not
 /// Python's separate `_TOGGLE_DEFAULTS` table, which can't drift from
 /// the call-time gate here the way two independently-maintained
 /// Python default sources theoretically could).
-pub fn is_visible_to_role(tier: AccessTier, role: CatalogRole, conn: &Connection) -> bool {
+///
+/// Phase G: `project_settings_repository` is sea-orm-backed now, so
+/// this is `async fn` and takes `db: &DatabaseConnection` instead of
+/// a rusqlite `&Connection` -- this function never touched rusqlite
+/// for anything else, so there's no legacy connection to thread
+/// through at all any more (its one real caller, `ConexusServer::
+/// list_tools`, drops its own now-unneeded `conn.lock()` guard
+/// entirely as a result).
+pub async fn is_visible_to_role(
+    tier: AccessTier,
+    role: CatalogRole,
+    db: &DatabaseConnection,
+) -> bool {
     if role == CatalogRole::Admin {
         return true;
     }
@@ -146,8 +158,12 @@ pub fn is_visible_to_role(tier: AccessTier, role: CatalogRole, conn: &Connection
             if role != CatalogRole::Worker {
                 return false;
             }
-            keys.iter()
-                .any(|k| project_settings_repository::get_bool(conn, k, default))
+            for k in keys {
+                if project_settings_repository::get_bool(db, k, default).await {
+                    return true;
+                }
+            }
+            false
         }
     }
 }
@@ -157,11 +173,26 @@ mod tests {
     use super::*;
     use conexus_core::capability::Capability;
     use conexus_db::schema::init_schema;
+    use rusqlite::Connection;
 
-    fn test_conn() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        init_schema(&conn).unwrap();
-        conn
+    /// `is_visible_to_role`'s own tests need a real sea-orm
+    /// `project_settings` table -- a real temp-file-backed connection,
+    /// not `sqlite::memory:` (a separate `:memory:` sea-orm connection
+    /// is its own isolated, schema-less database; there's no rusqlite
+    /// side to share a file with here at all any more, but `init_schema`
+    /// still needs a real file to run its DDL against before sea-orm
+    /// opens the same path).
+    async fn test_db() -> (tempfile::TempDir, DatabaseConnection) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        {
+            let c = Connection::open(&path).unwrap();
+            init_schema(&c).unwrap();
+        }
+        let db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        (dir, db)
     }
 
     fn cap_descriptor(name: &'static str, cap: Capability) -> ToolDescriptor {
@@ -273,89 +304,78 @@ mod tests {
 
     // -- is_visible_to_role -----------------------------------------------
 
-    #[test]
-    fn admin_sees_every_tier_unconditionally() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn admin_sees_every_tier_unconditionally() {
+        let (_dir, db) = test_db().await;
         for tier in [
             AccessTier::Operator,
             AccessTier::Worker,
             AccessTier::Any,
             AccessTier::WorkerIfToggled(&["some_key"], false),
         ] {
-            assert!(is_visible_to_role(tier, CatalogRole::Admin, &conn));
+            assert!(is_visible_to_role(tier, CatalogRole::Admin, &db).await);
         }
     }
 
-    #[test]
-    fn operator_tier_is_hidden_from_worker_and_anonymous() {
-        let conn = test_conn();
-        assert!(!is_visible_to_role(
-            AccessTier::Operator,
-            CatalogRole::Worker,
-            &conn
-        ));
-        assert!(!is_visible_to_role(
-            AccessTier::Operator,
-            CatalogRole::Anonymous,
-            &conn
-        ));
+    #[tokio::test]
+    async fn operator_tier_is_hidden_from_worker_and_anonymous() {
+        let (_dir, db) = test_db().await;
+        assert!(!is_visible_to_role(AccessTier::Operator, CatalogRole::Worker, &db).await);
+        assert!(!is_visible_to_role(AccessTier::Operator, CatalogRole::Anonymous, &db).await);
     }
 
-    #[test]
-    fn worker_tier_is_visible_to_worker_but_not_anonymous() {
-        let conn = test_conn();
-        assert!(is_visible_to_role(
-            AccessTier::Worker,
-            CatalogRole::Worker,
-            &conn
-        ));
-        assert!(!is_visible_to_role(
-            AccessTier::Worker,
-            CatalogRole::Anonymous,
-            &conn
-        ));
+    #[tokio::test]
+    async fn worker_tier_is_visible_to_worker_but_not_anonymous() {
+        let (_dir, db) = test_db().await;
+        assert!(is_visible_to_role(AccessTier::Worker, CatalogRole::Worker, &db).await);
+        assert!(!is_visible_to_role(AccessTier::Worker, CatalogRole::Anonymous, &db).await);
     }
 
-    #[test]
-    fn any_tier_is_visible_to_everyone_including_anonymous() {
-        let conn = test_conn();
-        assert!(is_visible_to_role(
-            AccessTier::Any,
-            CatalogRole::Anonymous,
-            &conn
-        ));
+    #[tokio::test]
+    async fn any_tier_is_visible_to_everyone_including_anonymous() {
+        let (_dir, db) = test_db().await;
+        assert!(is_visible_to_role(AccessTier::Any, CatalogRole::Anonymous, &db).await);
     }
 
-    #[test]
-    fn worker_if_toggled_is_never_visible_to_anonymous_regardless_of_toggle() {
-        let conn = test_conn();
-        assert!(!is_visible_to_role(
-            AccessTier::WorkerIfToggled(&["config_allow_worker_to_worker"], true),
-            CatalogRole::Anonymous,
-            &conn
-        ));
+    #[tokio::test]
+    async fn worker_if_toggled_is_never_visible_to_anonymous_regardless_of_toggle() {
+        let (_dir, db) = test_db().await;
+        assert!(
+            !is_visible_to_role(
+                AccessTier::WorkerIfToggled(&["config_allow_worker_to_worker"], true),
+                CatalogRole::Anonymous,
+                &db
+            )
+            .await
+        );
     }
 
-    #[test]
-    fn worker_if_toggled_uses_the_carried_default_when_no_row_exists() {
-        let conn = test_conn();
-        assert!(is_visible_to_role(
-            AccessTier::WorkerIfToggled(&["config_allow_worker_to_worker"], true),
-            CatalogRole::Worker,
-            &conn
-        ));
-        assert!(!is_visible_to_role(
-            AccessTier::WorkerIfToggled(&["config_allow_worker_to_worker"], false),
-            CatalogRole::Worker,
-            &conn
-        ));
+    #[tokio::test]
+    async fn worker_if_toggled_uses_the_carried_default_when_no_row_exists() {
+        let (_dir, db) = test_db().await;
+        assert!(
+            is_visible_to_role(
+                AccessTier::WorkerIfToggled(&["config_allow_worker_to_worker"], true),
+                CatalogRole::Worker,
+                &db
+            )
+            .await
+        );
+        assert!(
+            !is_visible_to_role(
+                AccessTier::WorkerIfToggled(&["config_allow_worker_to_worker"], false),
+                CatalogRole::Worker,
+                &db
+            )
+            .await
+        );
     }
 
-    #[test]
-    fn worker_if_toggled_reads_a_real_project_settings_override() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn worker_if_toggled_reads_a_real_project_settings_override() {
+        let (_dir, db) = test_db().await;
         project_settings_repository::upsert(
-            &conn,
+            &db,
             "config_allow_worker_to_worker",
             "false",
             None,
@@ -363,19 +383,23 @@ mod tests {
             "operator",
             "2026-01-01T00:00:00Z",
         )
+        .await
         .unwrap();
-        assert!(!is_visible_to_role(
-            AccessTier::WorkerIfToggled(&["config_allow_worker_to_worker"], true),
-            CatalogRole::Worker,
-            &conn
-        ));
+        assert!(
+            !is_visible_to_role(
+                AccessTier::WorkerIfToggled(&["config_allow_worker_to_worker"], true),
+                CatalogRole::Worker,
+                &db
+            )
+            .await
+        );
     }
 
-    #[test]
-    fn worker_if_toggled_any_truthy_key_is_enough() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn worker_if_toggled_any_truthy_key_is_enough() {
+        let (_dir, db) = test_db().await;
         project_settings_repository::upsert(
-            &conn,
+            &db,
             "config_allow_worker_self_assign",
             "false",
             None,
@@ -383,19 +407,23 @@ mod tests {
             "operator",
             "2026-01-01T00:00:00Z",
         )
+        .await
         .unwrap();
         // config_allow_worker_create_unassigned has no row -- falls back
         // to its own `true` default, so the OR still admits.
-        assert!(is_visible_to_role(
-            AccessTier::WorkerIfToggled(
-                &[
-                    "config_allow_worker_self_assign",
-                    "config_allow_worker_create_unassigned"
-                ],
-                true
-            ),
-            CatalogRole::Worker,
-            &conn
-        ));
+        assert!(
+            is_visible_to_role(
+                AccessTier::WorkerIfToggled(
+                    &[
+                        "config_allow_worker_self_assign",
+                        "config_allow_worker_create_unassigned"
+                    ],
+                    true
+                ),
+                CatalogRole::Worker,
+                &db
+            )
+            .await
+        );
     }
 }

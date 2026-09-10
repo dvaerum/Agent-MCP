@@ -66,8 +66,22 @@ fn forwarded_role_to_project_role(role: forwarding_header::ForwardedRole) -> Pro
 /// `hmac_key`: `None` when `--forwarding-hmac-in` was unset, the file
 /// was unreadable, or it was empty (the dormant-key state — see
 /// [`crate::boot::load_forwarding_hmac_key`]).
-pub fn resolve_principal(
-    conn: &Connection,
+///
+/// Phase G: `conn` is `&tokio::sync::Mutex<Connection>`, not a bare
+/// `&Connection` -- this function is `async fn` now (it needs to
+/// `.await` `conexus_auth::resolve_can_wake_loop`'s own sea-orm read),
+/// and a bare `&Connection` parameter would poison this function's
+/// returned future's `Send`-ness the moment it's referenced anywhere
+/// in the body, regardless of whether that reference's last use is
+/// before or after the `.await` (see `conexus_wakeloop::event_feed::
+/// assemble_event_feed`'s own doc comment for the fully-worked-out
+/// rule). Every rusqlite read below is done inside its own confined
+/// `{ let guard = conn.lock().await; ... }` block that never spans a
+/// suspension point -- the forwarding-header branch never touches
+/// `conn`/`sea_orm_db` at all and returns before either is needed.
+pub async fn resolve_principal(
+    conn: &tokio::sync::Mutex<Connection>,
+    sea_orm_db: &sea_orm::DatabaseConnection,
     authorization_header: Option<&str>,
     forwarding_header_value: Option<&str>,
     hmac_key: Option<&[u8]>,
@@ -128,32 +142,40 @@ pub fn resolve_principal(
         });
     };
 
-    let row = AgentRepository::get_by_token(conn, token).map_err(|_| PrincipalRejected {
-        reason: "Unauthorized: failed to resolve agent".to_string(),
-    })?;
-    let Some(row) = row else {
-        return Err(PrincipalRejected {
-            reason: "Unauthorized: valid token required".to_string(),
-        });
-    };
+    // Confined to its own block so the `MutexGuard` never spans the
+    // `resolve_can_wake_loop(...).await` below (see this function's
+    // own doc comment).
+    let row = {
+        let guard = conn.lock().await;
+        let row = AgentRepository::get_by_token(&guard, token).map_err(|_| PrincipalRejected {
+            reason: "Unauthorized: failed to resolve agent".to_string(),
+        })?;
+        let Some(row) = row else {
+            return Err(PrincipalRejected {
+                reason: "Unauthorized: valid token required".to_string(),
+            });
+        };
 
-    // R16-DiD-1: `get_by_token` returns a row for ANY status
-    // (terminated/tombstone included, for audit/attribution elsewhere)
-    // -- a real, found gap: this admission seam had NO liveness check
-    // at all, unlike Python's real `_bearer_is_active` gate on the
-    // identical `/mcp` path. Termination flips only `status`, never
-    // the token itself, so a terminated/tombstoned agent's original
-    // bearer stayed a fully valid `/mcp` credential indefinitely.
-    // Reuses the same canonical `AgentRepository::is_live` predicate
-    // `rest_principal.rs`'s sibling fix uses.
-    let live = AgentRepository::is_live(conn, &row.agent_id).map_err(|_| PrincipalRejected {
-        reason: "Unauthorized: failed to resolve agent".to_string(),
-    })?;
-    if !live {
-        return Err(PrincipalRejected {
-            reason: "Unauthorized: valid token required".to_string(),
-        });
-    }
+        // R16-DiD-1: `get_by_token` returns a row for ANY status
+        // (terminated/tombstone included, for audit/attribution elsewhere)
+        // -- a real, found gap: this admission seam had NO liveness check
+        // at all, unlike Python's real `_bearer_is_active` gate on the
+        // identical `/mcp` path. Termination flips only `status`, never
+        // the token itself, so a terminated/tombstoned agent's original
+        // bearer stayed a fully valid `/mcp` credential indefinitely.
+        // Reuses the same canonical `AgentRepository::is_live` predicate
+        // `rest_principal.rs`'s sibling fix uses.
+        let live =
+            AgentRepository::is_live(&guard, &row.agent_id).map_err(|_| PrincipalRejected {
+                reason: "Unauthorized: failed to resolve agent".to_string(),
+            })?;
+        if !live {
+            return Err(PrincipalRejected {
+                reason: "Unauthorized: valid token required".to_string(),
+            });
+        }
+        row
+    };
 
     let agent_role = normalize_agent_role(&row.agent_role);
     let caps = conexus_auth::resolve_capabilities(
@@ -177,7 +199,7 @@ pub fn resolve_principal(
     // a distinct function from the wake loop's own per-iteration
     // `check_auto_event_loop_flags` recheck. Resolved before the
     // struct literal below moves `row.agent_id`.
-    let can_wake_loop = conexus_auth::resolve_can_wake_loop(conn, &row.agent_id);
+    let can_wake_loop = conexus_auth::resolve_can_wake_loop(conn, sea_orm_db, &row.agent_id).await;
 
     Ok(Principal {
         kind: PrincipalKind::AgentBearer,
@@ -204,6 +226,27 @@ mod tests {
         conn
     }
 
+    /// A real temp-file-backed sea-orm connection for `resolve_
+    /// principal`'s own `project_settings` reads (via `resolve_can_
+    /// wake_loop`). A SEPARATE temp file from `test_conn`'s rusqlite
+    /// `:memory:` connection is fine here -- `agents` (rusqlite) and
+    /// `project_settings` (sea-orm) are disjoint tables, so nothing in
+    /// these tests needs the two sides to observe each other's data
+    /// (same precedent as `conexus_wakeloop::event_feed`'s own
+    /// `test_sea_orm_db`).
+    async fn test_sea_orm_db() -> (tempfile::TempDir, sea_orm::DatabaseConnection) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        {
+            let c = Connection::open(&path).unwrap();
+            init_schema(&c).unwrap();
+        }
+        let db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        (dir, db)
+    }
+
     fn seed_agent(conn: &Connection, token: &str, agent_id: &str, role: &str) {
         seed_agent_with_status(conn, token, agent_id, role, "active");
     }
@@ -223,18 +266,24 @@ mod tests {
         .unwrap();
     }
 
-    #[test]
-    fn no_headers_at_all_is_rejected() {
-        let conn = test_conn();
-        let result = resolve_principal(&conn, None, None, None, 1000);
+    #[tokio::test]
+    async fn no_headers_at_all_is_rejected() {
+        let conn = tokio::sync::Mutex::new(test_conn());
+        let (_dir, sea_orm_db) = test_sea_orm_db().await;
+        let result = resolve_principal(&conn, &sea_orm_db, None, None, None, 1000).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn a_valid_bearer_resolves_an_agent_bearer_principal() {
+    #[tokio::test]
+    async fn a_valid_bearer_resolves_an_agent_bearer_principal() {
         let conn = test_conn();
         seed_agent(&conn, "tok123", "agent-1", "worker");
-        let principal = resolve_principal(&conn, Some("Bearer tok123"), None, None, 1000).unwrap();
+        let conn = tokio::sync::Mutex::new(conn);
+        let (_dir, sea_orm_db) = test_sea_orm_db().await;
+        let principal =
+            resolve_principal(&conn, &sea_orm_db, Some("Bearer tok123"), None, None, 1000)
+                .await
+                .unwrap();
         assert_eq!(principal.kind, PrincipalKind::AgentBearer);
         assert_eq!(principal.agent_id.as_deref(), Some("agent-1"));
         assert_eq!(principal.agent_role, Some(AgentRole::Worker));
@@ -252,30 +301,36 @@ mod tests {
     /// A terminated agent's original token (never invalidated by
     /// termination -- only its `status` flips) stayed a fully valid
     /// `/mcp` credential indefinitely.
-    #[test]
-    fn a_terminated_agents_bearer_is_rejected() {
+    #[tokio::test]
+    async fn a_terminated_agents_bearer_is_rejected() {
         let conn = test_conn();
         seed_agent_with_status(&conn, "tok123", "agent-1", "worker", "terminated");
-        let result = resolve_principal(&conn, Some("Bearer tok123"), None, None, 1000);
+        let conn = tokio::sync::Mutex::new(conn);
+        let (_dir, sea_orm_db) = test_sea_orm_db().await;
+        let result =
+            resolve_principal(&conn, &sea_orm_db, Some("Bearer tok123"), None, None, 1000).await;
         assert!(
             result.is_err(),
             "a terminated agent's bearer must not resolve a principal at all"
         );
     }
 
-    #[test]
-    fn a_tombstoned_agents_bearer_is_rejected() {
+    #[tokio::test]
+    async fn a_tombstoned_agents_bearer_is_rejected() {
         let conn = test_conn();
         seed_agent_with_status(&conn, "tok123", "agent-1", "manager", "tombstone");
-        let result = resolve_principal(&conn, Some("Bearer tok123"), None, None, 1000);
+        let conn = tokio::sync::Mutex::new(conn);
+        let (_dir, sea_orm_db) = test_sea_orm_db().await;
+        let result =
+            resolve_principal(&conn, &sea_orm_db, Some("Bearer tok123"), None, None, 1000).await;
         assert!(
             result.is_err(),
             "a tombstoned agent's bearer must not resolve a principal at all"
         );
     }
 
-    #[test]
-    fn a_normal_workers_bearer_resolves_wake_loop_eligible_by_default() {
+    #[tokio::test]
+    async fn a_normal_workers_bearer_resolves_wake_loop_eligible_by_default() {
         // Both `agents.auto_event_loop` and `config_auto_event_loop_
         // global` default ON with no explicit configuration, so a
         // freshly-registered worker's very first `/mcp` request already
@@ -283,51 +338,83 @@ mod tests {
         // through `conexus-tools::instructions::render_all`).
         let conn = test_conn();
         seed_agent(&conn, "tok123", "agent-1", "worker");
-        let principal = resolve_principal(&conn, Some("Bearer tok123"), None, None, 1000).unwrap();
+        let conn = tokio::sync::Mutex::new(conn);
+        let (_dir, sea_orm_db) = test_sea_orm_db().await;
+        let principal =
+            resolve_principal(&conn, &sea_orm_db, Some("Bearer tok123"), None, None, 1000)
+                .await
+                .unwrap();
         assert!(principal.can_wake_loop);
     }
 
-    #[test]
-    fn the_admin_pseudo_agents_bearer_never_resolves_wake_loop_eligible() {
+    #[tokio::test]
+    async fn the_admin_pseudo_agents_bearer_never_resolves_wake_loop_eligible() {
         let conn = test_conn();
         seed_agent(&conn, "tokadmin", "admin", "manager");
-        let principal =
-            resolve_principal(&conn, Some("Bearer tokadmin"), None, None, 1000).unwrap();
+        let conn = tokio::sync::Mutex::new(conn);
+        let (_dir, sea_orm_db) = test_sea_orm_db().await;
+        let principal = resolve_principal(
+            &conn,
+            &sea_orm_db,
+            Some("Bearer tokadmin"),
+            None,
+            None,
+            1000,
+        )
+        .await
+        .unwrap();
         assert!(!principal.can_wake_loop);
     }
 
-    #[test]
-    fn an_unknown_bearer_token_is_rejected() {
-        let conn = test_conn();
-        let result = resolve_principal(&conn, Some("Bearer nope"), None, None, 1000);
+    #[tokio::test]
+    async fn an_unknown_bearer_token_is_rejected() {
+        let conn = tokio::sync::Mutex::new(test_conn());
+        let (_dir, sea_orm_db) = test_sea_orm_db().await;
+        let result =
+            resolve_principal(&conn, &sea_orm_db, Some("Bearer nope"), None, None, 1000).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn a_malformed_authorization_header_is_rejected() {
-        let conn = test_conn();
-        let result = resolve_principal(&conn, Some("not-bearer-shaped"), None, None, 1000);
+    #[tokio::test]
+    async fn a_malformed_authorization_header_is_rejected() {
+        let conn = tokio::sync::Mutex::new(test_conn());
+        let (_dir, sea_orm_db) = test_sea_orm_db().await;
+        let result = resolve_principal(
+            &conn,
+            &sea_orm_db,
+            Some("not-bearer-shaped"),
+            None,
+            None,
+            1000,
+        )
+        .await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn forwarding_header_present_with_no_key_loaded_falls_through_to_bearer() {
+    #[tokio::test]
+    async fn forwarding_header_present_with_no_key_loaded_falls_through_to_bearer() {
         let conn = test_conn();
         seed_agent(&conn, "tok123", "agent-1", "worker");
+        let conn = tokio::sync::Mutex::new(conn);
+        let (_dir, sea_orm_db) = test_sea_orm_db().await;
         let principal = resolve_principal(
             &conn,
+            &sea_orm_db,
             Some("Bearer tok123"),
             Some("op1.operator.9999999999.deadbeef"),
             None,
             1000,
         )
+        .await
         .unwrap();
         assert_eq!(principal.kind, PrincipalKind::AgentBearer);
     }
 
-    #[test]
-    fn a_verified_forwarding_header_builds_a_forwarding_header_principal_with_its_signed_role() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn a_verified_forwarding_header_builds_a_forwarding_header_principal_with_its_signed_role(
+    ) {
+        let conn = tokio::sync::Mutex::new(test_conn());
+        let (_dir, sea_orm_db) = test_sea_orm_db().await;
         let key = b"test-key-bytes";
         let signed = forwarding_header::sign(
             "op1",
@@ -336,8 +423,16 @@ mod tests {
             1000,
             forwarding_header::DEFAULT_TTL_SEC,
         );
-        let principal =
-            resolve_principal(&conn, None, Some(&signed), Some(key.as_slice()), 1005).unwrap();
+        let principal = resolve_principal(
+            &conn,
+            &sea_orm_db,
+            None,
+            Some(&signed),
+            Some(key.as_slice()),
+            1005,
+        )
+        .await
+        .unwrap();
         assert_eq!(principal.kind, PrincipalKind::ForwardingHeader);
         assert_eq!(principal.user_id.as_deref(), Some("op1"));
         assert_eq!(principal.project_role, Some(ProjectRole::Viewer));
@@ -346,18 +441,22 @@ mod tests {
         assert_ne!(principal.capabilities, Capabilities::Sysadmin);
     }
 
-    #[test]
-    fn an_unverifiable_forwarding_header_is_rejected_and_never_falls_through_to_bearer() {
+    #[tokio::test]
+    async fn an_unverifiable_forwarding_header_is_rejected_and_never_falls_through_to_bearer() {
         let conn = test_conn();
         seed_agent(&conn, "tok123", "agent-1", "worker");
+        let conn = tokio::sync::Mutex::new(conn);
+        let (_dir, sea_orm_db) = test_sea_orm_db().await;
         let key = b"test-key-bytes";
         let result = resolve_principal(
             &conn,
+            &sea_orm_db,
             Some("Bearer tok123"),
             Some("garbage.header.value.here"),
             Some(key.as_slice()),
             1000,
-        );
+        )
+        .await;
         assert!(
             result.is_err(),
             "an invalid forwarding header must reject, not fall through to the valid bearer"

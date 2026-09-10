@@ -29,6 +29,7 @@ pub mod groups;
 pub mod pending_directive;
 pub mod project_context;
 pub mod project_membership;
+pub mod project_settings;
 pub mod rag_chunk;
 pub mod rag_meta;
 pub mod scheduled_directive;

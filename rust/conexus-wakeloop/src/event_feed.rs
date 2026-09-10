@@ -548,16 +548,29 @@ pub fn collect_agent_profile_events_for(
 /// opposed to a clean "not found") degrades to `(true, None)` --
 /// matches Python's defensive fallback, since a lookup failure must
 /// never itself stop an otherwise-healthy agent's loop.
-pub fn check_auto_event_loop_flags(conn: &Connection, agent_id: &str) -> (bool, Option<String>) {
+///
+/// Phase G: `project_settings_repository` is sea-orm-backed now, so
+/// the global-flag read goes through `sea_orm_db` FIRST -- `conn`
+/// (still legacy rusqlite, `AgentRepository` is not a Phase G target)
+/// is locked only afterward, in its own confined scope, per this
+/// module's own doc comment on why a bare `&Connection` parameter
+/// can't coexist with an internal `.await` here.
+pub async fn check_auto_event_loop_flags(
+    conn: &AsyncMutex<Connection>,
+    sea_orm_db: &sea_orm::DatabaseConnection,
+    agent_id: &str,
+) -> (bool, Option<String>) {
     let global_on =
-        project_settings_repository::get_bool(conn, "config_auto_event_loop_global", true);
+        project_settings_repository::get_bool(sea_orm_db, "config_auto_event_loop_global", true)
+            .await;
     if !global_on {
         return (
             false,
             Some("config_auto_event_loop_global is OFF".to_string()),
         );
     }
-    match AgentRepository::get_by_id(conn, agent_id) {
+    let guard = conn.lock().await;
+    match AgentRepository::get_by_id(&guard, agent_id) {
         Err(_) => (true, None),
         Ok(None) => (false, Some(format!("agent '{agent_id}' not found"))),
         Ok(Some(row)) if row.status == "terminated" => {
@@ -586,19 +599,26 @@ pub fn check_auto_event_loop_flags(conn: &Connection, agent_id: &str) -> (bool, 
 /// `AgentRepository::update_field(..., LastActivityAt, ...)`), so this
 /// measures time-since-last-real-event across reconnects. A return
 /// `<= 0.0` means the window is already exceeded.
-pub fn idle_stop_seconds_remaining(conn: &Connection, agent_id: &str, now: &str) -> Option<f64> {
+pub async fn idle_stop_seconds_remaining(
+    conn: &AsyncMutex<Connection>,
+    sea_orm_db: &sea_orm::DatabaseConnection,
+    agent_id: &str,
+    now: &str,
+) -> Option<f64> {
     let window =
-        project_settings_repository::get_int(conn, "config_event_idle_stop_seconds", 604_800);
+        project_settings_repository::get_int(sea_orm_db, "config_event_idle_stop_seconds", 604_800)
+            .await;
     if window <= 0 {
         return None; // 0 = infinite / never stop
     }
-    let last = AgentRepository::get_by_id(conn, agent_id)
+    let guard = conn.lock().await;
+    let last = AgentRepository::get_by_id(&guard, agent_id)
         .ok()
         .flatten()
         .and_then(|a| a.last_activity_at);
     let seed_and_grant_full_window = || {
         let _ = AgentRepository::update_field(
-            conn,
+            &guard,
             agent_id,
             AgentField::LastActivityAt,
             FieldValue::Text(now.to_string()),
@@ -1474,19 +1494,26 @@ mod tests {
 
     // -- check_auto_event_loop_flags ----------------------------------------
 
-    #[test]
-    fn check_auto_event_loop_flags_healthy_agent_is_enabled() {
+    #[tokio::test]
+    async fn check_auto_event_loop_flags_healthy_agent_is_enabled() {
         let conn = test_conn();
         seed_agent(&conn, "alice");
-        assert_eq!(check_auto_event_loop_flags(&conn, "alice"), (true, None));
+        let conn = AsyncMutex::new(conn);
+        let (_dir, sea_orm_db) = test_sea_orm_db().await;
+        assert_eq!(
+            check_auto_event_loop_flags(&conn, &sea_orm_db, "alice").await,
+            (true, None)
+        );
     }
 
-    #[test]
-    fn check_auto_event_loop_flags_global_off_disables_everyone() {
+    #[tokio::test]
+    async fn check_auto_event_loop_flags_global_off_disables_everyone() {
         let conn = test_conn();
         seed_agent(&conn, "alice");
+        let conn = AsyncMutex::new(conn);
+        let (_dir, sea_orm_db) = test_sea_orm_db().await;
         project_settings_repository::upsert(
-            &conn,
+            &sea_orm_db,
             "config_auto_event_loop_global",
             "false",
             None,
@@ -1494,8 +1521,9 @@ mod tests {
             "operator",
             "2026-01-01T00:00:00Z",
         )
+        .await
         .unwrap();
-        let (enabled, reason) = check_auto_event_loop_flags(&conn, "alice");
+        let (enabled, reason) = check_auto_event_loop_flags(&conn, &sea_orm_db, "alice").await;
         assert!(!enabled);
         assert_eq!(
             reason.as_deref(),
@@ -1503,16 +1531,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn check_auto_event_loop_flags_unknown_agent_is_disabled_with_a_not_found_reason() {
-        let conn = test_conn();
-        let (enabled, reason) = check_auto_event_loop_flags(&conn, "nobody");
+    #[tokio::test]
+    async fn check_auto_event_loop_flags_unknown_agent_is_disabled_with_a_not_found_reason() {
+        let conn = AsyncMutex::new(test_conn());
+        let (_dir, sea_orm_db) = test_sea_orm_db().await;
+        let (enabled, reason) = check_auto_event_loop_flags(&conn, &sea_orm_db, "nobody").await;
         assert!(!enabled);
         assert!(reason.unwrap().contains("not found"));
     }
 
-    #[test]
-    fn check_auto_event_loop_flags_terminated_agent_is_disabled() {
+    #[tokio::test]
+    async fn check_auto_event_loop_flags_terminated_agent_is_disabled() {
         let conn = test_conn();
         seed_agent(&conn, "alice");
         AgentRepository::update_field(
@@ -1523,13 +1552,15 @@ mod tests {
             "2026-01-01T00:00:01Z",
         )
         .unwrap();
-        let (enabled, reason) = check_auto_event_loop_flags(&conn, "alice");
+        let conn = AsyncMutex::new(conn);
+        let (_dir, sea_orm_db) = test_sea_orm_db().await;
+        let (enabled, reason) = check_auto_event_loop_flags(&conn, &sea_orm_db, "alice").await;
         assert!(!enabled);
         assert!(reason.unwrap().contains("terminated"));
     }
 
-    #[test]
-    fn check_auto_event_loop_flags_per_agent_off_is_disabled_with_operator_pause_reason() {
+    #[tokio::test]
+    async fn check_auto_event_loop_flags_per_agent_off_is_disabled_with_operator_pause_reason() {
         let conn = test_conn();
         seed_agent(&conn, "alice");
         AgentRepository::update_field(
@@ -1540,19 +1571,23 @@ mod tests {
             "2026-01-01T00:00:01Z",
         )
         .unwrap();
-        let (enabled, reason) = check_auto_event_loop_flags(&conn, "alice");
+        let conn = AsyncMutex::new(conn);
+        let (_dir, sea_orm_db) = test_sea_orm_db().await;
+        let (enabled, reason) = check_auto_event_loop_flags(&conn, &sea_orm_db, "alice").await;
         assert!(!enabled);
         assert!(reason.unwrap().contains("paused by operator"));
     }
 
     // -- idle_stop_seconds_remaining ------------------------------------
 
-    #[test]
-    fn idle_stop_seconds_remaining_disabled_when_window_is_zero() {
+    #[tokio::test]
+    async fn idle_stop_seconds_remaining_disabled_when_window_is_zero() {
         let conn = test_conn();
         seed_agent(&conn, "alice");
+        let conn = AsyncMutex::new(conn);
+        let (_dir, sea_orm_db) = test_sea_orm_db().await;
         project_settings_repository::upsert(
-            &conn,
+            &sea_orm_db,
             "config_event_idle_stop_seconds",
             "0",
             None,
@@ -1560,19 +1595,22 @@ mod tests {
             "operator",
             "2026-01-01T00:00:00Z",
         )
+        .await
         .unwrap();
         assert_eq!(
-            idle_stop_seconds_remaining(&conn, "alice", "2026-01-01T00:00:00Z"),
+            idle_stop_seconds_remaining(&conn, &sea_orm_db, "alice", "2026-01-01T00:00:00Z").await,
             None
         );
     }
 
-    #[test]
-    fn idle_stop_seconds_remaining_seeds_and_grants_a_full_window_on_first_use() {
+    #[tokio::test]
+    async fn idle_stop_seconds_remaining_seeds_and_grants_a_full_window_on_first_use() {
         let conn = test_conn();
         seed_agent(&conn, "alice");
+        let conn = AsyncMutex::new(conn);
+        let (_dir, sea_orm_db) = test_sea_orm_db().await;
         project_settings_repository::upsert(
-            &conn,
+            &sea_orm_db,
             "config_event_idle_stop_seconds",
             "3600",
             None,
@@ -1580,21 +1618,26 @@ mod tests {
             "operator",
             "2026-01-01T00:00:00Z",
         )
+        .await
         .unwrap();
-        let remaining = idle_stop_seconds_remaining(&conn, "alice", "2026-01-01T00:00:00Z");
+        let remaining =
+            idle_stop_seconds_remaining(&conn, &sea_orm_db, "alice", "2026-01-01T00:00:00Z").await;
         assert_eq!(remaining, Some(3600.0));
         // Seeded the marker -- confirmed by a second call computing a
         // real elapsed-time delta instead of re-seeding to a fresh 3600.
-        let later = idle_stop_seconds_remaining(&conn, "alice", "2026-01-01T00:00:10Z");
+        let later =
+            idle_stop_seconds_remaining(&conn, &sea_orm_db, "alice", "2026-01-01T00:00:10Z").await;
         assert_eq!(later, Some(3590.0));
     }
 
-    #[test]
-    fn idle_stop_seconds_remaining_goes_negative_once_the_window_is_exceeded() {
+    #[tokio::test]
+    async fn idle_stop_seconds_remaining_goes_negative_once_the_window_is_exceeded() {
         let conn = test_conn();
         seed_agent(&conn, "alice");
+        let conn = AsyncMutex::new(conn);
+        let (_dir, sea_orm_db) = test_sea_orm_db().await;
         project_settings_repository::upsert(
-            &conn,
+            &sea_orm_db,
             "config_event_idle_stop_seconds",
             "60",
             None,
@@ -1602,9 +1645,11 @@ mod tests {
             "operator",
             "2026-01-01T00:00:00Z",
         )
+        .await
         .unwrap();
-        idle_stop_seconds_remaining(&conn, "alice", "2026-01-01T00:00:00Z"); // seed
-        let remaining = idle_stop_seconds_remaining(&conn, "alice", "2026-01-01T00:02:00Z");
+        idle_stop_seconds_remaining(&conn, &sea_orm_db, "alice", "2026-01-01T00:00:00Z").await; // seed
+        let remaining =
+            idle_stop_seconds_remaining(&conn, &sea_orm_db, "alice", "2026-01-01T00:02:00Z").await;
         assert!(remaining.unwrap() <= 0.0);
     }
 

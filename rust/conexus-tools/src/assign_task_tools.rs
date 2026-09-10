@@ -74,11 +74,28 @@ pub enum AssignAuthorization {
 /// self-claim, gated by `config_allow_worker_self_assign`; every other
 /// worker shape (targeting someone else, or self-targeting without
 /// `task_ids`) is rejected.
+///
+/// Phase G: `conn` stays a plain `&Connection` and this function stays
+/// SYNC, unlike most of this migration's converted call sites --
+/// `assign_task`'s own `Tool::call` already holds `conn`'s
+/// `MutexGuard` for OTHER synchronous work (`AgentRepository::
+/// get_by_id` for the admin `agent_id` alias) both before and after
+/// this call, so this function can't do its own internal
+/// `conn.lock()` without deadlocking against that already-live guard
+/// (`tokio::sync::Mutex` isn't reentrant). Instead, the two
+/// `project_settings` reads are hoisted OUT to the caller (resolved
+/// via `ctx.sea_orm_db` before the guard is ever taken) and passed in
+/// as plain `bool`s -- `allow_worker_create_unassigned`/
+/// `allow_worker_self_assign` -- so this function keeps doing only
+/// synchronous work with the connection it's handed, exactly as
+/// before.
 pub fn authorize_assign_task(
     conn: &Connection,
     target_agent_token: Option<&str>,
     has_task_ids: bool,
     principal: &Principal,
+    allow_worker_create_unassigned: bool,
+    allow_worker_self_assign: bool,
 ) -> Result<AssignAuthorization, String> {
     if principal.has_capability(Capability::TasksAssign) {
         return Ok(AssignAuthorization::Admin);
@@ -94,11 +111,7 @@ pub fn authorize_assign_task(
     };
 
     let Some(target_agent_token) = target_agent_token else {
-        if !project_settings_repository::get_bool(
-            conn,
-            "config_allow_worker_create_unassigned",
-            true,
-        ) {
+        if !allow_worker_create_unassigned {
             return Err(
                 "Unauthorized: worker self-filing of unassigned tasks is disabled by \
                  project policy (config_allow_worker_create_unassigned=false). Ask admin \
@@ -134,7 +147,7 @@ pub fn authorize_assign_task(
         );
     }
 
-    if !project_settings_repository::get_bool(conn, "config_allow_worker_self_assign", true) {
+    if !allow_worker_self_assign {
         return Err("Unauthorized: worker self-assignment is disabled \
              (config_allow_worker_self_assign=false). Ask admin to enable it in dashboard \
              Settings."
@@ -811,6 +824,24 @@ impl Tool for AssignTaskTool {
             let task_ids = str_array_arg_owned(arguments, "task_ids");
             let tasks_batch = parse_unassigned_task_specs(arguments);
 
+            // Phase G: resolved via sea-orm BEFORE `conn` is locked
+            // below -- `authorize_assign_task` needs both, but the
+            // guard here is held across other synchronous rusqlite
+            // work too (see that function's own doc comment for why
+            // it can't just lock `conn` internally).
+            let allow_worker_create_unassigned = project_settings_repository::get_bool(
+                ctx.sea_orm_db,
+                "config_allow_worker_create_unassigned",
+                true,
+            )
+            .await;
+            let allow_worker_self_assign = project_settings_repository::get_bool(
+                ctx.sea_orm_db,
+                "config_allow_worker_self_assign",
+                true,
+            )
+            .await;
+
             let conn = conn.lock().await;
 
             // Admin-only `agent_id` alias -> resolve to a token
@@ -857,6 +888,8 @@ impl Tool for AssignTaskTool {
                 target_agent_token.as_deref(),
                 !task_ids.is_empty(),
                 principal,
+                allow_worker_create_unassigned,
+                allow_worker_self_assign,
             ) {
                 Ok(auth) => auth,
                 Err(reason) => {
@@ -1656,7 +1689,7 @@ mod tests {
     fn authorize_admin_is_always_permitted() {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
-        let result = authorize_assign_task(&conn, None, false, &admin("alice"));
+        let result = authorize_assign_task(&conn, None, false, &admin("alice"), true, true);
         assert!(matches!(result, Ok(AssignAuthorization::Admin)));
     }
 
@@ -1664,7 +1697,7 @@ mod tests {
     fn authorize_worker_no_token_files_unassigned_by_default() {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
-        let result = authorize_assign_task(&conn, None, false, &worker("bob"));
+        let result = authorize_assign_task(&conn, None, false, &worker("bob"), true, true);
         assert!(matches!(
             result,
             Ok(AssignAuthorization::WorkerFileUnassigned { creator }) if creator == "bob"
@@ -1675,17 +1708,7 @@ mod tests {
     fn authorize_worker_no_token_denied_when_policy_off() {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
-        project_settings_repository::upsert(
-            &conn,
-            "config_allow_worker_create_unassigned",
-            "false",
-            None,
-            false,
-            "test",
-            NOW,
-        )
-        .unwrap();
-        let result = authorize_assign_task(&conn, None, false, &worker("bob"));
+        let result = authorize_assign_task(&conn, None, false, &worker("bob"), false, true);
         assert!(result.is_err());
     }
 
@@ -1694,7 +1717,8 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
         seed_agent(&conn, "bob");
-        let result = authorize_assign_task(&conn, Some("tok-bob"), true, &worker("bob"));
+        let result =
+            authorize_assign_task(&conn, Some("tok-bob"), true, &worker("bob"), true, true);
         assert!(matches!(
             result,
             Ok(AssignAuthorization::WorkerSelfClaim { worker_id }) if worker_id == "bob"
@@ -1706,7 +1730,8 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
         seed_agent(&conn, "bob");
-        let result = authorize_assign_task(&conn, Some("tok-bob"), false, &worker("bob"));
+        let result =
+            authorize_assign_task(&conn, Some("tok-bob"), false, &worker("bob"), true, true);
         assert!(result.is_err());
     }
 
@@ -1715,7 +1740,8 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
         seed_agent(&conn, "carol");
-        let result = authorize_assign_task(&conn, Some("tok-carol"), true, &worker("bob"));
+        let result =
+            authorize_assign_task(&conn, Some("tok-carol"), true, &worker("bob"), true, true);
         assert!(result.is_err());
     }
 

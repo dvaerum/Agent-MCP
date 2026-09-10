@@ -245,10 +245,11 @@ pub async fn wait_for_events_entry(
     let (sender, mut receiver) = ctx.waiter_registry.register(&agent_id);
 
     // Flag gate: if either toggle is OFF, return stop_listening now.
-    let (enabled, reason) = {
-        let guard = conn.lock().await;
-        event_feed::check_auto_event_loop_flags(&guard, &agent_id)
-    };
+    // Phase G: `check_auto_event_loop_flags` locks `conn` itself now
+    // (its own sea-orm `project_settings` read comes first) -- no
+    // pre-lock needed here any more.
+    let (enabled, reason) =
+        event_feed::check_auto_event_loop_flags(conn, ctx.sea_orm_db, &agent_id).await;
     if !enabled {
         ctx.waiter_registry.unregister(&agent_id, &sender);
         drain(&mut receiver);
@@ -301,10 +302,8 @@ pub async fn wait_for_events_entry(
     // Idle-stop (event-loop wind-down), checked once before the loop.
     // An enabled schedule suppresses idle-stop -- the agent must stay
     // present to receive its fires.
-    let idle_remaining = {
-        let guard = conn.lock().await;
-        event_feed::idle_stop_seconds_remaining(&guard, &agent_id, now_iso)
-    };
+    let idle_remaining =
+        event_feed::idle_stop_seconds_remaining(conn, ctx.sea_orm_db, &agent_id, now_iso).await;
     let has_schedule =
         scheduled_directive_repository::has_active(ctx.sea_orm_db, &agent_id, now_iso)
             .await
@@ -410,25 +409,23 @@ pub async fn wait_for_events_slow_path(
     // this is behaviorally identical to threading that value through
     // SlowPathSetup, without widening it for a value already validated
     // there as either "disabled" or "still positive").
-    let idle_remaining = {
-        let guard = conn.lock().await;
-        event_feed::idle_stop_seconds_remaining(&guard, &agent_id, &now_iso())
-    };
+    let idle_remaining =
+        event_feed::idle_stop_seconds_remaining(conn, ctx.sea_orm_db, &agent_id, &now_iso()).await;
     let idle_deadline: Option<Instant> =
         idle_remaining.map(|secs| poll_start + Duration::from_secs_f64(secs.max(0.0)));
 
-    // Idle backlog reminder.
-    let (reminder_enabled, reminder_interval) = {
-        let guard = conn.lock().await;
-        (
-            project_settings_repository::get_bool(&guard, "config_idle_reminder_enabled", true),
-            project_settings_repository::get_int(
-                &guard,
-                "config_idle_reminder_interval_seconds",
-                3600,
-            ),
-        )
-    };
+    // Idle backlog reminder. Phase G: both reads go through
+    // `ctx.sea_orm_db` -- no `conn` lock needed for this at all any
+    // more.
+    let reminder_enabled =
+        project_settings_repository::get_bool(ctx.sea_orm_db, "config_idle_reminder_enabled", true)
+            .await;
+    let reminder_interval = project_settings_repository::get_int(
+        ctx.sea_orm_db,
+        "config_idle_reminder_interval_seconds",
+        3600,
+    )
+    .await;
     let mut reminder_deadline: Option<Instant> = if reminder_enabled && reminder_interval > 0 {
         let due_in =
             idle_reminder::seconds_until_due(&agent_id, reminder_interval as f64, now_mono());
@@ -445,13 +442,18 @@ pub async fn wait_for_events_slow_path(
 
     let gate_agent_id = agent_id.clone();
     let liveness_conn = conn;
+    let liveness_sea_orm_db = ctx.sea_orm_db;
     let mut gate = RevalidatingStream::new(
         receiver,
         move || {
             let agent_id = gate_agent_id.clone();
             Box::pin(async move {
-                let guard = liveness_conn.lock().await;
-                let (enabled, reason) = event_feed::check_auto_event_loop_flags(&guard, &agent_id);
+                let (enabled, reason) = event_feed::check_auto_event_loop_flags(
+                    liveness_conn,
+                    liveness_sea_orm_db,
+                    &agent_id,
+                )
+                .await;
                 if enabled {
                     Liveness::live()
                 } else {
@@ -506,17 +508,34 @@ pub async fn wait_for_events_slow_path(
         // A schedule is due now -> fire it and return.
         if let Some(due) = &soonest_due {
             if due.as_str() <= now_iso_str.as_str() {
-                let assembled = event_feed::assemble_event_feed(
-                    conn,
-                    &agent_id,
-                    since.as_deref(),
-                    &now_iso_str,
-                    Vec::new(),
-                    true,
-                    process_env,
-                    ctx.sea_orm_db,
-                )
-                .await;
+                // A transient DB error here (e.g. a momentary sea-orm
+                // pool-acquire contention) must NOT be treated the same
+                // as "genuinely no events yet" -- that silently drops a
+                // real, already-fired schedule for this poll cycle,
+                // relying entirely on the NEXT wake to notice it (which
+                // may not come for a long time). Retry a few times
+                // before falling through -- each attempt is a fresh,
+                // independent acquire, so a one-off contention blip
+                // resolves on the very next try almost always.
+                let mut assembled;
+                let mut attempts_left = 3u32;
+                loop {
+                    assembled = event_feed::assemble_event_feed(
+                        conn,
+                        &agent_id,
+                        since.as_deref(),
+                        &now_iso_str,
+                        Vec::new(),
+                        true,
+                        process_env,
+                        ctx.sea_orm_db,
+                    )
+                    .await;
+                    attempts_left -= 1;
+                    if assembled.is_ok() || attempts_left == 0 {
+                        break;
+                    }
+                }
                 if let Ok(assembled) = assembled {
                     if !assembled.events.is_empty() {
                         hold_ladder::reset(&agent_id);
@@ -607,17 +626,33 @@ pub async fn wait_for_events_slow_path(
             }
             Ok(StreamSlice::Item(WakeSignal::Wake)) => {
                 let now_iso_str = now_iso();
-                let assembled = event_feed::assemble_event_feed(
-                    conn,
-                    &agent_id,
-                    since.as_deref(),
-                    &now_iso_str,
-                    Vec::new(),
-                    true,
-                    process_env,
-                    ctx.sea_orm_db,
-                )
-                .await;
+                // Same transient-error-vs-genuinely-nothing-new
+                // distinction as the schedule-due branch above: a
+                // one-off DB contention blip here must not be
+                // indistinguishable from "the wake was spurious" -- that
+                // would silently drop whatever real event fired this
+                // wake for the rest of this poll's hold window. Retry a
+                // few times (each a fresh, independent acquire) before
+                // falling through to the genuine "nothing new" case.
+                let mut assembled;
+                let mut attempts_left = 3u32;
+                loop {
+                    assembled = event_feed::assemble_event_feed(
+                        conn,
+                        &agent_id,
+                        since.as_deref(),
+                        &now_iso_str,
+                        Vec::new(),
+                        true,
+                        process_env,
+                        ctx.sea_orm_db,
+                    )
+                    .await;
+                    attempts_left -= 1;
+                    if assembled.is_ok() || attempts_left == 0 {
+                        break;
+                    }
+                }
                 if let Ok(assembled) = assembled {
                     if !assembled.events.is_empty() {
                         hold_ladder::reset(&agent_id);
@@ -914,9 +949,19 @@ async fn send_with_side_effects(
     let message_type = args.message_type.to_string();
     let priority = args.priority.to_string();
 
+    // Phase G: resolved via sea-orm before `conn` is locked below --
+    // see `can_agents_communicate`'s own doc comment (`agent_messaging`
+    // module) for why this read is hoisted all the way out here.
+    let allow_worker_to_worker = project_settings_repository::get_bool(
+        ctx.sea_orm_db,
+        "config_allow_worker_to_worker",
+        true,
+    )
+    .await;
+
     let outcome = {
         let guard = conn.lock().await;
-        crate::agent_messaging::send_agent_message(&guard, principal, args)
+        crate::agent_messaging::send_agent_message(&guard, principal, args, allow_worker_to_worker)
     }?;
 
     if let crate::agent_messaging::SendOutcome::Sent { ref message_id } = outcome {
@@ -1489,18 +1534,21 @@ mod tests {
     // Phase G (sea-orm migration): a real, schema-initialized,
     // temp-file-backed sea-orm connection for ToolCallContext::
     // sea_orm_db -- `scheduled_directive_repository` (has_active/
-    // soonest_due_at/create) is sea-orm-backed now and every
-    // `wait_for_events_entry`/`wait_for_events_slow_path` call in this
-    // file reads through it unconditionally, so a schema-less
-    // `sqlite::memory:` would make every such read a silent `DbErr`
-    // (swallowed by `.unwrap_or(false)`/`.unwrap_or(None)` -- masking
-    // real bugs rather than surfacing them) and would hard-fail any
-    // test that seeds a schedule via `scheduled_directive_repository::
-    // create`. A SEPARATE temp file from `test_conn`'s legacy
-    // connection is fine -- nothing in this module's tests needs the
-    // rusqlite and sea-orm sides to see each other's data (agents/
-    // settings stay on the legacy connection; `scheduled_directive`
-    // reads/writes go exclusively through this one). The returned
+    // soonest_due_at/create) AND `project_settings_repository` are
+    // both sea-orm-backed now, and every `wait_for_events_entry`/
+    // `wait_for_events_slow_path` call in this file reads through this
+    // connection unconditionally, so a schema-less `sqlite::memory:`
+    // would make every such read a silent `DbErr` (swallowed by
+    // `.unwrap_or(false)`/`.unwrap_or(None)`/`project_settings_
+    // repository::get_bool`'s own default-on-any-error contract --
+    // masking real bugs rather than surfacing them) and would
+    // hard-fail any test that seeds a schedule via `scheduled_
+    // directive_repository::create`. A SEPARATE temp file from
+    // `test_conn`'s legacy connection is fine -- nothing in this
+    // module's tests needs the rusqlite and sea-orm sides to see each
+    // other's data (`agents` stays on the legacy connection;
+    // `project_settings`/`scheduled_directive` reads/writes go
+    // exclusively through this one). The returned
     // `TempDir` must be kept alive by the caller for as long as the
     // connection is used.
     //
@@ -1545,28 +1593,30 @@ mod tests {
     // schema-init file I/O before it doesn't await anything, so it
     // isn't part of that race at all.
     //
-    // Phase G: `assemble_event_feed`'s `collect_events_with_cap`/
-    // `collect_unassigned_task_events_for` now issue REAL sea-orm
-    // queries (not just the initial connect) on every call --
-    // including from deep inside these paused-clock tests' own
-    // `wait_for_events_slow_path` exercise, well after this function
-    // has already returned and re-paused the clock. Each such query
-    // can itself need to acquire the pool's single connection
-    // (sea-orm's sqlite driver hardcodes `max_connections(1)`), racing
-    // the SAME paused-clock-vs-acquire-deadline hazard described
-    // above -- just at query time instead of connect time, and not
-    // fixable by a resume()/pause() bracket at THIS call site since
-    // the query happens later, inside production code this function
-    // has no visibility into. Fixed at the actual root instead of
-    // re-applying the bracket ad hoc at every future query call site:
-    // `ConnectOptions::acquire_timeout` raised far past any test's own
-    // multi-second timing assertions, so the auto-fast-forward can
-    // never race a real acquire into a spurious timeout regardless of
-    // where in the call chain the query happens -- a real (wall-clock)
-    // acquire always completes via its own OS-scheduled wakeup long
-    // before virtual time could ever reach this ceiling. Verified
-    // empirically: reproduced 4/5 under real 16-way parallel
-    // contention before this fix, 0/20 after.
+    // Phase G: `assemble_event_feed`'s collectors now issue REAL
+    // sea-orm queries on every call, including from deep inside these
+    // paused-clock tests' own `wait_for_events_slow_path` exercise,
+    // well after this function has already returned and re-paused the
+    // clock. This is NOT fixable by raising `acquire_timeout` -- that
+    // was tried and made things WORSE: under `start_paused`, tokio's
+    // auto-advance jumps the virtual clock to the NEAREST registered
+    // timer the instant the executor sees nothing else runnable, and
+    // sqlx's own per-acquire deadline (a real `tokio::time::timeout`
+    // wrapping the acquire) IS such a timer -- so every acquire, under
+    // real contention, can advance the clock by EXACTLY
+    // `acquire_timeout`, real duration or not. A large value (`3600s`,
+    // an earlier attempt) blew every short test deadline in one jump;
+    // this value only needs to be large enough that a genuine acquire
+    // completes before it under realistic contention -- callers that
+    // actually rely on the query's RESULT retry on `Err` instead (see
+    // `wait_for_events_slow_path`'s own two `assemble_event_feed` call
+    // sites), so a transient acquire timeout here costs a retry, not a
+    // silently-dropped event. The 2 tests whose own assertion depends
+    // on that query's result finding real data (`wake_signal_delivers_
+    // pending_events`, `wait_for_events_tool_delivers_a_fast_path_
+    // event_through_the_real_trait_call`) don't use the paused clock
+    // at all -- they use `test_sea_orm_db()` (real time) instead, since
+    // neither needs virtual-time compression to begin with.
     async fn test_sea_orm_db_paused() -> (tempfile::TempDir, sea_orm::DatabaseConnection) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.db");
@@ -1576,7 +1626,23 @@ mod tests {
         }
         tokio::time::resume();
         let mut opts = sea_orm::ConnectOptions::new(format!("sqlite://{}", path.display()));
-        opts.acquire_timeout(Duration::from_secs(3600));
+        opts.acquire_timeout(Duration::from_secs(5));
+        // sqlx's connection-pool defaults schedule two REAL background
+        // timers (`max_lifetime`/`idle_timeout`, both `Some(30min)` by
+        // default) independent of `acquire_timeout` above -- under
+        // `start_paused = true`, once this connection has been
+        // acquired/released a few times with the runtime otherwise
+        // idle, tokio's auto-advance can jump straight to whichever of
+        // these fires soonest, silently fast-forwarding `Instant::now()`
+        // by up to ~30 minutes mid-test. Found empirically (a NEW,
+        // 100%-reproducible-in-isolation failure once this crate's own
+        // wake-loop preamble gained its first real per-poll sea-orm
+        // awaits, Phase G project_settings_repository conversion):
+        // disabling both removes that source of timer contention
+        // entirely, on top of the `acquire_timeout` fix above (a
+        // DIFFERENT, already-fixed instance of this same class).
+        opts.max_lifetime(None);
+        opts.idle_timeout(None);
         let db = sea_orm::Database::connect(opts).await.unwrap();
         tokio::time::pause();
         (dir, db)
@@ -1682,23 +1748,21 @@ mod tests {
     async fn flag_gate_off_returns_stop_listening_and_unregisters() {
         let conn = test_conn();
         seed_agent(&conn, "alice").await;
-        {
-            let guard = conn.lock().await;
-            conexus_db::project_settings_repository::upsert(
-                &guard,
-                "config_auto_event_loop_global",
-                "false",
-                None,
-                false,
-                "operator",
-                "2026-01-01T00:00:00Z",
-            )
-            .unwrap();
-        }
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
+        conexus_db::project_settings_repository::upsert(
+            &sea_orm_db,
+            "config_auto_event_loop_global",
+            "false",
+            None,
+            false,
+            "operator",
+            "2026-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
 
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -1724,18 +1788,20 @@ mod tests {
     async fn pre_loop_idle_stop_fires_when_window_already_exceeded() {
         let conn = test_conn();
         seed_agent(&conn, "alice").await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
+        conexus_db::project_settings_repository::upsert(
+            &sea_orm_db,
+            "config_event_idle_stop_seconds",
+            "60",
+            None,
+            false,
+            "operator",
+            "2026-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
         {
             let guard = conn.lock().await;
-            conexus_db::project_settings_repository::upsert(
-                &guard,
-                "config_event_idle_stop_seconds",
-                "60",
-                None,
-                false,
-                "operator",
-                "2026-01-01T00:00:00Z",
-            )
-            .unwrap();
             // Seed last_activity_at far enough in the past that the
             // 60s window is already exceeded by NOW.
             AgentRepository::update_field(
@@ -1750,7 +1816,6 @@ mod tests {
 
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -1774,18 +1839,20 @@ mod tests {
     async fn an_active_schedule_suppresses_idle_stop() {
         let conn = test_conn();
         seed_agent(&conn, "alice").await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
+        conexus_db::project_settings_repository::upsert(
+            &sea_orm_db,
+            "config_event_idle_stop_seconds",
+            "60",
+            None,
+            false,
+            "operator",
+            "2026-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
         {
             let guard = conn.lock().await;
-            conexus_db::project_settings_repository::upsert(
-                &guard,
-                "config_event_idle_stop_seconds",
-                "60",
-                None,
-                false,
-                "operator",
-                "2026-01-01T00:00:00Z",
-            )
-            .unwrap();
             AgentRepository::update_field(
                 &guard,
                 "alice",
@@ -1798,7 +1865,6 @@ mod tests {
 
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         scheduled_directive_repository::create(
             &sea_orm_db,
             "sched_1",
@@ -1974,13 +2040,13 @@ mod tests {
         assert_eq!(registry.waiter_count("bob"), 0);
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn wake_signal_delivers_pending_events() {
         let conn = test_conn();
         seed_agent(&conn, "carol").await;
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db_paused().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -2244,7 +2310,7 @@ mod tests {
 
     // -- WaitForEventsTool (through the real Tool trait) ---------------------
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn wait_for_events_tool_delivers_a_fast_path_event_through_the_real_trait_call() {
         use conexus_auth::Tool;
 
@@ -2253,7 +2319,7 @@ mod tests {
         send_message(&conn, "m1", "kate", &now_iso(), "text").await;
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db_paused().await;
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -2975,22 +3041,20 @@ mod tests {
         let conn = test_conn();
         seed_agent(&conn, "alice").await;
         seed_agent(&conn, "bob").await;
-        {
-            let guard = conn.lock().await;
-            project_settings_repository::upsert(
-                &guard,
-                "config_allow_worker_to_worker",
-                "false",
-                None,
-                false,
-                "test",
-                NOW,
-            )
-            .unwrap();
-        }
+        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
+        project_settings_repository::upsert(
+            &sea_orm_db,
+            "config_allow_worker_to_worker",
+            "false",
+            None,
+            false,
+            "test",
+            NOW,
+        )
+        .await
+        .unwrap();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
