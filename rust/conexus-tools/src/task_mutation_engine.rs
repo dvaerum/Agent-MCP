@@ -445,7 +445,6 @@ pub fn advance_dependents_after_completion(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use conexus_db::agent_repository::{AgentRepository, NewAgent};
     use conexus_db::schema::init_schema;
     use conexus_db::task_repository::NewTask;
 
@@ -458,18 +457,10 @@ mod tests {
     }
 
     fn seed_agent(conn: &Connection, agent_id: &str) {
-        AgentRepository::create(
-            conn,
-            NewAgent {
-                token: &format!("tok-{agent_id}"),
-                agent_id,
-                created_at: NOW,
-                status: "active",
-                current_task: None,
-                working_directory: "/tmp",
-                color: None,
-                agent_role: "worker",
-            },
+        conn.execute(
+            "INSERT INTO agents (token, agent_id, created_at, status, working_directory, agent_role) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            (&format!("tok-{agent_id}"), agent_id, NOW, "active", "/tmp", "worker"),
         )
         .unwrap();
     }

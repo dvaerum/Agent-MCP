@@ -121,7 +121,6 @@ mod tests {
     use conexus_auth::ToolCallContext;
     use conexus_core::capability::Capabilities;
     use conexus_core::principal::PrincipalKind;
-    use conexus_db::agent_repository::NewAgent;
     use conexus_db::schema::init_schema;
     use conexus_wakeloop::waiter_registry::WaiterRegistry;
     use std::collections::HashSet;
@@ -147,18 +146,17 @@ mod tests {
     }
 
     fn seed(conn: &Connection, agent_id: &str, role: &str) {
-        AgentRepository::create(
-            conn,
-            NewAgent {
-                token: &format!("{agent_id}-tok"),
+        conn.execute(
+            "INSERT INTO agents (token, agent_id, created_at, status, working_directory, agent_role) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            (
+                format!("{agent_id}-tok"),
                 agent_id,
-                created_at: "2026-06-01T00:00:00Z",
-                status: "active",
-                current_task: None,
-                working_directory: "/tmp",
-                color: None,
-                agent_role: role,
-            },
+                "2026-06-01T00:00:00Z",
+                "active",
+                "/tmp",
+                role,
+            ),
         )
         .unwrap();
     }

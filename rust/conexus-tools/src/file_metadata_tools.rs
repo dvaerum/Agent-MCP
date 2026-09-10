@@ -335,8 +335,11 @@ mod tests {
         let path = dir.path().join("test.db");
         let conn = Connection::open(&path).unwrap();
         init_schema(&conn).unwrap();
+        let sea_orm_db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
         AgentRepository::create(
-            &conn,
+            &sea_orm_db,
             NewAgent {
                 token: "tok",
                 agent_id: "alice",
@@ -348,10 +351,8 @@ mod tests {
                 agent_role: "worker",
             },
         )
+        .await
         .unwrap();
-        let sea_orm_db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
-            .await
-            .unwrap();
         (dir, AsyncMutex::new(conn), sea_orm_db)
     }
 

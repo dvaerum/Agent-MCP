@@ -3111,15 +3111,14 @@ pub async fn edit_agent(
         let new_profile = profile_value.and_then(Value::as_str).unwrap_or("");
         let now = chrono::Utc::now().to_rfc3339();
         let operator_id = resolved.admission.caller_identity();
-        let guard = shared.conn.lock().await;
         let reviewed = conexus_db::agent_repository::AgentRepository::review_profile(
-            &guard,
+            &shared.sea_orm_db,
             &agent_id,
             Some(new_profile).filter(|s| !s.is_empty()),
             Some(&operator_id),
             &now,
-        );
-        drop(guard);
+        )
+        .await;
         match reviewed {
             Ok(Some(result)) => {
                 updated_fields.insert("profile".to_string(), json!(result.agent.profile));

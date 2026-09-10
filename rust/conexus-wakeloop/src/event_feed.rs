@@ -876,7 +876,7 @@ pub async fn assemble_event_feed(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use conexus_db::agent_repository::{AgentRepository, NewAgent};
+    use conexus_db::agent_repository::AgentRepository;
     use conexus_db::message_repository::{self as msg_repo, NewMessage};
     use conexus_db::schema::init_schema;
     use conexus_db::task_repository::{self, NewTask};
@@ -1065,19 +1065,27 @@ mod tests {
         conn
     }
 
+    /// A plain sync `INSERT` rather than the now-async `AgentRepository::
+    /// create` -- this helper is pure fixture setup for the collectors
+    /// under test here, never a test of `create()`'s own validation, and
+    /// most of its ~20 call sites only have a `test_conn()` (in-memory,
+    /// no sea-orm `DatabaseConnection` in scope) or a `test_sea_orm_db()`
+    /// pointed at a DELIBERATELY separate temp file from `conn` -- routing
+    /// this seed through sea-orm would silently write to the wrong
+    /// database in those tests (the exact "two separate databases"
+    /// footgun this crate's fixtures are supposed to avoid).
     fn seed_agent(conn: &Connection, agent_id: &str) {
-        AgentRepository::create(
-            conn,
-            NewAgent {
-                token: &format!("tok-{agent_id}"),
+        conn.execute(
+            "INSERT INTO agents (token, agent_id, created_at, status, working_directory, agent_role) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            (
+                format!("tok-{agent_id}"),
                 agent_id,
-                created_at: "2026-01-01T00:00:00Z",
-                status: "active",
-                current_task: None,
-                working_directory: "/tmp",
-                color: None,
-                agent_role: "worker",
-            },
+                "2026-01-01T00:00:00Z",
+                "active",
+                "/tmp",
+                "worker",
+            ),
         )
         .unwrap();
     }
@@ -1453,18 +1461,19 @@ mod tests {
 
     // -- collect_agent_profile_events_for -----------------------------------
 
-    #[test]
-    fn collect_agent_profile_events_for_projects_the_repo_row() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn collect_agent_profile_events_for_projects_the_repo_row() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         seed_agent(&conn, "manager");
         seed_agent(&conn, "worker");
         AgentRepository::review_profile(
-            &conn,
+            &db,
             "worker",
             Some("curated"),
             Some("manager"),
             "2026-01-01T00:00:01Z",
         )
+        .await
         .unwrap();
 
         let events = collect_agent_profile_events_for(&conn, "someone-else", None).unwrap();

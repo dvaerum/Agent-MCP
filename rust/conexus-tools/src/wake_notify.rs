@@ -190,18 +190,17 @@ mod tests {
     fn deliver_broadcasts_wake_all_for_flag_recheck_to_every_live_agent() {
         let conn = Connection::open_in_memory().unwrap();
         conexus_db::schema::init_schema(&conn).unwrap();
-        conexus_db::agent_repository::AgentRepository::create(
-            &conn,
-            conexus_db::agent_repository::NewAgent {
-                token: "tok",
-                agent_id: "alice",
-                created_at: "2026-06-01T00:00:00Z",
-                status: "active",
-                current_task: None,
-                working_directory: "/tmp",
-                color: None,
-                agent_role: "worker",
-            },
+        conn.execute(
+            "INSERT INTO agents (token, agent_id, created_at, status, working_directory, agent_role) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            (
+                "tok",
+                "alice",
+                "2026-06-01T00:00:00Z",
+                "active",
+                "/tmp",
+                "worker",
+            ),
         )
         .unwrap();
         let registry = WaiterRegistry::new();

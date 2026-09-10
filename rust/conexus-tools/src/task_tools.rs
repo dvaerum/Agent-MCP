@@ -2923,18 +2923,13 @@ mod tests {
     #[test]
     fn agent_assignable_true_for_a_live_agent() {
         let conn = test_conn();
-        conexus_db::agent_repository::AgentRepository::create(
-            &conn,
-            conexus_db::agent_repository::NewAgent {
-                token: "tok",
-                agent_id: "alice",
-                created_at: "2026-01-01T00:00:00Z",
-                status: "active",
-                current_task: None,
-                working_directory: "/tmp",
-                color: None,
-                agent_role: "worker",
-            },
+        // Fixture-only insert (not asserting on AgentRepository::create's
+        // own return value/validation) -- raw SQL avoids pulling a
+        // sea-orm DatabaseConnection into this sync test.
+        conn.execute(
+            "INSERT INTO agents (token, agent_id, created_at, status, working_directory, agent_role) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            ("tok", "alice", "2026-01-01T00:00:00Z", "active", "/tmp", "worker"),
         )
         .unwrap();
         assert!(agent_assignable(&conn, "alice"));
@@ -2952,11 +2947,20 @@ mod tests {
         // FK artefact) is not a live agent -- pinning work onto it is
         // unreachable work attributed to a deleted identity.
         let conn = test_conn();
-        conexus_db::agent_repository::AgentRepository::insert_tombstone(
-            &conn,
-            "__tombstone_ghost",
-            "[deleted-ghost]",
-            "2026-01-01T00:00:00Z",
+        // Fixture-only insert (not asserting on insert_tombstone's own
+        // idempotency/shape) -- raw SQL avoids pulling a sea-orm
+        // DatabaseConnection into this sync test. Mirrors
+        // AgentRepository::insert_tombstone's own INSERT shape
+        // (status='tombstone', working_directory='', color='#000000').
+        conn.execute(
+            "INSERT INTO agents (token, agent_id, created_at, status, working_directory, color, updated_at) \
+             VALUES (?1, ?2, ?3, 'tombstone', '', '#000000', ?4)",
+            (
+                "__tombstone_ghost",
+                "[deleted-ghost]",
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T00:00:00Z",
+            ),
         )
         .unwrap();
         assert!(!agent_assignable(&conn, "[deleted-ghost]"));
@@ -2972,18 +2976,13 @@ mod tests {
     #[test]
     fn agent_assignable_false_for_a_terminated_agent() {
         let conn = test_conn();
-        conexus_db::agent_repository::AgentRepository::create(
-            &conn,
-            conexus_db::agent_repository::NewAgent {
-                token: "tok",
-                agent_id: "bob",
-                created_at: "2026-01-01T00:00:00Z",
-                status: "terminated",
-                current_task: None,
-                working_directory: "/tmp",
-                color: None,
-                agent_role: "worker",
-            },
+        // Fixture-only insert (not asserting on AgentRepository::create's
+        // own return value/validation) -- raw SQL avoids pulling a
+        // sea-orm DatabaseConnection into this sync test.
+        conn.execute(
+            "INSERT INTO agents (token, agent_id, created_at, status, working_directory, agent_role) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            ("tok", "bob", "2026-01-01T00:00:00Z", "terminated", "/tmp", "worker"),
         )
         .unwrap();
         assert!(!agent_assignable(&conn, "bob"));
@@ -4700,20 +4699,16 @@ mod create_task_tests {
 
     async fn seed_agent(conn: &AsyncMutex<Connection>, agent_id: &str) {
         let guard = conn.lock().await;
-        conexus_db::agent_repository::AgentRepository::create(
-            &guard,
-            conexus_db::agent_repository::NewAgent {
-                token: &format!("tok-{agent_id}"),
-                agent_id,
-                created_at: NOW,
-                status: "active",
-                current_task: None,
-                working_directory: "/tmp",
-                color: None,
-                agent_role: "worker",
-            },
-        )
-        .unwrap();
+        // Fixture-only insert (not asserting on AgentRepository::create's
+        // own return value/validation) -- raw SQL avoids pulling a
+        // sea-orm DatabaseConnection into this helper.
+        guard
+            .execute(
+                "INSERT INTO agents (token, agent_id, created_at, status, working_directory, agent_role) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                (&format!("tok-{agent_id}"), agent_id, NOW, "active", "/tmp", "worker"),
+            )
+            .unwrap();
     }
 
     fn seed_task(conn: &Connection, id: &str, parent: Option<&str>) {
@@ -5209,7 +5204,7 @@ mod update_task_status_tests {
     use super::*;
     use conexus_core::capability::Capabilities;
     use conexus_core::principal::PrincipalKind;
-    use conexus_db::agent_repository::{AgentRepository, NewAgent};
+    use conexus_db::agent_repository::AgentRepository;
     use conexus_db::scheduled_directive_repository::NullableUpdate;
     use conexus_db::schema::init_schema;
     use conexus_db::task_repository::{NewTask, TaskFields};
@@ -5254,20 +5249,16 @@ mod update_task_status_tests {
 
     async fn seed_agent(conn: &AsyncMutex<Connection>, agent_id: &str) {
         let guard = conn.lock().await;
-        AgentRepository::create(
-            &guard,
-            NewAgent {
-                token: &format!("tok-{agent_id}"),
-                agent_id,
-                created_at: NOW,
-                status: "active",
-                current_task: None,
-                working_directory: "/tmp",
-                color: None,
-                agent_role: "worker",
-            },
-        )
-        .unwrap();
+        // Fixture-only insert (not asserting on AgentRepository::create's
+        // own return value/validation) -- raw SQL avoids pulling a
+        // sea-orm DatabaseConnection into this helper.
+        guard
+            .execute(
+                "INSERT INTO agents (token, agent_id, created_at, status, working_directory, agent_role) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                (&format!("tok-{agent_id}"), agent_id, NOW, "active", "/tmp", "worker"),
+            )
+            .unwrap();
     }
 
     fn seed_task(
@@ -5716,9 +5707,16 @@ mod update_task_status_tests {
         // a TERMINATED agent.
         let (dir, conn) = test_conn();
         seed_agent(&conn, "bob").await;
+        // `terminate` is itself under test elsewhere for its own
+        // return-value/idempotency behavior; here it's fixture setup,
+        // but it's an UPDATE (not a plain insert), so it goes through
+        // the real sea-orm connection rather than a raw-SQL shortcut.
+        let sea_orm_db = test_sea_orm_db(dir.path()).await;
+        AgentRepository::terminate(&sea_orm_db, "bob", NOW)
+            .await
+            .unwrap();
         {
             let guard = conn.lock().await;
-            AgentRepository::terminate(&guard, "bob", NOW).unwrap();
             seed_task(&guard, "t1", "pending", None, None);
         }
         let result = call(
@@ -5762,7 +5760,7 @@ mod update_task_tests {
     use super::*;
     use conexus_core::capability::Capabilities;
     use conexus_core::principal::PrincipalKind;
-    use conexus_db::agent_repository::{AgentRepository, NewAgent};
+    use conexus_db::agent_repository::AgentRepository;
     use conexus_db::schema::init_schema;
     use conexus_db::task_repository::NewTask;
     use conexus_wakeloop::waiter_registry::{WaiterRegistry, WakeSignal};
@@ -5816,20 +5814,16 @@ mod update_task_tests {
 
     async fn seed_agent(conn: &AsyncMutex<Connection>, agent_id: &str) {
         let guard = conn.lock().await;
-        AgentRepository::create(
-            &guard,
-            NewAgent {
-                token: &format!("tok-{agent_id}"),
-                agent_id,
-                created_at: NOW,
-                status: "active",
-                current_task: None,
-                working_directory: "/tmp",
-                color: None,
-                agent_role: "worker",
-            },
-        )
-        .unwrap();
+        // Fixture-only insert (not asserting on AgentRepository::create's
+        // own return value/validation) -- raw SQL avoids pulling a
+        // sea-orm DatabaseConnection into this helper.
+        guard
+            .execute(
+                "INSERT INTO agents (token, agent_id, created_at, status, working_directory, agent_role) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                (&format!("tok-{agent_id}"), agent_id, NOW, "active", "/tmp", "worker"),
+            )
+            .unwrap();
     }
 
     fn seed_task(conn: &Connection, id: &str, status: &str, assigned_to: Option<&str>) {
@@ -6083,17 +6077,26 @@ mod update_task_tests {
     /// `_agent_assignable`'s liveness half, not just existence.
     #[tokio::test]
     async fn reassigning_to_a_terminated_agent_is_rejected() {
-        let conn = test_conn();
+        // Real-temp-file-backed `conn`/`sea_orm_db` pair (not the
+        // in-memory `test_conn()`) -- `terminate` here is fixture setup
+        // going through the real sea-orm connection (an UPDATE, not a
+        // plain insert), so it must share the SAME db file `call`'s own
+        // `sea_orm_db` reconnects to.
+        let (_dir, db_path, conn) = test_conn_file();
         seed_agent(&conn, "alice").await;
         seed_agent(&conn, "zombie").await;
+        let sea_orm_db = reconnect_sea_orm(&db_path).await;
+        AgentRepository::terminate(&sea_orm_db, "zombie", NOW)
+            .await
+            .unwrap();
         {
             let guard = conn.lock().await;
-            AgentRepository::terminate(&guard, "zombie", NOW).unwrap();
             seed_task(&guard, "t1", "pending", Some("alice"));
         }
-        let result = call(
+        let result = call_with_sea_orm(
             serde_json::json!({"task_id": "t1", "assigned_to": "zombie"}),
             &conn,
+            &sea_orm_db,
         )
         .await;
         assert!(
@@ -6688,7 +6691,7 @@ mod delete_task_tests {
     }
 
     use super::*;
-    use conexus_db::agent_repository::{AgentRepository, NewAgent};
+    use conexus_db::agent_repository::AgentRepository;
     use conexus_db::scheduled_directive_repository::NullableUpdate;
     use conexus_db::schema::init_schema;
     use conexus_db::task_repository::{NewTask, TaskFields};
@@ -6729,20 +6732,16 @@ mod delete_task_tests {
 
     async fn seed_agent(conn: &AsyncMutex<Connection>, agent_id: &str) {
         let guard = conn.lock().await;
-        AgentRepository::create(
-            &guard,
-            NewAgent {
-                token: &format!("tok-{agent_id}"),
-                agent_id,
-                created_at: NOW,
-                status: "active",
-                current_task: None,
-                working_directory: "/tmp",
-                color: None,
-                agent_role: "worker",
-            },
-        )
-        .unwrap();
+        // Fixture-only insert (not asserting on AgentRepository::create's
+        // own return value/validation) -- raw SQL avoids pulling a
+        // sea-orm DatabaseConnection into this helper.
+        guard
+            .execute(
+                "INSERT INTO agents (token, agent_id, created_at, status, working_directory, agent_role) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                (&format!("tok-{agent_id}"), agent_id, NOW, "active", "/tmp", "worker"),
+            )
+            .unwrap();
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -7496,7 +7495,6 @@ mod bulk_task_operations_tests {
     use super::*;
     use conexus_core::capability::Capabilities;
     use conexus_core::principal::PrincipalKind;
-    use conexus_db::agent_repository::NewAgent;
     use conexus_db::schema::init_schema;
     use conexus_wakeloop::waiter_registry::{WaiterRegistry, WakeSignal};
 
@@ -7541,18 +7539,13 @@ mod bulk_task_operations_tests {
     }
 
     fn seed_agent(conn: &Connection, agent_id: &str) {
-        AgentRepository::create(
-            conn,
-            NewAgent {
-                token: &format!("tok-{agent_id}"),
-                agent_id,
-                created_at: NOW,
-                status: "active",
-                current_task: None,
-                working_directory: "/tmp",
-                color: None,
-                agent_role: "worker",
-            },
+        // Fixture-only insert (not asserting on AgentRepository::create's
+        // own return value/validation) -- raw SQL avoids pulling a
+        // sea-orm DatabaseConnection into this sync helper.
+        conn.execute(
+            "INSERT INTO agents (token, agent_id, created_at, status, working_directory, agent_role) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            (&format!("tok-{agent_id}"), agent_id, NOW, "active", "/tmp", "worker"),
         )
         .unwrap();
     }
@@ -7996,9 +7989,19 @@ mod bulk_task_operations_tests {
         {
             let guard = conn.lock().await;
             seed_agent(&guard, "carol");
-            AgentRepository::terminate(&guard, "carol", NOW).unwrap();
             seed_task(&guard, "t1", "pending", None, "alice");
         }
+        // `terminate` is itself under test elsewhere for its own
+        // return-value/idempotency behavior; here it's fixture setup,
+        // but it's an UPDATE (not a plain insert), so it goes through
+        // the real sea-orm connection rather than a raw-SQL shortcut.
+        // `test_conn()` in this module is already real-temp-file-backed
+        // (not `:memory:`), so this reconnects to the same path
+        // `call`'s own `test_sea_orm_db(dir)` uses.
+        let sea_orm_db = test_sea_orm_db(dir.path()).await;
+        AgentRepository::terminate(&sea_orm_db, "carol", NOW)
+            .await
+            .unwrap();
         let result = call(
             serde_json::json!({"operations": [{"type": "reassign", "task_id": "t1", "assigned_to": "carol"}]}),
             &admin("alice"),
