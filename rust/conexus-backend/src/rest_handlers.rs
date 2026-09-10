@@ -1734,9 +1734,14 @@ pub async fn all_data(
     // "last 100" cap, further narrowed by a smaller `?limit` -- matches
     // Python's `min(100, section_limit)` exactly.
     let actions_cap = section_limit.min(100);
-    let actions_rows =
-        conexus_db::agent_action_repository::list_recent(&guard, None, None, actions_cap)
-            .unwrap_or_default();
+    let actions_rows = conexus_db::agent_action_repository::list_recent(
+        &shared.sea_orm_db,
+        None,
+        None,
+        actions_cap,
+    )
+    .await
+    .unwrap_or_default();
     let actions_data: Vec<Value> = actions_rows
         .iter()
         .map(|a| {
@@ -2309,7 +2314,17 @@ pub async fn create_message(
         // branch of an un-scoped `let tx = ...; if ... { drop(guard);
         // return ...}` shape -- confining it here avoids that entirely
         // rather than fighting NLL diagnostics branch by branch.
-        let outcome: Result<usize, ()> = (|| {
+        //
+        // Phase G: `agent_action_repository` is sea-orm-backed now, so
+        // its audit-log write can no longer run inside this SYNC
+        // closure (on `&tx`) -- the closure instead returns `details`
+        // alongside the sent count, and the actual write happens AFTER
+        // `guard` drops, via `shared.sea_orm_db`, non-atomic with the
+        // message-send transaction above -- same established tradeoff
+        // as every other converted `agent_action_repository` call site
+        // in this migration (see `conexus_tools::project_settings_
+        // tools`'s own doc comment for the precedent).
+        let outcome: Result<(usize, Value), ()> = (|| {
             let tx = guard.unchecked_transaction().map_err(|_| ())?;
             conexus_db::message_repository::bulk_send(&tx, &rows).map_err(|_| ())?;
             let mut details = json!({"recipients": recipients, "sent_count": recipients.len()});
@@ -2317,21 +2332,23 @@ pub async fn create_message(
                 details["operator"] = json!(operator_id);
                 details["acting_as"] = json!(acting);
             }
-            conexus_db::agent_action_repository::log_agent_action(
-                &tx,
+            tx.commit().map_err(|_| ())?;
+            Ok((message_ids.len(), details))
+        })();
+        drop(guard);
+        if let Ok((_, details)) = &outcome {
+            let _ = conexus_db::agent_action_repository::log_agent_action(
+                &shared.sea_orm_db,
                 &operator_id,
                 "broadcast_message_via_dashboard",
                 None,
-                Some(&details),
+                Some(details),
                 &now,
             )
-            .map_err(|_| ())?;
-            tx.commit().map_err(|_| ())?;
-            Ok(message_ids.len())
-        })();
-        drop(guard);
+            .await;
+        }
         return match outcome {
-            Ok(sent_count) => {
+            Ok((sent_count, _)) => {
                 // BL-R8-1 sibling fix: the single-recipient branch
                 // already fires this post-commit; this branch was the
                 // one this migration's own port missed -- Python's
@@ -2372,16 +2389,24 @@ pub async fn create_message(
 
     // Same closure-confinement as the broadcast branch above -- see its
     // comment for why.
+    //
+    // Phase G: `agent_action_repository` is sea-orm-backed now, so its
+    // audit-log write can no longer run inside this SYNC closure (on
+    // `&tx`) -- the closure returns `Ok(details)` on a successfully
+    // committed send instead, and the actual write happens AFTER
+    // `guard` drops, via `shared.sea_orm_db`, non-atomic with the
+    // message-send transaction above -- same established tradeoff as
+    // the broadcast branch above.
     enum SingleSendOutcome {
         Sent,
         RecipientNotFound,
         ParentNotFound,
         Failed,
     }
-    let outcome: SingleSendOutcome = (|| {
+    let commit_result: Result<Value, SingleSendOutcome> = (|| {
         let tx = match guard.unchecked_transaction() {
             Ok(tx) => tx,
-            Err(_) => return SingleSendOutcome::Failed,
+            Err(_) => return Err(SingleSendOutcome::Failed),
         };
         let sent = conexus_db::message_repository::send(
             &tx,
@@ -2406,31 +2431,39 @@ pub async fn create_message(
                     details["operator"] = json!(operator_id);
                     details["acting_as"] = json!(acting);
                 }
-                let log_result = conexus_db::agent_action_repository::log_agent_action(
-                    &tx,
-                    &operator_id,
-                    "sent_message_via_dashboard",
-                    None,
-                    Some(&details),
-                    &now,
-                );
-                if log_result.is_err() || tx.commit().is_err() {
-                    return SingleSendOutcome::Failed;
+                if tx.commit().is_err() {
+                    return Err(SingleSendOutcome::Failed);
                 }
-                SingleSendOutcome::Sent
+                Ok(details)
             }
             Err(conexus_db::message_repository::SendMessageError::RecipientNotFound(_)) => {
-                SingleSendOutcome::RecipientNotFound
+                Err(SingleSendOutcome::RecipientNotFound)
             }
             Err(conexus_db::message_repository::SendMessageError::ParentMessageNotFound(_)) => {
-                SingleSendOutcome::ParentNotFound
+                Err(SingleSendOutcome::ParentNotFound)
             }
             Err(conexus_db::message_repository::SendMessageError::Db(_)) => {
-                SingleSendOutcome::Failed
+                Err(SingleSendOutcome::Failed)
             }
         }
     })();
     drop(guard);
+
+    let outcome = match commit_result {
+        Ok(details) => {
+            let _ = conexus_db::agent_action_repository::log_agent_action(
+                &shared.sea_orm_db,
+                &operator_id,
+                "sent_message_via_dashboard",
+                None,
+                Some(&details),
+                &now,
+            )
+            .await;
+            SingleSendOutcome::Sent
+        }
+        Err(e) => e,
+    };
 
     match outcome {
         SingleSendOutcome::Sent => {
@@ -2554,10 +2587,17 @@ pub async fn patch_message(
 
     // Closure-confined transaction -- see `create_message`'s single-send
     // branch comment for why this shape is needed at all.
-    let ok: bool = (|| -> bool {
+    //
+    // Phase G: `agent_action_repository` is sea-orm-backed now, so its
+    // audit-log write can no longer run inside this SYNC closure --
+    // the closure returns `Some(details)` on a successfully committed
+    // update instead, and the actual write happens AFTER `guard`
+    // drops, via `shared.sea_orm_db` -- same established tradeoff as
+    // `create_message`'s own broadcast/single-send branches.
+    let commit_result: Option<Value> = (|| -> Option<Value> {
         let tx = match guard.unchecked_transaction() {
             Ok(tx) => tx,
-            Err(_) => return false,
+            Err(_) => return None,
         };
         for (col, val) in &updates {
             let result = match *col {
@@ -2568,21 +2608,32 @@ pub async fn patch_message(
                 _ => unreachable!("updates only ever pushes \"read\"/\"delivered\""),
             };
             if result.is_err() {
-                return false;
+                return None;
             }
         }
         let details = json!({"message_id": message_id, "fields": fields});
-        let log_result = conexus_db::agent_action_repository::log_agent_action(
-            &tx,
-            &operator_id,
-            "updated_message",
-            None,
-            Some(&details),
-            &now,
-        );
-        log_result.is_ok() && tx.commit().is_ok()
+        if tx.commit().is_err() {
+            return None;
+        }
+        Some(details)
     })();
     drop(guard);
+
+    let ok = match commit_result {
+        Some(details) => {
+            let _ = conexus_db::agent_action_repository::log_agent_action(
+                &shared.sea_orm_db,
+                &operator_id,
+                "updated_message",
+                None,
+                Some(&details),
+                &now,
+            )
+            .await;
+            true
+        }
+        None => false,
+    };
 
     if ok {
         Json(json!({"success": true})).into_response()
@@ -2622,26 +2673,44 @@ pub async fn delete_message(
 
     // Closure-confined transaction -- see `create_message`'s single-send
     // branch comment for why this shape is needed at all.
-    let ok: bool = (|| -> bool {
+    //
+    // Phase G: `agent_action_repository` is sea-orm-backed now, so its
+    // audit-log write can no longer run inside this SYNC closure --
+    // the closure returns `Some(details)` on a successfully committed
+    // delete instead, and the actual write happens AFTER `guard`
+    // drops, via `shared.sea_orm_db` -- same established tradeoff as
+    // `create_message`'s own broadcast/single-send branches.
+    let commit_result: Option<Value> = (|| -> Option<Value> {
         let tx = match guard.unchecked_transaction() {
             Ok(tx) => tx,
-            Err(_) => return false,
+            Err(_) => return None,
         };
         if conexus_db::message_repository::delete(&tx, &message_id).is_err() {
-            return false;
+            return None;
         }
         let details = json!({"message_id": message_id});
-        let log_result = conexus_db::agent_action_repository::log_agent_action(
-            &tx,
-            &operator_id,
-            "deleted_message_via_dashboard",
-            None,
-            Some(&details),
-            &now,
-        );
-        log_result.is_ok() && tx.commit().is_ok()
+        if tx.commit().is_err() {
+            return None;
+        }
+        Some(details)
     })();
     drop(guard);
+
+    let ok = match commit_result {
+        Some(details) => {
+            let _ = conexus_db::agent_action_repository::log_agent_action(
+                &shared.sea_orm_db,
+                &operator_id,
+                "deleted_message_via_dashboard",
+                None,
+                Some(&details),
+                &now,
+            )
+            .await;
+            true
+        }
+        None => false,
+    };
 
     if ok {
         Json(json!({"success": true, "deleted": message_id})).into_response()
@@ -3343,15 +3412,15 @@ pub async fn disconnect_agent(
     }
     let now = chrono::Utc::now().to_rfc3339();
     let principal = resolved.dispatch_principal.clone();
-    let guard = shared.conn.lock().await;
     let result = conexus_tools::admin_tools::disconnect_agent(
-        &guard,
+        &shared.conn,
+        &shared.sea_orm_db,
         &shared.waiter_registry,
         Some(&principal),
         &agent_id,
         &now,
-    );
-    drop(guard);
+    )
+    .await;
     if let ToolResult::Ok { data, message } = &result {
         let payload = data.clone().unwrap_or(Value::Null);
         return Json(json!({
@@ -3388,15 +3457,15 @@ pub async fn reconnect_agent(
     }
     let now = chrono::Utc::now().to_rfc3339();
     let principal = resolved.dispatch_principal.clone();
-    let guard = shared.conn.lock().await;
     let result = conexus_tools::admin_tools::reconnect_agent(
-        &guard,
+        &shared.conn,
+        &shared.sea_orm_db,
         &shared.waiter_registry,
         Some(&principal),
         &agent_id,
         &now,
-    );
-    drop(guard);
+    )
+    .await;
     if let ToolResult::Ok { data, message } = &result {
         let payload = data.clone().unwrap_or(Value::Null);
         return Json(json!({
@@ -3493,12 +3562,11 @@ pub async fn poke_agent_directive(
     }
 
     let poke_id = format!("poke_{:016x}", random_id_u64());
-    // `pending_directive_repository` is sea-orm-backed (Phase G);
-    // `agent_action_repository`'s audit write below is not yet -- the
-    // two writes are no longer inside a shared transaction, so they're
-    // no longer atomic with each other (the same non-atomic-audit-log
-    // tradeoff every prior Phase G PR touching `agent_action_repository`
-    // has already accepted).
+    // `pending_directive_repository` AND `agent_action_repository` are
+    // both sea-orm-backed now (Phase G); the two writes are still not
+    // inside a shared transaction, so they're not atomic with each
+    // other (the same non-atomic-audit-log tradeoff every prior Phase
+    // G PR touching `agent_action_repository` has already accepted).
     let created = conexus_db::pending_directive_repository::create_poke(
         &shared.sea_orm_db,
         &poke_id,
@@ -3511,16 +3579,16 @@ pub async fn poke_agent_directive(
     .await
     .is_ok()
         && {
-            let guard = shared.conn.lock().await;
             let details = json!({"poke_id": poke_id, "agent_id": agent_id, "priority": priority});
             let log_result = conexus_db::agent_action_repository::log_agent_action(
-                &guard,
+                &shared.sea_orm_db,
                 &operator_id,
                 "poke_agent_directive",
                 None,
                 Some(&details),
                 &now,
-            );
+            )
+            .await;
             log_result.is_ok()
         };
 

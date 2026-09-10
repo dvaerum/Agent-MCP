@@ -1138,16 +1138,15 @@ impl Tool for CreateProjectContextTool {
                     }
                 }
             };
-            let guard = conn.lock().await;
             let _ = agent_action_repository::log_agent_action(
-                &guard,
+                ctx.sea_orm_db,
                 requesting_agent_id,
                 "created_memory",
                 None,
                 Some(&serde_json::json!({"context_key": context_key})),
                 now,
-            );
-            drop(guard);
+            )
+            .await;
 
             // BL-R14-1: fire the full post-write wake set this key
             // requires. The write already committed above (rusqlite
@@ -1175,19 +1174,14 @@ impl Tool for CreateProjectContextTool {
 /// created (matches `upsert`'s own `created` flag; unused by the
 /// caller's response shape today but kept for parity/future use).
 ///
-/// Takes the whole `&AsyncMutex<Connection>`, not an already-locked
-/// `&Connection` -- a bare `&Connection` isn't `Send` (rusqlite's
-/// `Connection` holds a `RefCell` internally), so storing one as an
-/// `async fn`'s own parameter and holding it live across the
-/// `sea_orm_db` awaits above would make this function's generated
-/// future non-`Send`, which `Tool::call`'s `BoxFuture` requires. Only
-/// locking the legacy connection AFTER those awaits, for the single
-/// synchronous `log_agent_action` call, keeps the lock scope (and any
-/// non-`Send` value) off the future's live-across-await state
-/// entirely.
+/// `agent_action_repository` is sea-orm-backed now too (Phase G), so
+/// this function no longer touches the legacy connection at all -- no
+/// `&Connection`/`&AsyncMutex<Connection>` parameter here (an unused
+/// one would still poison this `async fn`'s own generated future's
+/// `Send`-ness; see `conexus_wakeloop::event_feed::collect_scheduled_
+/// directive_events_for`'s own doc for the identical fix).
 #[allow(clippy::too_many_arguments)]
 async fn single_update_project_context(
-    conn: &AsyncMutex<Connection>,
     sea_orm_db: &sea_orm::DatabaseConnection,
     requesting_agent_id: &str,
     context_key: &str,
@@ -1216,15 +1210,15 @@ async fn single_update_project_context(
             check logs."
             .to_string(),
     })?;
-    let guard = conn.lock().await;
     let _ = agent_action_repository::log_agent_action(
-        &guard,
+        sea_orm_db,
         requesting_agent_id,
         "updated_context",
         None,
         Some(&serde_json::json!({"context_key": context_key, "action": "set/update"})),
         now,
-    );
+    )
+    .await;
     Ok(created)
 }
 
@@ -1247,15 +1241,12 @@ enum BulkUpdateOutcome {
 /// Python's "atomic on authorization, not on per-item success"
 /// design.
 ///
-/// Takes the whole `&AsyncMutex<Connection>`, not an already-locked
-/// `&Connection` -- see [`single_update_project_context`]'s doc for
-/// why a bare `&Connection` can't be held live across this function's
-/// own `sea_orm_db` awaits without breaking `Tool::call`'s `Send`
-/// future requirement. Each Phase 2 iteration locks the legacy
-/// connection fresh, only for its own synchronous `log_agent_action`
-/// call.
+/// `agent_action_repository` is sea-orm-backed now too (Phase G), so
+/// this function no longer touches the legacy connection at all -- see
+/// [`single_update_project_context`]'s doc for why an unused
+/// `&Connection`/`&AsyncMutex<Connection>` parameter can't be kept
+/// around defensively on an `async fn`.
 async fn bulk_update_project_context_entries(
-    conn: &AsyncMutex<Connection>,
     sea_orm_db: &sea_orm::DatabaseConnection,
     requesting_agent_id: &str,
     updates: &[Value],
@@ -1318,9 +1309,8 @@ async fn bulk_update_project_context_entries(
                 outcomes.push(BulkUpdateOutcome::Updated {
                     context_key: context_key.to_string(),
                 });
-                let guard = conn.lock().await;
                 let _ = agent_action_repository::log_agent_action(
-                    &guard,
+                    sea_orm_db,
                     requesting_agent_id,
                     "bulk_updated_context",
                     None,
@@ -1329,7 +1319,8 @@ async fn bulk_update_project_context_entries(
                         "operation": format!("bulk_update_{}", i + 1),
                     })),
                     now,
-                );
+                )
+                .await;
             }
             Err(_e) => outcomes.push(BulkUpdateOutcome::Failed {
                 context_key: context_key.to_string(),
@@ -1443,7 +1434,6 @@ impl Tool for UpdateProjectContextTool {
                 };
 
                 let outcomes = match bulk_update_project_context_entries(
-                    conn,
                     ctx.sea_orm_db,
                     requesting_agent_id,
                     updates,
@@ -1501,7 +1491,6 @@ impl Tool for UpdateProjectContextTool {
             let value_json_str = context_value.to_string();
 
             if let Err(denial) = single_update_project_context(
-                conn,
                 ctx.sea_orm_db,
                 requesting_agent_id,
                 context_key,
@@ -1632,7 +1621,6 @@ impl Tool for BulkUpdateProjectContextTool {
             let is_admin = principal.is_some_and(conexus_core::principal::is_operator_tier);
 
             let outcomes = match bulk_update_project_context_entries(
-                conn,
                 ctx.sea_orm_db,
                 requesting_agent_id,
                 updates,
@@ -1822,9 +1810,8 @@ impl Tool for DeleteProjectContextTool {
                 .map(|(k, _, _)| k.as_str())
                 .collect();
 
-            let guard = conn.lock().await;
             let _ = agent_action_repository::log_agent_action(
-                &guard,
+                ctx.sea_orm_db,
                 requesting_agent_id,
                 "deleted_context",
                 None,
@@ -1835,13 +1822,15 @@ impl Tool for DeleteProjectContextTool {
                     "total_deleted": deleted_rows.len(),
                 })),
                 now,
-            );
+            )
+            .await;
 
             // BL-R4-1: prune each deleted key's RAG chunk + hash
             // watermark in the SAME transaction/connection as the row
             // delete -- the incremental indexer never sweeps orphans,
             // so a deleted context row's chunk would otherwise stay
             // queryable via ask_project_rag forever.
+            let guard = conn.lock().await;
             for key in &deleted_keys {
                 let _ = conexus_db::rag_repository::purge_source(&guard, "context", key);
             }
@@ -1968,7 +1957,7 @@ impl Tool for BackupProjectContextTool {
     fn call<'a>(
         principal: Option<&'a Principal>,
         arguments: &'a Value,
-        conn: &'a AsyncMutex<Connection>,
+        _conn: &'a AsyncMutex<Connection>,
         now: &'a str,
         ctx: &'a conexus_auth::ToolCallContext<'a>,
     ) -> conexus_auth::BoxFuture<'a, ToolResult> {
@@ -1995,7 +1984,6 @@ impl Tool for BackupProjectContextTool {
                 Err(_) => Utc::now(),
             };
 
-            let guard = conn.lock().await;
             let entries = match project_context_repository::list_all(ctx.sea_orm_db).await {
                 Ok(rows) => rows,
                 Err(_e) => {
@@ -2081,7 +2069,7 @@ impl Tool for BackupProjectContextTool {
             let backup_path = backup_path_resolved.display().to_string();
 
             let _ = agent_action_repository::log_agent_action(
-                &guard,
+                ctx.sea_orm_db,
                 requesting_agent_id,
                 "backup_project_context",
                 Some(&backup_name),
@@ -2090,8 +2078,8 @@ impl Tool for BackupProjectContextTool {
                     "backup_path": backup_path,
                 })),
                 now,
-            );
-            drop(guard);
+            )
+            .await;
 
             let created_at = backup_data["created_at"].as_str().unwrap_or(now);
             let mut response_parts = vec![

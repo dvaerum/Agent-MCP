@@ -541,22 +541,20 @@ impl Tool for CreateScheduledDirectiveTool {
                     }
                 }
             };
-            {
-                let guard = conn.lock().await;
-                let _ = agent_action_repository::log_agent_action(
-                    &guard,
-                    created_by,
-                    "create_scheduled_directive",
-                    None,
-                    Some(&serde_json::json!({
-                        "directive_id": directive_id,
-                        "agent_id": target_agent_id,
-                        "interval_seconds": interval,
-                        "run_now": run_now,
-                    })),
-                    now,
-                );
-            }
+            let _ = agent_action_repository::log_agent_action(
+                ctx.sea_orm_db,
+                created_by,
+                "create_scheduled_directive",
+                None,
+                Some(&serde_json::json!({
+                    "directive_id": directive_id,
+                    "agent_id": target_agent_id,
+                    "interval_seconds": interval,
+                    "run_now": run_now,
+                })),
+                now,
+            )
+            .await;
             // Wake a currently-holding wait_for_events so a run_now (or an
             // immediately-due) schedule fires now rather than on the next
             // ~2s flag-recheck slice.
@@ -915,20 +913,18 @@ impl Tool for UpdateScheduledDirectiveTool {
                     }
                 }
             };
-            {
-                let guard = conn.lock().await;
-                let _ = agent_action_repository::log_agent_action(
-                    &guard,
-                    updated_by,
-                    "update_scheduled_directive",
-                    None,
-                    Some(&serde_json::json!({
-                        "directive_id": directive_id,
-                        "agent_id": existing.agent_id,
-                    })),
-                    now,
-                );
-            }
+            let _ = agent_action_repository::log_agent_action(
+                ctx.sea_orm_db,
+                updated_by,
+                "update_scheduled_directive",
+                None,
+                Some(&serde_json::json!({
+                    "directive_id": directive_id,
+                    "agent_id": existing.agent_id,
+                })),
+                now,
+            )
+            .await;
             ctx.waiter_registry.notify(&existing.agent_id);
 
             ToolResult::Ok {
@@ -1027,20 +1023,18 @@ impl Tool for DeleteScheduledDirectiveTool {
                     message: "Failed to delete scheduled directive".to_string(),
                 };
             }
-            {
-                let guard = conn.lock().await;
-                let _ = agent_action_repository::log_agent_action(
-                    &guard,
-                    principal.actor_label(),
-                    "delete_scheduled_directive",
-                    None,
-                    Some(&serde_json::json!({
-                        "directive_id": directive_id,
-                        "agent_id": existing.agent_id,
-                    })),
-                    now,
-                );
-            }
+            let _ = agent_action_repository::log_agent_action(
+                ctx.sea_orm_db,
+                principal.actor_label(),
+                "delete_scheduled_directive",
+                None,
+                Some(&serde_json::json!({
+                    "directive_id": directive_id,
+                    "agent_id": existing.agent_id,
+                })),
+                now,
+            )
+            .await;
 
             ToolResult::Ok {
                 data: Some(serde_json::json!({"deleted": directive_id})),

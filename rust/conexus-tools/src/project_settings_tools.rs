@@ -274,12 +274,13 @@ impl conexus_auth::Tool for UpdateProjectSettingsTool {
                     }
                 }
             };
-            // Phase G: `project_settings_repository` is sea-orm-backed
-            // now, so the audit-log write below is a SEPARATE,
-            // non-atomic write against the legacy connection -- no
-            // longer sharing one transaction with the settings write
-            // itself (previously "matches Python's `with unit_of_work()
-            // as u:` wrapping both calls on one cursor"; this migration
+            // Phase G: `project_settings_repository` and
+            // `agent_action_repository` are both sea-orm-backed now,
+            // so the audit-log write below is a SEPARATE, non-atomic
+            // write -- no longer sharing one transaction with the
+            // settings write itself (previously "matches Python's
+            // `with unit_of_work() as u:` wrapping both calls on one
+            // cursor"; this migration
             // has already accepted the identical tradeoff everywhere
             // else `agent_action_repository`'s audit write follows a
             // converted repository's own write, e.g. `conexus_wakeloop::
@@ -292,13 +293,15 @@ impl conexus_auth::Tool for UpdateProjectSettingsTool {
             let conn = conn.lock().await;
             let audit_details = serde_json::json!({"context_key": context_key, "created": created});
             if let Err(_e) = agent_action_repository::log_agent_action(
-                &conn,
+                ctx.sea_orm_db,
                 requesting_actor,
                 "updated_setting",
                 None,
                 Some(&audit_details),
                 now,
-            ) {
+            )
+            .await
+            {
                 // Best-effort, see this block's own doc comment above.
             }
 
@@ -397,20 +400,22 @@ impl conexus_auth::Tool for DeleteProjectSettingsTool {
                     hint: None,
                 };
             }
-            // Phase G: audit-log write against the legacy connection,
-            // non-atomic with the sea-orm delete above that already
-            // durably committed -- same established tradeoff as the
-            // update tool above (see its own doc comment).
+            // Phase G: sea-orm audit-log write, non-atomic with the
+            // sea-orm delete above that already durably committed --
+            // same established tradeoff as the update tool above (see
+            // its own doc comment).
             let conn = conn.lock().await;
             let audit_details = serde_json::json!({"context_key": context_key});
             if let Err(_e) = agent_action_repository::log_agent_action(
-                &conn,
+                ctx.sea_orm_db,
                 requesting_actor,
                 "deleted_setting",
                 None,
                 Some(&audit_details),
                 now,
-            ) {
+            )
+            .await
+            {
                 // Best-effort audit, same rationale as the update tool above.
             }
 

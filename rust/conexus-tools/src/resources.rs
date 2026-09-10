@@ -226,8 +226,8 @@ impl std::error::Error for ReadError {}
 /// parameter on an `async fn` poisons the returned future's `Send`ness
 /// regardless of whether it's held across the internal `.await`
 /// (`Connection: Send` but NOT `Sync`, so `&Connection: !Send`) -- see
-/// `conexus_wakeloop::event_feed::collect_scheduled_directive_events_for`'s
-/// own doc for the identical rule. The lock is scoped to the sync
+/// `conexus_wakeloop::event_feed::collect_events_with_cap`'s own doc
+/// for the identical rule. The lock is scoped to the sync
 /// `count_unread` call and dropped before the `count_active_by_assignee`
 /// await, not held live across it.
 pub async fn render_status(

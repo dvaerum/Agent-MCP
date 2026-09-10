@@ -273,22 +273,23 @@ impl Tool for ViewAuditLogTool {
     fn call<'a>(
         _principal: Option<&'a Principal>,
         arguments: &'a Value,
-        conn: &'a AsyncMutex<Connection>,
+        _conn: &'a AsyncMutex<Connection>,
         _now: &'a str,
-        _ctx: &'a conexus_auth::ToolCallContext<'a>,
+        ctx: &'a conexus_auth::ToolCallContext<'a>,
     ) -> conexus_auth::BoxFuture<'a, ToolResult> {
         Box::pin(async move {
             let filter_agent_id = arguments.get("agent_id").and_then(Value::as_str);
             let filter_action = arguments.get("action").and_then(Value::as_str);
             let limit = clamp_audit_log_limit(arguments);
 
-            let guard = conn.lock().await;
             let rows = match agent_action_repository::list_recent(
-                &guard,
+                ctx.sea_orm_db,
                 filter_agent_id,
                 filter_action,
                 limit,
-            ) {
+            )
+            .await
+            {
                 Ok(rows) => rows,
                 Err(_e) => {
                     return ToolResult::Failed {
@@ -298,7 +299,6 @@ impl Tool for ViewAuditLogTool {
                     }
                 }
             };
-            drop(guard);
 
             let entries: Vec<Value> = rows
                 .iter()
@@ -403,7 +403,7 @@ impl Tool for GetAgentTokensTool {
         arguments: &'a Value,
         conn: &'a AsyncMutex<Connection>,
         now: &'a str,
-        _ctx: &'a conexus_auth::ToolCallContext<'a>,
+        ctx: &'a conexus_auth::ToolCallContext<'a>,
     ) -> conexus_auth::BoxFuture<'a, ToolResult> {
         Box::pin(async move {
             let filter_status = arguments.get("filter_status").and_then(Value::as_str);
@@ -482,9 +482,8 @@ impl Tool for GetAgentTokensTool {
                 .collect();
 
             let requesting_agent_id = principal.map(Principal::actor_label).unwrap_or("operator");
-            let guard = conn.lock().await;
             let _ = agent_action_repository::log_agent_action(
-                &guard,
+                ctx.sea_orm_db,
                 requesting_agent_id,
                 "get_agent_tokens",
                 None,
@@ -497,8 +496,8 @@ impl Tool for GetAgentTokensTool {
                     "tokens_exposed": expose_tokens,
                 })),
                 now,
-            );
-            drop(guard);
+            )
+            .await;
 
             let has_more = offset + (agents_data.len() as i64) < total_count;
             let response_data = serde_json::json!({
@@ -818,16 +817,18 @@ impl Tool for RegisterAgentTool {
                 );
             }
 
+            drop(guard);
+
             let requesting_agent_id = principal.map(Principal::actor_label).unwrap_or("operator");
             let _ = agent_action_repository::log_agent_action(
-                &guard,
+                ctx.sea_orm_db,
                 requesting_agent_id,
                 "registered_agent",
                 None,
                 Some(&serde_json::json!({"agent_id": agent_id, "role": role})),
                 now,
-            );
-            drop(guard);
+            )
+            .await;
 
             let project_name_arg = arguments.get("project_name").and_then(Value::as_str);
             let project_for_snippet = resolve_snippet_project(project_name_arg, principal);
@@ -889,7 +890,7 @@ impl Tool for RotateAgentTokenTool {
         arguments: &'a Value,
         conn: &'a AsyncMutex<Connection>,
         now: &'a str,
-        _ctx: &'a conexus_auth::ToolCallContext<'a>,
+        ctx: &'a conexus_auth::ToolCallContext<'a>,
     ) -> conexus_auth::BoxFuture<'a, ToolResult> {
         Box::pin(async move {
             let Some(agent_id) = arguments.get("agent_id").and_then(Value::as_str) else {
@@ -954,8 +955,9 @@ impl Tool for RotateAgentTokenTool {
             // discipline the durable audit trail applies elsewhere.
             let old_suffix = old_token.get(old_token.len().saturating_sub(4)..);
             let new_suffix = &new_token[new_token.len() - 4..];
+            drop(guard);
             let _ = agent_action_repository::log_agent_action(
-                &guard,
+                ctx.sea_orm_db,
                 requesting_agent_id,
                 "rotated_agent_token",
                 None,
@@ -965,8 +967,8 @@ impl Tool for RotateAgentTokenTool {
                     "new_token_suffix": new_suffix,
                 })),
                 now,
-            );
-            drop(guard);
+            )
+            .await;
 
             ToolResult::Ok {
                 data: Some(serde_json::json!({"agent_id": agent_id, "token": new_token})),
@@ -1002,7 +1004,7 @@ impl Tool for RestoreAgentTool {
         arguments: &'a Value,
         conn: &'a AsyncMutex<Connection>,
         now: &'a str,
-        _ctx: &'a conexus_auth::ToolCallContext<'a>,
+        ctx: &'a conexus_auth::ToolCallContext<'a>,
     ) -> conexus_auth::BoxFuture<'a, ToolResult> {
         Box::pin(async move {
             let Some(agent_id) = arguments.get("agent_id").and_then(Value::as_str) else {
@@ -1066,16 +1068,18 @@ impl Tool for RestoreAgentTool {
                 now,
             );
 
+            drop(guard);
+
             let requesting_agent_id = principal.map(Principal::actor_label).unwrap_or("operator");
             let _ = agent_action_repository::log_agent_action(
-                &guard,
+                ctx.sea_orm_db,
                 requesting_agent_id,
                 "restored_agent",
                 None,
                 Some(&serde_json::json!({"agent_id": agent_id})),
                 now,
-            );
-            drop(guard);
+            )
+            .await;
 
             ToolResult::Ok {
                 data: Some(serde_json::json!({"agent_id": agent_id, "status": "created"})),
@@ -1258,16 +1262,18 @@ impl Tool for EditAgentTool {
                 applied.push(field);
             }
 
+            drop(guard);
+
             let requesting_agent_id = principal.map(Principal::actor_label).unwrap_or("operator");
             let _ = agent_action_repository::log_agent_action(
-                &guard,
+                ctx.sea_orm_db,
                 requesting_agent_id,
                 "edited_agent",
                 None,
                 Some(&serde_json::json!({"agent_id": agent_id, "fields": applied})),
                 now,
-            );
-            drop(guard);
+            )
+            .await;
 
             if applied.contains(&"auto_event_loop") {
                 ctx.waiter_registry.notify(agent_id);
@@ -1387,15 +1393,16 @@ impl Tool for TerminateAgentTool {
             // discipline) since it's an audit-completeness quirk, not a
             // security-relevant one -- the capability gate above already
             // requires agents.terminate regardless of who is logged.
+            drop(guard);
             let _ = agent_action_repository::log_agent_action(
-                &guard,
+                ctx.sea_orm_db,
                 "admin",
                 "terminated_agent",
                 None,
                 Some(&serde_json::json!({"agent_id": agent_id})),
                 now,
-            );
-            drop(guard);
+            )
+            .await;
 
             // BL-R10-2: wake every worker so a live wait_for_events
             // waiter picks up the newly-unassigned task(s) immediately
@@ -1770,7 +1777,7 @@ impl Tool for PurgeAgentTool {
             // ordering ("so the action log has a non-tombstoned
             // 'purged_agent' entry").
             let _ = agent_action_repository::log_agent_action(
-                &guard,
+                ctx.sea_orm_db,
                 requesting_agent_id,
                 "purged_agent",
                 None,
@@ -1780,7 +1787,8 @@ impl Tool for PurgeAgentTool {
                     "counts": counts,
                 })),
                 now,
-            );
+            )
+            .await;
 
             if AgentRepository::delete(&guard, agent_id).is_err() {
                 return ToolResult::Failed {
@@ -1855,8 +1863,21 @@ fn require_agents_terminate_capability(principal: Option<&Principal>) -> Option<
 /// wake-loop's own flag-recheck arm; only an SSE-only-connected,
 /// currently-non-parked agent keeps its stream open until its own
 /// natural reconnect.
-pub fn disconnect_agent(
-    conn: &Connection,
+///
+/// Phase G: `conn` is `&tokio::sync::Mutex<Connection>`, not a bare
+/// `&Connection` -- this is `async fn` now (`agent_action_repository`'s
+/// own audit-log write goes through sea-orm), and a bare `&Connection`
+/// parameter would poison this function's returned future's `Send`-
+/// ness the moment it's referenced anywhere in the body (see
+/// `conexus_backend::principal_resolve::resolve_principal`'s own doc
+/// comment for the fully-worked-out rule; same shape as
+/// [`disconnect_all_agents`]'s own doc comment). `conn` is locked ONCE
+/// and the guard held across the `log_agent_action` `.await` below --
+/// safe, since `MutexGuard<Connection>: Send` (unlike a bare
+/// `&Connection`).
+pub async fn disconnect_agent(
+    conn: &tokio::sync::Mutex<Connection>,
+    sea_orm_db: &sea_orm::DatabaseConnection,
     waiter_registry: &conexus_wakeloop::waiter_registry::WaiterRegistry,
     principal: Option<&Principal>,
     agent_id: &str,
@@ -1866,7 +1887,9 @@ pub fn disconnect_agent(
         return denial;
     }
 
-    let Ok(row) = conexus_db::agent_repository::AgentRepository::get_by_id(conn, agent_id) else {
+    let guard = conn.lock().await;
+
+    let Ok(row) = conexus_db::agent_repository::AgentRepository::get_by_id(&guard, agent_id) else {
         return ToolResult::Failed {
             message: "A database error occurred; it has been logged. Retry, or ask an operator \
                 to check logs."
@@ -1883,7 +1906,7 @@ pub fn disconnect_agent(
 
     use conexus_db::agent_repository::{AgentField, AgentRepository, FieldValue};
     if AgentRepository::update_field(
-        conn,
+        &guard,
         agent_id,
         AgentField::AutoEventLoop,
         FieldValue::Bool(false),
@@ -1898,13 +1921,14 @@ pub fn disconnect_agent(
 
     let actor_label = principal.map(Principal::actor_label).unwrap_or("operator");
     let _ = agent_action_repository::log_agent_action(
-        conn,
+        sea_orm_db,
         actor_label,
         "disconnected_agent",
         None,
         Some(&serde_json::json!({"agent_id": agent_id})),
         now,
-    );
+    )
+    .await;
 
     waiter_registry.notify(agent_id);
 
@@ -1925,8 +1949,12 @@ pub fn disconnect_agent(
 /// thing -- unlike disconnect, reconnect has no stream to close at
 /// all in Python either). Flips `auto_event_loop` ON and wakes the
 /// parked long-poll so a still-listening waiter re-checks and resumes.
-pub fn reconnect_agent(
-    conn: &Connection,
+///
+/// Phase G: same `&tokio::sync::Mutex<Connection>` + `sea_orm_db`
+/// shape as [`disconnect_agent`]'s own doc comment explains.
+pub async fn reconnect_agent(
+    conn: &tokio::sync::Mutex<Connection>,
+    sea_orm_db: &sea_orm::DatabaseConnection,
     waiter_registry: &conexus_wakeloop::waiter_registry::WaiterRegistry,
     principal: Option<&Principal>,
     agent_id: &str,
@@ -1936,7 +1964,9 @@ pub fn reconnect_agent(
         return denial;
     }
 
-    let Ok(row) = conexus_db::agent_repository::AgentRepository::get_by_id(conn, agent_id) else {
+    let guard = conn.lock().await;
+
+    let Ok(row) = conexus_db::agent_repository::AgentRepository::get_by_id(&guard, agent_id) else {
         return ToolResult::Failed {
             message: "A database error occurred; it has been logged. Retry, or ask an operator \
                 to check logs."
@@ -1953,7 +1983,7 @@ pub fn reconnect_agent(
 
     use conexus_db::agent_repository::{AgentField, AgentRepository, FieldValue};
     if AgentRepository::update_field(
-        conn,
+        &guard,
         agent_id,
         AgentField::AutoEventLoop,
         FieldValue::Bool(true),
@@ -1968,13 +1998,14 @@ pub fn reconnect_agent(
 
     let actor_label = principal.map(Principal::actor_label).unwrap_or("operator");
     let _ = agent_action_repository::log_agent_action(
-        conn,
+        sea_orm_db,
         actor_label,
         "reconnected_agent",
         None,
         Some(&serde_json::json!({"agent_id": agent_id})),
         now,
-    );
+    )
+    .await;
 
     waiter_registry.notify(agent_id);
 
@@ -2037,13 +2068,14 @@ pub async fn disconnect_all_agents(
     let guard = conn.lock().await;
     let actor_label = principal.map(Principal::actor_label).unwrap_or("operator");
     let _ = agent_action_repository::log_agent_action(
-        &guard,
+        sea_orm_db,
         actor_label,
         "disconnected_all_agents",
         None,
         Some(&serde_json::json!({})),
         now,
-    );
+    )
+    .await;
 
     if let Ok(active) = conexus_db::agent_repository::AgentRepository::list_active(&guard) {
         for agent in active {
@@ -2099,13 +2131,14 @@ pub async fn reconnect_all_agents(
     let guard = conn.lock().await;
     let actor_label = principal.map(Principal::actor_label).unwrap_or("operator");
     let _ = agent_action_repository::log_agent_action(
-        &guard,
+        sea_orm_db,
         actor_label,
         "reconnected_all_agents",
         None,
         Some(&serde_json::json!({})),
         now,
-    );
+    )
+    .await;
 
     if let Ok(active) = conexus_db::agent_repository::AgentRepository::list_active(&guard) {
         for agent in active {
@@ -2414,10 +2447,22 @@ mod tests {
         )
     }
 
-    async fn seed(conn: &AsyncMutex<Connection>, agent_id: &str, action_type: &str, ts: &str) {
-        let guard = conn.lock().await;
-        agent_action_repository::log_agent_action(&guard, agent_id, action_type, None, None, ts)
-            .unwrap();
+    async fn seed(
+        sea_orm_db: &sea_orm::DatabaseConnection,
+        agent_id: &str,
+        action_type: &str,
+        ts: &str,
+    ) {
+        agent_action_repository::log_agent_action(
+            sea_orm_db,
+            agent_id,
+            action_type,
+            None,
+            None,
+            ts,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -2431,8 +2476,8 @@ mod tests {
     #[tokio::test]
     async fn view_audit_log_returns_recent_entries_for_an_operator() {
         let (_dir, conn, sea_orm_db) = setup().await;
-        seed(&conn, "alice", "created_task", "2026-06-01T00:00:00Z").await;
-        seed(&conn, "bob", "deleted_task", "2026-06-01T00:00:01Z").await;
+        seed(&sea_orm_db, "alice", "created_task", "2026-06-01T00:00:00Z").await;
+        seed(&sea_orm_db, "bob", "deleted_task", "2026-06-01T00:00:01Z").await;
         let op = operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
@@ -2458,9 +2503,9 @@ mod tests {
     #[tokio::test]
     async fn view_audit_log_filters_by_agent_id_and_action() {
         let (_dir, conn, sea_orm_db) = setup().await;
-        seed(&conn, "alice", "created_task", "2026-06-01T00:00:00Z").await;
-        seed(&conn, "alice", "deleted_task", "2026-06-01T00:00:01Z").await;
-        seed(&conn, "bob", "deleted_task", "2026-06-01T00:00:02Z").await;
+        seed(&sea_orm_db, "alice", "created_task", "2026-06-01T00:00:00Z").await;
+        seed(&sea_orm_db, "alice", "deleted_task", "2026-06-01T00:00:01Z").await;
+        seed(&sea_orm_db, "bob", "deleted_task", "2026-06-01T00:00:02Z").await;
         let op = operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
@@ -4006,18 +4051,16 @@ mod tests {
         let (_dir, conn, sea_orm_db) = setup().await;
         seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
         seed_task(&conn, "task-1", None, "unassigned", "2026-06-01T00:00:00Z").await;
-        {
-            let guard = conn.lock().await;
-            agent_action_repository::log_agent_action(
-                &guard,
-                "alice",
-                "did_something",
-                None,
-                None,
-                "2026-06-01T00:00:00Z",
-            )
-            .unwrap();
-        }
+        agent_action_repository::log_agent_action(
+            &sea_orm_db,
+            "alice",
+            "did_something",
+            None,
+            None,
+            "2026-06-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();

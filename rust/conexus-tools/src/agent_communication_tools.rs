@@ -965,23 +965,21 @@ async fn send_with_side_effects(
     }?;
 
     if let crate::agent_messaging::SendOutcome::Sent { ref message_id } = outcome {
-        {
-            let guard = conn.lock().await;
-            let _ = conexus_db::agent_action_repository::log_agent_action(
-                &guard,
-                &crate::agent_messaging::sender_label(principal),
-                "send_message",
-                None,
-                Some(&serde_json::json!({
-                    "recipient": recipient_id,
-                    "message_type": message_type,
-                    "priority": priority,
-                    "delivery_status": "stored",
-                    "message_id": message_id,
-                })),
-                now,
-            );
-        }
+        let _ = conexus_db::agent_action_repository::log_agent_action(
+            ctx.sea_orm_db,
+            &crate::agent_messaging::sender_label(principal),
+            "send_message",
+            None,
+            Some(&serde_json::json!({
+                "recipient": recipient_id,
+                "message_type": message_type,
+                "priority": priority,
+                "delivery_status": "stored",
+                "message_id": message_id,
+            })),
+            now,
+        )
+        .await;
         ctx.waiter_registry.notify(&recipient_id);
     }
 
@@ -3023,15 +3021,20 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM agent_messages", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 1);
+        drop(guard);
 
-        // Durable audit row confirmed.
-        let action_count: i64 = guard
-            .query_row(
-                "SELECT COUNT(*) FROM agent_actions WHERE action_type = 'send_message'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
+        // Durable audit row confirmed. `agent_action_repository` is
+        // sea-orm-backed now (Phase G), so this reads through
+        // `sea_orm_db`, not `conn`.
+        let action_count = conexus_db::agent_action_repository::list_recent(
+            &sea_orm_db,
+            None,
+            Some("send_message"),
+            50,
+        )
+        .await
+        .unwrap()
+        .len();
         assert_eq!(action_count, 1);
     }
 
@@ -3416,16 +3419,19 @@ mod tests {
         // Each recipient gets its OWN durable "send_message" audit row
         // (Python's fan-out calls the full send tool impl per
         // recipient, not just a bare write) -- confirmed here, not
-        // assumed.
-        let guard = conn.lock().await;
-        let action_count: i64 = guard
-            .query_row(
-                "SELECT COUNT(*) FROM agent_actions WHERE action_type = 'send_message'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
+        // assumed. `agent_action_repository` is sea-orm-backed now
+        // (Phase G), so this reads through `sea_orm_db`, not `conn`.
+        let action_count = conexus_db::agent_action_repository::list_recent(
+            &sea_orm_db,
+            None,
+            Some("send_message"),
+            50,
+        )
+        .await
+        .unwrap()
+        .len();
         assert_eq!(action_count, 2);
+        let guard = conn.lock().await;
         let message_count: i64 = guard
             .query_row("SELECT COUNT(*) FROM agent_messages", [], |row| row.get(0))
             .unwrap();

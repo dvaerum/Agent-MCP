@@ -281,12 +281,31 @@ fn parse_unassigned_task_specs(arguments: &Value) -> Option<Vec<UnassignedTaskSp
 /// check (a worker may only attach a child under a parent it owns; a
 /// foreign-or-nonexistent parent collapses to the same phantom
 /// `NotFound`, never distinguishing the two).
+/// One `created_unassigned_task` audit-log entry deferred out of
+/// [`create_unassigned_tasks`] -- see that function's own Phase G note
+/// for why the write itself can't happen inside that (sync, `&Connection`-
+/// taking) helper any more.
+struct UnassignedTaskAudit {
+    task_id: String,
+    title: String,
+    mode: &'static str,
+}
+
+/// Phase G: `agent_action_repository` is sea-orm-backed now, so this
+/// still-sync helper (called from inside an open `rusqlite::Transaction`,
+/// via `tx: &Connection`) can no longer write the audit log itself --
+/// it collects [`UnassignedTaskAudit`] entries instead and returns them
+/// alongside the `ToolResult`, for the caller to write via `ctx.sea_orm_db`
+/// AFTER the transaction commits (same established tradeoff as every
+/// other converted `agent_action_repository` call site in this
+/// migration; see `project_settings_tools.rs`'s own doc comment for
+/// the precedent).
 fn create_unassigned_tasks(
     tx: &Connection,
     arguments: &Value,
     worker_created_by: Option<&str>,
     now: &str,
-) -> Result<ToolResult, rusqlite::Error> {
+) -> Result<(ToolResult, Vec<UnassignedTaskAudit>), rusqlite::Error> {
     let creator = worker_created_by.unwrap_or("admin");
 
     let batch = parse_unassigned_task_specs(arguments);
@@ -301,22 +320,28 @@ fn create_unassigned_tasks(
         let parent_ids: Vec<Option<String>> = match &batch {
             Some(specs) => {
                 if specs.iter().any(|s| s.parent_task_id.is_none()) {
-                    return Ok(ToolResult::Conflict {
-                        reason: "Workers cannot create root tasks. Every task filed via \
+                    return Ok((
+                        ToolResult::Conflict {
+                            reason: "Workers cannot create root tasks. Every task filed via \
                             assign_task must specify a parent_task_id -- and the parent \
                             must be a task you own."
-                            .to_string(),
-                    });
+                                .to_string(),
+                        },
+                        Vec::new(),
+                    ));
                 }
                 specs.iter().map(|s| s.parent_task_id.clone()).collect()
             }
             None => {
                 if single_parent.is_none() {
-                    return Ok(ToolResult::Conflict {
-                        reason: "Workers cannot create root tasks. Specify a parent_task_id \
+                    return Ok((
+                        ToolResult::Conflict {
+                            reason: "Workers cannot create root tasks. Specify a parent_task_id \
                             -- a task you own -- when filing an unassigned task."
-                            .to_string(),
-                    });
+                                .to_string(),
+                        },
+                        Vec::new(),
+                    ));
                 }
                 vec![single_parent.clone()]
             }
@@ -335,16 +360,20 @@ fn create_unassigned_tasks(
                     )
                 });
             if !owns {
-                return Ok(ToolResult::NotFound {
-                    resource: "task".to_string(),
-                    identifier: parent_id,
-                    hint: None,
-                });
+                return Ok((
+                    ToolResult::NotFound {
+                        resource: "task".to_string(),
+                        identifier: parent_id,
+                        hint: None,
+                    },
+                    Vec::new(),
+                ));
             }
         }
     }
 
     let mut created: Vec<(String, String, String)> = Vec::new(); // (task_id, title, priority)
+    let mut audit_entries: Vec<UnassignedTaskAudit> = Vec::new();
 
     if let Some(specs) = &batch {
         // R5-F5: single-root guard for the bulk path -- both a
@@ -354,17 +383,20 @@ fn create_unassigned_tasks(
         let parentless_count = specs.iter().filter(|s| s.parent_task_id.is_none()).count();
         if parentless_count > 0 {
             if let Some(conflict) = single_root_conflict(tx) {
-                return Ok(conflict);
+                return Ok((conflict, Vec::new()));
             }
             if parentless_count > 1 {
-                return Ok(ToolResult::Conflict {
-                    reason: format!(
-                        "Cannot create more than one root task in a single batch. This \
+                return Ok((
+                    ToolResult::Conflict {
+                        reason: format!(
+                            "Cannot create more than one root task in a single batch. This \
                          batch has {parentless_count} tasks without a parent_task_id; at \
                          most one task per batch may omit parent_task_id (it becomes the \
                          root). Give the rest a parent_task_id."
-                    ),
-                });
+                        ),
+                    },
+                    Vec::new(),
+                ));
             }
         }
         for spec in specs {
@@ -386,20 +418,17 @@ fn create_unassigned_tasks(
                 },
             )?;
             let _ = link_child_to_parent(tx, spec.parent_task_id.as_deref(), &fresh.task_id, now);
-            let _ = agent_action_repository::log_agent_action(
-                tx,
-                creator,
-                "created_unassigned_task",
-                Some(&fresh.task_id),
-                Some(&serde_json::json!({"title": spec.title, "mode": "unassigned_multiple"})),
-                now,
-            );
+            audit_entries.push(UnassignedTaskAudit {
+                task_id: fresh.task_id.clone(),
+                title: spec.title.clone(),
+                mode: "unassigned_multiple",
+            });
             created.push((fresh.task_id, spec.title.clone(), spec.priority.clone()));
         }
     } else if let (Some(title), Some(description)) = (&single_title, &single_description) {
         if single_parent.is_none() {
             if let Some(conflict) = single_root_conflict(tx) {
-                return Ok(conflict);
+                return Ok((conflict, Vec::new()));
             }
         }
         let fresh = task_repository::create_in_transaction(
@@ -420,22 +449,22 @@ fn create_unassigned_tasks(
             },
         )?;
         let _ = link_child_to_parent(tx, single_parent.as_deref(), &fresh.task_id, now);
-        let _ = agent_action_repository::log_agent_action(
-            tx,
-            creator,
-            "created_unassigned_task",
-            Some(&fresh.task_id),
-            Some(&serde_json::json!({"title": title, "mode": "unassigned_single"})),
-            now,
-        );
+        audit_entries.push(UnassignedTaskAudit {
+            task_id: fresh.task_id.clone(),
+            title: title.clone(),
+            mode: "unassigned_single",
+        });
         created.push((fresh.task_id, title.clone(), single_priority.clone()));
     } else {
-        return Ok(ToolResult::Invalid {
-            field: None,
-            message: "Provide either 'task_title' and 'task_description' for single task, \
+        return Ok((
+            ToolResult::Invalid {
+                field: None,
+                message: "Provide either 'task_title' and 'task_description' for single task, \
                 or 'tasks' array for multiple tasks."
-                .to_string(),
-        });
+                    .to_string(),
+            },
+            Vec::new(),
+        ));
     }
 
     let mut response_parts = vec![
@@ -455,10 +484,13 @@ fn create_unassigned_tasks(
             .to_string(),
     );
 
-    Ok(ToolResult::Ok {
-        data: None,
-        message: Some(response_parts.join("\n")),
-    })
+    Ok((
+        ToolResult::Ok {
+            data: None,
+            message: Some(response_parts.join("\n")),
+        },
+        audit_entries,
+    ))
 }
 
 // ── Mode 3: _assign_to_existing_tasks ───────────────────────────────
@@ -468,13 +500,24 @@ fn create_unassigned_tasks(
 /// non-admin self-claim caller sees the IDENTICAL phantom `NotFound`
 /// for every non-claimable outcome (nonexistent, foreign-owned,
 /// terminal), never learning which case it hit.
+///
+/// Phase G: `agent_action_repository` is sea-orm-backed now, so this
+/// still-sync helper (called from inside an open `rusqlite::Transaction`,
+/// via `tx: &Connection`) no longer writes its own `assigned_task`
+/// audit-log rows -- the caller does, via `ctx.sea_orm_db`, once for
+/// each of `task_ids` AFTER the transaction commits (this function
+/// always reaches the assignment loop unconditionally on every
+/// `task_ids` entry, with no per-item skip, so the caller's own
+/// `task_ids` slice is exactly the audit set -- no need to thread
+/// anything back). Same established tradeoff as every other converted
+/// `agent_action_repository` call site in this migration; see
+/// `project_settings_tools.rs`'s own doc comment for the precedent.
 #[allow(clippy::too_many_arguments)]
 fn assign_to_existing_tasks(
     tx: &Connection,
     target_agent_id: &str,
     task_ids: &[String],
     coordination_notes: Option<&str>,
-    requesting_actor: &str,
     is_admin_request: bool,
     now: &str,
 ) -> Result<ToolResult, rusqlite::Error> {
@@ -597,6 +640,9 @@ fn assign_to_existing_tasks(
         });
     }
 
+    // Phase G: the `agent_action_repository` audit-log write for each
+    // `task_id` here moved to the caller (after `tx` commits) -- see
+    // this function's own Phase G note above.
     for task_id in task_ids {
         let _ = task_repository::update_fields_in_transaction(
             tx,
@@ -607,17 +653,6 @@ fn assign_to_existing_tasks(
                 ),
                 ..Default::default()
             },
-            now,
-        );
-        let _ = agent_action_repository::log_agent_action(
-            tx,
-            requesting_actor,
-            "assigned_task",
-            Some(task_id),
-            Some(&serde_json::json!({
-                "agent_id": target_agent_id,
-                "mode": "existing_task_assignment",
-            })),
             now,
         );
     }
@@ -655,43 +690,64 @@ fn assign_to_existing_tasks(
 
 // ── Mode 2: _create_and_assign_multiple_tasks ───────────────────────
 
+/// `(task_id, title, priority)` per task created -- shared by
+/// [`create_and_assign_multiple_tasks`]'s return shape and its
+/// caller's post-commit `agent_action_repository` audit loop.
+type CreatedTasks = Vec<(String, String, String)>;
+
 /// Port of `_create_and_assign_multiple_tasks` (Mode 2). Admin-only in
 /// practice -- `authorize_assign_task` never routes a worker here
 /// (Mode 2 requires `target_agent_token` + `tasks`, which only an
 /// admin/manager can reach per the permission matrix).
+///
+/// Phase G: `agent_action_repository` is sea-orm-backed now, so this
+/// still-sync helper (called from inside an open `rusqlite::Transaction`,
+/// via `tx: &Connection`) can no longer write the audit log itself --
+/// it returns `created` (`(task_id, title, priority)` per task, already
+/// needed for the response text) alongside the `ToolResult`, for the
+/// caller to write via `ctx.sea_orm_db` AFTER the transaction commits.
+/// Same established tradeoff as every other converted
+/// `agent_action_repository` call site in this migration; see
+/// `project_settings_tools.rs`'s own doc comment for the precedent.
 fn create_and_assign_multiple_tasks(
     tx: &Connection,
     target_agent_id: &str,
     specs: &[UnassignedTaskSpec],
     coordination_notes: Option<&str>,
     now: &str,
-) -> Result<ToolResult, rusqlite::Error> {
+) -> Result<(ToolResult, CreatedTasks), rusqlite::Error> {
     if !agent_assignable(tx, target_agent_id) {
-        return Ok(ToolResult::NotFound {
-            resource: "agent".to_string(),
-            identifier: target_agent_id.to_string(),
-            hint: None,
-        });
+        return Ok((
+            ToolResult::NotFound {
+                resource: "agent".to_string(),
+                identifier: target_agent_id.to_string(),
+                hint: None,
+            },
+            Vec::new(),
+        ));
     }
 
     let parentless_count = specs.iter().filter(|s| s.parent_task_id.is_none()).count();
     if parentless_count > 0 {
         if let Some(conflict) = single_root_conflict(tx) {
-            return Ok(conflict);
+            return Ok((conflict, Vec::new()));
         }
         if parentless_count > 1 {
-            return Ok(ToolResult::Conflict {
-                reason: format!(
-                    "Cannot create more than one root task in a single batch. This batch \
+            return Ok((
+                ToolResult::Conflict {
+                    reason: format!(
+                        "Cannot create more than one root task in a single batch. This batch \
                      has {parentless_count} tasks without a parent_task_id; at most one \
                      task per batch may omit parent_task_id (it becomes the root). Give \
                      the rest a parent_task_id."
-                ),
-            });
+                    ),
+                },
+                Vec::new(),
+            ));
         }
     }
 
-    let mut created: Vec<(String, String, String)> = Vec::new();
+    let mut created: CreatedTasks = Vec::new();
     for spec in specs {
         let fresh = task_repository::create_in_transaction(
             tx,
@@ -711,18 +767,6 @@ fn create_and_assign_multiple_tasks(
             },
         )?;
         let _ = link_child_to_parent(tx, spec.parent_task_id.as_deref(), &fresh.task_id, now);
-        let _ = agent_action_repository::log_agent_action(
-            tx,
-            "admin",
-            "assigned_task",
-            Some(&fresh.task_id),
-            Some(&serde_json::json!({
-                "agent_id": target_agent_id,
-                "title": spec.title,
-                "mode": "multiple_task_creation",
-            })),
-            now,
-        );
         created.push((fresh.task_id, spec.title.clone(), spec.priority.clone()));
     }
 
@@ -756,10 +800,13 @@ fn create_and_assign_multiple_tasks(
         response_parts.push(format!("\n\u{1F4CB} **Coordination Notes:** {notes}"));
     }
 
-    Ok(ToolResult::Ok {
-        data: None,
-        message: Some(response_parts.join("\n")),
-    })
+    Ok((
+        ToolResult::Ok {
+            data: None,
+            message: Some(response_parts.join("\n")),
+        },
+        created,
+    ))
 }
 
 // ── assign_task tool (top-level dispatch) ───────────────────────────
@@ -908,27 +955,56 @@ impl Tool for AssignTaskTool {
                     AssignAuthorization::WorkerFileUnassigned { creator } => Some(creator.as_str()),
                     _ => None,
                 };
-                let tx = match conn.unchecked_transaction() {
-                    Ok(tx) => tx,
-                    Err(_) => {
-                        return ToolResult::Failed {
-                            message: "Database error assigning task".to_string(),
+                // Scoped in its own block so `tx` (a `rusqlite::
+                // Transaction`, not `Send`) is lexically dropped --
+                // not merely logically consumed by `commit()` -- before
+                // the audit-log `.await` below; see the identical
+                // rationale on `UpdateTaskStatusTool::call` (task_tools.rs).
+                let (result, audit_entries) = {
+                    let tx = match conn.unchecked_transaction() {
+                        Ok(tx) => tx,
+                        Err(_) => {
+                            return ToolResult::Failed {
+                                message: "Database error assigning task".to_string(),
+                            }
                         }
-                    }
-                };
-                let result = match create_unassigned_tasks(&tx, arguments, worker_created_by, now) {
-                    Ok(r) => r,
-                    Err(_) => {
-                        return ToolResult::Failed {
-                            message: "Database error assigning task".to_string(),
-                        }
-                    }
-                };
-                if matches!(result, ToolResult::Ok { .. }) {
-                    if tx.commit().is_err() {
+                    };
+                    let (result, audit_entries) =
+                        match create_unassigned_tasks(&tx, arguments, worker_created_by, now) {
+                            Ok(r) => r,
+                            Err(_) => {
+                                return ToolResult::Failed {
+                                    message: "Database error assigning task".to_string(),
+                                }
+                            }
+                        };
+                    if matches!(result, ToolResult::Ok { .. }) && tx.commit().is_err() {
                         return ToolResult::Failed {
                             message: "Database error assigning task".to_string(),
                         };
+                    }
+                    (result, audit_entries)
+                };
+                if matches!(result, ToolResult::Ok { .. }) {
+                    // Phase G: `agent_action_repository` is sea-orm-
+                    // backed now, so these audit-log writes are
+                    // SEPARATE, non-atomic writes AFTER the transaction
+                    // above has already durably committed -- same
+                    // established tradeoff as every other converted
+                    // `agent_action_repository` call site in this
+                    // migration (see `project_settings_tools.rs`'s own
+                    // doc comment for the precedent).
+                    let creator = worker_created_by.unwrap_or("admin");
+                    for entry in &audit_entries {
+                        let _ = agent_action_repository::log_agent_action(
+                            ctx.sea_orm_db,
+                            creator,
+                            "created_unassigned_task",
+                            Some(&entry.task_id),
+                            Some(&serde_json::json!({"title": entry.title, "mode": entry.mode})),
+                            now,
+                        )
+                        .await;
                     }
                     if let Ok(active) = AgentRepository::list_active(&conn) {
                         for agent in active {
@@ -965,35 +1041,64 @@ impl Tool for AssignTaskTool {
 
             if !task_ids.is_empty() {
                 // Mode 3: assign to existing unassigned tasks.
-                let tx = match conn.unchecked_transaction() {
-                    Ok(tx) => tx,
-                    Err(_) => {
-                        return ToolResult::Failed {
-                            message: "Database error assigning task".to_string(),
+                //
+                // Scoped in its own block so `tx` (a `rusqlite::
+                // Transaction`, not `Send`) is lexically dropped -- not
+                // merely logically consumed by `commit()` -- before the
+                // audit-log `.await` below; see the identical rationale
+                // on `UpdateTaskStatusTool::call` (task_tools.rs).
+                let (result, committed) = {
+                    let tx = match conn.unchecked_transaction() {
+                        Ok(tx) => tx,
+                        Err(_) => {
+                            return ToolResult::Failed {
+                                message: "Database error assigning task".to_string(),
+                            }
                         }
-                    }
-                };
-                let result = match assign_to_existing_tasks(
-                    &tx,
-                    &target_agent_id,
-                    &task_ids,
-                    coordination_notes.as_deref(),
-                    &requesting_actor,
-                    is_admin_request,
-                    now,
-                ) {
-                    Ok(r) => r,
-                    Err(_) => {
-                        return ToolResult::Failed {
-                            message: "Database error assigning task".to_string(),
+                    };
+                    let result = match assign_to_existing_tasks(
+                        &tx,
+                        &target_agent_id,
+                        &task_ids,
+                        coordination_notes.as_deref(),
+                        is_admin_request,
+                        now,
+                    ) {
+                        Ok(r) => r,
+                        Err(_) => {
+                            return ToolResult::Failed {
+                                message: "Database error assigning task".to_string(),
+                            }
                         }
-                    }
-                };
-                if matches!(result, ToolResult::Ok { .. }) {
-                    if tx.commit().is_err() {
+                    };
+                    let committed = matches!(result, ToolResult::Ok { .. });
+                    if committed && tx.commit().is_err() {
                         return ToolResult::Failed {
                             message: "Database error assigning task".to_string(),
                         };
+                    }
+                    (result, committed)
+                };
+                if committed {
+                    // Phase G: `agent_action_repository` is sea-orm-
+                    // backed now, so these audit-log writes are
+                    // SEPARATE, non-atomic writes AFTER the transaction
+                    // above has already durably committed -- see
+                    // `assign_to_existing_tasks`'s own Phase G doc
+                    // comment for why the caller (here) owns them.
+                    for task_id in &task_ids {
+                        let _ = agent_action_repository::log_agent_action(
+                            ctx.sea_orm_db,
+                            &requesting_actor,
+                            "assigned_task",
+                            Some(task_id.as_str()),
+                            Some(&serde_json::json!({
+                                "agent_id": target_agent_id,
+                                "mode": "existing_task_assignment",
+                            })),
+                            now,
+                        )
+                        .await;
                     }
                     ctx.waiter_registry.notify(&target_agent_id);
                 }
@@ -1016,33 +1121,63 @@ impl Tool for AssignTaskTool {
                         };
                     }
                 }
-                let tx = match conn.unchecked_transaction() {
-                    Ok(tx) => tx,
-                    Err(_) => {
-                        return ToolResult::Failed {
-                            message: "Database error assigning task".to_string(),
+                // Scoped in its own block so `tx` (a `rusqlite::
+                // Transaction`, not `Send`) is lexically dropped -- not
+                // merely logically consumed by `commit()` -- before the
+                // audit-log `.await` below; see the identical rationale
+                // on `UpdateTaskStatusTool::call` (task_tools.rs).
+                let (result, created, committed) = {
+                    let tx = match conn.unchecked_transaction() {
+                        Ok(tx) => tx,
+                        Err(_) => {
+                            return ToolResult::Failed {
+                                message: "Database error assigning task".to_string(),
+                            }
                         }
-                    }
-                };
-                let result = match create_and_assign_multiple_tasks(
-                    &tx,
-                    &target_agent_id,
-                    specs,
-                    coordination_notes.as_deref(),
-                    now,
-                ) {
-                    Ok(r) => r,
-                    Err(_) => {
-                        return ToolResult::Failed {
-                            message: "Database error assigning task".to_string(),
+                    };
+                    let (result, created) = match create_and_assign_multiple_tasks(
+                        &tx,
+                        &target_agent_id,
+                        specs,
+                        coordination_notes.as_deref(),
+                        now,
+                    ) {
+                        Ok(r) => r,
+                        Err(_) => {
+                            return ToolResult::Failed {
+                                message: "Database error assigning task".to_string(),
+                            }
                         }
-                    }
-                };
-                if matches!(result, ToolResult::Ok { .. }) {
-                    if tx.commit().is_err() {
+                    };
+                    let committed = matches!(result, ToolResult::Ok { .. });
+                    if committed && tx.commit().is_err() {
                         return ToolResult::Failed {
                             message: "Database error assigning task".to_string(),
                         };
+                    }
+                    (result, created, committed)
+                };
+                if committed {
+                    // Phase G: `agent_action_repository` is sea-orm-
+                    // backed now, so these audit-log writes are
+                    // SEPARATE, non-atomic writes AFTER the transaction
+                    // above has already durably committed -- see
+                    // `create_and_assign_multiple_tasks`'s own Phase G
+                    // doc comment for why the caller (here) owns them.
+                    for (task_id, title, _priority) in &created {
+                        let _ = agent_action_repository::log_agent_action(
+                            ctx.sea_orm_db,
+                            "admin",
+                            "assigned_task",
+                            Some(task_id),
+                            Some(&serde_json::json!({
+                                "agent_id": target_agent_id,
+                                "title": title,
+                                "mode": "multiple_task_creation",
+                            })),
+                            now,
+                        )
+                        .await;
                     }
                     ctx.waiter_registry.notify(&target_agent_id);
                 }
@@ -1077,132 +1212,149 @@ impl Tool for AssignTaskTool {
                 }
             }
 
-            let tx = match conn.unchecked_transaction() {
-                Ok(tx) => tx,
-                Err(_) => {
-                    return ToolResult::Failed {
-                        message: "Database error assigning task".to_string(),
-                    }
-                }
-            };
-
-            if !agent_assignable(&tx, &target_agent_id) {
-                return ToolResult::NotFound {
-                    resource: "agent".to_string(),
-                    identifier: target_agent_id.clone(),
-                    hint: None,
-                };
-            }
-
-            if parent_task_id.is_none() {
-                if let Some(conflict) = single_root_conflict(&tx) {
-                    return conflict;
-                }
-            }
-
-            let workload = if validate_agent_workload {
-                analyze_agent_workload(&tx, &target_agent_id, now).ok()
-            } else {
-                None
-            };
-
-            let new_task_id = task_repository::generate_task_id();
-            if !depends_on_tasks.is_empty() {
-                match find_dependency_cycle(&tx, &new_task_id, &depends_on_tasks) {
-                    Ok(Some(cycle)) => {
-                        return ToolResult::Conflict {
-                            reason: format!(
-                                "Cannot create task with depends_on_tasks {depends_on_tasks:?}: \
-                                 would introduce a dependency cycle ({}).",
-                                cycle.join(" -> ")
-                            ),
-                        };
-                    }
-                    Ok(None) => {}
+            // Scoped in its own block so `tx` (a `rusqlite::Transaction`,
+            // not `Send`) is lexically dropped -- not merely logically
+            // consumed by `commit()` -- before the audit-log `.await`
+            // below; see the identical rationale on `UpdateTaskStatusTool::
+            // call` (task_tools.rs).
+            let (new_task_id, fresh_task, workload) = {
+                let tx = match conn.unchecked_transaction() {
+                    Ok(tx) => tx,
                     Err(_) => {
                         return ToolResult::Failed {
                             message: "Database error assigning task".to_string(),
                         }
                     }
-                }
-            }
+                };
 
-            let mut initial_notes: Vec<conexus_db::task_repository::TaskNote> = Vec::new();
-            if let Some(notes) = &coordination_notes {
-                initial_notes.push(conexus_db::task_repository::TaskNote {
-                    timestamp: now.to_string(),
-                    author: Some("admin".to_string()),
-                    content: format!("\u{1F4CB} Coordination: {notes}"),
-                });
-            }
-            if let Some(w) = &workload {
-                let mut content = format!(
-                    "\u{1F464} Agent workload: {} ({} active tasks)",
-                    w.capacity_status, w.total_active_tasks
-                );
-                if let Some(hours) = estimated_hours.as_ref().and_then(Value::as_f64) {
-                    content.push_str(&format!(" | Estimated: {hours}h"));
+                if !agent_assignable(&tx, &target_agent_id) {
+                    return ToolResult::NotFound {
+                        resource: "agent".to_string(),
+                        identifier: target_agent_id.clone(),
+                        hint: None,
+                    };
                 }
-                initial_notes.push(conexus_db::task_repository::TaskNote {
-                    timestamp: now.to_string(),
-                    author: Some("system".to_string()),
-                    content,
-                });
-            }
 
-            let fresh_task = match task_repository::create_in_transaction(
-                &tx,
-                NewTask {
-                    task_id: Some(&new_task_id),
-                    title: task_title,
-                    description: Some(task_description),
-                    assigned_to: Some(&target_agent_id),
-                    created_by: "admin",
-                    status: "pending",
-                    priority: &priority,
-                    parent_task: parent_task_id.as_deref(),
-                    child_tasks: None,
-                    depends_on_tasks: Some(&depends_on_tasks),
-                    notes: Some(&initial_notes),
-                    now,
-                },
-            ) {
-                Ok(row) => row,
-                Err(_) => {
-                    return ToolResult::Failed {
-                        message: "Database error assigning task".to_string(),
+                if parent_task_id.is_none() {
+                    if let Some(conflict) = single_root_conflict(&tx) {
+                        return conflict;
                     }
                 }
-            };
-            let _ = link_child_to_parent(&tx, parent_task_id.as_deref(), &new_task_id, now);
 
-            if let Ok(Some(agent)) = AgentRepository::get_by_id(&tx, &target_agent_id) {
-                if agent.current_task.is_none() {
-                    let _ = AgentRepository::update_field(
-                        &tx,
-                        &target_agent_id,
-                        conexus_db::agent_repository::AgentField::CurrentTask,
-                        conexus_db::agent_repository::FieldValue::OptionalText(Some(
-                            new_task_id.clone(),
-                        )),
-                        now,
-                    );
+                let workload = if validate_agent_workload {
+                    analyze_agent_workload(&tx, &target_agent_id, now).ok()
+                } else {
+                    None
+                };
+
+                let new_task_id = task_repository::generate_task_id();
+                if !depends_on_tasks.is_empty() {
+                    match find_dependency_cycle(&tx, &new_task_id, &depends_on_tasks) {
+                        Ok(Some(cycle)) => {
+                            return ToolResult::Conflict {
+                                reason: format!(
+                                "Cannot create task with depends_on_tasks {depends_on_tasks:?}: \
+                                 would introduce a dependency cycle ({}).",
+                                cycle.join(" -> ")
+                            ),
+                            };
+                        }
+                        Ok(None) => {}
+                        Err(_) => {
+                            return ToolResult::Failed {
+                                message: "Database error assigning task".to_string(),
+                            }
+                        }
+                    }
                 }
-            }
+
+                let mut initial_notes: Vec<conexus_db::task_repository::TaskNote> = Vec::new();
+                if let Some(notes) = &coordination_notes {
+                    initial_notes.push(conexus_db::task_repository::TaskNote {
+                        timestamp: now.to_string(),
+                        author: Some("admin".to_string()),
+                        content: format!("\u{1F4CB} Coordination: {notes}"),
+                    });
+                }
+                if let Some(w) = &workload {
+                    let mut content = format!(
+                        "\u{1F464} Agent workload: {} ({} active tasks)",
+                        w.capacity_status, w.total_active_tasks
+                    );
+                    if let Some(hours) = estimated_hours.as_ref().and_then(Value::as_f64) {
+                        content.push_str(&format!(" | Estimated: {hours}h"));
+                    }
+                    initial_notes.push(conexus_db::task_repository::TaskNote {
+                        timestamp: now.to_string(),
+                        author: Some("system".to_string()),
+                        content,
+                    });
+                }
+
+                let fresh_task = match task_repository::create_in_transaction(
+                    &tx,
+                    NewTask {
+                        task_id: Some(&new_task_id),
+                        title: task_title,
+                        description: Some(task_description),
+                        assigned_to: Some(&target_agent_id),
+                        created_by: "admin",
+                        status: "pending",
+                        priority: &priority,
+                        parent_task: parent_task_id.as_deref(),
+                        child_tasks: None,
+                        depends_on_tasks: Some(&depends_on_tasks),
+                        notes: Some(&initial_notes),
+                        now,
+                    },
+                ) {
+                    Ok(row) => row,
+                    Err(_) => {
+                        return ToolResult::Failed {
+                            message: "Database error assigning task".to_string(),
+                        }
+                    }
+                };
+                let _ = link_child_to_parent(&tx, parent_task_id.as_deref(), &new_task_id, now);
+
+                if let Ok(Some(agent)) = AgentRepository::get_by_id(&tx, &target_agent_id) {
+                    if agent.current_task.is_none() {
+                        let _ = AgentRepository::update_field(
+                            &tx,
+                            &target_agent_id,
+                            conexus_db::agent_repository::AgentField::CurrentTask,
+                            conexus_db::agent_repository::FieldValue::OptionalText(Some(
+                                new_task_id.clone(),
+                            )),
+                            now,
+                        );
+                    }
+                }
+                if tx.commit().is_err() {
+                    return ToolResult::Failed {
+                        message: "Database error assigning task".to_string(),
+                    };
+                }
+
+                (new_task_id, fresh_task, workload)
+            };
+
+            // Phase G: `agent_action_repository` is sea-orm-backed now,
+            // so the audit-log write is a SEPARATE, non-atomic write
+            // AFTER the transaction above has already durably
+            // committed -- same established tradeoff as every other
+            // converted `agent_action_repository` call site in this
+            // migration (see `project_settings_tools.rs`'s own doc
+            // comment for the precedent).
             let _ = agent_action_repository::log_agent_action(
-                &tx,
+                ctx.sea_orm_db,
                 "admin",
                 "assigned_task",
                 Some(&new_task_id),
                 Some(&serde_json::json!({"agent_id": target_agent_id, "title": task_title})),
                 now,
-            );
-
-            if tx.commit().is_err() {
-                return ToolResult::Failed {
-                    message: "Database error assigning task".to_string(),
-                };
-            }
+            )
+            .await;
             ctx.waiter_registry.notify(&target_agent_id);
 
             let mut response_parts = vec![
@@ -1315,7 +1467,7 @@ impl Tool for CreateSelfTaskTool {
         // never calls notify_agent_inbox/notify_unassigned_task_appeared.
         // The creating agent is already active (it's THEIR request);
         // nobody else needs waking for a task that only affects them.
-        _ctx: &'a conexus_auth::ToolCallContext<'a>,
+        ctx: &'a conexus_auth::ToolCallContext<'a>,
     ) -> conexus_auth::BoxFuture<'a, ToolResult> {
         Box::pin(async move {
             let principal = principal.expect("Cap-gated tool always has a resolved principal");
@@ -1360,172 +1512,190 @@ impl Tool for CreateSelfTaskTool {
                     .and_then(|a| a.current_task)
             };
 
-            let tx = match conn.unchecked_transaction() {
-                Ok(tx) => tx,
-                Err(_) => {
-                    return ToolResult::Failed {
-                        message: "Database error creating self task".to_string(),
-                    }
-                }
-            };
-
-            // Hierarchy: agents can NEVER create root tasks.
-            if requesting_agent_id != "admin" && actual_parent_task_id.is_none() {
-                let suggested = tx
-                    .query_row(
-                        "SELECT task_id, title FROM tasks WHERE assigned_to = ?1 OR \
-                         created_by = ?1 ORDER BY created_at DESC LIMIT 1",
-                        [requesting_agent_id.as_str()],
-                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-                    )
-                    .ok();
-                let suggestion_text = suggested
-                    .map(|(id, title)| format!("\nSuggested parent: {id} ({title})"))
-                    .unwrap_or_default();
-                return ToolResult::Conflict {
-                    reason: format!(
-                        "Agents cannot create root tasks. Every task must have a \
-                         parent.{suggestion_text}\nPlease specify a parent_task_id."
-                    ),
-                };
-            }
-
-            if actual_parent_task_id.is_none() {
-                if let Some(conflict) = single_root_conflict(&tx) {
-                    return conflict;
-                }
-            }
-
-            // AZ-R19-1 / R4-F5: a non-privileged caller may only parent
-            // (or depend) under a task it OWNS; foreign-or-nonexistent
-            // collapses to the same phantom NotFound.
-            let is_privileged = principal.has_capability(Capability::TasksAssign);
-            if !is_privileged {
-                if let Some(parent_id) = &actual_parent_task_id {
-                    let owns = task_repository::get_by_id_in_transaction(&tx, parent_id)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|p| {
-                            can_access_task(
-                                p.assigned_to.as_deref(),
-                                Some(p.created_by.as_str()),
-                                Some(requesting_agent_id.as_str()),
-                                false,
-                                false,
-                                false,
-                                false,
-                            )
-                        });
-                    if !owns {
-                        return ToolResult::NotFound {
-                            resource: "task".to_string(),
-                            identifier: parent_id.clone(),
-                            hint: None,
-                        };
-                    }
-                }
-                for dep_id in &depends_on_tasks {
-                    let owns = task_repository::get_by_id_in_transaction(&tx, dep_id)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|d| {
-                            can_access_task(
-                                d.assigned_to.as_deref(),
-                                Some(d.created_by.as_str()),
-                                Some(requesting_agent_id.as_str()),
-                                false,
-                                false,
-                                false,
-                                false,
-                            )
-                        });
-                    if !owns {
-                        return ToolResult::NotFound {
-                            resource: "task".to_string(),
-                            identifier: dep_id.clone(),
-                            hint: None,
-                        };
-                    }
-                }
-            }
-
-            let new_task_id = task_repository::generate_task_id();
-            if !depends_on_tasks.is_empty() {
-                match find_dependency_cycle(&tx, &new_task_id, &depends_on_tasks) {
-                    Ok(Some(cycle)) => {
-                        return ToolResult::Conflict {
-                            reason: format!(
-                                "Cannot create task with depends_on_tasks {depends_on_tasks:?}: \
-                                 would introduce a dependency cycle ({}).",
-                                cycle.join(" -> ")
-                            ),
-                        };
-                    }
-                    Ok(None) => {}
+            // Scoped in its own block so `tx` (a `rusqlite::Transaction`,
+            // not `Send`) is lexically dropped -- not merely logically
+            // consumed by `commit()` -- before the audit-log `.await`
+            // below; see the identical rationale on `UpdateTaskStatusTool::
+            // call` (task_tools.rs).
+            let new_task_id = {
+                let tx = match conn.unchecked_transaction() {
+                    Ok(tx) => tx,
                     Err(_) => {
                         return ToolResult::Failed {
                             message: "Database error creating self task".to_string(),
                         }
                     }
-                }
-            }
+                };
 
-            let fresh_task = match task_repository::create_in_transaction(
-                &tx,
-                NewTask {
-                    task_id: Some(&new_task_id),
-                    title: &task_title,
-                    description: Some(&task_description),
-                    assigned_to: Some(&requesting_agent_id),
-                    created_by: &requesting_agent_id,
-                    status: "pending",
-                    priority: &priority,
-                    parent_task: actual_parent_task_id.as_deref(),
-                    child_tasks: None,
-                    depends_on_tasks: Some(&depends_on_tasks),
-                    notes: None,
-                    now,
-                },
-            ) {
-                Ok(row) => row,
-                Err(_) => {
+                // Hierarchy: agents can NEVER create root tasks.
+                if requesting_agent_id != "admin" && actual_parent_task_id.is_none() {
+                    let suggested = tx
+                        .query_row(
+                            "SELECT task_id, title FROM tasks WHERE assigned_to = ?1 OR \
+                         created_by = ?1 ORDER BY created_at DESC LIMIT 1",
+                            [requesting_agent_id.as_str()],
+                            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                        )
+                        .ok();
+                    let suggestion_text = suggested
+                        .map(|(id, title)| format!("\nSuggested parent: {id} ({title})"))
+                        .unwrap_or_default();
+                    return ToolResult::Conflict {
+                        reason: format!(
+                            "Agents cannot create root tasks. Every task must have a \
+                         parent.{suggestion_text}\nPlease specify a parent_task_id."
+                        ),
+                    };
+                }
+
+                if actual_parent_task_id.is_none() {
+                    if let Some(conflict) = single_root_conflict(&tx) {
+                        return conflict;
+                    }
+                }
+
+                // AZ-R19-1 / R4-F5: a non-privileged caller may only parent
+                // (or depend) under a task it OWNS; foreign-or-nonexistent
+                // collapses to the same phantom NotFound.
+                let is_privileged = principal.has_capability(Capability::TasksAssign);
+                if !is_privileged {
+                    if let Some(parent_id) = &actual_parent_task_id {
+                        let owns = task_repository::get_by_id_in_transaction(&tx, parent_id)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|p| {
+                                can_access_task(
+                                    p.assigned_to.as_deref(),
+                                    Some(p.created_by.as_str()),
+                                    Some(requesting_agent_id.as_str()),
+                                    false,
+                                    false,
+                                    false,
+                                    false,
+                                )
+                            });
+                        if !owns {
+                            return ToolResult::NotFound {
+                                resource: "task".to_string(),
+                                identifier: parent_id.clone(),
+                                hint: None,
+                            };
+                        }
+                    }
+                    for dep_id in &depends_on_tasks {
+                        let owns = task_repository::get_by_id_in_transaction(&tx, dep_id)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|d| {
+                                can_access_task(
+                                    d.assigned_to.as_deref(),
+                                    Some(d.created_by.as_str()),
+                                    Some(requesting_agent_id.as_str()),
+                                    false,
+                                    false,
+                                    false,
+                                    false,
+                                )
+                            });
+                        if !owns {
+                            return ToolResult::NotFound {
+                                resource: "task".to_string(),
+                                identifier: dep_id.clone(),
+                                hint: None,
+                            };
+                        }
+                    }
+                }
+
+                let new_task_id = task_repository::generate_task_id();
+                if !depends_on_tasks.is_empty() {
+                    match find_dependency_cycle(&tx, &new_task_id, &depends_on_tasks) {
+                        Ok(Some(cycle)) => {
+                            return ToolResult::Conflict {
+                                reason: format!(
+                                "Cannot create task with depends_on_tasks {depends_on_tasks:?}: \
+                                 would introduce a dependency cycle ({}).",
+                                cycle.join(" -> ")
+                            ),
+                            };
+                        }
+                        Ok(None) => {}
+                        Err(_) => {
+                            return ToolResult::Failed {
+                                message: "Database error creating self task".to_string(),
+                            }
+                        }
+                    }
+                }
+
+                let fresh_task = match task_repository::create_in_transaction(
+                    &tx,
+                    NewTask {
+                        task_id: Some(&new_task_id),
+                        title: &task_title,
+                        description: Some(&task_description),
+                        assigned_to: Some(&requesting_agent_id),
+                        created_by: &requesting_agent_id,
+                        status: "pending",
+                        priority: &priority,
+                        parent_task: actual_parent_task_id.as_deref(),
+                        child_tasks: None,
+                        depends_on_tasks: Some(&depends_on_tasks),
+                        notes: None,
+                        now,
+                    },
+                ) {
+                    Ok(row) => row,
+                    Err(_) => {
+                        return ToolResult::Failed {
+                            message: "Database error creating self task".to_string(),
+                        }
+                    }
+                };
+                let _ =
+                    link_child_to_parent(&tx, actual_parent_task_id.as_deref(), &new_task_id, now);
+
+                if requesting_agent_id != "admin" {
+                    if let Ok(Some(agent)) = AgentRepository::get_by_id(&tx, &requesting_agent_id) {
+                        if agent.current_task.is_none() {
+                            let _ = AgentRepository::update_field(
+                                &tx,
+                                &requesting_agent_id,
+                                conexus_db::agent_repository::AgentField::CurrentTask,
+                                conexus_db::agent_repository::FieldValue::OptionalText(Some(
+                                    new_task_id.clone(),
+                                )),
+                                now,
+                            );
+                        }
+                    }
+                }
+                if tx.commit().is_err() {
                     return ToolResult::Failed {
                         message: "Database error creating self task".to_string(),
-                    }
+                    };
                 }
-            };
-            let _ = link_child_to_parent(&tx, actual_parent_task_id.as_deref(), &new_task_id, now);
+                let _ = fresh_task;
 
-            if requesting_agent_id != "admin" {
-                if let Ok(Some(agent)) = AgentRepository::get_by_id(&tx, &requesting_agent_id) {
-                    if agent.current_task.is_none() {
-                        let _ = AgentRepository::update_field(
-                            &tx,
-                            &requesting_agent_id,
-                            conexus_db::agent_repository::AgentField::CurrentTask,
-                            conexus_db::agent_repository::FieldValue::OptionalText(Some(
-                                new_task_id.clone(),
-                            )),
-                            now,
-                        );
-                    }
-                }
-            }
+                new_task_id
+            };
+
+            // Phase G: `agent_action_repository` is sea-orm-backed now,
+            // so the audit-log write is a SEPARATE, non-atomic write
+            // AFTER the transaction above has already durably
+            // committed -- same established tradeoff as every other
+            // converted `agent_action_repository` call site in this
+            // migration (see `project_settings_tools.rs`'s own doc
+            // comment for the precedent).
             let _ = agent_action_repository::log_agent_action(
-                &tx,
+                ctx.sea_orm_db,
                 &requesting_agent_id,
                 "created_self_task",
                 Some(&new_task_id),
                 Some(&serde_json::json!({"title": task_title})),
                 now,
-            );
-
-            if tx.commit().is_err() {
-                return ToolResult::Failed {
-                    message: "Database error creating self task".to_string(),
-                };
-            }
-            let _ = fresh_task;
+            )
+            .await;
 
             ToolResult::Ok {
                 data: Some(serde_json::json!({"task_id": new_task_id})),
@@ -1564,10 +1734,14 @@ mod tests {
 
     // `call_assign`'s own `sea_orm_db` is a throwaway `:memory:`
     // connection, discarded once the call returns -- unreachable for a
-    // POST-call `task_repository::list_all` assertion. Tests that need
-    // to verify the write landed use this real-temp-file-backed `conn`
-    // instead, then open a FRESH sea-orm connection to the SAME path
-    // afterward (never reusing `call_assign`'s own internal one).
+    // POST-call `task_repository::list_all` (or, Phase G,
+    // `agent_action_repository`) assertion. Tests that need to verify
+    // the write landed use this real-temp-file-backed `conn` instead:
+    // either open a FRESH sea-orm connection to the SAME path
+    // afterward for a post-call read, or pass one to
+    // `call_assign_with_sea_orm` up front when the assertion needs to
+    // see a write the CALL ITSELF made through `sea_orm_db` (its own
+    // audit-log row).
     fn test_conn_file() -> (
         tempfile::TempDir,
         std::path::PathBuf,
@@ -1664,14 +1838,30 @@ mod tests {
         principal: &Principal,
         conn: &AsyncMutex<Connection>,
     ) -> ToolResult {
+        let sea_orm_db = test_sea_orm_db().await;
+        call_assign_with_sea_orm(args, principal, conn, &sea_orm_db).await
+    }
+
+    // `call_assign`'s own `sea_orm_db` is a throwaway `:memory:`
+    // connection, discarded once the call returns -- unreachable for a
+    // POST-call assertion (`agent_action_repository`'s own audit-log
+    // write, Phase G, now goes through it too). A test that needs to
+    // verify EITHER a task row OR an audit row landed uses this variant
+    // instead, passing a real-temp-file-backed `sea_orm_db` that shares
+    // `conn`'s own `test_conn_file()` path.
+    async fn call_assign_with_sea_orm(
+        args: Value,
+        principal: &Principal,
+        conn: &AsyncMutex<Connection>,
+        sea_orm_db: &sea_orm::DatabaseConnection,
+    ) -> ToolResult {
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
-            &sea_orm_db,
+            sea_orm_db,
         );
         AssignTaskTool::call(Some(principal), &args, conn, NOW, &ctx).await
     }
@@ -1869,7 +2059,12 @@ mod tests {
             let guard = conn.lock().await;
             seed_task(&guard, "root", "pending", Some("bob"), "bob", None);
         }
-        let result = call_assign(
+        // Phase G: `agent_action_repository`'s own audit-log write now
+        // goes through `sea_orm_db` too -- shares `conn`'s real file so
+        // the post-call assertion below can see it (see
+        // `call_assign_with_sea_orm`'s own doc for why).
+        let db = reconnect_sea_orm(&db_path).await;
+        let result = call_assign_with_sea_orm(
             serde_json::json!({
                 "task_title": "worker filed this",
                 "task_description": "triage me",
@@ -1877,10 +2072,10 @@ mod tests {
             }),
             &worker("bob"),
             &conn,
+            &db,
         )
         .await;
         assert!(matches!(result, ToolResult::Ok { .. }));
-        let db = reconnect_sea_orm(&db_path).await;
         let rows = task_repository::list_all(&db, None).await.unwrap();
         let new_task = rows
             .iter()
@@ -1890,15 +2085,18 @@ mod tests {
             new_task.created_by, "bob",
             "Mode-0 must record the real worker as created_by, not 'admin'"
         );
-        let guard = conn.lock().await;
-        let audit_actor: String = guard
-            .query_row(
-                "SELECT agent_id FROM agent_actions WHERE action_type = 'created_unassigned_task' \
-                 ORDER BY timestamp DESC LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let audit_actor = conexus_db::agent_action_repository::list_recent(
+            &db,
+            None,
+            Some("created_unassigned_task"),
+            50,
+        )
+        .await
+        .unwrap()
+        .last()
+        .expect("no audit row found")
+        .agent_id
+        .clone();
         assert_eq!(
             audit_actor, "bob",
             "audit actor for the Mode-0 create must be the worker, not 'admin'"
@@ -2005,7 +2203,13 @@ mod tests {
 
     #[tokio::test]
     async fn mode3_worker_self_claims_an_unassigned_task() {
-        let conn = test_conn();
+        // Real-temp-file-backed `conn` (not the plain in-memory
+        // `test_conn()`) -- Phase G's `agent_action_repository` audit
+        // write now goes through a sea-orm connection shared with
+        // `conn` via `call_assign_with_sea_orm`, needed for the
+        // post-call audit-actor assertion below (see that helper's own
+        // doc).
+        let (_dir, db_path, conn) = test_conn_file();
         {
             let guard = conn.lock().await;
             seed_agent(&guard, "bob");
@@ -2015,10 +2219,12 @@ mod tests {
             seed_task(&guard, "root", "pending", None, "alice", None);
             seed_task(&guard, "t1", "pending", None, "alice", Some("root"));
         }
-        let result = call_assign(
+        let db = reconnect_sea_orm(&db_path).await;
+        let result = call_assign_with_sea_orm(
             serde_json::json!({"task_ids": ["t1"]}),
             &worker("bob"),
             &conn,
+            &db,
         )
         .await;
         assert!(matches!(result, ToolResult::Ok { .. }));
@@ -2027,18 +2233,19 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(row.assigned_to.as_deref(), Some("bob"));
+        drop(guard);
         // OBS-R17-AZ (ported from `tests/test_sec_r17_request_assist_
         // oracle.py::test_mode3_self_claim_audit_actor_is_worker`): the
         // audit record must attribute the self-claim to the REAL
         // requesting worker, not a hardcoded "admin" literal.
-        let audit_actor: String = guard
-            .query_row(
-                "SELECT agent_id FROM agent_actions WHERE action_type = 'assigned_task' \
-                 ORDER BY timestamp DESC LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let audit_actor =
+            conexus_db::agent_action_repository::list_recent(&db, None, Some("assigned_task"), 50)
+                .await
+                .unwrap()
+                .last()
+                .expect("no audit row found")
+                .agent_id
+                .clone();
         assert_eq!(audit_actor, "bob");
     }
 
@@ -2824,14 +3031,30 @@ mod create_self_task_tests {
     }
 
     async fn call(args: Value, principal: &Principal, conn: &AsyncMutex<Connection>) -> ToolResult {
+        let sea_orm_db = test_sea_orm_db().await;
+        call_with_sea_orm(args, principal, conn, &sea_orm_db).await
+    }
+
+    // `call`'s own `sea_orm_db` is a throwaway `:memory:` connection,
+    // discarded once the call returns -- unreachable for a POST-call
+    // `agent_action_repository` assertion (Phase G: its audit-log write
+    // now goes through sea-orm too). A test that needs to verify the
+    // audit row landed uses this variant instead, passing a real-temp-
+    // file-backed `sea_orm_db` that shares `conn`'s own
+    // `test_conn_file()` path.
+    async fn call_with_sea_orm(
+        args: Value,
+        principal: &Principal,
+        conn: &AsyncMutex<Connection>,
+        sea_orm_db: &sea_orm::DatabaseConnection,
+    ) -> ToolResult {
         let registry = WaiterRegistry::new();
         let file_map = conexus_wakeloop::file_map::FileMap::new();
-        let sea_orm_db = test_sea_orm_db().await;
         let ctx = conexus_auth::ToolCallContext::off_wire(
             &registry,
             &file_map,
             std::path::Path::new("/tmp"),
-            &sea_orm_db,
+            sea_orm_db,
         );
         CreateSelfTaskTool::call(Some(principal), &args, conn, NOW, &ctx).await
     }
@@ -3036,25 +3259,33 @@ mod create_self_task_tests {
 
     #[tokio::test]
     async fn writes_a_durable_audit_row() {
-        let conn = test_conn();
+        // Real-temp-file-backed `conn` (not the plain in-memory
+        // `test_conn()`) -- Phase G's `agent_action_repository` audit
+        // write now goes through a sea-orm connection shared with
+        // `conn` via `call_with_sea_orm`, needed for the post-call
+        // assertion below (see that helper's own doc).
+        let (_dir, db_path, conn) = test_conn_file();
         {
             let guard = conn.lock().await;
             seed_task(&guard, "root", Some("bob"), "bob", None);
         }
-        call(
+        let db = reconnect_sea_orm(&db_path).await;
+        call_with_sea_orm(
             serde_json::json!({"task_title": "x", "task_description": "desc", "parent_task_id": "root"}),
             &worker("bob"),
             &conn,
+            &db,
         )
         .await;
-        let guard = conn.lock().await;
-        let count: i64 = guard
-            .query_row(
-                "SELECT COUNT(*) FROM agent_actions WHERE action_type = 'created_self_task'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let count = conexus_db::agent_action_repository::list_recent(
+            &db,
+            None,
+            Some("created_self_task"),
+            50,
+        )
+        .await
+        .unwrap()
+        .len();
         assert_eq!(count, 1);
     }
 }
