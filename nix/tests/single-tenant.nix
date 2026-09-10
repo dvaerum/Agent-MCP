@@ -424,7 +424,7 @@ pkgs.testers.nixosTest {
     # assertion before this one.
     machine.succeed(
         "curl -fsS -c /tmp/agent-mcp-cookies.txt "
-        "-F username=ci-sentinel -F password=ci-sentinel-pw "
+        "--data 'username=ci-sentinel&password=ci-sentinel-pw' "
         "http://127.0.0.1:${toString ports.routerPort}/agent-mcp/login"
     )
     machine.succeed(

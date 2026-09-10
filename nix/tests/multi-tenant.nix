@@ -226,7 +226,7 @@ pkgs.testers.nixosTest {
     # the cookie jar persists across the rest of the test.
     machine.succeed(
         "curl -fsS -c /tmp/agent-mcp-cookies.txt "
-        "-F username=ci-sentinel -F password=ci-sentinel-pw "
+        "--data 'username=ci-sentinel&password=ci-sentinel-pw' "
         "http://127.0.0.1:${toString ports.routerPort}/agent-mcp/login"
     )
 
