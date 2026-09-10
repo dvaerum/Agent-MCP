@@ -444,7 +444,14 @@ pub fn decide_create_project(
         )));
     }
 
-    match registry.register(&name, &workspace.to_string_lossy(), "python", now) {
+    // Phase F (prancy-napping-pie): a brand-new project always gets
+    // the Rust backend -- the Python implementation is fully
+    // superseded in production and staged for deletion. This is
+    // deliberately NOT `project_registry::DEFAULT_BACKEND_IMPL`
+    // ("python"), which is a DIFFERENT concern: how to interpret a
+    // truly legacy on-disk record with no `backend_impl` key at all
+    // (predating this field), not the default for a new one.
+    match registry.register(&name, &workspace.to_string_lossy(), "rust", now) {
         Ok(_) => {}
         Err(e @ (RegistryError::ProjectNameTaken(_) | RegistryError::AliasCollision(_))) => {
             return Ok(CreateProjectOutcome::Rejected(map_create_registry_error(
@@ -984,6 +991,35 @@ mod tests {
         assert_eq!(
             membership_rows, 0,
             "this function no longer grants membership itself"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_newly_created_project_registers_with_the_rust_backend_impl() {
+        // Phase F (prancy-napping-pie): the Python backend is fully
+        // superseded in production (both live projects already run
+        // Rust) and staged for deletion -- a brand-new project must
+        // never default to the now-dead "python" implementation.
+        let (_dir, c, db) = conn_with_sea_orm().await;
+        let uid = seed_user(&db, "alice").await;
+        let dir = tempfile::tempdir().unwrap();
+        let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
+        let parent = dir.path().join("workspaces");
+
+        decide_create_project(
+            &c,
+            &registry,
+            &parent,
+            false,
+            Some(&uid),
+            Some(&serde_json::json!("proj-a")),
+            now_dt(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            registry.get("proj-a").unwrap().unwrap().backend_impl,
+            "rust"
         );
     }
 
