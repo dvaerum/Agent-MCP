@@ -5,25 +5,32 @@
  * each group on the groups dashboard) via a description registry at
  * ``agent_mcp/dashboard/lib/capability-descriptions.ts``. The
  * canonical list of capability strings lives in
- * ``agent_mcp/core/capabilities.py`` — ``KNOWN_CAPABILITIES``.
+ * ``rust/conexus-core/src/capability.rs`` — the ``Capability`` enum's
+ * ``as_str()`` method (Phase F, prancy-napping-pie: this test used to
+ * parse ``agent_mcp/core/capabilities.py``'s ``KNOWN_CAPABILITIES``
+ * frozenset, deleted along with the rest of the Python source tree —
+ * ``Capability``/``Capability::ALL`` is its direct, already-existing
+ * Rust replacement, "the Rust equivalent of KNOWN_CAPABILITIES" per
+ * that enum's own doc comment).
  *
  * This test enforces two-way completeness:
  *
- *  1. **Every cap in ``KNOWN_CAPABILITIES`` has a description.**
+ *  1. **Every cap in the Rust ``Capability`` enum has a description.**
  *     Adding a new cap to the backend without a description means the
  *     dashboard shows an empty tooltip — fails CI.
  *
- *  2. **Every key in the description registry exists in
- *     ``KNOWN_CAPABILITIES``.**  Stale entries (cap removed from the
- *     backend, description forgotten) clutter the dashboard list with
- *     phantom capabilities that the resolver never grants — fails CI.
+ *  2. **Every key in the description registry exists in the Rust
+ *     enum.**  Stale entries (cap removed from the backend,
+ *     description forgotten) clutter the dashboard list with phantom
+ *     capabilities that the resolver never grants — fails CI.
  *
- * Implementation: parse the Python source for ``KNOWN_CAPABILITIES``
- * (a frozenset literal with one cap-string per line) rather than
- * shelling out to Python. Keeps the dashboard test suite self-contained
- * — no Python dep, no subprocess, no test fixtures — and the parse
- * is robust to comment lines and leading whitespace because we only
- * accept matches inside double-quoted strings.
+ * Implementation: parse the Rust source for ``as_str()``'s match arms
+ * (one ``Capability::Variant => "dotted.string",`` per line) rather
+ * than shelling out to `cargo`/a real Rust toolchain. Keeps the
+ * dashboard test suite self-contained — no Rust dep, no subprocess,
+ * no test fixtures — and the parse is robust to comment lines and
+ * leading whitespace because we only accept matches inside
+ * double-quoted strings on a ``=>`` line.
  */
 
 import { describe, expect, it } from "vitest"
@@ -33,37 +40,41 @@ import { resolve } from "node:path"
 import { CAPABILITY_DESCRIPTIONS } from "@/lib/capability-descriptions"
 
 // Resolve relative to this test file so the test runs identically
-// from the dashboard dir, repo root, or CI cwd. The Python source
-// lives at <repo>/agent_mcp/core/capabilities.py, four levels up
-// from this file: agent_mcp/dashboard/tests/<this>.test.ts.
+// from the dashboard dir, repo root, or CI cwd. The Rust source lives
+// at <repo>/rust/conexus-core/src/capability.rs, five levels up from
+// this file: agent_mcp/dashboard/tests/<this>.test.ts.
 const DASHBOARD_ROOT = resolve(__dirname, "..")
-const CAPABILITIES_PY = resolve(
+const CAPABILITY_RS = resolve(
   DASHBOARD_ROOT,
   "..",
-  "core",
-  "capabilities.py",
+  "..",
+  "rust",
+  "conexus-core",
+  "src",
+  "capability.rs",
 )
 
 function parseKnownCapabilities(): Set<string> {
-  const src = readFileSync(CAPABILITIES_PY, "utf8")
-  // Find the KNOWN_CAPABILITIES frozenset literal. Match from
-  // ``KNOWN_CAPABILITIES`` up to the closing ``})``. The body is a
-  // multi-line ``frozenset({...})`` with one cap-string per line.
+  const src = readFileSync(CAPABILITY_RS, "utf8")
+  // Find the `as_str()` match body. Match from `fn as_str` up to the
+  // closing `}` of the match block (the next line starting with a
+  // lone `}` at the same indent as `match self {`).
   const match = src.match(
-    /KNOWN_CAPABILITIES\s*:\s*frozenset\[str\]\s*=\s*frozenset\(\{([\s\S]*?)\}\)/m,
+    /fn as_str\(&self\) -> &'static str \{\s*match self \{([\s\S]*?)\n\s*\}\s*\n\s*\}/m,
   )
   if (!match) {
     throw new Error(
-      "could not locate KNOWN_CAPABILITIES literal in " + CAPABILITIES_PY,
+      "could not locate Capability::as_str()'s match body in " +
+        CAPABILITY_RS,
     )
   }
   const body = match[1]!
-  // Each cap is a double-quoted string. Comments may appear; we want
-  // only the quoted strings.
-  const caps = [...body.matchAll(/"([^"]+)"/g)].map((m) => m[1]!)
+  // Each arm's RHS is a double-quoted string after `=>`. We want only
+  // those, not the `Capability::Variant` LHS.
+  const caps = [...body.matchAll(/=>\s*"([^"]+)"/g)].map((m) => m[1]!)
   if (caps.length === 0) {
     throw new Error(
-      "parsed zero capabilities from KNOWN_CAPABILITIES — regex broke?",
+      "parsed zero capabilities from Capability::as_str() — regex broke?",
     )
   }
   return new Set(caps)
@@ -73,28 +84,28 @@ describe("capability descriptions registry", () => {
   const known = parseKnownCapabilities()
   const described = new Set(Object.keys(CAPABILITY_DESCRIPTIONS))
 
-  it("covers every member of KNOWN_CAPABILITIES", () => {
+  it("covers every member of the Rust Capability enum", () => {
     const missing = [...known].filter((cap) => !described.has(cap)).sort()
     expect(
       missing,
       `Capability descriptions registry is missing entries for ` +
-        `${missing.length} cap(s) present in KNOWN_CAPABILITIES:\n  ` +
+        `${missing.length} cap(s) present in Capability::as_str():\n  ` +
         missing.join("\n  ") +
         "\nAdd a one-line description in " +
         "agent_mcp/dashboard/lib/capability-descriptions.ts.",
     ).toEqual([])
   })
 
-  it("has no orphan entries (every key is in KNOWN_CAPABILITIES)", () => {
+  it("has no orphan entries (every key is in the Rust Capability enum)", () => {
     const orphans = [...described].filter((cap) => !known.has(cap)).sort()
     expect(
       orphans,
       `Capability descriptions registry has ${orphans.length} orphan ` +
         `entr${orphans.length === 1 ? "y" : "ies"} not present in ` +
-        `KNOWN_CAPABILITIES:\n  ` +
+        `Capability::as_str():\n  ` +
         orphans.join("\n  ") +
-        "\nEither add the cap to KNOWN_CAPABILITIES in " +
-        "agent_mcp/core/capabilities.py, or drop the description.",
+        "\nEither add the cap to the Capability enum in " +
+        "rust/conexus-core/src/capability.rs, or drop the description.",
     ).toEqual([])
   })
 
