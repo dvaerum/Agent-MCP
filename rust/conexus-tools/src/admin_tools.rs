@@ -1704,8 +1704,12 @@ impl Tool for PurgeAgentTool {
                         .to_string(),
                 };
             }
-            let _ =
-                conexus_db::message_repository::rename_participant(&guard, agent_id, &tombstone);
+            let _ = conexus_db::message_repository::rename_participant(
+                ctx.sea_orm_db,
+                agent_id,
+                &tombstone,
+            )
+            .await;
             let _ = guard.execute(
                 "UPDATE tasks SET created_by = ?1 WHERE created_by = ?2",
                 (&tombstone, agent_id),
