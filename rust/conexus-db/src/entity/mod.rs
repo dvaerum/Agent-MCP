@@ -20,6 +20,7 @@
 //! settle the module's own shape/conventions on the smallest possible
 //! tables before repeating it 11 more times.
 
+pub mod agent;
 pub mod agent_action;
 pub mod claude_code_session;
 pub mod file_metadata;
