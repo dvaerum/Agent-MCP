@@ -1,25 +1,22 @@
-"""Static-grep guards for the Phase 1 PR D dashboard auth migration.
+"""Static-grep guards for the dashboard's session-cookie auth surface.
 
 Asserts that:
 
-  * Mutation handlers in the per-resource router modules under
-    ``agent_mcp/app/routers/`` no longer read ``body['token']`` /
-    ``data.get('token')`` to authenticate (auth moved to the
-    ``require_operator_session`` dependency). Reads in the dep
-    itself are allow-listed.
-  * The dashboard's ``agent_mcp/dashboard/lib/api.ts`` no longer
-    splices ``token: tokens.admin_token`` into mutation payloads —
-    the session cookie is what authenticates.
-  * No leftover ``TODO(prancy-napping-pie PR D)`` markers remain in
-    the source tree (PR D's sweep is complete).
+  * ``agent_mcp/dashboard/lib/api/*.ts`` no longer splices
+    ``token: tokens.admin_token`` into mutation payloads — the session
+    cookie is what authenticates.
+  * ``ApiClient`` redirects to ``/agent-mcp/login`` on a 401, preserving
+    the current path in ``?next=``.
 
-Wave 8 PR 2 rewire: the single ``agent_mcp/app/routes.py`` file was
-deleted; the same invariant must now hold across every per-resource
-``agent_mcp/app/routers/*.py`` module the handlers moved to. The test
-scans the whole subpackage instead of a single file.
-
-These tests are intentionally grep-style + structural. The wire
-contract is exercised by ``tests/test_dashboard_session_auth.py``.
+Phase F (prancy-napping-pie): this file used to also grep-check the
+Python backend (``agent_mcp/app/routers/*.py``, ``agent_mcp/router/
+app.py``) for the same body-token-read pattern, plus a TODO-marker
+sweep over the whole ``agent_mcp/**/*.py`` tree — all three deleted
+here, not trimmed: their subject (the Python router/app auth-handler
+layer) is gone, superseded by ``conexus-router``/``conexus-backend``'s
+own Rust auth gates (`rest_gate.rs`/`session_gate.rs`), which carry
+their own test coverage. What survives is pure dashboard-TS grep
+coverage, unaffected by that deletion.
 """
 
 from __future__ import annotations
@@ -28,8 +25,6 @@ import re
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-ROUTERS_DIR = REPO_ROOT / "agent_mcp" / "app" / "routers"
-ROUTER_APP_FILE = REPO_ROOT / "agent_mcp" / "router" / "app.py"
 # W6-followup F1 split the old lib/api.ts God-module into per-resource
 # modules under lib/api/. The mutation payloads (token-strip guard) and
 # the request core (401 redirect) now live across several of them, so
@@ -37,96 +32,10 @@ ROUTER_APP_FILE = REPO_ROOT / "agent_mcp" / "router" / "app.py"
 API_TS_DIR = REPO_ROOT / "agent_mcp" / "dashboard" / "lib" / "api"
 
 
-# ── helpers ────────────────────────────────────────────────────────
-
-
-def _read(path: Path) -> str:
-    return path.read_text(encoding="utf-8")
-
-
 def _read_api_client() -> str:
     """Concatenate every per-resource api module (core + bundles)."""
     return "\n".join(
         p.read_text(encoding="utf-8") for p in sorted(API_TS_DIR.glob("*.ts"))
-    )
-
-
-# Patterns that indicate a handler is reading a token field out of an
-# in-memory body / form dict to authenticate. Matches:
-#   data.get('token')          data.get("token")
-#   data['token']              data["token"]
-#   body.get('token')          form.get('token')
-#   body['token']              form['token']
-_TOKEN_BODY_PATTERNS = [
-    re.compile(r"\bdata\.get\(\s*['\"]token['\"]"),
-    re.compile(r"\bdata\[\s*['\"]token['\"]\s*\]"),
-    re.compile(r"\bbody\.get\(\s*['\"]token['\"]"),
-    re.compile(r"\bbody\[\s*['\"]token['\"]\s*\]"),
-    re.compile(r"\bform\.get\(\s*['\"]token['\"]"),
-    re.compile(r"\bform\[\s*['\"]token['\"]\s*\]"),
-]
-
-
-def _scan(text: str, patterns: list[re.Pattern]) -> list[tuple[int, str]]:
-    """Return (line_number, matched_line) for every pattern hit."""
-    hits: list[tuple[int, str]] = []
-    for i, line in enumerate(text.splitlines(), start=1):
-        # Skip comments + obvious docstring lines: the regex catches
-        # them, but they're not real code paths.
-        stripped = line.strip()
-        if stripped.startswith("#"):
-            continue
-        for pat in patterns:
-            if pat.search(line):
-                hits.append((i, line.rstrip()))
-                break
-    return hits
-
-
-# ── backend: token must not be read inside mutation handlers ──────
-
-
-def test_routes_py_does_not_read_token_from_body_in_mutation_handlers() -> None:
-    """Per-resource router handlers under ``agent_mcp/app/routers/``
-    must not authenticate via ``data.get('token')`` / ``body['token']``.
-
-    PR D moves auth into the ``require_operator_session`` FastAPI
-    dependency. Each per-handler ``admin_token = data.get('token')``
-    + ``verify_token(admin_token, ...)`` ladder is replaced.
-
-    The dep itself + the legacy ``verify_token`` helper are allowed —
-    they're imports of the auth surface, not handler-local reads.
-
-    Wave 8 PR 2 rewire: the legacy single-file ``agent_mcp/app/routes.py``
-    is gone; the same invariant is now enforced across every per-resource
-    router module the handlers moved to.
-    """
-    all_hits: list[tuple[Path, int, str]] = []
-    for path in sorted(ROUTERS_DIR.glob("*.py")):
-        text = _read(path)
-        for n, ln in _scan(text, _TOKEN_BODY_PATTERNS):
-            all_hits.append((path, n, ln))
-    assert all_hits == [], (
-        "Found legacy body-token reads in agent_mcp/app/routers/:\n  "
-        + "\n  ".join(
-            f"{p.relative_to(REPO_ROOT)}:{n}: {ln}" for p, n, ln in all_hits
-        )
-    )
-
-
-def test_router_app_does_not_read_token_from_body_in_mutation_handlers() -> None:
-    """``agent_mcp/router/app.py`` router-level handlers must not
-    authenticate via body['token'] / form['token'] either.
-
-    The router uses session-cookie auth via the
-    ``require_operator_session_middleware``. Form-based handlers
-    (e.g. __create) no longer need to extract a token from the form.
-    """
-    text = _read(ROUTER_APP_FILE)
-    hits = _scan(text, _TOKEN_BODY_PATTERNS)
-    assert hits == [], (
-        "Found legacy body-token reads in agent_mcp/router/app.py:\n  "
-        + "\n  ".join(f"{n}: {ln}" for n, ln in hits)
     )
 
 
@@ -152,27 +61,6 @@ def test_dashboard_api_client_strips_token_field_from_payloads() -> None:
     assert hits == [], (
         "Dashboard mutation payloads still include token: tokens.admin_token:\n  "
         + "\n  ".join(f"{n}: {ln}" for n, ln in hits)
-    )
-
-
-# ── TODO sweep — PR D markers all addressed ───────────────────────
-
-
-def test_no_lingering_pr_d_todo_markers() -> None:
-    """``grep -rn TODO(prancy-napping-pie PR D) agent_mcp/`` → empty.
-
-    PR D promised to address every such marker. If new code adds one
-    after PR D ships, it should use a different tracking marker.
-    """
-    needle = "TODO(prancy-napping-pie PR D)"
-    hits: list[tuple[Path, int, str]] = []
-    for path in REPO_ROOT.glob("agent_mcp/**/*.py"):
-        for i, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-            if needle in line:
-                hits.append((path, i, line.rstrip()))
-    assert hits == [], (
-        "Found lingering PR D TODO markers:\n  "
-        + "\n  ".join(f"{p}:{n}: {ln}" for p, n, ln in hits)
     )
 
 
