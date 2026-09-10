@@ -2033,9 +2033,7 @@ pub async fn list_participants(
     }
     let limit = crate::read_limits::clamp_section_limit(params.get("limit").map(String::as_str));
 
-    let guard = shared.conn.lock().await;
-    let result = conexus_db::message_repository::list_participants(&guard, limit);
-    drop(guard);
+    let result = conexus_db::message_repository::list_participants(&shared.sea_orm_db, limit).await;
 
     match result {
         Ok(p) => {
@@ -2505,9 +2503,8 @@ pub async fn get_message_thread(
     Path(message_id): Path<String>,
     State(shared): State<Arc<SharedState>>,
 ) -> Response {
-    let guard = shared.conn.lock().await;
-    let thread = conexus_db::message_repository::fetch_thread(&guard, &message_id);
-    drop(guard);
+    let thread =
+        conexus_db::message_repository::fetch_thread(&shared.sea_orm_db, &message_id).await;
     match thread {
         Ok(rows) if !rows.is_empty() => {
             let thread: Vec<Value> = rows.iter().map(message_row_to_json).collect();

@@ -40,12 +40,12 @@
 
 use rusqlite::{Connection, OptionalExtension, Result, Row, ToSql};
 use sea_orm::{
-    ColumnTrait, Condition, DatabaseConnection, DbErr, EntityTrait, QueryFilter, QueryOrder,
-    QuerySelect,
+    ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, DbErr, EntityTrait, QueryFilter,
+    QueryOrder, QuerySelect, Statement,
 };
 use std::collections::HashMap;
 
-use crate::entity::message;
+use crate::entity::{agent, message};
 use crate::pagination_cache::StableOrderCache;
 use crate::sql_util::{in_placeholders, to_sql_refs};
 
@@ -699,7 +699,18 @@ const THREAD_WALK_CAP: usize = 10_000;
 /// Walks `parent_message_id` upward from `message_id` to find the
 /// thread root. Returns `None` — never an error — for: a missing
 /// message, a broken chain, a cycle, or exceeding [`THREAD_WALK_CAP`].
-fn resolve_thread_root(conn: &Connection, message_id: &str) -> Result<Option<String>> {
+///
+/// Phase G (sea-orm migration): sea-orm-backed (`async`, `db: &
+/// sea_orm::DatabaseConnection`) — PR 4/5 of this repository's own
+/// conversion sequence. A single-row lookup per step via the typed
+/// `Entity::find_by_id`, same idiom every other sea-orm-converted
+/// function in this crate uses for a keyed single-row read; the walk
+/// itself stays iterative (no CTE can express "stop early once you
+/// hit a NULL parent" the way this loop's own early-return does).
+async fn resolve_thread_root(
+    db: &DatabaseConnection,
+    message_id: &str,
+) -> std::result::Result<Option<String>, DbErr> {
     let mut current = message_id.to_string();
     let mut seen = std::collections::HashSet::new();
 
@@ -707,17 +718,11 @@ fn resolve_thread_root(conn: &Connection, message_id: &str) -> Result<Option<Str
         if !seen.insert(current.clone()) {
             return Ok(None); // cycle
         }
-        let parent: Option<Option<String>> = conn
-            .query_row(
-                "SELECT parent_message_id FROM agent_messages WHERE message_id = ?1",
-                [&current],
-                |row| row.get(0),
-            )
-            .optional()?;
-        match parent {
+        let row = message::Entity::find_by_id(&current).one(db).await?;
+        match row {
             None => return Ok(None), // message itself doesn't exist (broken chain)
-            Some(None) => return Ok(Some(current)), // reached the root
-            Some(Some(p)) => current = p,
+            Some(m) if m.parent_message_id.is_none() => return Ok(Some(current)), // root
+            Some(m) => current = m.parent_message_id.unwrap(),
         }
     }
     Ok(None) // cap exceeded
@@ -726,22 +731,51 @@ fn resolve_thread_root(conn: &Connection, message_id: &str) -> Result<Option<Str
 /// The whole thread (root + every descendant) containing `message_id`,
 /// oldest-first. Empty (not an error) if [`resolve_thread_root`] can't
 /// resolve a root for any of its documented reasons.
-pub fn fetch_thread(conn: &Connection, message_id: &str) -> Result<Vec<MessageRow>> {
-    let Some(root) = resolve_thread_root(conn, message_id)? else {
+///
+/// Phase G (sea-orm migration): sea-orm-backed (`async`, `db: &
+/// sea_orm::DatabaseConnection`) — PR 4/5 of this repository's own
+/// conversion sequence. The `WITH RECURSIVE` descendant walk itself
+/// stays a raw-SQL escape hatch (`Statement::from_sql_and_values` +
+/// `query_all_raw`, same precedent `agent_action_repository::
+/// list_recent`/`agent_repository::insert_tombstone` already
+/// established) — sea-orm's typed query builder has no vocabulary for
+/// a recursive CTE.
+pub async fn fetch_thread(
+    db: &DatabaseConnection,
+    message_id: &str,
+) -> std::result::Result<Vec<MessageRow>, DbErr> {
+    let Some(root) = resolve_thread_root(db, message_id).await? else {
         return Ok(Vec::new());
     };
 
     let sql = format!(
         "WITH RECURSIVE thread(message_id) AS ( \
-             SELECT message_id FROM agent_messages WHERE message_id = ?1 \
+             SELECT message_id FROM agent_messages WHERE message_id = ? \
              UNION \
              SELECT m.message_id FROM agent_messages m JOIN thread t ON m.parent_message_id = t.message_id \
          ) \
          SELECT {COLUMNS} FROM agent_messages WHERE message_id IN (SELECT message_id FROM thread) ORDER BY timestamp ASC"
     );
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map([&root], row_to_message)?;
-    rows.collect()
+    let stmt =
+        Statement::from_sql_and_values(sea_orm::DatabaseBackend::Sqlite, &sql, [root.into()]);
+    let rows = db.query_all_raw(stmt).await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(MessageRow {
+                message_id: row.try_get("", "message_id")?,
+                sender_id: row.try_get("", "sender_id")?,
+                recipient_id: row.try_get("", "recipient_id")?,
+                message_content: row.try_get("", "message_content")?,
+                message_type: row.try_get("", "message_type")?,
+                priority: row.try_get("", "priority")?,
+                timestamp: row.try_get("", "timestamp")?,
+                delivered: row.try_get("", "delivered")?,
+                read: row.try_get("", "read")?,
+                subject: row.try_get("", "subject")?,
+                parent_message_id: row.try_get("", "parent_message_id")?,
+            })
+        })
+        .collect()
 }
 
 /// Rewrites BOTH `sender_id` and `recipient_id` from `old_id` to
@@ -913,20 +947,37 @@ pub struct Participants {
 /// is prepended to `live` if not already present — this can push
 /// `live.len()` one past `limit`, matching Python's exact behavior
 /// (the prepend happens AFTER the limited query, not before).
-pub fn list_participants(conn: &Connection, limit: i64) -> Result<Participants> {
-    let mut stmt = conn.prepare(
-        "SELECT agent_id, status FROM agents WHERE status IS NULL OR status NOT IN ('terminated', 'tombstone') \
-         ORDER BY agent_id ASC LIMIT ?1",
-    )?;
-    let mut live: Vec<LiveParticipant> = stmt
-        .query_map([limit], |row| {
-            Ok(LiveParticipant {
-                agent_id: row.get(0)?,
-                status: row.get(1)?,
-            })
-        })?
-        .collect::<Result<Vec<_>>>()?;
-    drop(stmt);
+///
+/// Phase G (sea-orm migration): sea-orm-backed (`async`, `db: &
+/// sea_orm::DatabaseConnection`) — PR 3/5 of this repository's own
+/// conversion sequence. The live-agent half reads `entity::agent`
+/// (already ported, `agent_repository`'s own Phase G work) via the
+/// typed builder (`agents.status` is `NOT NULL` in the schema, so the
+/// `status IS NULL OR ...` half of the raw SQL's OR was always dead —
+/// a bare `is_not_in` filter is equivalent, not a behavior change);
+/// the two DISTINCT-prefix reads over `agent_messages` use
+/// `Column::like` (a `LIKE` pattern, same wire shape as the raw SQL)
+/// plus `.distinct()`, since sea-orm's builder DOES have vocabulary
+/// for both — no raw-SQL escape hatch needed here, unlike
+/// [`fetch_thread`]'s recursive CTE.
+pub async fn list_participants(
+    db: &DatabaseConnection,
+    limit: i64,
+) -> std::result::Result<Participants, DbErr> {
+    let limit_u64 = limit.max(0) as u64;
+
+    let mut live: Vec<LiveParticipant> = agent::Entity::find()
+        .filter(agent::Column::Status.is_not_in(["terminated", "tombstone"]))
+        .order_by_asc(agent::Column::AgentId)
+        .limit(limit_u64)
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|m| LiveParticipant {
+            agent_id: m.agent_id,
+            status: Some(m.status),
+        })
+        .collect();
     if !live.iter().any(|p| p.agent_id == "admin") {
         live.insert(
             0,
@@ -938,21 +989,29 @@ pub fn list_participants(conn: &Connection, limit: i64) -> Result<Participants> 
     }
 
     let mut tombstone_ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    {
-        let mut stmt = conn.prepare("SELECT DISTINCT sender_id FROM agent_messages WHERE sender_id LIKE '[deleted-%' LIMIT ?1")?;
-        for row in stmt.query_map([limit], |row| row.get::<_, String>(0))? {
-            tombstone_ids.insert(row?);
-        }
-    }
-    {
-        let mut stmt =
-            conn.prepare("SELECT DISTINCT recipient_id FROM agent_messages WHERE recipient_id LIKE '[deleted-%' LIMIT ?1")?;
-        for row in stmt.query_map([limit], |row| row.get::<_, String>(0))? {
-            tombstone_ids.insert(row?);
-        }
-    }
+    let senders: Vec<String> = message::Entity::find()
+        .select_only()
+        .column(message::Column::SenderId)
+        .distinct()
+        .filter(message::Column::SenderId.like("[deleted-%"))
+        .limit(limit_u64)
+        .into_tuple()
+        .all(db)
+        .await?;
+    tombstone_ids.extend(senders);
+    let recipients: Vec<String> = message::Entity::find()
+        .select_only()
+        .column(message::Column::RecipientId)
+        .distinct()
+        .filter(message::Column::RecipientId.like("[deleted-%"))
+        .limit(limit_u64)
+        .into_tuple()
+        .all(db)
+        .await?;
+    tombstone_ids.extend(recipients);
+
     let mut tombstones: Vec<String> = tombstone_ids.into_iter().collect();
-    tombstones.truncate(limit.max(0) as usize);
+    tombstones.truncate(limit_u64 as usize);
 
     Ok(Participants { live, tombstones })
 }
@@ -1737,9 +1796,9 @@ mod tests {
         assert_eq!(ids(&page2), vec!["m2", "m1"]);
     }
 
-    #[test]
-    fn fetch_thread_from_leaf_or_root_returns_the_same_thread_oldest_first() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn fetch_thread_from_leaf_or_root_returns_the_same_thread_oldest_first() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         seed_agent(&conn, "alice");
         seed_agent(&conn, "bob");
         let mut root = new_msg("root", "alice", "bob", "start");
@@ -1754,8 +1813,8 @@ mod tests {
         reply2.parent_message_id = Some("reply1");
         send(&conn, reply2).unwrap();
 
-        let from_root = fetch_thread(&conn, "root").unwrap();
-        let from_leaf = fetch_thread(&conn, "reply2").unwrap();
+        let from_root = fetch_thread(&db, "root").await.unwrap();
+        let from_leaf = fetch_thread(&db, "reply2").await.unwrap();
         assert_eq!(ids(&from_root), vec!["root", "reply1", "reply2"]);
         assert_eq!(
             ids(&from_leaf),
@@ -1764,20 +1823,20 @@ mod tests {
         );
     }
 
-    #[test]
-    fn fetch_thread_lone_message_is_a_single_element_thread() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn fetch_thread_lone_message_is_a_single_element_thread() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         seed_agent(&conn, "alice");
         seed_agent(&conn, "bob");
         send(&conn, new_msg("solo", "alice", "bob", "alone")).unwrap();
 
-        assert_eq!(ids(&fetch_thread(&conn, "solo").unwrap()), vec!["solo"]);
+        assert_eq!(ids(&fetch_thread(&db, "solo").await.unwrap()), vec!["solo"]);
     }
 
-    #[test]
-    fn fetch_thread_nonexistent_message_returns_empty() {
-        let conn = test_conn();
-        assert_eq!(fetch_thread(&conn, "nope").unwrap(), Vec::new());
+    #[tokio::test]
+    async fn fetch_thread_nonexistent_message_returns_empty() {
+        let (_dir, _conn, db) = test_conn_with_sea_orm().await;
+        assert_eq!(fetch_thread(&db, "nope").await.unwrap(), Vec::new());
     }
 
     #[tokio::test]
@@ -1905,7 +1964,7 @@ mod tests {
             .await
             .unwrap();
 
-        let participants = list_participants(&conn, 50).unwrap();
+        let participants = list_participants(&db, 50).await.unwrap();
         let ids: Vec<&str> = participants
             .live
             .iter()
@@ -1941,7 +2000,7 @@ mod tests {
         )
         .unwrap();
 
-        let participants = list_participants(&conn, 50).unwrap();
+        let participants = list_participants(&db, 50).await.unwrap();
         assert!(participants
             .tombstones
             .contains(&"[deleted-bob]".to_string()));
