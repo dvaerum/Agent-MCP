@@ -710,7 +710,7 @@ impl Tool for RegisterAgentTool {
     fn call<'a>(
         principal: Option<&'a Principal>,
         arguments: &'a Value,
-        conn: &'a AsyncMutex<Connection>,
+        _conn: &'a AsyncMutex<Connection>,
         now: &'a str,
         ctx: &'a conexus_auth::ToolCallContext<'a>,
     ) -> conexus_auth::BoxFuture<'a, ToolResult> {
@@ -773,9 +773,8 @@ impl Tool for RegisterAgentTool {
             let color_index = AGENT_COLOR_INDEX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let agent_color = next_agent_color(color_index);
 
-            let guard = conn.lock().await;
             let created_row = match conexus_db::agent_repository::AgentRepository::create(
-                &guard,
+                ctx.sea_orm_db,
                 conexus_db::agent_repository::NewAgent {
                     token: &new_agent_token,
                     agent_id,
@@ -786,7 +785,9 @@ impl Tool for RegisterAgentTool {
                     color: Some(agent_color),
                     agent_role: role,
                 },
-            ) {
+            )
+            .await
+            {
                 Ok(row) => row,
                 Err(conexus_db::agent_repository::CreateAgentError::InvalidAgentId(_)) => {
                     return ToolResult::Invalid {
@@ -811,14 +812,13 @@ impl Tool for RegisterAgentTool {
             if role == "manager" {
                 let seed_ts = created_row.created_at.clone();
                 let _ = conexus_db::agent_repository::AgentRepository::seed_manager_profile(
-                    &guard,
+                    ctx.sea_orm_db,
                     agent_id,
                     MANAGER_DEFAULT_PROFILE,
                     &seed_ts,
-                );
+                )
+                .await;
             }
-
-            drop(guard);
 
             let requesting_agent_id = principal.map(Principal::actor_label).unwrap_or("operator");
             let _ = agent_action_repository::log_agent_action(
@@ -922,6 +922,8 @@ impl Tool for RotateAgentTokenTool {
                 };
             };
 
+            drop(guard);
+
             if TERMINAL_AGENT_STATUSES.contains(&row.status.as_str()) {
                 return ToolResult::Conflict {
                     reason: format!(
@@ -934,8 +936,13 @@ impl Tool for RotateAgentTokenTool {
             let old_token = row.token;
             let new_token = generate_token();
             match conexus_db::agent_repository::AgentRepository::rotate_token(
-                &guard, agent_id, &new_token, now,
-            ) {
+                ctx.sea_orm_db,
+                agent_id,
+                &new_token,
+                now,
+            )
+            .await
+            {
                 Ok(true) => {}
                 Ok(false) => {
                     return ToolResult::Failed {
@@ -956,7 +963,6 @@ impl Tool for RotateAgentTokenTool {
             // discipline the durable audit trail applies elsewhere.
             let old_suffix = old_token.get(old_token.len().saturating_sub(4)..);
             let new_suffix = &new_token[new_token.len() - 4..];
-            drop(guard);
             let _ = agent_action_repository::log_agent_action(
                 ctx.sea_orm_db,
                 requesting_agent_id,
@@ -1326,14 +1332,13 @@ impl Tool for TerminateAgentTool {
             use conexus_db::agent_repository::AgentRepository;
             use conexus_wakeloop::event_feed::UNASSIGNED_TASK_TERMINAL_STATUSES as TERMINAL_TASK_STATUSES;
 
-            let guard = conn.lock().await;
             // `terminate()`'s own NOT_TERMINAL_SQL guard covers BOTH
             // "no such agent" and "already terminal" with the same
             // `false` -- matches Python's own combined outcome here
             // (no in-memory cache to distinguish the two cases either,
             // and no separate Conflict branch exists for terminate,
             // unlike rotate_agent_token's explicit check).
-            match AgentRepository::terminate(&guard, agent_id, now) {
+            match AgentRepository::terminate(ctx.sea_orm_db, agent_id, now).await {
                 Ok(true) => {}
                 Ok(false) => {
                     return ToolResult::NotFound {
@@ -1394,7 +1399,6 @@ impl Tool for TerminateAgentTool {
             // discipline) since it's an audit-completeness quirk, not a
             // security-relevant one -- the capability gate above already
             // requires agents.terminate regardless of who is logged.
-            drop(guard);
             let _ = agent_action_repository::log_agent_action(
                 ctx.sea_orm_db,
                 "admin",
@@ -1686,11 +1690,12 @@ impl Tool for PurgeAgentTool {
             // tombstone must exist as an agents row before any rewrite.
             // INSERT OR IGNORE makes a re-purge a no-op.
             if AgentRepository::insert_tombstone(
-                &guard,
+                ctx.sea_orm_db,
                 &format!("__tombstone_{agent_id}"),
                 &tombstone,
                 now,
             )
+            .await
             .is_err()
             {
                 return ToolResult::Failed {
@@ -1791,7 +1796,10 @@ impl Tool for PurgeAgentTool {
             )
             .await;
 
-            if AgentRepository::delete(&guard, agent_id).is_err() {
+            if AgentRepository::delete(ctx.sea_orm_db, agent_id)
+                .await
+                .is_err()
+            {
                 return ToolResult::Failed {
                     message: "A database error occurred; it has been logged. Retry, or ask an \
                         operator to check logs."
@@ -2601,6 +2609,11 @@ mod tests {
         }
     }
 
+    /// A plain sync `INSERT` rather than the now-async `AgentRepository::
+    /// create` -- this helper is pure fixture setup for the ~45 tests
+    /// below (none of them test `create()`'s own validation), and
+    /// converting every one of those call sites to thread a sea-orm
+    /// `DatabaseConnection` through would be pure churn for no signal.
     async fn seed_agent(
         conn: &AsyncMutex<Connection>,
         agent_id: &str,
@@ -2608,20 +2621,13 @@ mod tests {
         created_at: &str,
     ) {
         let guard = conn.lock().await;
-        conexus_db::agent_repository::AgentRepository::create(
-            &guard,
-            conexus_db::agent_repository::NewAgent {
-                token,
-                agent_id,
-                created_at,
-                status: "active",
-                current_task: None,
-                working_directory: "/tmp",
-                color: None,
-                agent_role: "worker",
-            },
-        )
-        .unwrap();
+        guard
+            .execute(
+                "INSERT INTO agents (token, agent_id, created_at, status, working_directory, agent_role) \
+                 VALUES (?1, ?2, ?3, 'active', '/tmp', 'worker')",
+                (token, agent_id, created_at),
+            )
+            .unwrap();
     }
 
     #[tokio::test]
@@ -2735,15 +2741,13 @@ mod tests {
     async fn get_agent_tokens_filters_by_status() {
         let (_dir, conn, sea_orm_db) = setup().await;
         seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
-        {
-            let guard = conn.lock().await;
-            conexus_db::agent_repository::AgentRepository::terminate(
-                &guard,
-                "alice",
-                "2026-06-01T00:00:01Z",
-            )
-            .unwrap();
-        }
+        conexus_db::agent_repository::AgentRepository::terminate(
+            &sea_orm_db,
+            "alice",
+            "2026-06-01T00:00:01Z",
+        )
+        .await
+        .unwrap();
         let op = confirmed_operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
@@ -2827,23 +2831,21 @@ mod tests {
     async fn view_status_reports_live_agents_and_excludes_the_system_pseudo_agent() {
         let (_dir, conn, sea_orm_db) = setup().await;
         seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
-        {
-            let guard = conn.lock().await;
-            conexus_db::agent_repository::AgentRepository::create(
-                &guard,
-                conexus_db::agent_repository::NewAgent {
-                    token: "tok-system",
-                    agent_id: "system",
-                    created_at: "2026-06-01T00:00:00Z",
-                    status: "system",
-                    current_task: None,
-                    working_directory: "/tmp",
-                    color: None,
-                    agent_role: "worker",
-                },
-            )
-            .unwrap();
-        }
+        conexus_db::agent_repository::AgentRepository::create(
+            &sea_orm_db,
+            conexus_db::agent_repository::NewAgent {
+                token: "tok-system",
+                agent_id: "system",
+                created_at: "2026-06-01T00:00:00Z",
+                status: "system",
+                current_task: None,
+                working_directory: "/tmp",
+                color: None,
+                agent_role: "worker",
+            },
+        )
+        .await
+        .unwrap();
         let op = operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
@@ -2870,15 +2872,13 @@ mod tests {
     async fn view_status_excludes_a_terminated_agent() {
         let (_dir, conn, sea_orm_db) = setup().await;
         seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
-        {
-            let guard = conn.lock().await;
-            conexus_db::agent_repository::AgentRepository::terminate(
-                &guard,
-                "alice",
-                "2026-06-01T00:00:01Z",
-            )
-            .unwrap();
-        }
+        conexus_db::agent_repository::AgentRepository::terminate(
+            &sea_orm_db,
+            "alice",
+            "2026-06-01T00:00:01Z",
+        )
+        .await
+        .unwrap();
         let op = operator();
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
@@ -3211,15 +3211,13 @@ mod tests {
     async fn rotate_agent_token_refuses_a_terminated_agent() {
         let (_dir, conn, sea_orm_db) = setup().await;
         seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
-        {
-            let guard = conn.lock().await;
-            conexus_db::agent_repository::AgentRepository::terminate(
-                &guard,
-                "alice",
-                "2026-06-01T00:00:01Z",
-            )
-            .unwrap();
-        }
+        conexus_db::agent_repository::AgentRepository::terminate(
+            &sea_orm_db,
+            "alice",
+            "2026-06-01T00:00:01Z",
+        )
+        .await
+        .unwrap();
         let op = operator_with(&[Capability::AgentsRotateToken]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
@@ -3276,15 +3274,13 @@ mod tests {
     async fn restore_agent_flips_a_terminated_agent_back_to_created() {
         let (_dir, conn, sea_orm_db) = setup().await;
         seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
-        {
-            let guard = conn.lock().await;
-            conexus_db::agent_repository::AgentRepository::terminate(
-                &guard,
-                "alice",
-                "2026-06-01T00:00:01Z",
-            )
-            .unwrap();
-        }
+        conexus_db::agent_repository::AgentRepository::terminate(
+            &sea_orm_db,
+            "alice",
+            "2026-06-01T00:00:01Z",
+        )
+        .await
+        .unwrap();
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
@@ -3353,13 +3349,14 @@ mod tests {
                 "2026-06-01T00:00:00Z",
             )
             .unwrap();
-            conexus_db::agent_repository::AgentRepository::terminate(
-                &guard,
-                "alice",
-                "2026-06-01T00:00:01Z",
-            )
-            .unwrap();
         }
+        conexus_db::agent_repository::AgentRepository::terminate(
+            &sea_orm_db,
+            "alice",
+            "2026-06-01T00:00:01Z",
+        )
+        .await
+        .unwrap();
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
@@ -3714,15 +3711,13 @@ mod tests {
         // branch exists for terminate (unlike rotate_agent_token).
         let (_dir, conn, sea_orm_db) = setup().await;
         seed_agent(&conn, "alice", "tok-a", "2026-06-01T00:00:00Z").await;
-        {
-            let guard = conn.lock().await;
-            conexus_db::agent_repository::AgentRepository::terminate(
-                &guard,
-                "alice",
-                "2026-06-01T00:00:01Z",
-            )
-            .unwrap();
-        }
+        conexus_db::agent_repository::AgentRepository::terminate(
+            &sea_orm_db,
+            "alice",
+            "2026-06-01T00:00:01Z",
+        )
+        .await
+        .unwrap();
         let op = operator_with(&[Capability::AgentsTerminate]);
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();

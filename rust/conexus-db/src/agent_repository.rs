@@ -21,33 +21,35 @@
 //! by exactly one place upstream (Phase D's app layer) rather than
 //! scattered across every write method.
 //!
-//! Phase G (sea-orm migration): [`AgentRepository::query`] alone is
-//! now sea-orm-backed (`async`, takes `&sea_orm::DatabaseConnection`)
-//! — PR 1/4 of this repository's own conversion sequence. Every other
-//! method here, including `get_by_token`/`is_live`/`get_by_id`/
-//! `update_field`/`reconcile_current_task_on_reassign`/
-//! `clear_current_task_for`/`clear_current_task_for_many`/
-//! `list_active`/`list_profile_changes_since`, is DELIBERATELY,
-//! PERMANENTLY staying rusqlite-only: they're hot-path (every `/mcp`/
-//! `/api` request resolves its bearer through `get_by_token`+
-//! `is_live`), transaction-bound, or wake-loop-collector-bound —
-//! mirroring `resolve_capabilities`/`group_membership_repository`'s
-//! own established "one sync implementation, never duplicated across
-//! a sync/async split" precedent (PR #990). See
+//! Phase G (sea-orm migration): [`AgentRepository::query`] was the
+//! first method converted (`async`, takes `&sea_orm::
+//! DatabaseConnection`) — PR 1/4 of this repository's own conversion
+//! sequence. PR 2/4 converts the CRUD-lifecycle writes: `create`/
+//! `seed_manager_profile`/`terminate`/`delete`/`rotate_token`/
+//! `insert_tombstone`/`review_profile`. Every other method here,
+//! including `get_by_token`/`is_live`/`get_by_id`/`update_field`/
+//! `reconcile_current_task_on_reassign`/`clear_current_task_for`/
+//! `clear_current_task_for_many`/`list_active`/
+//! `list_profile_changes_since`, is DELIBERATELY, PERMANENTLY staying
+//! rusqlite-only: they're hot-path (every `/mcp`/`/api` request
+//! resolves its bearer through `get_by_token`+`is_live`),
+//! transaction-bound, or wake-loop-collector-bound — mirroring
+//! `resolve_capabilities`/`group_membership_repository`'s own
+//! established "one sync implementation, never duplicated across a
+//! sync/async split" precedent (PR #990). See
 //! `conexus_backend::principal_resolve`/`conexus_auth::
 //! wake_loop_eligibility`/`conexus_wakeloop::event_feed`'s own doc
 //! comments for the specific reasoning per call site — those already
 //! say "AgentRepository is not a Phase G target," which remains true
 //! for the methods they call; it was never true for the whole
-//! repository, and `query` above is the first of this repository's
-//! own reads to actually convert.
+//! repository.
 
 use crate::pagination_cache::StableOrderCache;
 use regex::Regex;
 use rusqlite::{Connection, OptionalExtension, Result, Row};
 use sea_orm::{
-    ColumnTrait, DatabaseConnection, DbErr, EntityTrait, Order as SeaOrmOrder, PaginatorTrait,
-    QueryFilter, QueryOrder, QuerySelect,
+    ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection, DbErr, EntityTrait,
+    Order as SeaOrmOrder, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Statement,
 };
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -149,6 +151,25 @@ fn agent_row_from_model(m: agent::Model) -> AgentRow {
     }
 }
 
+/// Read one row by `agent_id` through the sea-orm `Entity` — the
+/// re-read-after-write primitive [`AgentRepository::create`]/
+/// [`AgentRepository::review_profile`] need for their own return
+/// value, since [`AgentRepository::get_by_id`] stays rusqlite-only
+/// (see this module's own doc). Not `pub`: every async reader outside
+/// this file already has [`AgentRepository::query`]; this is purely
+/// internal plumbing for the CRUD-lifecycle writes converted in PR
+/// 2/4.
+async fn find_agent_row(
+    db: &DatabaseConnection,
+    agent_id: &str,
+) -> std::result::Result<Option<AgentRow>, DbErr> {
+    Ok(agent::Entity::find()
+        .filter(agent::Column::AgentId.eq(agent_id))
+        .one(db)
+        .await?
+        .map(agent_row_from_model))
+}
+
 /// One row of the `wait_for_events` peer-profile-change catch-up feed —
 /// see [`AgentRepository::list_profile_changes_since`].
 #[derive(Debug, Clone, PartialEq)]
@@ -240,11 +261,15 @@ pub struct NewAgent<'a> {
 /// propagated error, so callers can map it to a real `Conflict`
 /// (matching `conexus-core`'s `ToolResult`) without string-sniffing
 /// a SQLite error message.
+///
+/// Phase G (sea-orm migration): `Conflict`/`Db` carry `DbErr` now
+/// that [`AgentRepository::create`] is sea-orm-backed — no rusqlite
+/// variant remains, there is no sync twin of `create`.
 #[derive(Debug)]
 pub enum CreateAgentError {
     InvalidAgentId(String),
-    Conflict(rusqlite::Error),
-    Db(rusqlite::Error),
+    Conflict(DbErr),
+    Db(DbErr),
 }
 
 impl std::fmt::Display for CreateAgentError {
@@ -261,10 +286,14 @@ impl std::fmt::Display for CreateAgentError {
 
 impl std::error::Error for CreateAgentError {}
 
-fn is_unique_violation(err: &rusqlite::Error) -> bool {
+/// Classifies a failed INSERT as a UNIQUE(`agent_id`)/PRIMARY
+/// KEY(`token`) collision — same `DbErr::sql_err()` idiom
+/// `group_membership_repository::is_unique_violation` already
+/// establishes for sea-orm's own error shape.
+fn is_unique_violation(err: &DbErr) -> bool {
     matches!(
-        err,
-        rusqlite::Error::SqliteFailure(e, _) if e.code == rusqlite::ErrorCode::ConstraintViolation
+        err.sql_err(),
+        Some(sea_orm::SqlErr::UniqueConstraintViolation(_))
     )
 }
 
@@ -402,9 +431,16 @@ impl AgentRepository {
     /// Validates `agent_id` synchronously (matching Python: no write
     /// happens for an invalid/reserved id). A duplicate `agent_id` or
     /// `token` surfaces as [`CreateAgentError::Conflict`].
-    pub fn create(
-        conn: &Connection,
-        new_agent: NewAgent,
+    ///
+    /// Phase G (sea-orm migration): sea-orm-backed (`async`, `db: &
+    /// sea_orm::DatabaseConnection`) — see this module's own doc.
+    /// Built via `Entity::insert`, same idiom `task_repository::
+    /// create`/`group_membership_repository::create_group` already
+    /// establish; re-reads the inserted row via [`find_agent_row`]
+    /// ("async calls async") rather than [`Self::get_by_id`].
+    pub async fn create(
+        db: &DatabaseConnection,
+        new_agent: NewAgent<'_>,
     ) -> std::result::Result<AgentRow, CreateAgentError> {
         if !is_valid_agent_id(new_agent.agent_id)
             || new_agent.agent_id.starts_with(RESERVED_AGENT_ID_PREFIX)
@@ -414,21 +450,19 @@ impl AgentRepository {
             ));
         }
 
-        conn.execute(
-            "INSERT INTO agents (token, agent_id, created_at, status, current_task, \
-             working_directory, color, agent_role) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            (
-                new_agent.token,
-                new_agent.agent_id,
-                new_agent.created_at,
-                new_agent.status,
-                new_agent.current_task,
-                new_agent.working_directory,
-                new_agent.color,
-                new_agent.agent_role,
-            ),
-        )
-        .map_err(|e| {
+        let am = agent::ActiveModel {
+            token: Set(new_agent.token.to_string()),
+            agent_id: Set(new_agent.agent_id.to_string()),
+            created_at: Set(new_agent.created_at.to_string()),
+            status: Set(new_agent.status.to_string()),
+            current_task: Set(new_agent.current_task.map(String::from)),
+            working_directory: Set(new_agent.working_directory.to_string()),
+            color: Set(new_agent.color.map(String::from)),
+            agent_role: Set(new_agent.agent_role.to_string()),
+            ..Default::default()
+        };
+
+        agent::Entity::insert(am).exec(db).await.map_err(|e| {
             if is_unique_violation(&e) {
                 CreateAgentError::Conflict(e)
             } else {
@@ -436,9 +470,14 @@ impl AgentRepository {
             }
         })?;
 
-        Self::get_by_id(conn, new_agent.agent_id)
+        find_agent_row(db, new_agent.agent_id)
+            .await
             .map_err(CreateAgentError::Db)?
-            .ok_or_else(|| CreateAgentError::Db(rusqlite::Error::QueryReturnedNoRows))
+            .ok_or_else(|| {
+                CreateAgentError::Db(DbErr::RecordNotFound(
+                    "just-inserted agent row not found".to_string(),
+                ))
+            })
     }
 
     /// Seeds a freshly-registered `manager`-role agent's profile with
@@ -451,17 +490,40 @@ impl AgentRepository {
     /// `AgentField` enum doesn't cover these profile columns at all --
     /// matches Python's own choice of a raw SQL UPDATE here instead of
     /// its usual per-field repo helper).
-    pub fn seed_manager_profile(
-        conn: &Connection,
+    ///
+    /// Phase G (sea-orm migration): sea-orm-backed (`async`, `db: &
+    /// sea_orm::DatabaseConnection`) — see this module's own doc.
+    /// Built via `Entity::update_many` + `col_expr` (the same
+    /// multi-column typed-UPDATE idiom `claude_code_session_repository::
+    /// update_activity` already establishes), not a raw SQL string:
+    /// every column touched here is expressible through
+    /// `ColumnTrait`/`col_expr`.
+    pub async fn seed_manager_profile(
+        db: &DatabaseConnection,
         agent_id: &str,
         profile: &str,
         seed_ts: &str,
-    ) -> Result<()> {
-        conn.execute(
-            "UPDATE agents SET profile = ?1, profile_updated_at = ?2, \
-             profile_reviewed_at = ?3, profile_updated_by = NULL WHERE agent_id = ?4",
-            (profile, seed_ts, seed_ts, agent_id),
-        )?;
+    ) -> std::result::Result<(), DbErr> {
+        agent::Entity::update_many()
+            .col_expr(
+                agent::Column::Profile,
+                sea_orm::sea_query::Expr::value(profile),
+            )
+            .col_expr(
+                agent::Column::ProfileUpdatedAt,
+                sea_orm::sea_query::Expr::value(seed_ts),
+            )
+            .col_expr(
+                agent::Column::ProfileReviewedAt,
+                sea_orm::sea_query::Expr::value(seed_ts),
+            )
+            .col_expr(
+                agent::Column::ProfileUpdatedBy,
+                sea_orm::sea_query::Expr::value(None::<String>),
+            )
+            .filter(agent::Column::AgentId.eq(agent_id))
+            .exec(db)
+            .await?;
         Ok(())
     }
 
@@ -493,37 +555,91 @@ impl AgentRepository {
     /// or it was already terminal (`terminated`/`tombstone`), which
     /// Python excludes explicitly so a second `terminate()` call is a
     /// no-op rather than re-stamping `terminated_at`.
-    pub fn terminate(conn: &Connection, agent_id: &str, now: &str) -> Result<bool> {
-        let changed = conn.execute(
-            &format!(
-                "UPDATE agents SET status = 'terminated', terminated_at = ?1, updated_at = ?1, \
-                 current_task = NULL WHERE agent_id = ?2 AND {NOT_TERMINAL_SQL}"
-            ),
-            (now, agent_id),
-        )?;
-        Ok(changed > 0)
+    ///
+    /// Phase G (sea-orm migration): sea-orm-backed (`async`, `db: &
+    /// sea_orm::DatabaseConnection`) — see this module's own doc. The
+    /// exclusion mirrors [`NOT_TERMINAL_SQL`] (kept as a raw SQL
+    /// fragment for the untouched sync methods that still use it) via
+    /// `Column::Status.is_not_in([...])` instead.
+    pub async fn terminate(
+        db: &DatabaseConnection,
+        agent_id: &str,
+        now: &str,
+    ) -> std::result::Result<bool, DbErr> {
+        let result = agent::Entity::update_many()
+            .col_expr(
+                agent::Column::Status,
+                sea_orm::sea_query::Expr::value("terminated"),
+            )
+            .col_expr(
+                agent::Column::TerminatedAt,
+                sea_orm::sea_query::Expr::value(now),
+            )
+            .col_expr(
+                agent::Column::UpdatedAt,
+                sea_orm::sea_query::Expr::value(now),
+            )
+            .col_expr(
+                agent::Column::CurrentTask,
+                sea_orm::sea_query::Expr::value(None::<String>),
+            )
+            .filter(agent::Column::AgentId.eq(agent_id))
+            .filter(agent::Column::Status.is_not_in(["terminated", "tombstone"]))
+            .exec(db)
+            .await?;
+        Ok(result.rows_affected > 0)
     }
 
     /// Hard delete — distinct from `terminate()`'s soft delete.
-    pub fn delete(conn: &Connection, agent_id: &str) -> Result<bool> {
-        let changed = conn.execute("DELETE FROM agents WHERE agent_id = ?1", [agent_id])?;
-        Ok(changed > 0)
+    ///
+    /// Phase G (sea-orm migration): sea-orm-backed (`async`, `db: &
+    /// sea_orm::DatabaseConnection`) — see this module's own doc.
+    /// Built via `Entity::delete_many` (keyed on `agent_id`, not
+    /// `Entity::delete_by_id`, since the Entity's primary key is
+    /// `token` — see `entity::agent`'s own doc), same idiom
+    /// `claude_code_session_repository::delete_by_agent_id` already
+    /// establishes.
+    pub async fn delete(
+        db: &DatabaseConnection,
+        agent_id: &str,
+    ) -> std::result::Result<bool, DbErr> {
+        let result = agent::Entity::delete_many()
+            .filter(agent::Column::AgentId.eq(agent_id))
+            .exec(db)
+            .await?;
+        Ok(result.rows_affected > 0)
     }
 
     /// The one write path for the auth secret (`token` is off
     /// `update_field`'s allowlist by design). `false` iff no agent
     /// with that `agent_id` exists.
-    pub fn rotate_token(
-        conn: &Connection,
+    ///
+    /// Phase G (sea-orm migration): sea-orm-backed (`async`, `db: &
+    /// sea_orm::DatabaseConnection`) — see this module's own doc.
+    /// Writes the primary-key column (`token`) via `col_expr` on an
+    /// `update_many` filtered by `agent_id`, not `ActiveModel::
+    /// update` (which would require already knowing the row's CURRENT
+    /// primary key to address it, the exact value this call is
+    /// replacing).
+    pub async fn rotate_token(
+        db: &DatabaseConnection,
         agent_id: &str,
         new_token: &str,
         now: &str,
-    ) -> Result<bool> {
-        let changed = conn.execute(
-            "UPDATE agents SET token = ?1, updated_at = ?2 WHERE agent_id = ?3",
-            (new_token, now, agent_id),
-        )?;
-        Ok(changed > 0)
+    ) -> std::result::Result<bool, DbErr> {
+        let result = agent::Entity::update_many()
+            .col_expr(
+                agent::Column::Token,
+                sea_orm::sea_query::Expr::value(new_token),
+            )
+            .col_expr(
+                agent::Column::UpdatedAt,
+                sea_orm::sea_query::Expr::value(now),
+            )
+            .filter(agent::Column::AgentId.eq(agent_id))
+            .exec(db)
+            .await?;
+        Ok(result.rows_affected > 0)
     }
 
     /// Monotonically advance `last_event_seen_at`; never regresses.
@@ -566,16 +682,22 @@ impl AgentRepository {
     /// actually changed (SHA-256 comparison, matching Python) — a
     /// reviewer re-approving an unchanged profile shouldn't churn its
     /// update-audit trail. Returns `None` if the agent doesn't exist.
-    pub fn review_profile(
-        conn: &Connection,
+    ///
+    /// Phase G (sea-orm migration): sea-orm-backed (`async`, `db: &
+    /// sea_orm::DatabaseConnection`) — see this module's own doc. Both
+    /// the existence check and the final re-read go through
+    /// [`find_agent_row`] ("async calls async") rather than
+    /// [`Self::get_by_id`].
+    pub async fn review_profile(
+        db: &DatabaseConnection,
         agent_id: &str,
         new_profile: Option<&str>,
         editor_id: Option<&str>,
         now: &str,
-    ) -> Result<Option<ReviewProfileResult>> {
+    ) -> std::result::Result<Option<ReviewProfileResult>, DbErr> {
         use sha2::{Digest, Sha256};
 
-        let Some(existing) = Self::get_by_id(conn, agent_id)? else {
+        let Some(existing) = find_agent_row(db, agent_id).await? else {
             return Ok(None);
         };
 
@@ -584,19 +706,47 @@ impl AgentRepository {
         let changed = hash(new_profile) != hash(existing.profile.as_deref());
 
         if changed {
-            conn.execute(
-                "UPDATE agents SET profile = ?1, profile_updated_at = ?2, profile_updated_by = ?3, \
-                 profile_reviewed_at = ?2, updated_at = ?2 WHERE agent_id = ?4",
-                (new_profile, now, editor_id, agent_id),
-            )?;
+            agent::Entity::update_many()
+                .col_expr(
+                    agent::Column::Profile,
+                    sea_orm::sea_query::Expr::value(new_profile),
+                )
+                .col_expr(
+                    agent::Column::ProfileUpdatedAt,
+                    sea_orm::sea_query::Expr::value(now),
+                )
+                .col_expr(
+                    agent::Column::ProfileUpdatedBy,
+                    sea_orm::sea_query::Expr::value(editor_id),
+                )
+                .col_expr(
+                    agent::Column::ProfileReviewedAt,
+                    sea_orm::sea_query::Expr::value(now),
+                )
+                .col_expr(
+                    agent::Column::UpdatedAt,
+                    sea_orm::sea_query::Expr::value(now),
+                )
+                .filter(agent::Column::AgentId.eq(agent_id))
+                .exec(db)
+                .await?;
         } else {
-            conn.execute(
-                "UPDATE agents SET profile_reviewed_at = ?1, updated_at = ?1 WHERE agent_id = ?2",
-                (now, agent_id),
-            )?;
+            agent::Entity::update_many()
+                .col_expr(
+                    agent::Column::ProfileReviewedAt,
+                    sea_orm::sea_query::Expr::value(now),
+                )
+                .col_expr(
+                    agent::Column::UpdatedAt,
+                    sea_orm::sea_query::Expr::value(now),
+                )
+                .filter(agent::Column::AgentId.eq(agent_id))
+                .exec(db)
+                .await?;
         }
 
-        let agent = Self::get_by_id(conn, agent_id)?
+        let agent = find_agent_row(db, agent_id)
+            .await?
             .expect("row existed a moment ago under the same connection");
         Ok(Some(ReviewProfileResult { agent, changed }))
     }
@@ -670,17 +820,32 @@ impl AgentRepository {
     /// agent's `token`/`agent_id` still satisfies the FK from
     /// `agent_messages`. Idempotent by construction — re-purging the
     /// same id is a no-op, not a conflict.
-    pub fn insert_tombstone(
-        conn: &Connection,
+    ///
+    /// Phase G (sea-orm migration): sea-orm-backed (`async`, `db: &
+    /// sea_orm::DatabaseConnection`) — see this module's own doc.
+    /// SQLite's `INSERT OR IGNORE` swallows a violation of ANY unique
+    /// constraint on the row (both the `token` primary key and the
+    /// `agent_id` unique index), which sea-orm's typed
+    /// `.on_conflict()` builder can't express (it targets exactly one
+    /// named conflict column/index) — this crate's established raw-
+    /// SQL escape hatch (`Statement::from_sql_and_values`, same idiom
+    /// `agent_action_repository::list_recent`/
+    /// `group_membership_repository::ensure_group` already use) is
+    /// the correct tool here, not a bent typed-builder call.
+    pub async fn insert_tombstone(
+        db: &DatabaseConnection,
         token: &str,
         tombstone_agent_id: &str,
         now: &str,
-    ) -> Result<()> {
-        conn.execute(
+    ) -> std::result::Result<(), DbErr> {
+        let backend = db.get_database_backend();
+        let stmt = Statement::from_sql_and_values(
+            backend,
             "INSERT OR IGNORE INTO agents (token, agent_id, created_at, status, working_directory, color, updated_at) \
-             VALUES (?1, ?2, ?3, 'tombstone', '', '#000000', ?3)",
-            (token, tombstone_agent_id, now),
-        )?;
+             VALUES (?, ?, ?, 'tombstone', '', '#000000', ?)",
+            [token.into(), tombstone_agent_id.into(), now.into(), now.into()],
+        );
+        db.execute_raw(stmt).await?;
         Ok(())
     }
 
@@ -1050,9 +1215,26 @@ mod tests {
         conn
     }
 
-    fn seed(conn: &Connection, agent_id: &str, token: &str, status: &str) {
+    /// A file-backed DB opened as BOTH a `rusqlite::Connection` (for
+    /// every still-sync method under test) and a sea-orm
+    /// `DatabaseConnection` (for `query` from PR 1/4 and the
+    /// CRUD-lifecycle writes converted in PR 2/4) -- an in-memory
+    /// `:memory:` DB can't be shared across two separate connection
+    /// handles the way a real file can.
+    async fn test_conn_with_sea_orm() -> (tempfile::TempDir, Connection, DatabaseConnection) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent_repository_test.db");
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn).unwrap();
+        let db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        (dir, conn, db)
+    }
+
+    async fn seed(db: &DatabaseConnection, agent_id: &str, token: &str, status: &str) {
         AgentRepository::create(
-            conn,
+            db,
             NewAgent {
                 token,
                 agent_id,
@@ -1064,6 +1246,7 @@ mod tests {
                 agent_role: "worker",
             },
         )
+        .await
         .unwrap();
     }
 
@@ -1073,10 +1256,10 @@ mod tests {
         assert_eq!(AgentRepository::get_by_id(&conn, "nope").unwrap(), None);
     }
 
-    #[test]
-    fn create_then_get_by_id_and_get_by_token_round_trip() {
-        let conn = test_conn();
-        seed(&conn, "alice", "tok-alice", "active");
+    #[tokio::test]
+    async fn create_then_get_by_id_and_get_by_token_round_trip() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
+        seed(&db, "alice", "tok-alice", "active").await;
 
         let by_id = AgentRepository::get_by_id(&conn, "alice").unwrap().unwrap();
         assert_eq!(by_id.agent_id, "alice");
@@ -1091,11 +1274,11 @@ mod tests {
         assert_eq!(by_token, by_id);
     }
 
-    #[test]
-    fn create_rejects_invalid_agent_id_before_any_write() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn create_rejects_invalid_agent_id_before_any_write() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         let err = AgentRepository::create(
-            &conn,
+            &db,
             NewAgent {
                 token: "t1",
                 agent_id: "Bad-ID", // uppercase, leading letter but rule violated
@@ -1107,16 +1290,17 @@ mod tests {
                 agent_role: "worker",
             },
         )
+        .await
         .unwrap_err();
         assert!(matches!(err, CreateAgentError::InvalidAgentId(_)));
         assert_eq!(AgentRepository::get_by_token(&conn, "t1").unwrap(), None);
     }
 
-    #[test]
-    fn create_rejects_reserved_admin_prefix() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn create_rejects_reserved_admin_prefix() {
+        let (_dir, _conn, db) = test_conn_with_sea_orm().await;
         let err = AgentRepository::create(
-            &conn,
+            &db,
             NewAgent {
                 token: "t1",
                 agent_id: "admin-bob",
@@ -1128,20 +1312,22 @@ mod tests {
                 agent_role: "worker",
             },
         )
+        .await
         .unwrap_err();
         assert!(matches!(err, CreateAgentError::InvalidAgentId(_)));
     }
 
-    #[test]
-    fn seed_manager_profile_sets_all_three_columns_and_leaves_updated_by_null() {
-        let conn = test_conn();
-        seed(&conn, "manager-1", "tok-m1", "active");
+    #[tokio::test]
+    async fn seed_manager_profile_sets_all_three_columns_and_leaves_updated_by_null() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
+        seed(&db, "manager-1", "tok-m1", "active").await;
         AgentRepository::seed_manager_profile(
-            &conn,
+            &db,
             "manager-1",
             "You are a manager.",
             "2026-06-01T00:00:00Z",
         )
+        .await
         .unwrap();
         let row = AgentRepository::get_by_id(&conn, "manager-1")
             .unwrap()
@@ -1158,19 +1344,19 @@ mod tests {
         assert_eq!(row.profile_updated_by, None);
     }
 
-    #[test]
-    fn create_accepts_single_character_agent_id() {
-        let conn = test_conn();
-        seed(&conn, "a", "tok-a", "active");
+    #[tokio::test]
+    async fn create_accepts_single_character_agent_id() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
+        seed(&db, "a", "tok-a", "active").await;
         assert!(AgentRepository::get_by_id(&conn, "a").unwrap().is_some());
     }
 
-    #[test]
-    fn create_duplicate_agent_id_is_a_conflict_not_a_generic_db_error() {
-        let conn = test_conn();
-        seed(&conn, "alice", "tok-alice", "active");
+    #[tokio::test]
+    async fn create_duplicate_agent_id_is_a_conflict_not_a_generic_db_error() {
+        let (_dir, _conn, db) = test_conn_with_sea_orm().await;
+        seed(&db, "alice", "tok-alice", "active").await;
         let err = AgentRepository::create(
-            &conn,
+            &db,
             NewAgent {
                 token: "tok-other",
                 agent_id: "alice",
@@ -1182,17 +1368,18 @@ mod tests {
                 agent_role: "worker",
             },
         )
+        .await
         .unwrap_err();
         assert!(matches!(err, CreateAgentError::Conflict(_)));
     }
 
-    #[test]
-    fn list_active_excludes_terminated_and_tombstone() {
-        let conn = test_conn();
-        seed(&conn, "live1", "t1", "active");
-        seed(&conn, "dead1", "t2", "terminated");
-        seed(&conn, "tomb1", "t3", "tombstone");
-        seed(&conn, "live2", "t4", "created");
+    #[tokio::test]
+    async fn list_active_excludes_terminated_and_tombstone() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
+        seed(&db, "live1", "t1", "active").await;
+        seed(&db, "dead1", "t2", "terminated").await;
+        seed(&db, "tomb1", "t3", "tombstone").await;
+        seed(&db, "live2", "t4", "created").await;
 
         let mut ids: Vec<_> = AgentRepository::list_active(&conn)
             .unwrap()
@@ -1203,12 +1390,12 @@ mod tests {
         assert_eq!(ids, vec!["live1", "live2"]);
     }
 
-    #[test]
-    fn list_all_bounded_includes_every_status_and_respects_the_limit() {
-        let conn = test_conn();
-        seed(&conn, "live1", "t1", "active");
-        seed(&conn, "dead1", "t2", "terminated");
-        seed(&conn, "tomb1", "t3", "tombstone");
+    #[tokio::test]
+    async fn list_all_bounded_includes_every_status_and_respects_the_limit() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
+        seed(&db, "live1", "t1", "active").await;
+        seed(&db, "dead1", "t2", "terminated").await;
+        seed(&db, "tomb1", "t3", "tombstone").await;
 
         let all = AgentRepository::list_all_bounded(&conn, 10).unwrap();
         let mut ids: Vec<_> = all.iter().map(|a| a.agent_id.as_str()).collect();
@@ -1223,12 +1410,12 @@ mod tests {
         assert_eq!(capped.len(), 2);
     }
 
-    #[test]
-    fn list_for_dashboard_excludes_only_tombstone_and_the_limit_applies_after_that_filter() {
-        let conn = test_conn();
-        seed(&conn, "live1", "t1", "active");
-        seed(&conn, "dead1", "t2", "terminated");
-        seed(&conn, "tomb1", "t3", "tombstone");
+    #[tokio::test]
+    async fn list_for_dashboard_excludes_only_tombstone_and_the_limit_applies_after_that_filter() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
+        seed(&db, "live1", "t1", "active").await;
+        seed(&db, "dead1", "t2", "terminated").await;
+        seed(&db, "tomb1", "t3", "tombstone").await;
 
         let unfiltered = AgentRepository::list_for_dashboard(&conn, None, 10).unwrap();
         let mut ids: Vec<_> = unfiltered.iter().map(|a| a.agent_id.as_str()).collect();
@@ -1259,13 +1446,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn count_active_by_status_excludes_terminal_and_groups_correctly() {
-        let conn = test_conn();
-        seed(&conn, "a1", "t1", "active");
-        seed(&conn, "a2", "t2", "active");
-        seed(&conn, "c1", "t3", "created");
-        seed(&conn, "d1", "t4", "terminated");
+    #[tokio::test]
+    async fn count_active_by_status_excludes_terminal_and_groups_correctly() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
+        seed(&db, "a1", "t1", "active").await;
+        seed(&db, "a2", "t2", "active").await;
+        seed(&db, "c1", "t3", "created").await;
+        seed(&db, "d1", "t4", "terminated").await;
 
         let counts = AgentRepository::count_active_by_status(&conn).unwrap();
         assert_eq!(counts.get("active"), Some(&2));
@@ -1287,10 +1474,10 @@ mod tests {
         assert_eq!(result, None);
     }
 
-    #[test]
-    fn update_field_writes_value_and_bumps_updated_at() {
-        let conn = test_conn();
-        seed(&conn, "alice", "tok-alice", "created");
+    #[tokio::test]
+    async fn update_field_writes_value_and_bumps_updated_at() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
+        seed(&db, "alice", "tok-alice", "created").await;
 
         let updated = AgentRepository::update_field(
             &conn,
@@ -1305,10 +1492,10 @@ mod tests {
         assert_eq!(updated.updated_at.as_deref(), Some("2026-01-02T00:00:00Z"));
     }
 
-    #[test]
-    fn update_field_auto_event_loop_coerces_bool_to_integer_column() {
-        let conn = test_conn();
-        seed(&conn, "alice", "tok-alice", "active");
+    #[tokio::test]
+    async fn update_field_auto_event_loop_coerces_bool_to_integer_column() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
+        seed(&db, "alice", "tok-alice", "active").await;
 
         let updated = AgentRepository::update_field(
             &conn,
@@ -1322,10 +1509,10 @@ mod tests {
         assert!(!updated.auto_event_loop);
     }
 
-    #[test]
-    fn terminate_sets_status_and_clears_current_task() {
-        let conn = test_conn();
-        seed(&conn, "alice", "tok-alice", "active");
+    #[tokio::test]
+    async fn terminate_sets_status_and_clears_current_task() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
+        seed(&db, "alice", "tok-alice", "active").await;
         AgentRepository::update_field(
             &conn,
             "alice",
@@ -1335,7 +1522,11 @@ mod tests {
         )
         .unwrap();
 
-        assert!(AgentRepository::terminate(&conn, "alice", "2026-01-03T00:00:00Z").unwrap());
+        assert!(
+            AgentRepository::terminate(&db, "alice", "2026-01-03T00:00:00Z")
+                .await
+                .unwrap()
+        );
 
         let row = AgentRepository::get_by_id(&conn, "alice").unwrap().unwrap();
         assert_eq!(row.status, "terminated");
@@ -1343,24 +1534,31 @@ mod tests {
         assert_eq!(row.current_task, None);
     }
 
-    #[test]
-    fn terminate_missing_agent_returns_false() {
-        let conn = test_conn();
-        assert!(!AgentRepository::terminate(&conn, "nope", "2026-01-01T00:00:00Z").unwrap());
+    #[tokio::test]
+    async fn terminate_missing_agent_returns_false() {
+        let (_dir, _conn, db) = test_conn_with_sea_orm().await;
+        assert!(
+            !AgentRepository::terminate(&db, "nope", "2026-01-01T00:00:00Z")
+                .await
+                .unwrap()
+        );
     }
 
-    #[test]
-    fn terminate_refuses_a_tombstone_row() {
+    #[tokio::test]
+    async fn terminate_refuses_a_tombstone_row() {
         // BL-R31-3b: a tombstone is already a purge artefact; flipping
         // its status to 'terminated' would leak `[deleted-<id>]` into
         // the terminated-agents listing. NOT_TERMINAL_SQL already
         // excludes 'tombstone' from terminate()'s WHERE clause -- this
         // pins that specific case (untested until now).
-        let conn = test_conn();
-        AgentRepository::insert_tombstone(&conn, "t1", "[deleted-ghost]", "2026-01-01T00:00:00Z")
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
+        AgentRepository::insert_tombstone(&db, "t1", "[deleted-ghost]", "2026-01-01T00:00:00Z")
+            .await
             .unwrap();
         assert!(
-            !AgentRepository::terminate(&conn, "[deleted-ghost]", "2026-01-02T00:00:00Z").unwrap()
+            !AgentRepository::terminate(&db, "[deleted-ghost]", "2026-01-02T00:00:00Z")
+                .await
+                .unwrap()
         );
         let row = AgentRepository::get_by_id(&conn, "[deleted-ghost]")
             .unwrap()
@@ -1371,39 +1569,48 @@ mod tests {
         );
     }
 
-    #[test]
-    fn terminate_already_terminal_is_a_noop_not_a_re_stamp() {
-        let conn = test_conn();
-        seed(&conn, "alice", "tok-alice", "active");
-        assert!(AgentRepository::terminate(&conn, "alice", "2026-01-01T00:00:00Z").unwrap());
+    #[tokio::test]
+    async fn terminate_already_terminal_is_a_noop_not_a_re_stamp() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
+        seed(&db, "alice", "tok-alice", "active").await;
+        assert!(
+            AgentRepository::terminate(&db, "alice", "2026-01-01T00:00:00Z")
+                .await
+                .unwrap()
+        );
         // Second terminate on an already-terminal row must report
         // "no row matched" — matches Python excluding terminal rows
         // from the UPDATE's WHERE clause explicitly.
-        assert!(!AgentRepository::terminate(&conn, "alice", "2026-01-02T00:00:00Z").unwrap());
+        assert!(
+            !AgentRepository::terminate(&db, "alice", "2026-01-02T00:00:00Z")
+                .await
+                .unwrap()
+        );
         let row = AgentRepository::get_by_id(&conn, "alice").unwrap().unwrap();
         assert_eq!(row.terminated_at.as_deref(), Some("2026-01-01T00:00:00Z"));
     }
 
-    #[test]
-    fn delete_removes_row_and_returns_true() {
-        let conn = test_conn();
-        seed(&conn, "alice", "tok-alice", "active");
-        assert!(AgentRepository::delete(&conn, "alice").unwrap());
+    #[tokio::test]
+    async fn delete_removes_row_and_returns_true() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
+        seed(&db, "alice", "tok-alice", "active").await;
+        assert!(AgentRepository::delete(&db, "alice").await.unwrap());
         assert_eq!(AgentRepository::get_by_id(&conn, "alice").unwrap(), None);
     }
 
-    #[test]
-    fn delete_missing_agent_returns_false() {
-        let conn = test_conn();
-        assert!(!AgentRepository::delete(&conn, "nope").unwrap());
+    #[tokio::test]
+    async fn delete_missing_agent_returns_false() {
+        let (_dir, _conn, db) = test_conn_with_sea_orm().await;
+        assert!(!AgentRepository::delete(&db, "nope").await.unwrap());
     }
 
-    #[test]
-    fn rotate_token_writes_new_token_and_old_token_no_longer_resolves() {
-        let conn = test_conn();
-        seed(&conn, "alice", "tok-old", "active");
+    #[tokio::test]
+    async fn rotate_token_writes_new_token_and_old_token_no_longer_resolves() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
+        seed(&db, "alice", "tok-old", "active").await;
         assert!(
-            AgentRepository::rotate_token(&conn, "alice", "tok-new", "2026-01-02T00:00:00Z")
+            AgentRepository::rotate_token(&db, "alice", "tok-new", "2026-01-02T00:00:00Z")
+                .await
                 .unwrap()
         );
         assert_eq!(
@@ -1419,11 +1626,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rotate_token_missing_agent_returns_false() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn rotate_token_missing_agent_returns_false() {
+        let (_dir, _conn, db) = test_conn_with_sea_orm().await;
         assert!(
-            !AgentRepository::rotate_token(&conn, "nope", "tok-new", "2026-01-01T00:00:00Z")
+            !AgentRepository::rotate_token(&db, "nope", "tok-new", "2026-01-01T00:00:00Z")
+                .await
                 .unwrap()
         );
     }
@@ -1440,10 +1648,10 @@ mod tests {
         .unwrap());
     }
 
-    #[test]
-    fn advance_event_cursor_first_write_advances_from_null() {
-        let conn = test_conn();
-        seed(&conn, "alice", "tok-alice", "active");
+    #[tokio::test]
+    async fn advance_event_cursor_first_write_advances_from_null() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
+        seed(&db, "alice", "tok-alice", "active").await;
         assert!(AgentRepository::advance_event_cursor(
             &conn,
             "alice",
@@ -1458,10 +1666,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn advance_event_cursor_never_regresses() {
-        let conn = test_conn();
-        seed(&conn, "alice", "tok-alice", "active");
+    #[tokio::test]
+    async fn advance_event_cursor_never_regresses() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
+        seed(&db, "alice", "tok-alice", "active").await;
         assert!(AgentRepository::advance_event_cursor(
             &conn,
             "alice",
@@ -1487,28 +1695,30 @@ mod tests {
         );
     }
 
-    #[test]
-    fn review_profile_missing_agent_returns_none() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn review_profile_missing_agent_returns_none() {
+        let (_dir, _conn, db) = test_conn_with_sea_orm().await;
         assert_eq!(
             AgentRepository::review_profile(
-                &conn,
+                &db,
                 "nope",
                 Some("hi"),
                 Some("editor"),
                 "2026-01-01T00:00:00Z"
             )
+            .await
             .unwrap(),
             None
         );
     }
 
-    #[test]
-    fn review_profile_always_stamps_reviewed_at() {
-        let conn = test_conn();
-        seed(&conn, "alice", "tok-alice", "active");
+    #[tokio::test]
+    async fn review_profile_always_stamps_reviewed_at() {
+        let (_dir, _conn, db) = test_conn_with_sea_orm().await;
+        seed(&db, "alice", "tok-alice", "active").await;
         let result =
-            AgentRepository::review_profile(&conn, "alice", None, None, "2026-01-01T00:00:00Z")
+            AgentRepository::review_profile(&db, "alice", None, None, "2026-01-01T00:00:00Z")
+                .await
                 .unwrap()
                 .unwrap();
         assert_eq!(
@@ -1517,17 +1727,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn review_profile_unchanged_content_does_not_touch_profile_updated_fields() {
-        let conn = test_conn();
-        seed(&conn, "alice", "tok-alice", "active");
+    #[tokio::test]
+    async fn review_profile_unchanged_content_does_not_touch_profile_updated_fields() {
+        let (_dir, _conn, db) = test_conn_with_sea_orm().await;
+        seed(&db, "alice", "tok-alice", "active").await;
         let first = AgentRepository::review_profile(
-            &conn,
+            &db,
             "alice",
             Some("v1"),
             Some("bob"),
             "2026-01-01T00:00:00Z",
         )
+        .await
         .unwrap()
         .unwrap();
         assert!(first.changed);
@@ -1536,12 +1747,13 @@ mod tests {
         // profile_updated_at/profile_updated_by, only
         // profile_reviewed_at.
         let second = AgentRepository::review_profile(
-            &conn,
+            &db,
             "alice",
             Some("v1"),
             Some("carol"),
             "2026-01-02T00:00:00Z",
         )
+        .await
         .unwrap()
         .unwrap();
         assert!(!second.changed);
@@ -1557,26 +1769,28 @@ mod tests {
         );
     }
 
-    #[test]
-    fn review_profile_changed_content_updates_profile_and_attribution() {
-        let conn = test_conn();
-        seed(&conn, "alice", "tok-alice", "active");
+    #[tokio::test]
+    async fn review_profile_changed_content_updates_profile_and_attribution() {
+        let (_dir, _conn, db) = test_conn_with_sea_orm().await;
+        seed(&db, "alice", "tok-alice", "active").await;
         AgentRepository::review_profile(
-            &conn,
+            &db,
             "alice",
             Some("v1"),
             Some("bob"),
             "2026-01-01T00:00:00Z",
         )
+        .await
         .unwrap();
 
         let second = AgentRepository::review_profile(
-            &conn,
+            &db,
             "alice",
             Some("v2"),
             Some("carol"),
             "2026-01-02T00:00:00Z",
         )
+        .await
         .unwrap()
         .unwrap();
         assert!(second.changed);
@@ -1588,12 +1802,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn clear_current_task_for_clears_every_matching_agent_and_returns_count() {
-        let conn = test_conn();
-        seed(&conn, "a1", "t1", "active");
-        seed(&conn, "a2", "t2", "active");
-        seed(&conn, "a3", "t3", "active");
+    #[tokio::test]
+    async fn clear_current_task_for_clears_every_matching_agent_and_returns_count() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
+        seed(&db, "a1", "t1", "active").await;
+        seed(&db, "a2", "t2", "active").await;
+        seed(&db, "a3", "t3", "active").await;
         AgentRepository::update_field(
             &conn,
             "a1",
@@ -1649,12 +1863,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn clear_current_task_for_many_clears_across_the_whole_set() {
-        let conn = test_conn();
-        seed(&conn, "a1", "t1", "active");
-        seed(&conn, "a2", "t2", "active");
-        seed(&conn, "a3", "t3", "active");
+    #[tokio::test]
+    async fn clear_current_task_for_many_clears_across_the_whole_set() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
+        seed(&db, "a1", "t1", "active").await;
+        seed(&db, "a2", "t2", "active").await;
+        seed(&db, "a3", "t3", "active").await;
         AgentRepository::update_field(
             &conn,
             "a1",
@@ -1696,11 +1910,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reconcile_current_task_on_reassign_clears_loser_and_sets_gainer_if_free() {
-        let conn = test_conn();
-        seed(&conn, "loser", "t1", "active");
-        seed(&conn, "gainer", "t2", "active");
+    #[tokio::test]
+    async fn reconcile_current_task_on_reassign_clears_loser_and_sets_gainer_if_free() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
+        seed(&db, "loser", "t1", "active").await;
+        seed(&db, "gainer", "t2", "active").await;
         AgentRepository::update_field(
             &conn,
             "loser",
@@ -1735,10 +1949,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reconcile_current_task_on_reassign_never_clobbers_a_busy_gainer() {
-        let conn = test_conn();
-        seed(&conn, "gainer", "t1", "active");
+    #[tokio::test]
+    async fn reconcile_current_task_on_reassign_never_clobbers_a_busy_gainer() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
+        seed(&db, "gainer", "t1", "active").await;
         AgentRepository::update_field(
             &conn,
             "gainer",
@@ -1767,15 +1981,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn insert_tombstone_creates_placeholder_row() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn insert_tombstone_creates_placeholder_row() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         AgentRepository::insert_tombstone(
-            &conn,
+            &db,
             "purged-token",
             "purged-agent",
             "2026-01-01T00:00:00Z",
         )
+        .await
         .unwrap();
         let row = AgentRepository::get_by_id(&conn, "purged-agent")
             .unwrap()
@@ -1786,23 +2001,25 @@ mod tests {
         assert_eq!(row.color.as_deref(), Some("#000000"));
     }
 
-    #[test]
-    fn insert_tombstone_is_idempotent_via_insert_or_ignore() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn insert_tombstone_is_idempotent_via_insert_or_ignore() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         AgentRepository::insert_tombstone(
-            &conn,
+            &db,
             "purged-token",
             "purged-agent",
             "2026-01-01T00:00:00Z",
         )
+        .await
         .unwrap();
         // Re-purging the same id must not error (INSERT OR IGNORE).
         AgentRepository::insert_tombstone(
-            &conn,
+            &db,
             "purged-token",
             "purged-agent",
             "2026-01-02T00:00:00Z",
         )
+        .await
         .unwrap();
         let row = AgentRepository::get_by_id(&conn, "purged-agent")
             .unwrap()
@@ -1830,25 +2047,6 @@ mod tests {
         rows.iter().map(|r| r.agent_id.as_str()).collect()
     }
 
-    /// A file-backed DB opened as BOTH a `rusqlite::Connection` (to
-    /// seed/mutate rows through the still-sync rest of this
-    /// repository) and a sea-orm `DatabaseConnection` (to exercise the
-    /// now-converted [`AgentRepository::query`]) -- the same
-    /// dual-connection recipe `task_repository::tests::
-    /// test_conn_with_sea_orm` uses, since an in-memory `:memory:` DB
-    /// can't be shared across two separate connection handles the way
-    /// a real file can.
-    async fn test_conn_with_sea_orm() -> (tempfile::TempDir, Connection, DatabaseConnection) {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("agent_query_test.db");
-        let conn = Connection::open(&path).unwrap();
-        init_schema(&conn).unwrap();
-        let db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
-            .await
-            .unwrap();
-        (dir, conn, db)
-    }
-
     #[tokio::test]
     async fn query_default_sort_is_created_at_desc_with_agent_id_tiebreaker() {
         let (_dir, conn, db) = test_conn_with_sea_orm().await;
@@ -1867,7 +2065,9 @@ mod tests {
     async fn query_excludes_tombstones_unconditionally() {
         let (_dir, conn, db) = test_conn_with_sea_orm().await;
         seed_with_timestamp(&conn, "live", "t1", "active", "2026-01-01T00:00:00Z");
-        AgentRepository::insert_tombstone(&conn, "t2", "tomb", "2026-01-01T00:00:00Z").unwrap();
+        AgentRepository::insert_tombstone(&db, "t2", "tomb", "2026-01-01T00:00:00Z")
+            .await
+            .unwrap();
 
         let repo = AgentRepository::new();
         let (rows, total) = repo.query(&db, AgentQueryFilters::default()).await.unwrap();
@@ -1879,7 +2079,9 @@ mod tests {
     async fn query_explicit_tombstone_status_filter_is_self_contradictory_and_returns_empty() {
         let (_dir, conn, db) = test_conn_with_sea_orm().await;
         seed_with_timestamp(&conn, "live", "t1", "active", "2026-01-01T00:00:00Z");
-        AgentRepository::insert_tombstone(&conn, "t2", "tomb", "2026-01-01T00:00:00Z").unwrap();
+        AgentRepository::insert_tombstone(&db, "t2", "tomb", "2026-01-01T00:00:00Z")
+            .await
+            .unwrap();
 
         let repo = AgentRepository::new();
         let (rows, total) = repo
@@ -1995,7 +2197,9 @@ mod tests {
         // #1) flips to terminated, which would normally drop it from
         // this include_terminated=false filter and shift every
         // later-ranked agent up by one.
-        AgentRepository::terminate(&conn, "pg-a5", "2026-01-01T00:10:00Z").unwrap();
+        AgentRepository::terminate(&db, "pg-a5", "2026-01-01T00:10:00Z")
+            .await
+            .unwrap();
 
         // offset=2 replays the ANCHOR from page1, not a re-filtered
         // live query -- so the window is still ordered_ids[2:4] from
@@ -2047,7 +2251,7 @@ mod tests {
 
         // Hard-delete the rank-3 agent (tc-a5) -- not yet delivered
         // by any page.
-        assert!(AgentRepository::delete(&conn, "tc-a5").unwrap());
+        assert!(AgentRepository::delete(&db, "tc-a5").await.unwrap());
 
         for offset in [2, 4, 6] {
             let (page, total) = repo.query(&db, filters(offset)).await.unwrap();
@@ -2100,12 +2304,14 @@ mod tests {
         assert_eq!(page.len(), 1);
     }
 
-    #[test]
-    fn dump_all_includes_terminal_statuses_unlike_every_other_listing() {
-        let conn = test_conn();
-        seed(&conn, "live", "t1", "active");
-        seed(&conn, "dead", "t2", "terminated");
-        AgentRepository::insert_tombstone(&conn, "t3", "tomb", "2026-01-01T00:00:00Z").unwrap();
+    #[tokio::test]
+    async fn dump_all_includes_terminal_statuses_unlike_every_other_listing() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
+        seed(&db, "live", "t1", "active").await;
+        seed(&db, "dead", "t2", "terminated").await;
+        AgentRepository::insert_tombstone(&db, "t3", "tomb", "2026-01-01T00:00:00Z")
+            .await
+            .unwrap();
 
         let mut ids: Vec<_> = AgentRepository::dump_all(&conn)
             .unwrap()
@@ -2118,18 +2324,19 @@ mod tests {
 
     // -- list_profile_changes_since --------------------------------------
 
-    #[test]
-    fn list_profile_changes_since_excludes_the_editors_own_edit() {
-        let conn = test_conn();
-        seed(&conn, "manager", "t1", "active");
-        seed(&conn, "worker", "t2", "active");
+    #[tokio::test]
+    async fn list_profile_changes_since_excludes_the_editors_own_edit() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
+        seed(&db, "manager", "t1", "active").await;
+        seed(&db, "worker", "t2", "active").await;
         AgentRepository::review_profile(
-            &conn,
+            &db,
             "worker",
             Some("curated by manager"),
             Some("manager"),
             "2026-01-01T00:00:01Z",
         )
+        .await
         .unwrap();
 
         // The editor (manager) never sees its own edit.
@@ -2148,19 +2355,20 @@ mod tests {
         assert_eq!(for_worker[0].profile_updated_by.as_deref(), Some("manager"));
     }
 
-    #[test]
-    fn list_profile_changes_since_excludes_own_null_editor_seed_but_not_a_peers() {
-        let conn = test_conn();
-        seed(&conn, "manager", "t1", "active");
-        seed(&conn, "peer", "t2", "active");
+    #[tokio::test]
+    async fn list_profile_changes_since_excludes_own_null_editor_seed_but_not_a_peers() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
+        seed(&db, "manager", "t1", "active").await;
+        seed(&db, "peer", "t2", "active").await;
         // A NULL-editor seed (e.g. an initial charter) on "manager".
         AgentRepository::review_profile(
-            &conn,
+            &db,
             "manager",
             Some("initial charter"),
             None,
             "2026-01-01T00:00:01Z",
         )
+        .await
         .unwrap();
 
         // "manager" itself never sees its own NULL-editor seed echoed back.
@@ -2178,18 +2386,19 @@ mod tests {
         assert_eq!(for_peer[0].agent_id, "manager");
     }
 
-    #[test]
-    fn list_profile_changes_since_excludes_rows_at_or_before_the_cursor() {
-        let conn = test_conn();
-        seed(&conn, "manager", "t1", "active");
-        seed(&conn, "worker", "t2", "active");
+    #[tokio::test]
+    async fn list_profile_changes_since_excludes_rows_at_or_before_the_cursor() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
+        seed(&db, "manager", "t1", "active").await;
+        seed(&db, "worker", "t2", "active").await;
         AgentRepository::review_profile(
-            &conn,
+            &db,
             "worker",
             Some("v1"),
             Some("manager"),
             "2026-01-01T00:00:00Z",
         )
+        .await
         .unwrap();
 
         assert!(AgentRepository::list_profile_changes_since(
@@ -2201,17 +2410,18 @@ mod tests {
         .is_empty());
     }
 
-    #[test]
-    fn list_profile_changes_since_excludes_tombstone_terminated_and_system_rows() {
-        let conn = test_conn();
-        seed(&conn, "alice", "t1", "active");
+    #[tokio::test]
+    async fn list_profile_changes_since_excludes_tombstone_terminated_and_system_rows() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
+        seed(&db, "alice", "t1", "active").await;
         AgentRepository::review_profile(
-            &conn,
+            &db,
             "alice",
             Some("v1"),
             Some("bob"),
             "2026-01-01T00:00:01Z",
         )
+        .await
         .unwrap();
         AgentRepository::update_field(
             &conn,
@@ -2233,24 +2443,25 @@ mod tests {
 
     // -- is_live -----------------------------------------------------------
 
-    #[test]
-    fn is_live_true_for_an_active_agent() {
-        let conn = test_conn();
-        seed(&conn, "alice", "t1", "active");
+    #[tokio::test]
+    async fn is_live_true_for_an_active_agent() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
+        seed(&db, "alice", "t1", "active").await;
         assert!(AgentRepository::is_live(&conn, "alice").unwrap());
     }
 
-    #[test]
-    fn is_live_false_for_a_terminated_agent() {
-        let conn = test_conn();
-        seed(&conn, "alice", "t1", "terminated");
+    #[tokio::test]
+    async fn is_live_false_for_a_terminated_agent() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
+        seed(&db, "alice", "t1", "terminated").await;
         assert!(!AgentRepository::is_live(&conn, "alice").unwrap());
     }
 
-    #[test]
-    fn is_live_false_for_a_tombstone() {
-        let conn = test_conn();
-        AgentRepository::insert_tombstone(&conn, "t1", "[deleted-alice]", "2026-01-01T00:00:00Z")
+    #[tokio::test]
+    async fn is_live_false_for_a_tombstone() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
+        AgentRepository::insert_tombstone(&db, "t1", "[deleted-alice]", "2026-01-01T00:00:00Z")
+            .await
             .unwrap();
         assert!(!AgentRepository::is_live(&conn, "[deleted-alice]").unwrap());
     }

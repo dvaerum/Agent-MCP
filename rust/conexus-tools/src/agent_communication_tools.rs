@@ -1662,20 +1662,20 @@ mod tests {
 
     async fn seed_agent(conn: &AsyncMutex<Connection>, agent_id: &str) {
         let guard = conn.lock().await;
-        AgentRepository::create(
-            &guard,
-            conexus_db::agent_repository::NewAgent {
-                token: &format!("tok-{agent_id}"),
-                agent_id,
-                created_at: "2026-01-01T00:00:00Z",
-                status: "active",
-                current_task: None,
-                working_directory: "/tmp",
-                color: None,
-                agent_role: "worker",
-            },
-        )
-        .unwrap();
+        guard
+            .execute(
+                "INSERT INTO agents (token, agent_id, created_at, status, working_directory, agent_role) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                (
+                    &format!("tok-{agent_id}"),
+                    agent_id,
+                    "2026-01-01T00:00:00Z",
+                    "active",
+                    "/tmp",
+                    "worker",
+                ),
+            )
+            .unwrap();
     }
 
     fn agent_bearer(agent_id: &str) -> Principal {

@@ -737,23 +737,21 @@ mod tests {
     #[tokio::test]
     async fn update_of_the_loop_toggle_actually_wakes_a_live_agents_waiter() {
         let (conn, sea_orm_db) = test_conn().await;
-        {
-            let guard = conn.lock().await;
-            conexus_db::agent_repository::AgentRepository::create(
-                &guard,
-                conexus_db::agent_repository::NewAgent {
-                    token: "tok-bob",
-                    agent_id: "bob",
-                    created_at: NOW,
-                    status: "created",
-                    current_task: None,
-                    working_directory: "/tmp",
-                    color: None,
-                    agent_role: "worker",
-                },
-            )
-            .unwrap();
-        }
+        conexus_db::agent_repository::AgentRepository::create(
+            &sea_orm_db,
+            conexus_db::agent_repository::NewAgent {
+                token: "tok-bob",
+                agent_id: "bob",
+                created_at: NOW,
+                status: "created",
+                current_task: None,
+                working_directory: "/tmp",
+                color: None,
+                agent_role: "worker",
+            },
+        )
+        .await
+        .unwrap();
         let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
         let (_tx, mut rx) = registry.register("bob");
         let file_map = conexus_wakeloop::file_map::FileMap::new();
@@ -796,23 +794,21 @@ mod tests {
         )
         .await
         .unwrap();
-        {
-            let guard = conn.lock().await;
-            conexus_db::agent_repository::AgentRepository::create(
-                &guard,
-                conexus_db::agent_repository::NewAgent {
-                    token: "tok-bob",
-                    agent_id: "bob",
-                    created_at: NOW,
-                    status: "created",
-                    current_task: None,
-                    working_directory: "/tmp",
-                    color: None,
-                    agent_role: "worker",
-                },
-            )
-            .unwrap();
-        }
+        conexus_db::agent_repository::AgentRepository::create(
+            &sea_orm_db,
+            conexus_db::agent_repository::NewAgent {
+                token: "tok-bob",
+                agent_id: "bob",
+                created_at: NOW,
+                status: "created",
+                current_task: None,
+                working_directory: "/tmp",
+                color: None,
+                agent_role: "worker",
+            },
+        )
+        .await
+        .unwrap();
         let registry = conexus_wakeloop::waiter_registry::WaiterRegistry::new();
         let (_tx, mut rx) = registry.register("bob");
         let file_map = conexus_wakeloop::file_map::FileMap::new();

@@ -873,7 +873,7 @@ pub fn list_participants(conn: &Connection, limit: i64) -> Result<Participants> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_repository::{AgentRepository, NewAgent};
+    use crate::agent_repository::AgentRepository;
     use crate::schema::init_schema;
 
     fn test_conn() -> Connection {
@@ -882,19 +882,38 @@ mod tests {
         conn
     }
 
+    /// A file-backed DB opened as BOTH a `rusqlite::Connection` (for
+    /// every still-sync function under test) and a sea-orm
+    /// `DatabaseConnection` (for the `AgentRepository` methods
+    /// converted to sea-orm) -- an in-memory `:memory:` DB can't be
+    /// shared across two separate connection handles the way a real
+    /// file can. Mirrors `agent_repository::tests::test_conn_with_sea_orm`.
+    async fn test_conn_with_sea_orm() -> (tempfile::TempDir, Connection, sea_orm::DatabaseConnection)
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("message_repository_test.db");
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn).unwrap();
+        let db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        (dir, conn, db)
+    }
+
     fn seed_agent(conn: &Connection, agent_id: &str) {
-        AgentRepository::create(
-            conn,
-            NewAgent {
-                token: &format!("tok-{agent_id}"),
+        conn.execute(
+            "INSERT INTO agents (token, agent_id, created_at, status, current_task, working_directory, color, agent_role) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            (
+                format!("tok-{agent_id}"),
                 agent_id,
-                created_at: "2026-01-01T00:00:00Z",
-                status: "active",
-                current_task: None,
-                working_directory: "/tmp",
-                color: None,
-                agent_role: "worker",
-            },
+                "2026-01-01T00:00:00Z",
+                "active",
+                Option::<String>::None,
+                "/tmp",
+                Option::<String>::None,
+                "worker",
+            ),
         )
         .unwrap();
     }
@@ -940,16 +959,12 @@ mod tests {
         assert!(!recipient_exists(&conn, "nope").unwrap());
     }
 
-    #[test]
-    fn recipient_exists_true_for_tombstoned_agent() {
-        let conn = test_conn();
-        AgentRepository::insert_tombstone(
-            &conn,
-            "tok-x",
-            "[deleted-alice]",
-            "2026-01-01T00:00:00Z",
-        )
-        .unwrap();
+    #[tokio::test]
+    async fn recipient_exists_true_for_tombstoned_agent() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
+        AgentRepository::insert_tombstone(&db, "tok-x", "[deleted-alice]", "2026-01-01T00:00:00Z")
+            .await
+            .unwrap();
         assert!(recipient_exists(&conn, "[deleted-alice]").unwrap());
     }
 
@@ -1779,12 +1794,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn list_participants_excludes_terminated_and_tombstone_and_prepends_admin() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn list_participants_excludes_terminated_and_tombstone_and_prepends_admin() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         seed_agent(&conn, "alice");
         seed_agent(&conn, "bob");
-        AgentRepository::terminate(&conn, "bob", "2026-01-01T00:00:00Z").unwrap();
+        AgentRepository::terminate(&db, "bob", "2026-01-01T00:00:00Z")
+            .await
+            .unwrap();
 
         let participants = list_participants(&conn, 50).unwrap();
         let ids: Vec<&str> = participants
@@ -1800,23 +1817,20 @@ mod tests {
         );
     }
 
-    #[test]
-    fn list_participants_extracts_tombstones_from_message_participants() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn list_participants_extracts_tombstones_from_message_participants() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         seed_agent(&conn, "alice");
+        AgentRepository::insert_tombstone(&db, "tok-bob", "[deleted-bob]", "2026-01-01T00:00:00Z")
+            .await
+            .unwrap();
         AgentRepository::insert_tombstone(
-            &conn,
-            "tok-bob",
-            "[deleted-bob]",
-            "2026-01-01T00:00:00Z",
-        )
-        .unwrap();
-        AgentRepository::insert_tombstone(
-            &conn,
+            &db,
             "tok-carol",
             "[deleted-carol]",
             "2026-01-01T00:00:00Z",
         )
+        .await
         .unwrap();
         send(&conn, new_msg("m1", "alice", "[deleted-bob]", "to a ghost")).unwrap();
         send(

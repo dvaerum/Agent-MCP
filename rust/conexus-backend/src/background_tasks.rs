@@ -653,18 +653,24 @@ mod subject_backfill_tests {
         let shared = test_shared().await;
         {
             let conn = shared.conn.lock().await;
-            conexus_db::agent_repository::AgentRepository::create(
-                &conn,
-                conexus_db::agent_repository::NewAgent {
-                    token: "tok-bob",
-                    agent_id: "bob",
-                    created_at: "2026-01-01T00:00:00Z",
-                    status: "created",
-                    current_task: None,
-                    working_directory: "/tmp",
-                    color: None,
-                    agent_role: "worker",
-                },
+            // Fixture data only (this test doesn't assert on `create()`
+            // itself) -- a raw insert rather than the sea-orm-backed
+            // `AgentRepository::create` so the row lands in `shared.conn`
+            // without needing a `DatabaseConnection` sharing its storage
+            // (`shared.sea_orm_db` is a separate `:memory:` DB here).
+            conn.execute(
+                "INSERT INTO agents (token, agent_id, created_at, status, current_task, working_directory, color, agent_role) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                (
+                    "tok-bob",
+                    "bob",
+                    "2026-01-01T00:00:00Z",
+                    "created",
+                    Option::<String>::None,
+                    "/tmp",
+                    Option::<String>::None,
+                    "worker",
+                ),
             )
             .unwrap();
             seed_root(&conn, "m1", "bob", "the deploy to staging just failed");

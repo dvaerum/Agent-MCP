@@ -1049,7 +1049,6 @@ mod tests {
     use super::*;
     use conexus_auth::ToolCallContext;
     use conexus_core::capability::{AgentRole, Capabilities};
-    use conexus_db::agent_repository::NewAgent;
     use conexus_db::schema::init_schema;
     use conexus_wakeloop::file_map::FileMap;
     use conexus_wakeloop::waiter_registry::WaiterRegistry;
@@ -1105,18 +1104,10 @@ mod tests {
     }
 
     fn seed_agent(conn: &Connection, agent_id: &str, role: &str) {
-        AgentRepository::create(
-            conn,
-            NewAgent {
-                token: &format!("{agent_id}-tok"),
-                agent_id,
-                created_at: NOW,
-                status: "active",
-                current_task: None,
-                working_directory: "/tmp",
-                color: None,
-                agent_role: role,
-            },
+        conn.execute(
+            "INSERT INTO agents (token, agent_id, created_at, status, working_directory, agent_role) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            (&format!("{agent_id}-tok"), agent_id, NOW, "active", "/tmp", role),
         )
         .unwrap();
     }

@@ -243,7 +243,7 @@ async fn apply(
             color,
             agent_role,
         } => AgentRepository::create(
-            conn,
+            sea_orm_db,
             NewAgent {
                 token: &token,
                 agent_id: &agent_id,
@@ -255,6 +255,7 @@ async fn apply(
                 agent_role: &agent_role,
             },
         )
+        .await
         .map(|_| ())
         .map_err(|e| e.to_string()),
 
@@ -272,12 +273,14 @@ async fn apply(
         }
 
         Operation::AgentTerminate { agent_id, now } => {
-            AgentRepository::terminate(conn, &agent_id, &now)
+            AgentRepository::terminate(sea_orm_db, &agent_id, &now)
+                .await
                 .map(|_| ())
                 .map_err(|e| e.to_string())
         }
 
-        Operation::AgentDelete { agent_id } => AgentRepository::delete(conn, &agent_id)
+        Operation::AgentDelete { agent_id } => AgentRepository::delete(sea_orm_db, &agent_id)
+            .await
             .map(|_| ())
             .map_err(|e| e.to_string()),
 
@@ -285,7 +288,8 @@ async fn apply(
             agent_id,
             new_token,
             now,
-        } => AgentRepository::rotate_token(conn, &agent_id, &new_token, &now)
+        } => AgentRepository::rotate_token(sea_orm_db, &agent_id, &new_token, &now)
+            .await
             .map(|_| ())
             .map_err(|e| e.to_string()),
 

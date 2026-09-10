@@ -349,7 +349,6 @@ mod tests {
     use conexus_auth::ToolCallContext;
     use conexus_core::capability::Capabilities;
     use conexus_core::schema_limits::PATH_MAX_LEN;
-    use conexus_db::agent_repository::NewAgent;
     use conexus_db::schema::init_schema;
     use conexus_wakeloop::file_map::FileMap;
     use conexus_wakeloop::waiter_registry::WaiterRegistry;
@@ -372,32 +371,30 @@ mod tests {
     async fn setup() -> AsyncMutex<Connection> {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
-        AgentRepository::create(
-            &conn,
-            NewAgent {
-                token: "tok",
-                agent_id: "alice",
-                created_at: "2026-06-01T00:00:00Z",
-                status: "active",
-                current_task: None,
-                working_directory: "/home/alice/repo",
-                color: None,
-                agent_role: "worker",
-            },
+        conn.execute(
+            "INSERT INTO agents (token, agent_id, created_at, status, working_directory, agent_role) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            (
+                "tok",
+                "alice",
+                "2026-06-01T00:00:00Z",
+                "active",
+                "/home/alice/repo",
+                "worker",
+            ),
         )
         .unwrap();
-        AgentRepository::create(
-            &conn,
-            NewAgent {
-                token: "tok2",
-                agent_id: "bob",
-                created_at: "2026-06-01T00:00:00Z",
-                status: "active",
-                current_task: None,
-                working_directory: "/home/bob/repo",
-                color: None,
-                agent_role: "worker",
-            },
+        conn.execute(
+            "INSERT INTO agents (token, agent_id, created_at, status, working_directory, agent_role) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            (
+                "tok2",
+                "bob",
+                "2026-06-01T00:00:00Z",
+                "active",
+                "/home/bob/repo",
+                "worker",
+            ),
         )
         .unwrap();
         AsyncMutex::new(conn)

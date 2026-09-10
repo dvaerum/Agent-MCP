@@ -178,7 +178,6 @@ mod tests {
     use conexus_auth::ToolCallContext;
     use conexus_core::capability::Capabilities;
     use conexus_core::principal::PrincipalKind;
-    use conexus_db::agent_repository::{AgentRepository, NewAgent};
     use conexus_db::schema::init_schema;
     use conexus_wakeloop::waiter_registry::WaiterRegistry;
     use std::collections::HashSet;
@@ -200,18 +199,17 @@ mod tests {
     async fn setup() -> AsyncMutex<Connection> {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
-        AgentRepository::create(
-            &conn,
-            NewAgent {
-                token: "tok-1",
-                agent_id: "worker-1",
-                created_at: "2026-06-01T00:00:00Z",
-                status: "active",
-                current_task: None,
-                working_directory: "/home/worker-1/repo",
-                color: None,
-                agent_role: "worker",
-            },
+        conn.execute(
+            "INSERT INTO agents (token, agent_id, created_at, status, working_directory, agent_role) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            (
+                "tok-1",
+                "worker-1",
+                "2026-06-01T00:00:00Z",
+                "active",
+                "/home/worker-1/repo",
+                "worker",
+            ),
         )
         .unwrap();
         AsyncMutex::new(conn)
@@ -253,18 +251,17 @@ mod tests {
         let conn = setup().await;
         {
             let c = conn.lock().await;
-            AgentRepository::create(
-                &c,
-                NewAgent {
-                    token: "tok-2",
-                    agent_id: "manager-1",
-                    created_at: "2026-06-01T00:00:00Z",
-                    status: "active",
-                    current_task: None,
-                    working_directory: "/home/manager-1/repo",
-                    color: None,
-                    agent_role: "manager",
-                },
+            c.execute(
+                "INSERT INTO agents (token, agent_id, created_at, status, working_directory, agent_role) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                (
+                    "tok-2",
+                    "manager-1",
+                    "2026-06-01T00:00:00Z",
+                    "active",
+                    "/home/manager-1/repo",
+                    "manager",
+                ),
             )
             .unwrap();
         }

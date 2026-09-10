@@ -1720,7 +1720,6 @@ mod tests {
 
     use super::*;
     use conexus_core::capability::Capabilities;
-    use conexus_db::agent_repository::NewAgent;
     use conexus_db::schema::init_schema;
     use conexus_wakeloop::waiter_registry::{WaiterRegistry, WakeSignal};
 
@@ -1789,18 +1788,20 @@ mod tests {
     }
 
     fn seed_agent(conn: &Connection, agent_id: &str) {
-        AgentRepository::create(
-            conn,
-            NewAgent {
-                token: &format!("tok-{agent_id}"),
+        // Fixture-only: a raw SQL insert (not `AgentRepository::create`,
+        // now async) keeps this helper sync so the many sync test call
+        // sites that seed fixture agents don't need to become async too.
+        conn.execute(
+            "INSERT INTO agents (token, agent_id, created_at, status, working_directory, agent_role) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            (
+                format!("tok-{agent_id}"),
                 agent_id,
-                created_at: NOW,
-                status: "active",
-                current_task: None,
-                working_directory: "/tmp",
-                color: None,
-                agent_role: "worker",
-            },
+                NOW,
+                "active",
+                "/tmp",
+                "worker",
+            ),
         )
         .unwrap();
     }
@@ -2444,11 +2445,19 @@ mod tests {
         // test_assign_existing_to_terminated_agent_rejected: assigning
         // an existing unassigned task to a TERMINATED agent must be
         // refused -- the row is untouched.
-        let conn = test_conn();
+        // Needs a file-backed DB (not `:memory:`) so the sea-orm
+        // connection used for `AgentRepository::terminate` sees the
+        // same rows as the rusqlite `conn` used for the rest of the
+        // fixture setup and assertions.
+        let (_dir, db_path, conn) = test_conn_file();
         {
             let guard = conn.lock().await;
             seed_agent(&guard, "bob");
-            AgentRepository::terminate(&guard, "bob", NOW).unwrap();
+        }
+        let db = reconnect_sea_orm(&db_path).await;
+        AgentRepository::terminate(&db, "bob", NOW).await.unwrap();
+        {
+            let guard = conn.lock().await;
             seed_task(&guard, "root", "pending", None, "alice", None);
             seed_task(&guard, "orphan", "pending", None, "alice", Some("root"));
         }
@@ -2610,20 +2619,21 @@ mod tests {
         let (_dir, db_path, conn) = test_conn_file();
         {
             let guard = conn.lock().await;
-            AgentRepository::create(
-                &guard,
-                NewAgent {
-                    token: "tok-bob",
-                    agent_id: "bob",
-                    created_at: NOW,
-                    status: "terminated",
-                    current_task: None,
-                    working_directory: "/tmp",
-                    color: None,
-                    agent_role: "worker",
-                },
-            )
-            .unwrap();
+            // Fixture-only, seeded straight into "terminated" status --
+            // not exercising `AgentRepository::create` itself.
+            guard
+                .execute(
+                    "INSERT INTO agents (token, agent_id, created_at, status, working_directory, agent_role) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    (
+                        "tok-bob",
+                        "bob",
+                        NOW,
+                        "terminated",
+                        "/tmp",
+                        "worker",
+                    ),
+                )
+                .unwrap();
         }
         let result = call_assign(
             serde_json::json!({
@@ -2755,12 +2765,16 @@ mod tests {
     async fn mode2_create_and_assign_multiple_to_terminated_agent_rejected() {
         // test_create_and_assign_multiple_to_terminated_rejected: no
         // task should be created+assigned to a TERMINATED agent.
-        let conn = test_conn();
+        // Needs a file-backed DB so the sea-orm connection used for
+        // `AgentRepository::terminate` sees the fixture agent seeded
+        // through the rusqlite `conn`.
+        let (_dir, db_path, conn) = test_conn_file();
         {
             let guard = conn.lock().await;
             seed_agent(&guard, "bob");
-            AgentRepository::terminate(&guard, "bob", NOW).unwrap();
         }
+        let db = reconnect_sea_orm(&db_path).await;
+        AgentRepository::terminate(&db, "bob", NOW).await.unwrap();
         let result = call_assign(
             serde_json::json!({
                 "agent_token": "tok-bob",
@@ -2788,12 +2802,16 @@ mod tests {
     async fn mode1_create_and_assign_single_to_terminated_agent_rejected() {
         // Mode-1 sibling of the same finding (single create+assign,
         // rather than the batch `tasks` array).
-        let conn = test_conn();
+        // Needs a file-backed DB so the sea-orm connection used for
+        // `AgentRepository::terminate` sees the fixture agent seeded
+        // through the rusqlite `conn`.
+        let (_dir, db_path, conn) = test_conn_file();
         {
             let guard = conn.lock().await;
             seed_agent(&guard, "bob");
-            AgentRepository::terminate(&guard, "bob", NOW).unwrap();
         }
+        let db = reconnect_sea_orm(&db_path).await;
+        AgentRepository::terminate(&db, "bob", NOW).await.unwrap();
         let result = call_assign(
             serde_json::json!({
                 "agent_token": "tok-bob",
@@ -2924,7 +2942,6 @@ mod create_self_task_tests {
 
     use super::*;
     use conexus_core::capability::Capabilities;
-    use conexus_db::agent_repository::NewAgent;
     use conexus_db::schema::init_schema;
     use conexus_wakeloop::waiter_registry::WaiterRegistry;
 
@@ -2987,18 +3004,20 @@ mod create_self_task_tests {
     }
 
     fn seed_agent(conn: &Connection, agent_id: &str) {
-        AgentRepository::create(
-            conn,
-            NewAgent {
-                token: &format!("tok-{agent_id}"),
+        // Fixture-only: a raw SQL insert (not `AgentRepository::create`,
+        // now async) keeps this helper sync so the many sync test call
+        // sites that seed fixture agents don't need to become async too.
+        conn.execute(
+            "INSERT INTO agents (token, agent_id, created_at, status, working_directory, agent_role) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            (
+                format!("tok-{agent_id}"),
                 agent_id,
-                created_at: NOW,
-                status: "active",
-                current_task: None,
-                working_directory: "/tmp",
-                color: None,
-                agent_role: "worker",
-            },
+                NOW,
+                "active",
+                "/tmp",
+                "worker",
+            ),
         )
         .unwrap();
     }

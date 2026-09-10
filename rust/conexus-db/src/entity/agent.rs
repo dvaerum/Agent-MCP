@@ -12,15 +12,14 @@
 //! constraint at the DDL level that sea-orm's derive macro can't
 //! express (and doesn't enforce) — modeled as a plain `String` here,
 //! matching `agent_repository::AgentRow::agent_role`'s own type.
-//! [`agent_repository::AgentRepository::query`](crate::agent_repository::AgentRepository::query),
-//! the only sea-orm-backed reader of this Entity so far, only ever
-//! READS this column (filters/sorts never touch `agent_role` at all);
-//! a real enum is deferred until a write path through this Entity
-//! actually needs one to enforce.
+//! [`agent_repository::AgentRepository::create`](crate::agent_repository::AgentRepository::create)
+//! writes it verbatim (no validation) and `query`'s own filters/sorts
+//! never touch it; a real enum is deferred until some caller actually
+//! needs one to enforce the constraint sea-orm itself won't.
 //!
 //! No `Relation` variants defined yet — nothing under sea-orm joins
-//! against `agents` yet (`AgentRepository::query` is the only
-//! sea-orm-backed reader, and it's a single-table query).
+//! against `agents` yet (every sea-orm-backed method on this Entity so
+//! far is a single-table query/write).
 
 use sea_orm::entity::prelude::*;
 
@@ -61,13 +60,14 @@ mod tests {
     use crate::schema::init_schema;
     use sea_orm::{ActiveValue::Set, Database, EntityTrait};
 
-    /// Writes through the REAL rusqlite `AgentRepository::create`, reads
-    /// back through the new sea-orm `Entity` (confirms the two schema
-    /// shapes genuinely agree, not just "the derive macro compiled");
-    /// then the reverse -- writes via `ActiveModel`, reads back through
-    /// the real rusqlite `AgentRepository::get_by_id`. Both connections
-    /// point at the SAME real temp-file DB (an in-memory `:memory:` DB
-    /// can't be shared across two separate connection handles).
+    /// Writes through the real sea-orm `AgentRepository::create`, reads
+    /// back through the `Entity` typed builder directly (confirms the
+    /// two schema shapes genuinely agree, not just "the derive macro
+    /// compiled"); then the reverse -- writes via `ActiveModel`, reads
+    /// back through the still-rusqlite `AgentRepository::get_by_id`.
+    /// Both connections point at the SAME real temp-file DB (an
+    /// in-memory `:memory:` DB can't be shared across two separate
+    /// connection handles).
     #[tokio::test]
     async fn entity_round_trips_against_the_real_schema_and_the_real_repository() {
         let dir = tempfile::tempdir().unwrap();
@@ -76,24 +76,27 @@ mod tests {
         {
             let conn = rusqlite::Connection::open(&path).unwrap();
             init_schema(&conn).unwrap();
-            AgentRepository::create(
-                &conn,
-                NewAgent {
-                    token: "tok-alice",
-                    agent_id: "alice",
-                    created_at: "2026-01-01T00:00:00Z",
-                    status: "active",
-                    current_task: None,
-                    working_directory: "/tmp/alice",
-                    color: Some("#FF5733"),
-                    agent_role: "manager",
-                },
-            )
-            .unwrap();
+            drop(conn);
         }
 
         let url = format!("sqlite://{}", path.display());
         let db = Database::connect(&url).await.unwrap();
+
+        AgentRepository::create(
+            &db,
+            NewAgent {
+                token: "tok-alice",
+                agent_id: "alice",
+                created_at: "2026-01-01T00:00:00Z",
+                status: "active",
+                current_task: None,
+                working_directory: "/tmp/alice",
+                color: Some("#FF5733"),
+                agent_role: "manager",
+            },
+        )
+        .await
+        .unwrap();
 
         let rows = Entity::find().all(&db).await.unwrap();
         assert_eq!(rows.len(), 1);
