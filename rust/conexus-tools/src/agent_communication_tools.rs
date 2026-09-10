@@ -274,14 +274,15 @@ pub async fn wait_for_events_entry(
     if let Ok(assembled) = fast_feed {
         if !assembled.events.is_empty() {
             hold_ladder::reset(&agent_id); // a real event resets the ladder
+            let _ = AgentRepository::advance_event_cursor(
+                ctx.sea_orm_db,
+                &agent_id,
+                &assembled.next_cursor,
+                now_iso,
+            )
+            .await;
             {
                 let guard = conn.lock().await;
-                let _ = AgentRepository::advance_event_cursor(
-                    &guard,
-                    &agent_id,
-                    &assembled.next_cursor,
-                    now_iso,
-                );
                 let _ = AgentRepository::update_field(
                     &guard,
                     &agent_id,
@@ -539,14 +540,15 @@ pub async fn wait_for_events_slow_path(
                 if let Ok(assembled) = assembled {
                     if !assembled.events.is_empty() {
                         hold_ladder::reset(&agent_id);
+                        let _ = AgentRepository::advance_event_cursor(
+                            ctx.sea_orm_db,
+                            &agent_id,
+                            &assembled.next_cursor,
+                            &now_iso_str,
+                        )
+                        .await;
                         {
                             let guard = conn.lock().await;
-                            let _ = AgentRepository::advance_event_cursor(
-                                &guard,
-                                &agent_id,
-                                &assembled.next_cursor,
-                                &now_iso_str,
-                            );
                             let _ = AgentRepository::update_field(
                                 &guard,
                                 &agent_id,
@@ -656,14 +658,15 @@ pub async fn wait_for_events_slow_path(
                 if let Ok(assembled) = assembled {
                     if !assembled.events.is_empty() {
                         hold_ladder::reset(&agent_id);
+                        let _ = AgentRepository::advance_event_cursor(
+                            ctx.sea_orm_db,
+                            &agent_id,
+                            &assembled.next_cursor,
+                            &now_iso_str,
+                        )
+                        .await;
                         {
                             let guard = conn.lock().await;
-                            let _ = AgentRepository::advance_event_cursor(
-                                &guard,
-                                &agent_id,
-                                &assembled.next_cursor,
-                                &now_iso_str,
-                            );
                             let _ = AgentRepository::update_field(
                                 &guard,
                                 &agent_id,
@@ -882,13 +885,13 @@ impl conexus_auth::Tool for FetchEventsSinceTool {
                 };
             };
             if !assembled.events.is_empty() {
-                let guard = conn.lock().await;
                 let _ = AgentRepository::advance_event_cursor(
-                    &guard,
+                    ctx.sea_orm_db,
                     agent_id,
                     &assembled.next_cursor,
                     now,
-                );
+                )
+                .await;
             }
 
             let body =

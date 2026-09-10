@@ -26,16 +26,18 @@
 //! DatabaseConnection`) — PR 1/4 of this repository's own conversion
 //! sequence. PR 2/4 converts the CRUD-lifecycle writes: `create`/
 //! `seed_manager_profile`/`terminate`/`delete`/`rotate_token`/
-//! `insert_tombstone`/`review_profile`. Every other method here,
-//! including `get_by_token`/`is_live`/`get_by_id`/`update_field`/
-//! `reconcile_current_task_on_reassign`/`clear_current_task_for`/
-//! `clear_current_task_for_many`/`list_active`/
-//! `list_profile_changes_since`, is DELIBERATELY, PERMANENTLY staying
-//! rusqlite-only: they're hot-path (every `/mcp`/`/api` request
-//! resolves its bearer through `get_by_token`+`is_live`),
-//! transaction-bound, or wake-loop-collector-bound — mirroring
-//! `resolve_capabilities`/`group_membership_repository`'s own
-//! established "one sync implementation, never duplicated across a
+//! `insert_tombstone`/`review_profile`. PR 3/4 converts the read/
+//! listing group: `count_active_by_status`/`list_all_bounded`/
+//! `list_for_dashboard`/`dump_all`/`advance_event_cursor`. Every other
+//! method here, including `get_by_token`/`is_live`/`get_by_id`/
+//! `update_field`/`reconcile_current_task_on_reassign`/
+//! `clear_current_task_for`/`clear_current_task_for_many`/
+//! `list_active`/`list_profile_changes_since`, is DELIBERATELY,
+//! PERMANENTLY staying rusqlite-only: they're hot-path (every `/mcp`/
+//! `/api` request resolves its bearer through `get_by_token`+
+//! `is_live`), transaction-bound, or wake-loop-collector-bound —
+//! mirroring `resolve_capabilities`/`group_membership_repository`'s
+//! own established "one sync implementation, never duplicated across a
 //! sync/async split" precedent (PR #990). See
 //! `conexus_backend::principal_resolve`/`conexus_auth::
 //! wake_loop_eligibility`/`conexus_wakeloop::event_feed`'s own doc
@@ -355,12 +357,28 @@ impl AgentRepository {
     /// the admin/tombstone rows itself, in the caller, not here --
     /// this is a faithful bounded-read primitive, not a second
     /// `list_active`.
-    pub fn list_all_bounded(conn: &Connection, limit: i64) -> Result<Vec<AgentRow>> {
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {AGENT_COLUMNS} FROM agents ORDER BY created_at DESC LIMIT ?1"
-        ))?;
-        let rows = stmt.query_map([limit], row_to_agent)?;
-        rows.collect()
+    ///
+    /// Phase G (sea-orm migration): sea-orm-backed (`async`, `db: &
+    /// sea_orm::DatabaseConnection`) — see this module's own doc.
+    /// Built via the typed query builder (`order_by_desc` + `limit`),
+    /// same idiom `task_repository::list_by_agent` already
+    /// establishes for a bounded, sorted, single-table read. A
+    /// negative `limit` clamps to 0 rows here (`as u64` saturates to
+    /// 0), unlike rusqlite's raw `LIMIT ?` (SQLite treats a negative
+    /// bound parameter as "no limit") -- every real caller
+    /// (`clamp_section_limit`) already only ever passes a
+    /// non-negative value, so this divergence is unreachable in
+    /// practice, not a behavior change for any real call site.
+    pub async fn list_all_bounded(
+        db: &DatabaseConnection,
+        limit: i64,
+    ) -> std::result::Result<Vec<AgentRow>, DbErr> {
+        let rows = agent::Entity::find()
+            .order_by_desc(agent::Column::CreatedAt)
+            .limit(limit.max(0) as u64)
+            .all(db)
+            .await?;
+        Ok(rows.into_iter().map(agent_row_from_model).collect())
     }
 
     /// `GET /api/agents`'s real query, faithfully -- every status
@@ -376,29 +394,30 @@ impl AgentRepository {
     /// tombstones interleaved near the top of `created_at DESC` still
     /// returns a full `limit` of real rows, matching Python's real
     /// two-branch WHERE clause exactly.
-    pub fn list_for_dashboard(
-        conn: &Connection,
+    ///
+    /// Phase G (sea-orm migration): sea-orm-backed (`async`, `db: &
+    /// sea_orm::DatabaseConnection`) — see this module's own doc. The
+    /// two-branch WHERE collapses into one typed-builder chain (an
+    /// unconditional `status != 'tombstone'` filter, plus an optional
+    /// `status = ...` narrow applied only when `status_filter` is
+    /// `Some`) rather than two separate SQL strings -- both branches
+    /// still compile down to the exact same WHERE clause shape the
+    /// prior raw-SQL version issued.
+    pub async fn list_for_dashboard(
+        db: &DatabaseConnection,
         status_filter: Option<&str>,
         limit: i64,
-    ) -> Result<Vec<AgentRow>> {
-        match status_filter {
-            None => {
-                let mut stmt = conn.prepare(&format!(
-                    "SELECT {AGENT_COLUMNS} FROM agents WHERE status != 'tombstone' \
-                     ORDER BY created_at DESC LIMIT ?1"
-                ))?;
-                let rows = stmt.query_map([limit], row_to_agent)?;
-                rows.collect()
-            }
-            Some(status) => {
-                let mut stmt = conn.prepare(&format!(
-                    "SELECT {AGENT_COLUMNS} FROM agents WHERE status = ?1 AND status != 'tombstone' \
-                     ORDER BY created_at DESC LIMIT ?2"
-                ))?;
-                let rows = stmt.query_map(rusqlite::params![status, limit], row_to_agent)?;
-                rows.collect()
-            }
+    ) -> std::result::Result<Vec<AgentRow>, DbErr> {
+        let mut query = agent::Entity::find().filter(agent::Column::Status.ne("tombstone"));
+        if let Some(status) = status_filter {
+            query = query.filter(agent::Column::Status.eq(status));
         }
+        let rows = query
+            .order_by_desc(agent::Column::CreatedAt)
+            .limit(limit.max(0) as u64)
+            .all(db)
+            .await?;
+        Ok(rows.into_iter().map(agent_row_from_model).collect())
     }
 
     /// True iff a live (non-terminated, non-tombstone) agent row exists
@@ -418,14 +437,29 @@ impl AgentRepository {
         .map(|row| row.is_some())
     }
 
-    pub fn count_active_by_status(conn: &Connection) -> Result<HashMap<String, i64>> {
-        let mut stmt = conn.prepare(&format!(
-            "SELECT status, COUNT(token) FROM agents WHERE {NOT_TERMINAL_SQL} GROUP BY status"
-        ))?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })?;
-        rows.collect()
+    /// Phase G (sea-orm migration): sea-orm-backed (`async`, `db: &
+    /// sea_orm::DatabaseConnection`) — see this module's own doc.
+    /// `SELECT status, COUNT(*) ... GROUP BY status` IS directly
+    /// expressible through sea-orm's typed builder (`select_only` +
+    /// `column` + `column_as` + `group_by`), same idiom
+    /// `task_repository::count_by_status` already establishes for this
+    /// exact shape -- no need for this crate's raw-SQL escape hatch.
+    /// The `NOT_TERMINAL_SQL` exclusion becomes
+    /// `Column::Status.is_not_in([...])`, matching `terminate`'s own
+    /// typed-builder translation of the same constant.
+    pub async fn count_active_by_status(
+        db: &DatabaseConnection,
+    ) -> std::result::Result<HashMap<String, i64>, DbErr> {
+        let counts: Vec<(String, i64)> = agent::Entity::find()
+            .filter(agent::Column::Status.is_not_in(["terminated", "tombstone"]))
+            .select_only()
+            .column(agent::Column::Status)
+            .column_as(agent::Column::Token.count(), "count")
+            .group_by(agent::Column::Status)
+            .into_tuple()
+            .all(db)
+            .await?;
+        Ok(counts.into_iter().collect())
     }
 
     /// Validates `agent_id` synchronously (matching Python: no write
@@ -651,30 +685,44 @@ impl AgentRepository {
     /// plain strings, matching Python's `MAX(COALESCE(x,''), ?)`
     /// pattern (the `COALESCE` guards the first-ever write, where the
     /// column is still `NULL`; `''` sorts before any real timestamp).
-    pub fn advance_event_cursor(
-        conn: &Connection,
+    ///
+    /// Phase G (sea-orm migration): sea-orm-backed (`async`, `db: &
+    /// sea_orm::DatabaseConnection`) — see this module's own doc.
+    /// Still a real "read the current value, compare in Rust, then
+    /// conditionally write" round trip (NOT a SQL `MAX()` expression)
+    /// — that's this method's existing, already-converted-nowhere
+    /// shape; nothing here changes it, it just moves the same two
+    /// steps onto the typed builder. The existence check and current-
+    /// value read go through [`find_agent_row`] ("async calls async"),
+    /// matching [`Self::create`]/[`Self::review_profile`]'s own
+    /// precedent; the conditional write is `update_many` + `col_expr`,
+    /// the same multi-column typed-UPDATE idiom used throughout this
+    /// module's other Phase G conversions.
+    pub async fn advance_event_cursor(
+        db: &DatabaseConnection,
         agent_id: &str,
         cursor_value: &str,
         now: &str,
-    ) -> Result<bool> {
-        let current: Option<Option<String>> = conn
-            .query_row(
-                "SELECT last_event_seen_at FROM agents WHERE agent_id = ?1",
-                [agent_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let Some(current) = current else {
+    ) -> std::result::Result<bool, DbErr> {
+        let Some(current) = find_agent_row(db, agent_id).await? else {
             return Ok(false); // no such agent
         };
-        if cursor_value <= current.unwrap_or_default().as_str() {
+        if cursor_value <= current.last_event_seen_at.unwrap_or_default().as_str() {
             return Ok(false); // not an advance
         }
-        let changed = conn.execute(
-            "UPDATE agents SET last_event_seen_at = ?1, updated_at = ?2 WHERE agent_id = ?3",
-            (cursor_value, now, agent_id),
-        )?;
-        Ok(changed > 0)
+        let result = agent::Entity::update_many()
+            .col_expr(
+                agent::Column::LastEventSeenAt,
+                sea_orm::sea_query::Expr::value(cursor_value),
+            )
+            .col_expr(
+                agent::Column::UpdatedAt,
+                sea_orm::sea_query::Expr::value(now),
+            )
+            .filter(agent::Column::AgentId.eq(agent_id))
+            .exec(db)
+            .await?;
+        Ok(result.rows_affected > 0)
     }
 
     /// Always stamps `profile_reviewed_at`. Only writes `profile`/
@@ -976,12 +1024,17 @@ impl AgentRepository {
     /// Every row, unconditionally — no status filtering at all, unlike
     /// every product-facing listing (which all exclude at least
     /// tombstones). For backup/differential-testing tooling only.
-    pub fn dump_all(conn: &Connection) -> Result<Vec<AgentRow>> {
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {AGENT_COLUMNS} FROM agents ORDER BY agent_id"
-        ))?;
-        let rows = stmt.query_map([], row_to_agent)?;
-        rows.collect()
+    ///
+    /// Phase G (sea-orm migration): sea-orm-backed (`async`, `db: &
+    /// sea_orm::DatabaseConnection`) — see this module's own doc.
+    /// Unbounded, unfiltered, `agent_id`-ordered read -- directly
+    /// expressible through the typed builder, no raw SQL needed.
+    pub async fn dump_all(db: &DatabaseConnection) -> std::result::Result<Vec<AgentRow>, DbErr> {
+        let rows = agent::Entity::find()
+            .order_by_asc(agent::Column::AgentId)
+            .all(db)
+            .await?;
+        Ok(rows.into_iter().map(agent_row_from_model).collect())
     }
 
     /// Peer profile changes newer than `since`, excluding `self_id`'s
@@ -1392,12 +1445,12 @@ mod tests {
 
     #[tokio::test]
     async fn list_all_bounded_includes_every_status_and_respects_the_limit() {
-        let (_dir, conn, db) = test_conn_with_sea_orm().await;
+        let (_dir, _conn, db) = test_conn_with_sea_orm().await;
         seed(&db, "live1", "t1", "active").await;
         seed(&db, "dead1", "t2", "terminated").await;
         seed(&db, "tomb1", "t3", "tombstone").await;
 
-        let all = AgentRepository::list_all_bounded(&conn, 10).unwrap();
+        let all = AgentRepository::list_all_bounded(&db, 10).await.unwrap();
         let mut ids: Vec<_> = all.iter().map(|a| a.agent_id.as_str()).collect();
         ids.sort();
         assert_eq!(
@@ -1406,18 +1459,20 @@ mod tests {
             "unlike list_active, every status must be included"
         );
 
-        let capped = AgentRepository::list_all_bounded(&conn, 2).unwrap();
+        let capped = AgentRepository::list_all_bounded(&db, 2).await.unwrap();
         assert_eq!(capped.len(), 2);
     }
 
     #[tokio::test]
     async fn list_for_dashboard_excludes_only_tombstone_and_the_limit_applies_after_that_filter() {
-        let (_dir, conn, db) = test_conn_with_sea_orm().await;
+        let (_dir, _conn, db) = test_conn_with_sea_orm().await;
         seed(&db, "live1", "t1", "active").await;
         seed(&db, "dead1", "t2", "terminated").await;
         seed(&db, "tomb1", "t3", "tombstone").await;
 
-        let unfiltered = AgentRepository::list_for_dashboard(&conn, None, 10).unwrap();
+        let unfiltered = AgentRepository::list_for_dashboard(&db, None, 10)
+            .await
+            .unwrap();
         let mut ids: Vec<_> = unfiltered.iter().map(|a| a.agent_id.as_str()).collect();
         ids.sort();
         assert_eq!(
@@ -1430,16 +1485,20 @@ mod tests {
         // not a client-side filter over an already-capped read, which
         // could silently return fewer than `limit` real rows if a
         // tombstone sorts ahead of them.
-        let capped = AgentRepository::list_for_dashboard(&conn, None, 1).unwrap();
+        let capped = AgentRepository::list_for_dashboard(&db, None, 1)
+            .await
+            .unwrap();
         assert_eq!(capped.len(), 1);
 
-        let status_scoped =
-            AgentRepository::list_for_dashboard(&conn, Some("terminated"), 10).unwrap();
+        let status_scoped = AgentRepository::list_for_dashboard(&db, Some("terminated"), 10)
+            .await
+            .unwrap();
         assert_eq!(status_scoped.len(), 1);
         assert_eq!(status_scoped[0].agent_id, "dead1");
 
-        let tombstone_scoped =
-            AgentRepository::list_for_dashboard(&conn, Some("tombstone"), 10).unwrap();
+        let tombstone_scoped = AgentRepository::list_for_dashboard(&db, Some("tombstone"), 10)
+            .await
+            .unwrap();
         assert!(
             tombstone_scoped.is_empty(),
             "an explicit status=tombstone query must still return nothing"
@@ -1448,13 +1507,13 @@ mod tests {
 
     #[tokio::test]
     async fn count_active_by_status_excludes_terminal_and_groups_correctly() {
-        let (_dir, conn, db) = test_conn_with_sea_orm().await;
+        let (_dir, _conn, db) = test_conn_with_sea_orm().await;
         seed(&db, "a1", "t1", "active").await;
         seed(&db, "a2", "t2", "active").await;
         seed(&db, "c1", "t3", "created").await;
         seed(&db, "d1", "t4", "terminated").await;
 
-        let counts = AgentRepository::count_active_by_status(&conn).unwrap();
+        let counts = AgentRepository::count_active_by_status(&db).await.unwrap();
         assert_eq!(counts.get("active"), Some(&2));
         assert_eq!(counts.get("created"), Some(&1));
         assert_eq!(counts.get("terminated"), None);
@@ -1636,15 +1695,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn advance_event_cursor_missing_agent_returns_false() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn advance_event_cursor_missing_agent_returns_false() {
+        let (_dir, _conn, db) = test_conn_with_sea_orm().await;
         assert!(!AgentRepository::advance_event_cursor(
-            &conn,
+            &db,
             "nope",
             "cursor-1",
             "2026-01-01T00:00:00Z"
         )
+        .await
         .unwrap());
     }
 
@@ -1653,11 +1713,12 @@ mod tests {
         let (_dir, conn, db) = test_conn_with_sea_orm().await;
         seed(&db, "alice", "tok-alice", "active").await;
         assert!(AgentRepository::advance_event_cursor(
-            &conn,
+            &db,
             "alice",
             "2026-01-01T00:00:01Z",
             "2026-01-01T00:00:01Z"
         )
+        .await
         .unwrap());
         let row = AgentRepository::get_by_id(&conn, "alice").unwrap().unwrap();
         assert_eq!(
@@ -1671,22 +1732,24 @@ mod tests {
         let (_dir, conn, db) = test_conn_with_sea_orm().await;
         seed(&db, "alice", "tok-alice", "active").await;
         assert!(AgentRepository::advance_event_cursor(
-            &conn,
+            &db,
             "alice",
             "2026-01-01T00:00:05Z",
             "2026-01-01T00:00:05Z"
         )
+        .await
         .unwrap());
 
         // An older cursor value must not overwrite the newer one, and
         // must report "no advance" so the caller doesn't publish a
         // spurious wake.
         assert!(!AgentRepository::advance_event_cursor(
-            &conn,
+            &db,
             "alice",
             "2026-01-01T00:00:02Z",
             "2026-01-01T00:00:06Z"
         )
+        .await
         .unwrap());
         let row = AgentRepository::get_by_id(&conn, "alice").unwrap().unwrap();
         assert_eq!(
@@ -2306,14 +2369,15 @@ mod tests {
 
     #[tokio::test]
     async fn dump_all_includes_terminal_statuses_unlike_every_other_listing() {
-        let (_dir, conn, db) = test_conn_with_sea_orm().await;
+        let (_dir, _conn, db) = test_conn_with_sea_orm().await;
         seed(&db, "live", "t1", "active").await;
         seed(&db, "dead", "t2", "terminated").await;
         AgentRepository::insert_tombstone(&db, "t3", "tomb", "2026-01-01T00:00:00Z")
             .await
             .unwrap();
 
-        let mut ids: Vec<_> = AgentRepository::dump_all(&conn)
+        let mut ids: Vec<_> = AgentRepository::dump_all(&db)
+            .await
             .unwrap()
             .into_iter()
             .map(|a| a.agent_id)
