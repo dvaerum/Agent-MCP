@@ -1,36 +1,29 @@
 """arch-deepening round-2 #2 — one ``assemble_event_feed`` owner + the
-two fold-in fixes.
+fold-in fix pinned below.
 
-Two invariants pinned here (both RED on main):
+**No self-wake on a no-op cursor advance**: ``advance_event_cursor``
+published ``agent.updated`` UNCONDITIONALLY on every cursor write.
+``agent.updated`` fans out to ``state.notify_waiters`` → every
+sibling ``wait_for_events`` waiter for that agent wakes and re-queries
+for nothing. Under fan-out (N concurrent waiters each writing the same
+high-water cursor) that is O(N) spurious wakes per event round. A
+no-op advance (cursor <= current) must fire NO wake at all.
 
-1. **inbox ≡ wait_for_events**: the inbox resource and
-   ``wait_for_events`` must return the IDENTICAL event list for the same
-   cursor. On main ``resources/inbox`` calls the narrower
-   ``_collect_events_for`` helper, which OMITS the unassigned-task
-   stream (and the merged-boundary clamp) that ``wait_for_events``
-   merges in — so an ``unassigned_task_appeared`` event surfaces in one
-   surface but not the other, despite inbox's docstring claiming
-   byte-identical output. Routing BOTH through ``assemble_event_feed``
-   makes the divergence unrepresentable.
-
-2. **no self-wake on a no-op cursor advance**: ``advance_event_cursor``
-   published ``agent.updated`` UNCONDITIONALLY on every cursor write.
-   ``agent.updated`` fans out to ``state.notify_waiters`` → every
-   sibling ``wait_for_events`` waiter for that agent wakes and re-queries
-   for nothing. Under fan-out (N concurrent waiters each writing the same
-   high-water cursor) that is O(N) spurious wakes per event round. A
-   no-op advance (cursor <= current) must fire NO wake at all.
+A sibling invariant (inbox ≡ wait_for_events for the same cursor) was
+also pinned here until Phase F's ``agent_mcp/resources/`` deletion
+retired the inbox resource; the Rust port's
+`resources.rs::render_inbox` already routes through the same
+`assemble_event_feed` pipeline `wait_for_events`/`fetch_events_since`
+use (see that module's own doc), so the divergence this test guarded
+against is structurally unrepresentable there.
 """
 
 from __future__ import annotations
 
 import datetime as _dt
-import json
 from pathlib import Path
 
 import pytest
-
-from tests.harness import with_bearer
 
 pytestmark = pytest.mark.asyncio
 
@@ -40,106 +33,6 @@ _BASE = _dt.datetime(2026, 1, 1, 0, 0, 0)
 
 def _ts(i: int) -> str:
     return (_BASE + _dt.timedelta(seconds=i)).isoformat()
-
-
-def _seed_unassigned_task(
-    task_id: str,
-    *,
-    updated_at: str,
-) -> None:
-    """Insert one unassigned task (every unassigned task now surfaces to
-    every agent) whose ``updated_at`` is ``updated_at``."""
-    from agent_mcp.db.connection import get_db_connection
-
-    conn = get_db_connection()
-    try:
-        conn.execute(
-            "INSERT INTO tasks (task_id, title, description, assigned_to, "
-            "created_by, status, priority, created_at, updated_at, "
-            "parent_task, child_tasks, depends_on_tasks, notes) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                task_id,
-                "unassigned work",
-                "",
-                None,
-                "admin",
-                "unassigned",
-                "medium",
-                updated_at,
-                updated_at,
-                None,
-                "[]",
-                "[]",
-                "[]",
-            ),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-
-# ---------------------------------------------------------------------------
-# Invariant 1: inbox and wait_for_events return the identical event list.
-# ---------------------------------------------------------------------------
-
-
-async def test_inbox_and_wait_for_events_identical_for_same_cursor(
-    tmp_path: Path,
-) -> None:
-    """A message AND a matching unassigned task exist since the cursor.
-    ``wait_for_events`` (fast path) surfaces both; the inbox resource
-    must surface the SAME two events. RED on main (inbox omits the
-    unassigned-task stream)."""
-    from agent_mcp.resources.inbox import render_inbox
-    from agent_mcp.tools.agent_communication_tools import (
-        send_agent_message_tool_impl,
-        wait_for_events_tool_impl,
-    )
-    from tests.harness import mcp_session
-
-    async with mcp_session(tmp_path) as admin:
-        alice = await admin.create_worker("alice")
-
-        with with_bearer(admin.admin_token):
-            await send_agent_message_tool_impl(
-                {
-                    "token": admin.admin_token,
-                    "recipient_id": "alice",
-                    "message": "hello alice",
-                    "deliver_method": "store",
-                }
-            )
-        _seed_unassigned_task("task-x", updated_at=_ts(500))
-
-        since = _ts(-1)
-
-        with with_bearer(alice.token):
-            wait_result = await wait_for_events_tool_impl(
-                {"token": alice.token, "since": since, "timeout_seconds": 1}
-            )
-        wait_events = wait_result.data["events"]
-
-        inbox_payload = json.loads(render_inbox("alice", since))
-        inbox_events = inbox_payload["events"]
-
-        # Both surfaces must agree on the unassigned-task event...
-        wait_types = sorted(e["type"] for e in wait_events)
-        inbox_types = sorted(e["type"] for e in inbox_events)
-        assert "unassigned_task_appeared" in wait_types, (
-            "wait_for_events must surface the matching unassigned task"
-        )
-        # ...and the two event lists must be byte-identical.
-        assert inbox_events == wait_events, (
-            "inbox and wait_for_events diverge for the same cursor:\n"
-            f"  inbox={inbox_types}\n  wait ={wait_types}"
-        )
-        assert inbox_payload["next_cursor"] == wait_result.data["next_cursor"]
-
-
-# ---------------------------------------------------------------------------
-# Invariant 2: a no-op cursor advance fires no agent-wake.
-# ---------------------------------------------------------------------------
 
 
 async def test_noop_cursor_advance_does_not_publish_agent_updated(

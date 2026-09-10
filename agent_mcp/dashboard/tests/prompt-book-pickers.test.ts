@@ -36,8 +36,12 @@ type Variable = {
   options?: string[]
 }
 type Prompt = { id: string; variables?: Variable[] }
+// Canonical source moved to rust/conexus-tools/prompts/catalog.json
+// in Phase F (agent_mcp/prompts/ itself is deleted); this is a
+// byte-identical copy of what the dashboard's real
+// GET /api/prompts/catalog route actually serves.
 const catalog: { prompts: Prompt[] } = JSON.parse(
-  read(REPO_ROOT, "agent_mcp/prompts/catalog.json"),
+  read(REPO_ROOT, "rust/conexus-tools/prompts/catalog.json"),
 )
 const promptById = (id: string) =>
   catalog.prompts.find((p) => p.id === id)!
