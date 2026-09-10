@@ -1,23 +1,37 @@
 """Regression guard: the home-manager module's router service must
-declare every env var the router needs to run under a non-root user.
+declare every env var / CLI flag the router needs to run under a
+non-root user.
 
 Background: from at least 2026-06-23 onward, real home-manager deploys
-hit a restart-loop on agent-mcp-router.service because
+hit a restart-loop on the (then-Python) router service because
 ``nix/home-manager-module.nix`` did not set ``AGENT_MCP_ROUTER_DB``.
-The Python default in ``agent_mcp.router.migrations_runner`` is
-``/var/lib/agent-mcp/router.db``; that path is unwritable by a
-user-mode systemd unit running as ``dennis``, so
-``run_router_migrations_upgrade()`` raised
+The Python default was ``/var/lib/agent-mcp/router.db``; that path is
+unwritable by a user-mode systemd unit running as ``dennis``, so the
+router's schema-migration step raised
 ``PermissionError: [Errno 13] Permission denied: '/var/lib/agent-mcp'``
 on every start.
 
+Retirement note
+----------------
+
+The Python router (``agent-mcp-router.service``) was retired together
+with the rest of the Python implementation; ``conexus-router`` (Rust)
+is now the only router. Most of the config surface this test used to
+find as ``Environment`` entries is now a real CLI flag on
+``conexus-router`` (see its own ``Cli`` struct doc in
+``rust/conexus-router/src/main.rs``) — ``--projects-file``,
+``--sock-dir``, ``--dashboard-dir``, ``--external-url``, ``--idle-sec``,
+``--port``. A handful have NO CLI-flag equivalent (env-var-only on the
+Rust router, mirroring the Python router's own env-var-only knobs) and
+must still be set via ``Environment``: ``AGENT_MCP_ROUTER_DB``,
+``AGENT_MCP_ROUTER_HOST``, ``AGENT_MCP_DEFAULT_WORKSPACE``.
+
 This test parses the home-manager module's router-service
-``Environment`` block and asserts every env var the router reads on
-startup is present. Anchoring the assertion on the
-``services.agent-mcp.router.*`` config -> Environment mapping prevents
-the same shape of regression from sneaking back in (e.g. a new env
-var with a ``/var/lib`` default gets read by the router but nobody
-remembers to set it in the user-scope unit).
+``Environment`` block for the env-var-only knobs and its ``ExecStart``
+for the flag-shaped ones, anchoring on the ``services.agent-mcp.router.*``
+config -> unit mapping so the same class of regression (a new
+router-startup input added upstream, and nobody remembering to wire it
+into the user-scope unit) can't sneak back in.
 """
 
 from __future__ import annotations
@@ -33,38 +47,64 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 _HM_MODULE = _REPO_ROOT / "nix" / "home-manager-module.nix"
 
 
+def _extract_router_service_block(text: str) -> str:
+    """Return the raw nix source of the ``"conexus-router" = { … };``
+    entry inside ``systemd.user.services``. The block runs to the
+    matching close-brace of its own attrset (tracked by brace depth,
+    since the router block itself contains nested ``{ … }`` and the
+    naive "next sibling key" anchor the old Python-router version of
+    this helper used doesn't hold once CLI-flag construction adds its
+    own ``let … in`` block before ``ExecStart``)."""
+    marker = '"conexus-router" = lib.mkIf'
+    start = text.index(marker)
+    brace_start = text.index("{", start)
+    depth = 1
+    i = brace_start + 1
+    while depth > 0:
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+        i += 1
+    return text[brace_start:i]
+
+
 def _extract_router_environment_block(text: str) -> str:
     """Return the contents of the router service's ``Environment = [ ... ]``
     list, raw nix source. Includes the conditional ``++ lib.optionals``
     additions so SSO env vars are matched too."""
-    # The router unit is the second systemd.user.services entry. Find
-    # the "agent-mcp-router" key, then the Environment = [ ... ] inside.
-    # We don't need a real nix parser — the file is hand-authored with
-    # consistent shape and our checks are presence-only.
-    marker = '"agent-mcp-router" = {'
-    start = text.index(marker)
-    # Inside the router block, find the Environment = [ ... ] list.
-    env_idx = text.index("Environment = [", start)
+    block = _extract_router_service_block(text)
+    env_idx = block.index("Environment = [")
     # The list extends until the matching `];` followed by an optional
-    # `++ lib.optionals … [ … ]` chain that the existing module uses
-    # for SSO vars. Walk forward up to the start of the next attribute
-    # in the Service block (we stop at the line that begins
-    # ``RuntimeDirectory = `` — a stable anchor that follows the
-    # Environment chain in the current module).
-    end = text.index("RuntimeDirectory = ", env_idx)
-    return text[env_idx:end]
+    # `++ lib.optionals … [ … ]` chain the module uses for SSO vars.
+    # Walk forward up to the start of the next attribute in the Service
+    # block (a stable anchor that follows the Environment chain in the
+    # current module).
+    end = block.index("RuntimeDirectory = ", env_idx)
+    return block[env_idx:end]
+
+
+def _extract_router_exec_start(text: str) -> str:
+    """Return the router service's ``ExecStart = …;`` raw nix source,
+    where the flag-shaped config surface (``--port``, ``--projects-file``,
+    etc.) lives."""
+    block = _extract_router_service_block(text)
+    start = block.index("ExecStart =")
+    end = block.index("Restart = ", start)
+    return block[start:end]
 
 
 def test_router_environment_sets_AGENT_MCP_ROUTER_DB() -> None:
     """The router service must set ``AGENT_MCP_ROUTER_DB`` to an
     XDG_DATA_HOME path. Without this, user-mode systemd falls back to
-    the ``/var/lib/agent-mcp/router.db`` default which it can't write,
-    and the router restart-loops forever (see module docstring)."""
+    conexus-router's own compiled-in ``/var/lib/agent-mcp/router.db``
+    default, which it can't write, and the router restart-loops
+    forever (see module docstring)."""
     text = _HM_MODULE.read_text()
     env_block = _extract_router_environment_block(text)
     assert "AGENT_MCP_ROUTER_DB" in env_block, (
         "home-manager-module.nix must set AGENT_MCP_ROUTER_DB on "
-        "agent-mcp-router.service; the python default "
+        "conexus-router; the compiled-in default "
         "(/var/lib/agent-mcp/router.db) is unwritable by user-mode units."
     )
     # It must point at an XDG_DATA_HOME-style path, not /var/lib/*.
@@ -106,30 +146,51 @@ def test_router_environment_has_no_var_lib_defaults() -> None:
 @pytest.mark.parametrize(
     "var_name",
     [
-        # Env vars the router reads at startup. Each MUST be set in
+        # Env vars `conexus-router` reads at startup that have NO
+        # CLI-flag equivalent (env-var-only, per its own `Cli` struct
+        # doc in rust/conexus-router/src/main.rs). Each MUST be set in
         # the home-manager router unit so the user-mode service has
-        # the values it needs without falling back to root-only paths.
-        # Sources:
-        #   - agent_mcp/router/migrations_runner.py:_DEFAULT_ROUTER_DB
-        #   - agent_mcp/router/app.py:PROJECTS_FILE / SOCK_DIR / DASHBOARD_DIR
-        #     / ROUTER_PORT / EXTERNAL_URL
-        "AGENT_MCP_PROJECTS_FILE",
-        "AGENT_MCP_SOCK_DIR",
-        "AGENT_MCP_DASHBOARD_DIR",
-        "AGENT_MCP_EXTERNAL_URL",
-        "AGENT_MCP_DEFAULT_WORKSPACE",
-        "AGENT_MCP_ROUTER_PORT",
-        "AGENT_MCP_IDLE_SEC",
+        # the values it needs without falling back to a root-only path
+        # or the wrong default.
         "AGENT_MCP_ROUTER_DB",
+        "AGENT_MCP_DEFAULT_WORKSPACE",
     ],
 )
 def test_router_environment_declares_required_var(var_name: str) -> None:
-    """Each env var the router reads on startup must be declared in
-    the home-manager router service's Environment block."""
+    """Each env-var-only startup input must be declared in the
+    home-manager router service's Environment block."""
     text = _HM_MODULE.read_text()
     env_block = _extract_router_environment_block(text)
     assert var_name in env_block, (
-        f"home-manager-module.nix: router service Environment must set "
-        f"{var_name} (the router reads it at startup; missing it makes "
-        f"the unit fall back to a path/value user-mode cannot satisfy)."
+        f"home-manager-module.nix: conexus-router Environment must set "
+        f"{var_name} (the router reads it at startup, with no CLI-flag "
+        "equivalent; missing it makes the unit fall back to a path/value "
+        "user-mode cannot satisfy)."
+    )
+
+
+@pytest.mark.parametrize(
+    "flag_name",
+    [
+        # Config surface that IS a real CLI flag on `conexus-router`
+        # (see its own `Cli` struct doc). Each MUST appear in the
+        # router unit's ExecStart.
+        "--port",
+        "--projects-file",
+        "--sock-dir",
+        "--dashboard-dir",
+        "--external-url",
+        "--idle-sec",
+    ],
+)
+def test_router_exec_start_passes_required_flag(flag_name: str) -> None:
+    """Each flag-shaped startup input must appear on conexus-router's
+    ExecStart line(s)."""
+    text = _HM_MODULE.read_text()
+    exec_start = _extract_router_exec_start(text)
+    assert flag_name in exec_start, (
+        f"home-manager-module.nix: conexus-router ExecStart must pass "
+        f"{flag_name} (real CLI flag on conexus-router; missing it "
+        "makes the unit fall back to conexus-router's own compiled-in "
+        "default)."
     )

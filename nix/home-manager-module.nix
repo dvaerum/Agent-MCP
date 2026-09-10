@@ -14,14 +14,22 @@
 #   - One declared list `daemonAgents` → N systemd template instances
 #     (agent-mcp-daemon-agent@<project>--<agent_id>.service), each
 #     running an event-driven wait_for_events loop against the router.
-#   - A thin always-on router (agent-mcp-router.service) on
-#     127.0.0.1:<port> (default 1337) does URL-path routing + activity
-#     tracking, calls systemctl --user start/stop for lazy spawn +
-#     idle shutdown, and serves the Next.js static dashboard at
-#     /agent-mcp/__dashboard/<name>/.
-#   - Per-project backends (agent-mcp@<name>.service template) are
-#     lazy-started by the router on first MCP request and idle-stopped
-#     after services.agent-mcp.router.idleSec seconds.
+#   - A thin always-on router (conexus-router.service, the CoNexus Rust
+#     router — see `conexusRouterPackage` below) on 127.0.0.1:<port>
+#     (default 1337) does URL-path routing + activity tracking, calls
+#     systemctl --user start/stop for lazy spawn + idle shutdown, and
+#     serves the Next.js static dashboard at /agent-mcp/__dashboard/<name>/.
+#   - Per-project backends (conexus@<name>.service template — see
+#     `conexusLauncherPackage` below) are lazy-started by the router on
+#     first MCP request and idle-stopped after
+#     services.agent-mcp.router.idleSec seconds.
+#
+# The Python implementation (agent-mcp@<name>.service /
+# agent-mcp-router.service, and the `router.impl` A/B flip between
+# them and their Rust counterparts) was retired once the Python source
+# tree was deleted wholesale and the Rust `rust/` workspace reached
+# functional completeness — see git history around the packages.nix
+# and this file's own `router.impl` removal for the cutover.
 #
 # Project membership is *not* declared in nix. Every project is
 # registered at runtime via POST /agent-mcp/__create (dashboard form
@@ -54,17 +62,20 @@ let
   # closure for no benefit.
   consumerPkgs = pkgs;
 
-  # EVERY derivation this module installs comes out of this one
-  # import: the Python tree, the interpreter the wrappers exec, the
-  # PYTHONPATH they bake in, and the dashboard. That is deliberate —
-  # see the `pkgs` option below. Nothing may be spliced onto the
-  # result afterwards; an attribute added with `//` here would be
-  # read by nothing, because packages.nix has already closed over its
-  # own `agentMcpPy` and `python` by the time it returns. (That was
-  # the `services.agent-mcp.package` bug: a silently ineffective
-  # override. The option is gone — see the mkRemovedOptionModule in
-  # `imports` — and tests/test_nix_module_package_set.py keeps this
-  # single-import shape from regressing.)
+  # EVERY derivation packages.nix still builds (the dashboard and the
+  # daemon-agent PreCompact hook — the Python application, its
+  # interpreter, and the PYTHONPATH-coupled wrappers around it were
+  # retired together with the Python source tree) comes out of this
+  # one import. That is deliberate — see the `pkgs` option below.
+  # Nothing may be spliced onto the result afterwards; an attribute
+  # added with `//` here would be read by nothing, because
+  # packages.nix has already closed over its own package set by the
+  # time it returns. (That was the `services.agent-mcp.package` bug,
+  # back when this import also built the Python tree: a silently
+  # ineffective override. The option is gone — see the
+  # mkRemovedOptionModule in `imports` — and
+  # tests/test_nix_module_package_set.py keeps this single-import
+  # shape from regressing.)
   pkgs' = import ./packages.nix {
     pkgs = cfg.pkgs;
     # nixpkgs' `lib` from the SAME set, matching flake.nix's call
@@ -80,17 +91,23 @@ let
 
   daemonAgentInstanceName = a: "${a.project}--${a.agentId}";
 
-  # `conexusDaemonAgentPackage` (Phase F): the Rust binary resolves
-  # its own token/URL/cursor paths from the `<project>--<agent_id>`
-  # instance argument directly (see rust/conexus-daemon-agent/src/
-  # main.rs), so unlike the Python pair this needs no per-invocation
-  # `cfg.router.port` substitution baked into the wrapper itself --
-  # `--router-port` is passed as a real CLI flag at ExecStart time
-  # instead (see the unit definition below).
-  daemonAgentWrapper =
-    if cfg.conexusDaemonAgentPackage != null
-    then cfg.conexusDaemonAgentPackage
-    else pkgs'.agentMcpDaemonAgentWrapper cfg.router.port;
+  # `conexusDaemonAgentPackage` is the only daemon-agent implementation
+  # now that the Python pair (`agentMcpDaemonAgentRunner`/`Wrapper` in
+  # packages.nix) was deleted with the rest of the Python tree. `null`
+  # is still a valid value (the option keeps `nullOr package` rather
+  # than becoming a no-default required option) — mirroring the exact
+  # same "silently omit the derived unit(s)" idiom `conexusLauncherPackage`
+  # and `conexusRouterPackage` already use for their own units, rather
+  # than throwing at eval time for a consumer who hasn't wired a
+  # package in yet. See each per-instance unit's own `lib.mkIf` below.
+  #
+  # The Rust binary resolves its own token/URL/cursor paths from the
+  # `<project>--<agent_id>` instance argument directly (see rust/
+  # conexus-daemon-agent/src/main.rs), so unlike the old Python pair
+  # this needs no per-invocation `cfg.router.port` substitution baked
+  # into the wrapper itself -- `--router-port` is passed as a real CLI
+  # flag at ExecStart time instead (see the unit definition below).
+  daemonAgentWrapper = cfg.conexusDaemonAgentPackage;
 
   # ── Shared systemd hardening (defense-in-depth) ───────────────────
   # The SAFE sandboxing subset, factored into nix/hardening.nix so the
@@ -206,13 +223,16 @@ in {
       description = ''
         The CoNexus Rust backend's systemd-user-template launcher
         (`nix/conexus.nix`'s `conexusLauncher`), for the
-        `conexus@<name>.service` user template (Phase D1 step 5,
-        prancy-napping-pie). `null` (the default) omits the template
-        entirely -- this module has no direct access to the `crane`
-        flake input, so the flake's own `homeModules.default`
-        wrapper sets this from its already-built `conexusPkgs`, the
-        same "build elsewhere, pass the package in" pattern `source`
-        already uses one option up.
+        `conexus@<name>.service` user template -- the ONLY per-project
+        backend implementation now that the Python one was retired.
+        `null` (the default) omits the template entirely -- this
+        module has no direct access to the `crane` flake input, so the
+        flake's own `homeModules.default` wrapper sets this from its
+        already-built `conexusPkgs`, the same "build elsewhere, pass
+        the package in" pattern `source` already uses one option up.
+        A `home-manager switch` with this left `null` and no override
+        leaves the profile with no per-project backend at all --
+        there is no other implementation left to fall back to.
       '';
     };
 
@@ -222,20 +242,22 @@ in {
       description = ''
         The CoNexus Rust reference daemon-agent binary
         (`nix/conexus.nix`'s `conexusDaemonAgentWrapper`), for
-        `agent-mcp-daemon-agent@<instance>.service` (Phase F,
-        prancy-napping-pie -- ported for implementation-language
-        consistency, not a functional need: this is a pure MCP
-        wire-protocol client with zero dependency on whether the
-        backend/router it talks to is Python or Rust).
+        `agent-mcp-daemon-agent@<instance>.service` -- the ONLY
+        daemon-agent implementation now that the Python pair
+        (`agentMcpDaemonAgentRunner`/`Wrapper`) was retired with the
+        rest of the Python tree.
 
-        `null` (the default) falls back to the Python pair
-        (`agentMcpDaemonAgentRunner`/`Wrapper` in `packages.nix`).
-        Unlike `conexusRouterPackage` below, this IS set by the
-        flake's own `homeModules.default` wrapper (same auto-wired
-        pattern as `conexusLauncherPackage`) -- a daemon-agent
-        instance is a per-agent client process with no port to bind
-        and no singleton to race, so building/switching this in
-        carries none of the router's production-outage risk.
+        `null` (the default) omits every `daemonAgents` entry's unit
+        entirely -- the same "silently omit the derived unit" idiom
+        `conexusLauncherPackage`/`conexusRouterPackage` already use,
+        rather than a no-default required option that would fail
+        eval for a consumer who hasn't wired a package in yet. Set by
+        the flake's own `homeModules.default` wrapper (same
+        auto-wired pattern as `conexusLauncherPackage`) -- a
+        daemon-agent instance is a per-agent client process with no
+        port to bind and no singleton to race, so building/switching
+        this in carries none of the router's former production-outage
+        risk (see `conexusRouterPackage`'s own doc for that history).
       '';
     };
 
@@ -245,27 +267,33 @@ in {
       description = ''
         The CoNexus Rust router wrapper (`nix/conexus.nix`'s
         `conexusRouterWrapper`), for the singleton `conexus-router`
-        user service (Phase F packaging prerequisite,
-        prancy-napping-pie). `null` (the default) omits the service
-        entirely.
+        user service -- the ONLY router implementation now that the
+        Python one (`agent-mcp-router.service`) and the `router.impl`
+        A/B flip between them were retired. `null` (the default)
+        omits the service entirely -- a `home-manager switch` with
+        this left `null` and no override leaves the profile with no
+        router at all (mirrors `conexusLauncherPackage`'s own
+        silently-no-backend outcome one option up; neither option
+        carries an assertion forcing it non-null, for the same
+        reason).
 
-        Deliberately NOT set by the flake's own
-        `homeModules.default` wrapper the way
-        `conexusLauncherPackage` is -- unlike `conexus@<name>`, which
-        starts on-demand per-project and only when a project's own
-        `backend_impl` registry flag requests it (so building the
-        launcher changes nothing for a running system), the router is
-        a SINGLETON that binds the same port `agent-mcp-router`
-        already listens on (`AGENT_MCP_ROUTER_PORT`, default 1337).
-        Defaulting this option non-null anywhere would make the
-        `conexus-router` unit's `Install.WantedBy` take effect on the
-        very next `home-manager switch`, racing the still-live Python
-        router for that port -- a real production-outage risk, not a
-        theoretical one. Setting this option is therefore the
-        deliberate act of opting into the router cutover itself; do
-        so only after the operator-authority decision recorded in the
-        migration plan's Phase F section, not as a side effect of
-        picking up a newer agent-mcp flake input.
+        Auto-wired by the flake's own `homeModules.default` wrapper
+        (`lib.mkDefault`, same pattern as `conexusLauncherPackage`/
+        `conexusDaemonAgentPackage`) -- this was DELIBERATELY not the
+        case while the Python router was still the live A/B default:
+        `conexus-router` is a SINGLETON binding the same port
+        `agent-mcp-router` used to (`AGENT_MCP_ROUTER_PORT`, default
+        1337), so auto-defaulting this while a Python router could
+        still be the active `Install.WantedBy` target risked a port
+        race on the very next `home-manager switch`. That risk no
+        longer exists: the Python router doesn't exist to race against
+        (it and `router.impl` were deleted together), so there is
+        exactly one router implementation for this option to enable,
+        and auto-wiring it now matches `conexusLauncherPackage`'s own
+        rationale exactly -- the flake building the ONLY Rust
+        implementation and handing it to the module is no longer a
+        cutover decision, it's just how the module gets its one
+        router binary, same as the backend launcher.
       '';
     };
 
@@ -280,25 +308,28 @@ in {
         }
       '';
       description = ''
-        Package set EVERY agent-mcp derivation is built from: the
-        Python application, the interpreter its wrappers exec, the
-        PYTHONPATH they bake in, the shell wrappers themselves and the
-        dashboard. Defaults to the `pkgs` home-manager itself is
-        configured with, which is what you want unless you have a
-        specific reason otherwise.
+        Package set the dashboard (Next.js static export) and the
+        daemon-agent PreCompact hook are built from in packages.nix —
+        and, via the flake's own `homeModules.default` wrapper, ALSO
+        the package set + toolchain (`crane.mkLib`) the CoNexus Rust
+        binaries (`conexusLauncherPackage`/`conexusRouterPackage`/
+        `conexusDaemonAgentPackage`) are built from, since that
+        wrapper threads this same option straight into its own
+        `nix/conexus.nix` import. Defaults to the `pkgs` home-manager
+        itself is configured with, which is what you want unless you
+        have a specific reason otherwise.
 
         **Why you would set it — the stable-channel security lag.**
-        agent-mcp's router is an aiohttp server exposed on whatever
-        interface `router.externalUrl` fronts. NixOS *stable* branches
-        do not take routine Python security backports, so a host
-        tracking e.g. nixos-26.05 keeps that branch's frozen aiohttp
-        (3.13.5, carrying advisories for pipelining DoS,
-        `max_line_size` / `client_max_size` bypass, CRLF injection and
-        WebSocket request smuggling) for the life of the release,
-        while nixos-unstable already ships the fixed 3.14.3. Pointing
-        this option at a fresher package set rebuilds agent-mcp — and
-        ONLY agent-mcp — against it; the rest of the home-manager
-        profile stays on the stable channel:
+        NixOS *stable* branches do not take routine backports the way
+        nixos-unstable does, so a host tracking e.g. nixos-26.05 can
+        lag behind on a dependency with a known advisory (previously:
+        the Python router's aiohttp; today the equivalent risk surface
+        is whatever crates.io advisories land against the `rust/`
+        workspace's dependency graph, or the dashboard's npm tree).
+        Pointing this option at a fresher package set rebuilds
+        agent-mcp's own derivations — and, through the flake wrapper,
+        the Rust toolchain they compile against — against it; the rest
+        of the home-manager profile stays on the stable channel:
 
         ```nix
         services.agent-mcp.pkgs = import agent-mcp.inputs.nixpkgs {
@@ -313,12 +344,12 @@ in {
         own flake produces — not your deployed closure. This option is
         the switch that does.
 
-        It must be a whole package set, not a single derivation: the
-        wrappers bake in `''${python}/bin/python` and a PYTHONPATH
-        built from the same set's site-packages, so an application
-        from one channel with an interpreter from another does not
-        merely mix closures, it fails to import. (That is why
-        `services.agent-mcp.package` was removed.)
+        It must be a whole package set, not a single derivation — a
+        derivation from one channel paired with a toolchain/stdenv from
+        another does not merely mix closures, it can fail to build or
+        import. (That mismatch is also why `services.agent-mcp.package`
+        was removed, back when this option's own derivation was the
+        Python application specifically.)
       '';
     };
 
@@ -363,38 +394,6 @@ in {
           The user can override per-project at create time by typing
           a path into the form's Workspace field; this default only
           kicks in when that field is empty.
-        '';
-      };
-
-      impl = lib.mkOption {
-        type = lib.types.enum [ "python" "rust" ];
-        default = "python";
-        description = ''
-          Which router implementation is the ACTIVE one -- the one
-          `Install.WantedBy` names, so it's the one that actually gets
-          started by a `home-manager switch`/`systemctl --user start
-          default.target`. The other implementation's unit still
-          exists (both `agent-mcp-router`/`conexus-router` are always
-          defined when their prerequisites are met -- see
-          `conexusRouterPackage`) but carries no `Install.WantedBy`,
-          so it never starts on its own.
-
-          This is the router's rollback-flip mechanism (Phase F,
-          prancy-napping-pie) -- the singleton equivalent of the
-          per-project `backend_impl` registry flag, since the router
-          has no smaller cutover unit to canary (Guiding Principle 2:
-          there is only one router). Flipping this option and running
-          `home-manager switch` is the intended, one-line rollback
-          path in EITHER direction: `"rust" -> "python"` if a
-          `conexus-router` cutover needs reverting, or the reverse to
-          try it. Both units read/write the SAME `router.db` (see
-          `AGENT_MCP_ROUTER_DB` on both), so switching does not
-          migrate or duplicate any state.
-
-          `"rust"` requires `conexusRouterPackage` to be set (enforced
-          by an assertion) -- flipping to Rust without ever building
-          its package would otherwise silently leave NO router
-          running at all after the switch.
         '';
       };
     };
@@ -600,7 +599,7 @@ in {
             example = "/home/alice/code/washing-brothers";
             description = ''
               Absolute workspace path the backend will run against
-              (--project-dir on agent-mcp@<name>.service). The
+              (--project-dir on conexus@<name>.service). The
               directory is NOT auto-created — the operator either
               provisions it ahead of time or hands the module an
               existing repo checkout.
@@ -693,31 +692,22 @@ in {
           create surprising precedence rules and a security footgun.
         '';
       }
-      {
-        # Phase F (prancy-napping-pie): flipping router.impl to "rust"
-        # with no conexusRouterPackage set would leave the profile
-        # with NO active router unit at all after the switch (neither
-        # agent-mcp-router's WantedBy, cleared by the flip, nor
-        # conexus-router's, since that unit doesn't even exist without
-        # the package) -- catch this at evaluation, not as a silent
-        # outage discovered after `home-manager switch`.
-        assertion = cfg.router.impl == "rust" -> cfg.conexusRouterPackage != null;
-        message = ''
-          services.agent-mcp.router.impl = "rust" requires
-          services.agent-mcp.conexusRouterPackage to be set -- without
-          it there is no conexus-router unit for Install.WantedBy to
-          name, and this flip would leave NO router running at all.
-        '';
-      }
     ];
 
-    home.packages = [
-      pkgs'.agentMcpBackendWrapper             # invoked by the systemd template launcher
-      pkgs'.agentMcpRouterWrapper              # invoked by agent-mcp-router.service
-      pkgs'.agentMcpLauncher                   # invoked by agent-mcp@.service via %i
-      daemonAgentWrapper                       # invoked by agent-mcp-daemon-agent@.service via %i
-      pkgs'.agentMcpDaemonAgentPrecompactHook  # operator-installed PreCompact hook
-    ];
+    # No `conexusLauncherPackage`/`conexusRouterPackage != null`
+    # assertion here -- consistent with how those two options already
+    # worked before `router.impl` existed (and still work now that
+    # it's gone): leaving either `null` silently omits its unit
+    # (`lib.mkIf` below), the same "no assertion, just no unit" shape
+    # this module has always used for an optional package producing an
+    # optional unit. There is no longer a second implementation for a
+    # missing package to fall back to, so an operator who never sets
+    # `conexusRouterPackage` gets no router, not a Python one.
+    home.packages =
+      lib.optional (daemonAgentWrapper != null) daemonAgentWrapper  # invoked by agent-mcp-daemon-agent@.service via %i
+      ++ [
+        pkgs'.agentMcpDaemonAgentPrecompactHook  # operator-installed PreCompact hook
+      ];
 
     # ── Systemd services ───────────────────────────────────────────
     # All three groups live under one attrset so the daemon-agent
@@ -729,130 +719,41 @@ in {
     #
     # Three groups:
     #
-    #   "agent-mcp@"             — per-project backend template
-    #                              (started lazily by the router).
-    #   "agent-mcp-router"       — always-on router (URL-keyed,
-    #                              idle-stop).
+    #   "conexus@"               — per-project backend template
+    #                              (started lazily by the router),
+    #                              omitted when `conexusLauncherPackage`
+    #                              is null.
+    #   "conexus-router"         — always-on router (URL-keyed,
+    #                              idle-stop), omitted when
+    #                              `conexusRouterPackage` is null.
     #   "agent-mcp-daemon-agent@<instance>"
     #                            — per-instance daemon-agent runner,
     #                              one entry per cfg.daemonAgents
     #                              element, each WantedBy default.target
     #                              so home-manager actually symlinks
-    #                              it from default.target.wants/.
+    #                              it from default.target.wants/;
+    #                              omitted when `conexusDaemonAgentPackage`
+    #                              is null.
+    #
+    # The Python-backed "agent-mcp@" / "agent-mcp-router" units (and
+    # the `router.impl` option that picked between them and these
+    # Rust ones) were retired once the Python source tree was deleted;
+    # `conexus@`/`conexus-router` are now unconditional -- there is no
+    # other implementation left for `Install.WantedBy` to pick between.
     systemd.user.services = {
-      "agent-mcp@" = {
-        Unit = {
-          Description = "Agent-MCP backend — project %i (UDS)";
-          # The backend talks to ollama for embeddings; ordering is
-          # advisory (ollama is a system service so user-scope can't
-          # bind it as a hard dep, but After= still helps at boot).
-          After = [ "ollama.service" ];
-        };
-        Service = {
-          Type = "simple";
-          # systemd creates and owns %t/agent-mcp/%i
-          # (= $XDG_RUNTIME_DIR/agent-mcp/<name>/) — tmpfs, 0700.
-          RuntimeDirectory = "agent-mcp/%i";
-          RuntimeDirectoryMode = "0700";
-          # Matches nix/module.nix's system-mode template (which has
-          # carried this since PR #214-era hardening) — home-manager's
-          # copy never got it, which is exactly what let a SIBLING
-          # unit's own RuntimeDirectory teardown (see agent-mcp-router/
-          # conexus-router's own RuntimeDirectoryPreserve comment below)
-          # go unnoticed for this long: without `=yes` here too, THIS
-          # unit's own stop/restart would ALSO be free to tear down its
-          # leaf on every cycle rather than just on uninstall.
-          RuntimeDirectoryPreserve = "yes";
-          Environment = [
-            # Backend MUST point at the same router.db as the router
-            # unit below. agent_mcp.app.deps._resolve_session_user lazily
-            # `from ..router import identity` and calls
-            # identity.get_session(...), which opens the path returned
-            # by agent_mcp.router.migrations_runner.get_router_db_path()
-            # — that helper honours AGENT_MCP_ROUTER_DB and otherwise
-            # falls back to /var/lib/agent-mcp/router.db (the system-mode
-            # default). User-mode units cannot read that path, the open
-            # raises PermissionError, the bare ``except Exception`` in
-            # _resolve_session_user logs "treating as anonymous", and
-            # every operator-only endpoint 401s.
-            #
-            # Same drift pattern as PR #223 (router unit got the var)
-            # and PR #224 (forwarding_hmac ExecStartPre). The value
-            # below MUST stay identical to the router unit's
-            # AGENT_MCP_ROUTER_DB — both processes open the same file.
-            "AGENT_MCP_ROUTER_DB=${config.xdg.dataHome}/agent-mcp/router.db"
-          ];
-          # F015 v4/v6/v7 port from nix/module.nix (PRs #214, #216,
-          # #217). The system-mode NixOS module gained these
-          # ExecStartPre lines; the home-manager template here was
-          # never updated, so real user-mode deploys hit:
-          #
-          #   agent-mcp-launcher: Error: Invalid value for
-          #     '--forwarding-hmac-in':
-          #     File '/run/user/1000/agent-mcp/<name>/forwarding_hmac'
-          #     does not exist.
-          #   systemd: agent-mcp@<name>.service: Main process exited,
-          #     code=exited, status=2/INVALIDARGUMENT
-          #   systemd: Scheduled restart job, restart counter is at 630.
-          #
-          # The launcher passes ``--forwarding-hmac-in
-          # $XDG_RUNTIME_DIR/agent-mcp/<name>/forwarding_hmac`` to the
-          # backend; without an ExecStartPre to materialise that file,
-          # the unit crash-loops forever.
-          #
-          # Rationale (per PR #214): the router (Python) used to write
-          # the key, but systemd's ``Restart=on-failure`` reactivates
-          # the unit without going through the router. Owning key
-          # generation in the unit ExecStartPre guarantees the file
-          # exists on EVERY start path (manual ``systemctl --user
-          # start``, on-failure restart, login activation).
-          #
-          # Notes on the shell + binaries:
-          # - ``pkgs.runtimeShell`` (PR #216 / F015 v6): coreutils
-          #   does NOT ship ``sh``; the original v4 used
-          #   ``${pkgs.coreutils}/bin/sh`` and every start failed with
-          #   ``status=203/EXEC``.
-          # - 32 raw bytes (PR #217 / F015 v7): bytes are binary; the
-          #   router's reader does NOT ``.strip()`` them. Use ``head
-          #   -c 32 /dev/urandom`` directly into the file.
-          # - Idempotent (``test -f … || { … ; }``): the router caches
-          #   the bytes in-memory and a re-spawn must not rotate the
-          #   key — see commit 862e594 (cache + file consistency).
-          # - ``$RUNTIME_DIRECTORY``: set by systemd when
-          #   ``RuntimeDirectory=`` is declared; resolves to
-          #   ``$XDG_RUNTIME_DIR/agent-mcp/<instance>``.
-          #
-          # Defensive socket cleanup retained as the second
-          # ExecStartPre (was the only entry before this fix).
-          ExecStartPre = [
-            "${pkgs.runtimeShell} -c 'test -f \"$RUNTIME_DIRECTORY/forwarding_hmac\" || { ${pkgs.coreutils}/bin/head -c 32 /dev/urandom > \"$RUNTIME_DIRECTORY/forwarding_hmac\" && ${pkgs.coreutils}/bin/chmod 600 \"$RUNTIME_DIRECTORY/forwarding_hmac\"; }'"
-            "${pkgs.coreutils}/bin/rm -f %t/agent-mcp/%i/backend.sock"
-          ];
-          ExecStart = "${pkgs'.agentMcpLauncher}/bin/agent-mcp-launcher %i";
-          Restart = "on-failure";
-          RestartSec = 5;
-          TimeoutStopSec = 10;
-        } // hardening;
-        # Not WantedBy any target — instances are started on demand by
-        # the router (`systemctl --user start agent-mcp@<name>`).
-      };
-
       # `conexus@<name>.service` — the CoNexus Rust backend user
-      # template (Phase D1 step 5). Structurally identical to
-      # `agent-mcp@` above (same RuntimeDirectory, same ExecStartPre
-      # HMAC-key/stale-socket handling, same restart budget, same
-      # hardening) except it has no `AGENT_MCP_ROUTER_DB` environment
-      # entry -- conexus-backend doesn't touch the router.db at all
-      # (no group-capability overlay from the per-project backend,
-      # matching Python's own documented behavior for this seam) --
-      # and the `ExecStart` target.
+      # template, and the ONLY per-project backend implementation now
+      # that the Python one (`agent-mcp@<name>.service`) was retired
+      # together with the rest of the Python source tree.
       #
-      # Decision #1 (2026-09-04, operator): SHARES `agent-mcp@`'s
-      # `RuntimeDirectory` (`agent-mcp/%i`, not a new `conexus/%i`) --
-      # a `backend_impl` flip is a same-path process swap. See
-      # `nix/module.nix`'s parallel system-mode template for the full
-      # rationale on why sharing the runtime dir across two mutually-
-      # exclusive unit templates is safe.
+      # `RuntimeDirectory = "agent-mcp/%i"` (not `conexus/%i`) is a
+      # historical holdover from when this path was shared with the
+      # since-deleted `agent-mcp@` template so a `backend_impl` flip
+      # was a same-path process swap (Decision #1, 2026-09-04,
+      # operator) — kept as-is rather than renamed, since renaming now
+      # would just be sock-path churn for every live deployment with
+      # zero behavioural benefit. See `nix/module.nix`'s parallel
+      # system-mode template for the fuller history.
       #
       # `null` by default (see `conexusLauncherPackage`'s option doc)
       # -- omitted until the flake's `homeModules.default`
@@ -865,9 +766,13 @@ in {
           Type = "simple";
           RuntimeDirectory = "agent-mcp/%i";
           RuntimeDirectoryMode = "0700";
-          # See `agent-mcp@`'s own RuntimeDirectoryPreserve comment
-          # above — same rationale, same fix, ported from
-          # nix/module.nix's already-correct system-mode template.
+          # RuntimeDirectoryPreserve=yes ported from nix/module.nix's
+          # already-correct system-mode template -- without it, this
+          # unit's own stop/restart is free to tear down its own leaf
+          # of the shared %t/agent-mcp/ tree on every cycle rather than
+          # just on uninstall (same class of bug as `conexus-router`'s
+          # own RuntimeDirectoryPreserve incident below, one level up
+          # the tree).
           RuntimeDirectoryPreserve = "yes";
           ExecStartPre = [
             "${pkgs.runtimeShell} -c 'test -f \"$RUNTIME_DIRECTORY/forwarding_hmac\" || { ${pkgs.coreutils}/bin/head -c 32 /dev/urandom > \"$RUNTIME_DIRECTORY/forwarding_hmac\" && ${pkgs.coreutils}/bin/chmod 600 \"$RUNTIME_DIRECTORY/forwarding_hmac\"; }'"
@@ -882,168 +787,27 @@ in {
         # the router (`systemctl --user start conexus@<name>`).
       };
 
-      "agent-mcp-router" = {
-        Unit = {
-          Description = "Agent-MCP router (URL-keyed, idle-stop)";
-          After = [ "ollama.service" ];
-        };
-        Service = {
-          Type = "simple";
-          Environment = [
-            "AGENT_MCP_PROJECTS_FILE=%h/.config/agent-mcp/projects.local.json"
-            "AGENT_MCP_SOCK_DIR=%t/agent-mcp"
-            "AGENT_MCP_DASHBOARD_DIR=${cfg.dashboard.package}/share/agent-mcp-dashboard"
-            "AGENT_MCP_EXTERNAL_URL=${cfg.router.externalUrl}"
-            "AGENT_MCP_DEFAULT_WORKSPACE=${cfg.router.defaultWorkspaceParent}"
-            "AGENT_MCP_ROUTER_PORT=${toString cfg.router.port}"
-            "AGENT_MCP_IDLE_SEC=${toString cfg.router.idleSec}"
-            "AGENT_MCP_README_HTML=${pkgs'.readmeHtml}"
-            "AGENT_MCP_INSTALLER_TEMPLATE=${pkgs'.installerTemplate}"
-            # Router DB lives under XDG_DATA_HOME (default
-            # ~/.local/share/agent-mcp/router.db). Without this, the
-            # python default in agent_mcp.router.migrations_runner
-            # (_DEFAULT_ROUTER_DB = /var/lib/agent-mcp/router.db) kicks
-            # in — and user-mode systemd units cannot write there, so
-            # the router restart-loops with
-            # `PermissionError: [Errno 13] Permission denied:
-            # '/var/lib/agent-mcp'`. The NixOS module uses
-            # /var/lib/agent-mcp/ which works for its system-mode user;
-            # user-mode home-manager units need an XDG path. The
-            # migrations_runner already mkdirs the parent so no
-            # tmpfiles equivalent is required.
-            "AGENT_MCP_ROUTER_DB=${config.xdg.dataHome}/agent-mcp/router.db"
-          ]
-          # Phase 3 Wave 3 (prancy-napping-pie): SSO env vars are
-          # appended conditionally. OIDC and proxy-header are
-          # mutually exclusive (enforced via the assertion above);
-          # both branches expand to [] when not configured, which
-          # leaves the legacy username/password mode active.
-          ++ lib.optionals (cfg.sso.oidc != null) [
-            "AGENT_MCP_SSO_OIDC_ISSUER=${cfg.sso.oidc.issuer}"
-            "AGENT_MCP_SSO_OIDC_CLIENT_ID=${cfg.sso.oidc.clientId}"
-            "AGENT_MCP_SSO_OIDC_CLIENT_SECRET_FILE=${
-              toString cfg.sso.oidc.clientSecretFile
-            }"
-            "AGENT_MCP_SSO_OIDC_PROVIDER_NAME=${cfg.sso.oidc.providerName}"
-            "AGENT_MCP_SSO_OIDC_GROUP_MAPPING=${
-              builtins.toJSON cfg.sso.oidc.groupMapping
-            }"
-            "AGENT_MCP_SSO_OIDC_SCOPES=${
-              lib.concatStringsSep " " cfg.sso.oidc.scopes
-            }"
-          ]
-          ++ lib.optionals (
-            cfg.sso.oidc != null && cfg.sso.oidc.redirectUrl != null
-          ) [
-            "AGENT_MCP_SSO_OIDC_REDIRECT_URL=${cfg.sso.oidc.redirectUrl}"
-          ]
-          ++ lib.optionals (cfg.sso.proxyHeader != null) [
-            "AGENT_MCP_SSO_PROXY_HEADER=${cfg.sso.proxyHeader.trustHeader}"
-            "AGENT_MCP_SSO_PROXY_TRUSTED_IPS=${
-              lib.concatStringsSep "," cfg.sso.proxyHeader.trustedIps
-            }"
-            "AGENT_MCP_SSO_PROXY_DEFAULT_SYSADMIN=${
-              if cfg.sso.proxyHeader.defaultIsSysadmin then "true" else "false"
-            }"
-          ];
-          # systemd creates and owns %t/agent-mcp/ at 0700 so the per-
-          # project subdirs the template creates inherit a private
-          # parent. (The template's own RuntimeDirectory creates each
-          # %t/agent-mcp/<name>/; this just ensures the parent exists.)
-          #
-          # RuntimeDirectoryPreserve=yes is NOT optional here (live
-          # incident, 2026-09-07): `RuntimeDirectory=agent-mcp` is a
-          # BARE, single-component value -- per systemd.exec(5)'s
-          # RuntimeDirectory= section, that bare path IS this unit's
-          # "innermost subdirectory", so on every stop (a crash-loop
-          # restart, a redeploy, `router.impl` A/B flip while BOTH
-          # router units briefly coexist) systemd rm's the ENTIRE
-          # %t/agent-mcp/ tree by default -- including every live
-          # per-project conexus@%i/agent-mcp@%i subdirectory and UDS
-          # socket unrelated units still own and are actively listening
-          # on. Confirmed live: a stray enabled-but-port-losing
-          # `agent-mcp-router` crash-looping every ~10s (address already
-          # in use against a running `conexus-router`) wiped
-          # %t/agent-mcp/ on each cycle, so `ss` kept showing per-project
-          # sockets LISTEN (the kernel remembers the bind) while every
-          # new connect() to the now-unlinked path failed --
-          # indistinguishable from "backend not ready" at every layer
-          # above this. `=yes` makes this unit's OWN stop leave the tree
-          # alone, matching nix/module.nix's system-mode template (which
-          # already carries the equivalent guard on ITS units).
-          RuntimeDirectory = "agent-mcp";
-          RuntimeDirectoryMode = "0700";
-          RuntimeDirectoryPreserve = "yes";
-          # Single-tenant: seed projects.local.json with the one
-          # declared project before the router starts. Multi-tenant
-          # this is a no-op (no ExecStartPre is set).
-          ExecStartPre = lib.mkIf (!cfg.multiTenant) [
-            "${singleProjectSeedScript}"
-          ];
-          ExecStart =
-            if cfg.multiTenant then
-              "${pkgs'.agentMcpRouterWrapper}/bin/agent-mcp-router"
-            else
-              # The wrapper does `exec python -m agent_mcp.cli router "$@"`,
-              # so passing flags through it lands them on the router
-              # subcommand as expected.
-              "${pkgs'.agentMcpRouterWrapper}/bin/agent-mcp-router "
-              + "--single-tenant ${lib.escapeShellArg cfg.singleProject.name} "
-              + "--single-workspace ${lib.escapeShellArg cfg.singleProject.workspace}";
-          Restart = "on-failure";
-          RestartSec = 10;
-          # Defense-in-depth ceiling on the SIGTERM → exit window.
-          # The router's own `_drain_proxy_tasks` on_shutdown hook +
-          # `shutdown_timeout=3.0` on `web.run_app` close down
-          # in-flight MCP Streamable-HTTP proxy connections inside
-          # a few seconds; this 15 s ceiling means even if the
-          # in-process drain misfires, systemd's SIGKILL window is
-          # short enough that the operator sees "router restarting"
-          # rather than the previous 90 s deploy outage. The default
-          # (90 s, inherited from systemd) was the source of the
-          # 2026-06-04 08:57 production stall — see PR <#TBD>.
-          TimeoutStopSec = 15;
-        } // hardening;
-        # `router.impl` (Phase F, prancy-napping-pie): only the ACTIVE
-        # implementation carries `Install.WantedBy` -- see that
-        # option's own doc for the rollback-flip rationale. Default
-        # ("python") reproduces this unit's behavior from before this
-        # option existed exactly (WantedBy always set) -- see
-        # `test_unset_option_is_exactly_todays_behaviour`-style
-        # coverage for this same "new option changes nothing by
-        # default" contract this module already holds itself to. A
-        # plain Nix `if`, not `lib.mkIf` -- whether `mkIf` resolves
-        # correctly here depends on `Install.WantedBy` being a real
-        # `mkOption`-typed submodule field in the CONSUMER's actual
-        # home-manager, which this repo has no local copy of to check
-        # directly (this module is exported for others to import, not
-        # imported by this flake itself); a plain `if` sidesteps the
-        # question entirely by resolving at eval time regardless of
-        # how the target option is declared.
-        Install.WantedBy = if cfg.router.impl == "python" then [ "default.target" ] else [ ];
-      };
-
-      # `conexus-router` — the CoNexus Rust router (Phase F packaging
-      # prerequisite, prancy-napping-pie). Structurally mirrors
-      # `agent-mcp-router` above (same RuntimeDirectory, same
-      # single-tenant seeding, same SSO env-var construction, same
-      # restart budget/hardening) except: (1) most of Python's
-      # env-var-only config surface is a real CLI flag on
-      # `conexus-router` (see its own `Cli` struct doc in
-      # rust/conexus-router/src/main.rs) -- passed as flags here
-      # rather than duplicated as env vars; (2) `AGENT_MCP_README_HTML`/
+      # `conexus-router` — the CoNexus Rust router, and the ONLY router
+      # implementation now that the Python one
+      # (`agent-mcp-router.service`) and the `router.impl` A/B flip
+      # between them were retired together with the rest of the Python
+      # source tree. Most of Python's env-var-only config surface is a
+      # real CLI flag on `conexus-router` (see its own `Cli` struct doc
+      # in rust/conexus-router/src/main.rs) -- passed as flags below
+      # rather than duplicated as env vars; `AGENT_MCP_README_HTML`/
       # `AGENT_MCP_INSTALLER_TEMPLATE` are deliberately omitted --
       # `conexus-router` parses `--readme-html`/`--installer-template`
       # but doesn't consume them yet (the `client_config`/`installer`
       # routes they'd feed stay explicitly, permanently deferred per
-      # the migration plan's own PR23-step-6 research finding).
+      # the migration plan's own PR23-step-6 research finding), and
+      # neither `readmeHtml` nor `installerTemplate` exist in
+      # packages.nix any more (they only ever served the now-deleted
+      # Python router's index page).
       #
-      # `null` by default (see `conexusRouterPackage`'s own option doc
-      # for why this is NOT auto-wired the way `conexusLauncherPackage`
-      # is) -- defining this unit changes nothing for any consumer
-      # until they explicitly set `conexusRouterPackage`, which is
-      # itself the router-cutover decision, not a side effect of
-      # taking this option's mere existence.
+      # `null` by default (see `conexusRouterPackage`'s own option doc)
+      # -- omitted until the flake's `homeModules.default` wrapper
+      # auto-wires it from `conexusPkgs.conexusRouterWrapper`, the same
+      # pattern `conexusLauncherPackage` already uses one unit up.
       "conexus-router" = lib.mkIf (cfg.conexusRouterPackage != null) {
         Unit = {
           Description = "CoNexus router (URL-keyed, idle-stop)";
@@ -1052,11 +816,23 @@ in {
         Service = {
           Type = "simple";
           Environment = [
-            # Same XDG-path rationale as `agent-mcp-router`'s own
-            # `AGENT_MCP_ROUTER_DB` comment above: user-mode units
+            # Router DB lives under XDG_DATA_HOME (default
+            # ~/.local/share/agent-mcp/router.db) -- user-mode units
             # cannot write to conexus-router's own compiled-in
-            # `/var/lib/agent-mcp/router.db` default.
+            # `/var/lib/agent-mcp/router.db` default (that path is the
+            # NixOS system-mode module's user, not this one's).
             "AGENT_MCP_ROUTER_DB=${config.xdg.dataHome}/agent-mcp/router.db"
+            # `--default-workspace` has no CLI-flag equivalent on
+            # `conexus-router` (env-var-only, mirroring the retired
+            # Python router's own `AGENT_MCP_DEFAULT_WORKSPACE` --
+            # see rust/conexus-router/src/main.rs's own
+            # `default_workspace_parent()` doc). Without this,
+            # `conexus-router` falls back to `$HOME/.local/share/agent-mcp/projects`,
+            # NOT `cfg.router.defaultWorkspaceParent` -- a real gap this
+            # unit had from the day `conexus-router` was first wired in
+            # here, masked while `router.impl` still defaulted to
+            # "python" (whose own unit DID set this).
+            "AGENT_MCP_DEFAULT_WORKSPACE=${cfg.router.defaultWorkspaceParent}"
           ]
           ++ lib.optionals (cfg.sso.oidc != null) [
             "AGENT_MCP_SSO_OIDC_ISSUER=${cfg.sso.oidc.issuer}"
@@ -1086,12 +862,25 @@ in {
               if cfg.sso.proxyHeader.defaultIsSysadmin then "true" else "false"
             }"
           ];
-          # See `agent-mcp-router`'s own RuntimeDirectoryPreserve
-          # comment above -- identical bare-parent footgun, identical
-          # fix. This unit is the one that was actually live-affected
-          # (2026-09-07): `conexus-router` itself restarting (e.g. this
-          # very cutover's home-manager switch) wiped the shared tree
-          # just as effectively as `agent-mcp-router`'s crash-loop did.
+          # RuntimeDirectoryPreserve=yes is NOT optional here (live
+          # incident, 2026-09-07): `RuntimeDirectory=agent-mcp` is a
+          # BARE, single-component value -- per systemd.exec(5)'s
+          # RuntimeDirectory= section, that bare path IS this unit's
+          # "innermost subdirectory", so on every stop (a crash-loop
+          # restart, a redeploy) systemd rm's the ENTIRE %t/agent-mcp/
+          # tree by default -- including every live per-project
+          # `conexus@%i` subdirectory and UDS socket unrelated units
+          # still own and are actively listening on. Confirmed live:
+          # `conexus-router` restarting (during this very cutover's
+          # home-manager switch, back when the retired Python router
+          # unit could also crash-loop against the same port) wiped
+          # %t/agent-mcp/ on each cycle, so `ss` kept showing
+          # per-project sockets LISTEN (the kernel remembers the bind)
+          # while every new connect() to the now-unlinked path failed --
+          # indistinguishable from "backend not ready" at every layer
+          # above this. `=yes` makes this unit's OWN stop leave the
+          # tree alone, matching nix/module.nix's system-mode template
+          # (which already carries the equivalent guard on ITS units).
           RuntimeDirectory = "agent-mcp";
           RuntimeDirectoryMode = "0700";
           RuntimeDirectoryPreserve = "yes";
@@ -1116,44 +905,30 @@ in {
               + "--single-workspace ${lib.escapeShellArg cfg.singleProject.workspace}";
           Restart = "on-failure";
           RestartSec = 10;
-          # Same defense-in-depth ceiling as `agent-mcp-router` above,
-          # even though `conexus-backend`'s own proxy-drain behavior
-          # hasn't hit an equivalent 90s-stall incident (none of this
-          # migration's own shutdown-path tests have needed a longer
-          # window) -- kept at the identical value so a router restart
-          # behaves identically to an operator regardless of which
-          # implementation is live.
+          # Defense-in-depth ceiling on the SIGTERM → exit window,
+          # ported from the retired Python router unit's identical
+          # directive (see its own removed comment, and the 2026-06-04
+          # 08:57 production stall it was added to guard against) --
+          # kept at the same value so a router restart behaves
+          # identically regardless of implementation.
           TimeoutStopSec = 15;
         } // hardening;
-        # `router.impl` (Phase F, prancy-napping-pie): mirrors
-        # `agent-mcp-router`'s own conditional WantedBy above -- only
-        # the ACTIVE implementation gets started. Default ("python")
-        # means this unit carries no WantedBy at all, same as before
-        # `router.impl` existed (the assertion above guarantees
-        # `conexusRouterPackage` is set whenever `impl == "rust"`, so
-        # this can never resolve to "wanted but the unit doesn't
-        # exist"). Plain Nix `if`, not `lib.mkIf` -- see the identical
-        # note on `agent-mcp-router`'s own WantedBy above.
-        Install.WantedBy = if cfg.router.impl == "rust" then [ "default.target" ] else [ ];
+        # Unconditional now that this is the only router implementation
+        # -- the `router.impl` A/B flip this WantedBy used to be
+        # conditioned on was retired together with the Python router.
+        Install.WantedBy = [ "default.target" ];
       };
     } // lib.listToAttrs (map (a: {
       name = "agent-mcp-daemon-agent@${daemonAgentInstanceName a}";
-      value = {
+      # Omitted when `conexusDaemonAgentPackage` is null -- see that
+      # option's own doc for why this mirrors `conexus@`/`conexus-router`'s
+      # "no package, no unit" idiom rather than a no-default required
+      # option.
+      value = lib.mkIf (cfg.conexusDaemonAgentPackage != null) {
         Unit = {
           Description = "Agent-MCP daemon agent — ${daemonAgentInstanceName a} (event-driven wait_for_events loop)";
-          # `router.impl`-aware (Phase F): a daemon-agent instance
-          # talks to whichever router implementation is actually
-          # live, not a hardcoded Python-only dependency. Mirrors
-          # `conexus-router`'s own conditional `Install.WantedBy`
-          # above -- without this, every daemon-agent activation
-          # unconditionally `Wants`ed (and thus started) the Python
-          # router alongside an already-running Rust one, regardless
-          # of `router.impl`, a real recurring bug found while
-          # deploying Phase G (the Python router would restart-crash-
-          # loop on every subsequent switch since it competes for the
-          # same port `conexus-router` already holds).
-          After = [ (if cfg.router.impl == "rust" then "conexus-router.service" else "agent-mcp-router.service") ];
-          Wants = [ (if cfg.router.impl == "rust" then "conexus-router.service" else "agent-mcp-router.service") ];
+          After = [ "conexus-router.service" ];
+          Wants = [ "conexus-router.service" ];
           # StartLimit* live in [Unit] (per `man systemd.unit`), not
           # in [Service] — putting them in Service makes systemd log
           # "Unknown key ... ignoring" and the rate-limiter never
@@ -1164,17 +939,11 @@ in {
         };
         Service = {
           Type = "simple";
-          # The two implementations take a different CLI shape: the
-          # Rust binary resolves its own token/URL/cursor paths from
-          # the instance argument PLUS an explicit `--router-port`
-          # flag (no per-build @router_port@ substitution needed);
-          # the Python wrapper already has the port baked in via
-          # `agentMcpDaemonAgentWrapper cfg.router.port` above, so it
-          # takes the instance name alone.
-          ExecStart =
-            if cfg.conexusDaemonAgentPackage != null
-            then "${daemonAgentWrapper}/bin/conexus-daemon-agent --router-port ${toString cfg.router.port} ${daemonAgentInstanceName a}"
-            else "${daemonAgentWrapper}/bin/agent-mcp-daemon-agent ${daemonAgentInstanceName a}";
+          # The Rust binary resolves its own token/URL/cursor paths
+          # from the instance argument PLUS an explicit `--router-port`
+          # flag (no per-build @router_port@ substitution needed, unlike
+          # the retired Python wrapper it replaces).
+          ExecStart = "${daemonAgentWrapper}/bin/conexus-daemon-agent --router-port ${toString cfg.router.port} ${daemonAgentInstanceName a}";
           Restart = "on-failure";
           RestartSec = 10;
         } // hardening;

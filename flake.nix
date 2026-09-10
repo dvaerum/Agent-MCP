@@ -75,29 +75,25 @@
       # superseded by `agent_mcp/router/`). Both were deleted with it.
       # `tests/test_nix_single_source_of_truth.py` keeps it that way.
 
-      # NixOS VM builder. `mode` selects the systemd shape via
-      # services.agent-mcp.mode in nix/vm.nix.
-      mkVm = mode: (lib.nixosSystem {
+      # NixOS VM builder. `nix/vm.nix` used to have a "single" bare-TCP
+      # single-backend shape alongside "multi" (the router shape); the
+      # former was retired with the rest of the Python implementation
+      # (see nix/module.nix's own module-doc comment), so there is now
+      # only one derivation. `mode` is still threaded through for
+      # nix/vm.nix's own function-signature compatibility with
+      # nix/vm-dev.nix, which imports the same file directly.
+      vmMulti = (lib.nixosSystem {
         inherit system;
         # specialArgs are the only way to thread arbitrary attrs into
         # the module function signatures. _module.args works too but
         # is more verbose and would require declaring them as options.
-        # craneLib (Phase D1 step 5): nix/vm.nix's own function head
-        # declares this param, so the module system requires SOME
-        # value here even for single-tenant mode, which doesn't use
-        # it — every declared name gets resolved through specialArgs
-        # with no fallback to a `?` default (see nix/vm.nix's own
-        # comment on this exact gotcha, right above its `llm` reads).
         specialArgs = {
           src = self;
-          inherit mode;
+          mode = "multi";
           craneLib = crane.mkLib pkgs;
         };
         modules = [ ./nix/vm.nix ];
       }).config.system.build.vm;
-
-      vmMulti = mkVm "multi";
-      vmSingle = mkVm "single";
 
       # Path B interactive sandbox VM (feat/agent-select-dropdown).
       # Same shape as vmMulti but with host:18080 → guest:1337
@@ -112,15 +108,13 @@
         modules = [ ./nix/vm-dev.nix ];
       }).config.system.build.vm;
 
-      # Wrapper script: parses flags, picks the right VM derivation,
-      # bind-mounts the persist dir, launches qemu.
+      # Wrapper script: bind-mounts the persist dir, launches qemu.
       runScript = pkgs.runCommand "agent-mcp-vm-run" {
         nativeBuildInputs = [ pkgs.makeWrapper ];
       } ''
         mkdir -p $out/bin
         substitute ${./nix/run-vm.sh} $out/bin/agent-mcp \
-          --replace-fail "@VM_MULTI@" "${vmMulti}" \
-          --replace-fail "@VM_SINGLE@" "${vmSingle}"
+          --replace-fail "@VM_MULTI@" "${vmMulti}"
         chmod +x $out/bin/agent-mcp
         # Ensure qemu + coreutils are on PATH for the run-*-vm script.
         wrapProgram $out/bin/agent-mcp \
@@ -164,15 +158,16 @@
       '';
     in {
       # ── packages ────────────────────────────────────────────────
-      # The three top-level packages the home-manager module consumes
-      # (agent-mcp, agent-mcp-dashboard, agent-mcp-router-wrapper) plus
-      # the VM derivations and the qemu run scripts.
+      # The Python `agent-mcp` / `agent-mcp-router-wrapper` outputs
+      # (buildPythonApplication over the now-deleted `agent_mcp/app`+
+      # `agent_mcp/router` tree) were retired together with the rest
+      # of the Python source tree — `conexus-backend`/`conexus-router`
+      # below are their sole replacements. `agent-mcp-dashboard` was
+      # always independent of the Python tree and is unaffected.
       packages.${system} = {
         # Phase 2 production set (consumed by the home-manager module).
-        agent-mcp = productionPkgs.agentMcpPy;
         agent-mcp-dashboard = productionPkgs.agentMcpDashboard;
-        agent-mcp-router-wrapper = productionPkgs.agentMcpRouterWrapper;
-        default = productionPkgs.agentMcpPy;
+        default = conexusPkgs.conexusBackend;
 
         # CoNexus Rust backend (Phase D1) — wired into the
         # `conexus@<name>.service` template via
@@ -181,14 +176,10 @@
         conexus-backend = conexusPkgs.conexusBackend;
         conexus-launcher = conexusPkgs.conexusLauncher;
 
-        # CoNexus Rust router (Phase F packaging prerequisite). Built
-        # and check-gated here, but NOT yet wired into any
-        # home-manager option or systemd unit — deploying it to
-        # replace `agent-mcp-router.service` is Phase F's own
-        # operator-authority cutover decision (a router restart is
-        # global/singleton, unlike the per-project backend's
-        # canary-per-project shape), tracked separately in
-        # prancy-napping-pie.md.
+        # CoNexus Rust router — the sole router implementation now
+        # that the Python one (`agent-mcp-router.service`) and the
+        # `router.impl` A/B flip between them were retired. Wired into
+        # `homeModules.default` via `conexusRouterPackage` below.
         conexus-router = conexusPkgs.conexusRouter;
         conexus-router-wrapper = conexusPkgs.conexusRouterWrapper;
 
@@ -201,7 +192,6 @@
 
         vm = vmMulti;
         vm-multi = vmMulti;
-        vm-single = vmSingle;
         vm-dev = vmDev;
         vm-run = runScript;
         vm-dev-run = runScriptDev;
@@ -263,12 +253,18 @@
         services.agent-mcp.source = lib.mkDefault self;
         services.agent-mcp.conexusLauncherPackage =
           lib.mkDefault conexusPkgsFor.conexusLauncher;
-        # Auto-wired (unlike conexusRouterPackage below) -- see this
-        # option's own doc in home-manager-module.nix for why a
-        # daemon-agent instance carries none of the router's
-        # port-collision/production-outage risk.
+        # Auto-wired -- see this option's own doc in
+        # home-manager-module.nix for why a daemon-agent instance
+        # carries none of the router's former port-collision risk.
         services.agent-mcp.conexusDaemonAgentPackage =
           lib.mkDefault conexusPkgsFor.conexusDaemonAgentWrapper;
+        # Auto-wired too, now that conexus-router is the ONLY router
+        # implementation (the Python router it used to risk racing for
+        # the port was retired together with `router.impl` -- see
+        # `conexusRouterPackage`'s own doc in home-manager-module.nix
+        # for the before/after reasoning).
+        services.agent-mcp.conexusRouterPackage =
+          lib.mkDefault conexusPkgsFor.conexusRouterWrapper;
       };
       homeModules.agent-mcp = self.homeModules.default;
 
@@ -278,23 +274,22 @@
 
       # `nix flake check` smoke test. Two flavours:
       #
-      #   - Build the three production derivations (agent-mcp,
-      #     dashboard, router wrapper). Cheap; under a minute on a
-      #     warm cache.
-      #   - The two `pkgs.nixosTest` VM scaffolds — multi-tenant +
-      #     single-tenant — added in Phase 3. First run is 10-15 min
-      #     because the test driver builds a NixOS VM, but the result
-      #     is cacheable and CI runners only pay it once per nixpkgs
-      #     bump.
+      #   - Build the production derivations (dashboard + the CoNexus
+      #     Rust binaries). Cheap; under a minute on a warm cache.
+      #   - The `pkgs.nixosTest` VM scaffolds — multi-tenant,
+      #     single-tenant, no-auto-cleanup, event-driven-coord — added
+      #     across Phase 3+. First run is several minutes because the
+      #     test driver builds a NixOS VM, but the result is cacheable
+      #     and CI runners only pay it once per nixpkgs bump.
       checks.${system} = {
-        agent-mcp = productionPkgs.agentMcpPy;
         agent-mcp-dashboard = productionPkgs.agentMcpDashboard;
-        agent-mcp-router-wrapper = productionPkgs.agentMcpRouterWrapper;
         # CoNexus Rust backend (Phase D1 step 4) — cheap build-only
-        # check, same rationale as the three Python derivations above.
-        # The CI-gated `conexus (Rust)` job already covers fmt/
-        # clippy/test/audit for the crate sources directly; this check
-        # additionally proves the flake's own crane wiring builds.
+        # check (the Python `agent-mcp`/`agent-mcp-router-wrapper`
+        # checks this used to sit alongside were retired with the
+        # Python source tree). The CI-gated `conexus (Rust)` job
+        # already covers fmt/clippy/test/audit for the crate sources
+        # directly; this check additionally proves the flake's own
+        # crane wiring builds.
         conexus-backend = conexusPkgs.conexusBackend;
         # CoNexus Rust router (Phase F packaging prerequisite) — same
         # cheap build-only rationale as conexus-backend above.
@@ -304,9 +299,11 @@
         conexus-daemon-agent = conexusPkgs.conexusDaemonAgent;
         vm-multi-tenant = import ./nix/tests/multi-tenant.nix {
           inherit pkgs lib self;
+          craneLib = crane.mkLib pkgs;
         };
         vm-single-tenant = import ./nix/tests/single-tenant.nix {
           inherit pkgs lib self;
+          craneLib = crane.mkLib pkgs;
         };
         # Regression guard: the dashboard auto-terminate-idle-agents
         # loop fixed in v5.0.3. Boots the multi-tenant stack, plants
@@ -315,6 +312,7 @@
         # browser connected. See ./nix/tests/no-auto-cleanup.nix.
         vm-no-auto-cleanup = import ./nix/tests/no-auto-cleanup.nix {
           inherit pkgs lib self;
+          craneLib = crane.mkLib pkgs;
         };
         # PR-2 event-coord E2E: drives wait_for_events,
         # fetch_events_since, and the toggle-flip stop_listening path
@@ -323,6 +321,7 @@
         # ./nix/tests/event-driven-coord.nix.
         vm-event-driven-coord = import ./nix/tests/event-driven-coord.nix {
           inherit pkgs lib self;
+          craneLib = crane.mkLib pkgs;
         };
       };
     };

@@ -19,7 +19,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use crate::orchestrator::runtime::RuntimeStore;
-use crate::project_registry::{ProjectRegistry, RegistryError, DEFAULT_BACKEND_IMPL};
+use crate::project_registry::{ProjectRegistry, RegistryError};
 
 /// `SOCK_DIR/<name>/<role>.sock` -- mkdir-as-side-effect, matching
 /// Python's own `_sock_path`. `role` is always `"backend"` today
@@ -71,17 +71,29 @@ pub fn ensure_forwarding_hmac_key(
     }
 }
 
-/// Resolve `name`'s registry `backend_impl`, defaulting to
-/// [`DEFAULT_BACKEND_IMPL`] when the project is unknown -- a
-/// concurrent delete/rename can race a reaper or stop call that's
-/// already mid-flight (winding a project DOWN, not creating one), so
-/// falling back preserves today's only behavior (the `agent-mcp@`
-/// template) rather than propagating an error.
+/// Resolve `name`'s registry `backend_impl`, defaulting to `"rust"`
+/// when the project is unknown -- a concurrent delete/rename can race
+/// a reaper or stop call that's already mid-flight (winding a project
+/// DOWN, not creating one), so falling back to a real unit name (never
+/// propagating an error) preserves today's only-attempt-a-stop
+/// behavior.
+///
+/// Deliberately NOT `project_registry::DEFAULT_BACKEND_IMPL` (Phase F,
+/// prancy-napping-pie): that constant is a DIFFERENT concern -- how to
+/// interpret a truly legacy on-disk record with no `backend_impl` key
+/// at all (predating the field, back when Python genuinely was the
+/// only implementation) -- not the fallback for a project this lookup
+/// can't find at all. Since the Nix `agent-mcp@` unit template no
+/// longer exists (the Python implementation itself is deleted, same
+/// `decide_create_project` rationale as `project_gate.rs`), defaulting
+/// this fallback to `"python"` would resolve to a unit that can never
+/// exist; `"rust"` is the only implementation a stop/reaper attempt
+/// could ever meaningfully target.
 pub fn backend_impl_for(registry: &ProjectRegistry, name: &str) -> Result<String, RegistryError> {
     Ok(registry
         .get(name)?
         .map(|p| p.backend_impl)
-        .unwrap_or_else(|| DEFAULT_BACKEND_IMPL.to_string()))
+        .unwrap_or_else(|| "rust".to_string()))
 }
 
 #[derive(Debug)]
@@ -339,10 +351,13 @@ mod tests {
     }
 
     #[test]
-    fn backend_impl_for_defaults_to_python_for_an_unknown_project() {
+    fn backend_impl_for_defaults_to_rust_for_an_unknown_project() {
+        // Phase F (prancy-napping-pie): the "agent-mcp@" unit template
+        // no longer exists in Nix -- an unknown-project fallback must
+        // resolve to a unit that can actually exist.
         let dir = tempfile::tempdir().unwrap();
         let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
-        assert_eq!(backend_impl_for(&registry, "nope").unwrap(), "python");
+        assert_eq!(backend_impl_for(&registry, "nope").unwrap(), "rust");
     }
 
     #[test]

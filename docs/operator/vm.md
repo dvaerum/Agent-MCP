@@ -60,25 +60,33 @@ nix run github:dvaerum/Agent-MCP -- [flags]
 | Flag                  | Meaning                                                                                                       |
 |-----------------------|---------------------------------------------------------------------------------------------------------------|
 | (default)             | Multi-tenant router on guest:1337, no auto-created project, persistent storage at `./vm-persistent-data/`.    |
-| `--minimal`           | Single-tenant agent-mcp backend on guest:8080. No router, no `/agent-mcp/` path prefix.                       |
 | `--ephemeral`         | Use a tmpdir for state; everything dies with the VM. Mutually exclusive with `--persist`.                     |
 | `--persist DIR`       | Persistent state directory on the host (default `./vm-persistent-data/`).                                     |
 | `--help`, `-h`        | Print usage and exit.                                                                                         |
 
-The host always reaches the VM on `http://localhost:5454`. The
-wrapper translates that to guest port 1337 (multi) or 8080
-(single) via qemu user-mode hostfwd, bound to 127.0.0.1.
+The host always reaches the VM on `http://localhost:5454`, translated
+to guest port 1337 via qemu user-mode hostfwd, bound to 127.0.0.1.
+
+History: this VM used to also support `--minimal`, booting a
+single-tenant agent-mcp backend directly on guest TCP `:8080` with no
+router in front of it. That shape ran the Python implementation and
+was retired together with it — the Rust `conexus-backend` binary only
+serves over a Unix domain socket, with no standalone TCP-port mode to
+replace it. `--minimal` is gone; the router + per-project template
+shape below is the only one this VM boots.
 
 ## Modes
 
-### Multi-tenant (default)
+### Multi-tenant (default, and only, shape)
 
-Mirrors the production `nixos-developer-system` deployment:
+Mirrors the production `nixos-developer-system` deployment, built on
+the CoNexus Rust implementation (`rust/conexus-router`,
+`rust/conexus-backend`):
 
-- `agent-mcp-router.service` — always-on aiohttp proxy on `:1337`
-  that fronts per-project backends and serves the static Next.js
-  dashboard under `/agent-mcp/`.
-- `agent-mcp@<name>.service` — systemd template; one instance per
+- `conexus-router.service` — always-on proxy on `:1337` that fronts
+  per-project backends and serves the static Next.js dashboard under
+  `/agent-mcp/`.
+- `conexus@<name>.service` — systemd template; one instance per
   registered project, listening on a UDS at
   `/run/agent-mcp/<name>/backend.sock`. Lazy-started by the router
   on first request, idle-reaped after 4 h.
@@ -88,19 +96,6 @@ Project creation goes through the dashboard's authenticated REST API
 URL convention. The legacy `agent-mcp-bootstrap.service` that POSTed
 to `/agent-mcp/__create` on first boot was retired with ADR 0014 —
 the `__create` endpoint no longer exists.
-
-### Single-tenant (`--minimal`)
-
-One backend on guest TCP `:8080` with no router and no path prefix:
-
-```
-http://localhost:5454/sse                              # MCP SSE
-http://localhost:5454/messages/<id>                    # MCP messages
-http://localhost:5454/api/tokens                       # per-agent bearer tokens
-```
-
-This is the lowest-overhead path to smoke-test the agent-mcp HTTP
-API itself.
 
 ## State layout
 
@@ -206,11 +201,11 @@ therefore adds `agent-mcp-llm-endpoint-check.service`: a boot-time
 oneshot that curls both `/v1/models` endpoints (10 attempts, 2 s
 apart) and hard-fails, naming the exact URLs on the serial console, if
 either is unreachable. Every unit that embeds or completes
-(`agent-mcp@` in multi mode, `agent-mcp-backend` in single) `Requires`
-it, so a dead endpoint stops the backend instead of degrading it.
-`agent-mcp-router.service` is deliberately *not* gated — it never
-talks to an LLM, and a dashboard that loads plus an explicit "backend
-failed to start" is more diagnostic than a refused connection.
+(`conexus@`) `Requires` it, so a dead endpoint stops the backend
+instead of degrading it. `conexus-router.service` is deliberately
+*not* gated — it never talks to an LLM, and a dashboard that loads
+plus an explicit "backend failed to start" is more diagnostic than a
+refused connection.
 
 ## Running the e2e tests against the VM
 
@@ -221,25 +216,24 @@ test suite at the VM:
 AGENT_MCP_BASE=http://localhost:5454 uv run pytest tests/e2e/
 ```
 
-Multi-tenant tests should target `http://localhost:5454/agent-mcp/`
-endpoints. Single-tenant tests want `--minimal` and target the
-backend directly.
+Tests should target `http://localhost:5454/agent-mcp/` endpoints.
 
 ## Build artefacts
 
 The flake exposes:
 
 ```
-nix build github:dvaerum/Agent-MCP#agent-mcp            # python package
+nix build github:dvaerum/Agent-MCP#conexus-backend      # Rust backend
+nix build github:dvaerum/Agent-MCP#conexus-router       # Rust router
 nix build github:dvaerum/Agent-MCP#agent-mcp-dashboard  # static export
 nix build github:dvaerum/Agent-MCP#vm-multi             # multi-tenant VM
-nix build github:dvaerum/Agent-MCP#vm-single            # single-tenant VM
 nix build github:dvaerum/Agent-MCP#default              # wrapper script
 ```
 
-`nix flake check` builds the python package + dashboard (CI-cheap)
-but skips the VM (CI-expensive). The repo's GitHub Actions
-workflow remains Python + dashboard only; the flake is opt-in.
+`nix flake check` builds the dashboard + CoNexus Rust binaries
+(CI-cheap) but skips the VM (CI-expensive). The repo's GitHub Actions
+workflow gates the Rust crates + dashboard directly; the flake is
+opt-in.
 
 ## Reusing the NixOS module standalone
 
@@ -253,7 +247,6 @@ workflow remains Python + dashboard only; the flake is opt-in.
         ({ ... }: {
           services.agent-mcp = {
             enable = true;
-            mode = "multi";
             src = agent-mcp;
             externalUrl = "https://agent.example.com";
           };
@@ -269,15 +262,15 @@ The module covers the systemd shape only — TLS termination
 
 ## Architecture notes
 
-- The router is the packaged one (`agent_mcp/router/`, invoked via
-  `python -m agent_mcp.cli router`), not a vendored script — the
-  pre-upstream `nix/router.py` copy was deleted 2026-08-09. Two env
-  knobs matter in the VM: `AGENT_MCP_SYSTEMCTL_MODE` switches between
-  `systemctl --user` (production, home-manager) and plain `systemctl`
-  (VM, where there's no per-user systemd instance), and
-  `AGENT_MCP_ROUTER_HOST` lets the VM bind `0.0.0.0` for qemu hostfwd.
+- The router is `conexus-router` (`rust/conexus-router`), the sole
+  implementation now that the Python one and the `router.impl` A/B
+  flip between them were retired. Two env knobs matter in the VM:
+  `AGENT_MCP_SYSTEMCTL_MODE` switches between `systemctl --user`
+  (production, home-manager) and plain `systemctl` (VM, where there's
+  no per-user systemd instance), and `AGENT_MCP_ROUTER_HOST` lets the
+  VM bind `0.0.0.0` for qemu hostfwd.
 - A polkit rule (in `nix/module.nix`) grants the unprivileged
-  `agent-mcp` user permission to start/stop `agent-mcp@*.service`
+  `agent-mcp` user permission to start/stop `conexus@*.service`
   units via systemd, so the router doesn't need root.
 - In `llm = "internal"` mode (the default — see
   [LLM endpoints](#llm-endpoints-in-guest-internal-vs-on-host-external)),

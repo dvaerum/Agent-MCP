@@ -1,5 +1,5 @@
-"""Regression guard: the Nix expressions must declare the Python
-application, and the router, exactly ONCE.
+"""Regression guard: the Nix expressions must not re-declare a Python
+application, and the router must not be re-vendored under ``nix/``.
 
 Background
 ----------
@@ -20,10 +20,20 @@ a fact with no single home.
 
 ``nix/package.nix`` turned out to be unreachable except for two flake
 outputs that were themselves redundant (see the PR that added this
-file), so the fix was deletion, not extraction. These tests keep it
-deleted: a second ``buildPythonApplication`` — or a re-vendored copy of
-the router that ``agent_mcp/router/`` already owns — fails here rather
-than silently drifting for another six months.
+file), so the fix was deletion, not extraction.
+
+Retirement note
+----------------
+
+The Python implementation this guard was originally about — the whole
+``agent_mcp/app``/``agent_mcp/router``/``agent_mcp/cli.py`` tree —
+was deleted wholesale once the Rust ``rust/`` workspace reached
+functional completeness (packaged separately via ``nix/conexus.nix``).
+``nix/packages.nix`` no longer calls ``buildPythonApplication`` at all
+— the "exactly one call site" invariant tightened to "zero call sites,
+anywhere": a second Python application derivation would be a full
+re-introduction of the retired implementation, not a drift of an
+existing one.
 """
 
 from __future__ import annotations
@@ -38,78 +48,43 @@ def _nix_expressions() -> list[Path]:
     return sorted(NIX_DIR.rglob("*.nix"))
 
 
-def test_exactly_one_python_application_derivation() -> None:
-    """Only ``nix/packages.nix`` may call ``buildPythonApplication``.
+def test_no_python_application_derivation_anywhere() -> None:
+    """No ``*.nix`` file may call ``buildPythonApplication``.
 
-    The dependency list is the fact with one home. A second call site is
-    a second copy of that list, and copies drift.
+    The Python implementation was retired wholesale; a Nix expression
+    building a Python application again would be a full reintroduction
+    of it (or a reincarnation of the very ``nix/package.nix`` /
+    ``nix/packages.nix`` duplication this test file was originally
+    written to catch), not a legitimate new feature that can slip in
+    silently.
     """
     declaring = [
         p.relative_to(REPO_ROOT).as_posix()
         for p in _nix_expressions()
         if "buildPythonApplication" in p.read_text()
     ]
-    assert declaring == ["nix/packages.nix"], (
-        "buildPythonApplication must be declared exactly once, in "
-        "nix/packages.nix — that expression owns the interpreter choice, "
-        "the pyproject version extraction, the dependency list and the "
-        "`mcp` floor gate. Found it in: " + ", ".join(declaring)
+    assert declaring == [], (
+        "buildPythonApplication must not appear in any Nix expression — "
+        "the Python implementation was retired in favor of the Rust "
+        "rust/ workspace (see nix/conexus.nix). Found it in: "
+        + ", ".join(declaring)
     )
 
 
 def test_no_vendored_router_copy_in_nix() -> None:
-    """The router lives in ``agent_mcp/router/``, not vendored under ``nix/``.
+    """The router does not live vendored under ``nix/``.
 
-    ``nix/router.py`` was a pre-upstream copy of ``agent_mcp/router/app.py``
-    that its own header admitted "runs nowhere"; likewise
-    ``nix/installer.sh.in`` had drifted behind
-    ``agent_mcp/router/installer.sh.in`` (it still emitted the ``type:"sse"``
-    client config retired in 3.0.0).
+    ``nix/router.py`` was a pre-upstream copy of the Python router's
+    ``app.py`` that its own header admitted "runs nowhere"; likewise
+    ``nix/installer.sh.in`` had drifted behind the Python router's own
+    copy (it still emitted the ``type:"sse"`` client config retired in
+    3.0.0). Both the originals and the vendored copies are gone now
+    that the Python implementation was retired wholesale — this test
+    just keeps the vendored-copy shape from coming back.
     """
-    for orphan, upstream in (
-        ("router.py", "agent_mcp/router/app.py"),
-        ("installer.sh.in", "agent_mcp/router/installer.sh.in"),
-    ):
+    for orphan in ("router.py", "installer.sh.in"):
         assert not (NIX_DIR / orphan).exists(), (
-            f"nix/{orphan} is a vendored copy of {upstream}; the packaged "
-            "module is the single source of truth. Delete the copy rather "
-            "than re-syncing it."
+            f"nix/{orphan} looks like a vendored copy of a retired Python "
+            "router asset. The Python implementation is gone; don't "
+            "re-vendor a copy of it under nix/."
         )
-
-
-def test_nix_dependency_list_matches_pyproject() -> None:
-    """Every ``[project].dependencies`` entry in pyproject must appear in
-    the one Nix dependency list.
-
-    Nix may list *more* than pyproject (``aiohttp`` is imported by
-    ``agent_mcp/router/*`` but not yet declared upstream), but it must
-    never list *fewer* — a missing entry means the build only works by
-    borrowing someone else's transitive closure.
-    """
-    pyproject = (REPO_ROOT / "pyproject.toml").read_text()
-    block = pyproject.split("\ndependencies = [", 1)[1].split("\n]", 1)[0]
-
-    declared: set[str] = set()
-    for line in block.splitlines():
-        line = line.strip()
-        if not line.startswith('"'):
-            continue
-        spec = line.split('"')[1]
-        # Strip extras and version constraints: `uvicorn[standard]`,
-        # `mcp>=1.27.0,<2` -> `uvicorn`, `mcp`.
-        name = spec.split("[")[0].split(">")[0].split("<")[0].split("=")[0]
-        declared.add(name.strip().lower().replace("_", "-"))
-
-    packages_nix = (NIX_DIR / "packages.nix").read_text()
-    deps_block = packages_nix.split("dependencies = with python.pkgs; [", 1)[1]
-    deps_block = deps_block.split("\n    ];", 1)[0]
-
-    # `mcpPinned` is the version-gated override of `python.pkgs.mcp`.
-    listed = set(deps_block.replace("mcpPinned", "mcp").split())
-
-    missing = sorted(declared - listed)
-    assert not missing, (
-        "pyproject declares dependencies that nix/packages.nix does not "
-        "list, so they reach the closure only transitively (if at all): "
-        + ", ".join(missing)
-    )

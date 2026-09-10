@@ -3,12 +3,20 @@
 # Wraps the pre-built `run-agent-mcp-vm` script that NixOS' qemu-vm
 # module emits, adding flag parsing + persist-dir bookkeeping.
 #
-# The flake hard-substitutes @VM_MULTI@ and @VM_SINGLE@ at build
-# time with the absolute store paths of the two VM derivations.
+# The flake hard-substitutes @VM_MULTI@ at build time with the
+# absolute store path of the VM derivation.
+#
+# History: this script used to also support `--minimal`, booting a
+# single-tenant agent-mcp backend directly on a TCP port with no
+# router in front of it. That shape ran the Python implementation and
+# was retired together with it -- the Rust `conexus-backend` binary
+# only serves over a Unix domain socket (see rust/conexus-backend/src/
+# main.rs's own module doc), so there is no TCP-port backend left to
+# boot standalone. `--minimal` is gone; only the router + per-project
+# template shape remains.
 set -euo pipefail
 
 MULTI_VM="@VM_MULTI@"
-SINGLE_VM="@VM_SINGLE@"
 
 print_usage() {
   cat <<EOF
@@ -23,8 +31,6 @@ boots land on /login. Projects are created from the dashboard UI
 after sign-in.
 
 Flags:
-  --minimal             Single-tenant agent-mcp backend on guest:8080
-                        (instead of router + template on guest:1337).
   --ephemeral           Use a tmpdir for VM state; nothing survives.
                         Mutually exclusive with --persist.
   --persist DIR         Persistent state directory on the host.
@@ -33,13 +39,11 @@ Flags:
 EOF
 }
 
-mode="multi"
 ephemeral=0
 persist_dir=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --minimal) mode="single"; shift ;;
     --ephemeral) ephemeral=1; shift ;;
     --persist)
       [[ $# -ge 2 ]] || { echo "agent-mcp: --persist needs a DIR" >&2; exit 2; }
@@ -50,12 +54,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# Mode → VM selector.
-if [[ "$mode" == "multi" ]]; then
-  vm_store="$MULTI_VM"
-else
-  vm_store="$SINGLE_VM"
-fi
+vm_store="$MULTI_VM"
 
 # Persist dir resolution.
 if [[ "$ephemeral" == "1" && -n "$persist_dir" ]]; then
@@ -90,15 +89,10 @@ mkdir -p -- "$AGENT_MCP_OLLAMA_DIR"
 export TMPDIR="$state_dir"
 export USE_TMPDIR=1
 
-if [[ "$mode" == "multi" ]]; then
-  echo "agent-mcp: booting multi-tenant VM"
-  echo "agent-mcp: dashboard will appear at http://localhost:5454/agent-mcp/"
-  echo "agent-mcp: first boot lands on /setup; create the first operator,"
-  echo "agent-mcp: then create projects from the dashboard UI."
-else
-  echo "agent-mcp: booting single-tenant VM"
-  echo "agent-mcp: backend reachable at http://localhost:5454/"
-fi
+echo "agent-mcp: booting multi-tenant VM"
+echo "agent-mcp: dashboard will appear at http://localhost:5454/agent-mcp/"
+echo "agent-mcp: first boot lands on /setup; create the first operator,"
+echo "agent-mcp: then create projects from the dashboard UI."
 echo "agent-mcp: state dir: $state_dir"
 echo "agent-mcp: Ctrl-C to shut down"
 

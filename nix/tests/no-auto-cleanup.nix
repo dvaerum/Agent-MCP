@@ -44,12 +44,20 @@
 # router cold-start + project creation puts the total runtime around
 # 5-7 minutes — heavier than `multi-tenant.nix`'s ~3 minutes but well
 # under the per-check budget for the existing VM tests.
-{ pkgs, lib, self, ... }:
+{ pkgs, lib, self, craneLib, ... }:
 
 let
   ports = import ./_ports.nix;
   packagedPkgs = import ../packages.nix {
     inherit pkgs lib;
+    src = self;
+  };
+  # The Python router/backend this test used to boot
+  # (`agentMcpRouterWrapper`/`agentMcpLauncher`) was retired together
+  # with the rest of the Python source tree; `conexus-router`/
+  # `conexus-backend` (via `nix/conexus.nix`) are the sole replacement.
+  conexusPkgs = import ../conexus.nix {
+    inherit pkgs lib craneLib;
     src = self;
   };
 in
@@ -67,8 +75,8 @@ pkgs.testers.nixosTest {
     };
     users.groups.testuser = {};
 
-    systemd.services."agent-mcp@" = {
-      description = "Agent-MCP backend — project %i";
+    systemd.services."conexus@" = {
+      description = "CoNexus backend — project %i";
       after = [ "fake-openai.service" ];
       serviceConfig = {
         Type = "simple";
@@ -95,7 +103,7 @@ pkgs.testers.nixosTest {
         ];
         RuntimeDirectory = "agent-mcp/%i";
         RuntimeDirectoryMode = "0700";
-        # See agent-mcp-router's own RuntimeDirectoryPreserve comment
+        # See conexus-router's own RuntimeDirectoryPreserve comment
         # below -- same bare-parent-vs-%i-child sharing, same fix.
         RuntimeDirectoryPreserve = "yes";
         # F015 v4 (see nix/module.nix): the per-project forwarding-HMAC
@@ -110,49 +118,49 @@ pkgs.testers.nixosTest {
           "${pkgs.coreutils}/bin/rm -f /run/agent-mcp/%i/backend.sock"
         ];
         ExecStart = ''
-          ${packagedPkgs.agentMcpLauncher}/bin/agent-mcp-launcher %i
+          ${conexusPkgs.conexusLauncher}/bin/conexus-launcher %i
         '';
         Restart = "on-failure";
         RestartSec = 5;
       };
     };
 
-    systemd.services.agent-mcp-router = {
-      description = "Agent-MCP router (no-auto-cleanup test)";
+    # `conexus-router` (Rust) — the sole router implementation now
+    # that the Python one (`agent-mcp-router`) was retired. See
+    # multi-tenant.nix's own comment on its `conexus-router` unit for
+    # the flag-vs-env-var split rationale.
+    systemd.services.conexus-router = {
+      description = "CoNexus router (no-auto-cleanup test)";
       wantedBy = [ "multi-user.target" ];
       after = [ "fake-openai.service" "network.target" ];
       environment = {
-        AGENT_MCP_PROJECTS_FILE = "/home/testuser/.config/agent-mcp/projects.local.json";
         # Phase 1 PR B (prancy-napping-pie): see multi-tenant.nix.
         AGENT_MCP_ROUTER_DB = "/home/testuser/.config/agent-mcp/router.db";
         # Phase 1 PR C: see single-tenant.nix.
         AGENT_MCP_BOOTSTRAP_USERNAME = "ci-sentinel";
         AGENT_MCP_BOOTSTRAP_PASSWORD = "ci-sentinel-pw";
-        AGENT_MCP_SOCK_DIR = "/run/agent-mcp";
         # The template unit is a SYSTEM service and the router runs as
         # an unprivileged user, so lazy-spawn must drive the system bus
         # (`systemctl start`, authorised by the polkit rule below) —
         # NOT `systemctl --user`, which would target testuser's own
-        # systemd instance where no agent-mcp@ unit exists. Mirrors
-        # production `nix/module.nix` (multi mode).
+        # systemd instance where no conexus@ unit exists. Mirrors
+        # production `nix/module.nix`.
         AGENT_MCP_SYSTEMCTL_MODE = "system";
-        AGENT_MCP_DASHBOARD_DIR = "${packagedPkgs.agentMcpDashboard}/share/agent-mcp-dashboard";
-        AGENT_MCP_EXTERNAL_URL = "http://localhost:${toString ports.routerPort}";
-        AGENT_MCP_DEFAULT_WORKSPACE = "/home/testuser/projects";
-        AGENT_MCP_ROUTER_PORT = toString ports.routerPort;
         AGENT_MCP_ROUTER_HOST = "0.0.0.0";
-        AGENT_MCP_IDLE_SEC = "14400";
-        AGENT_MCP_README_HTML = "${packagedPkgs.readmeHtml}";
-        AGENT_MCP_INSTALLER_TEMPLATE = "${packagedPkgs.installerTemplate}";
+        # `--default-workspace` has no CLI-flag equivalent on
+        # `conexus-router` (env-var-only); without it, projects created
+        # via __create/api/router/projects would land under the wrong
+        # fallback path (see home-manager-module.nix's own comment).
+        AGENT_MCP_DEFAULT_WORKSPACE = "/home/testuser/projects";
       };
       serviceConfig = {
         Type = "simple";
         User = "testuser";
         Group = "testuser";
         # RuntimeDirectoryPreserve=yes (live incident 2026-09-07, see
-        # nix/home-manager-module.nix's agent-mcp-router unit for the
+        # nix/home-manager-module.nix's conexus-router unit for the
         # full writeup): this bare, single-component RuntimeDirectory
-        # is a strict parent of agent-mcp@'s own "agent-mcp/%i" above --
+        # is a strict parent of conexus@'s own "agent-mcp/%i" above --
         # per systemd.exec(5), that makes it THIS unit's own innermost
         # subdirectory, so without `=yes` every stop of this router
         # (crash-loop, redeploy) recursively deletes the whole
@@ -162,7 +170,14 @@ pkgs.testers.nixosTest {
         RuntimeDirectoryMode = "0700";
         RuntimeDirectoryPreserve = "yes";
         ExecStartPre = "${pkgs.coreutils}/bin/mkdir -p /home/testuser/.config/agent-mcp /home/testuser/projects";
-        ExecStart = "${packagedPkgs.agentMcpRouterWrapper}/bin/agent-mcp-router";
+        ExecStart =
+          "${conexusPkgs.conexusRouterWrapper}/bin/conexus-router "
+          + "--port ${toString ports.routerPort} "
+          + "--projects-file /home/testuser/.config/agent-mcp/projects.local.json "
+          + "--sock-dir /run/agent-mcp "
+          + "--dashboard-dir ${packagedPkgs.agentMcpDashboard}/share/agent-mcp-dashboard "
+          + "--external-url ${lib.escapeShellArg "http://localhost:${toString ports.routerPort}"} "
+          + "--idle-sec 14400";
         Restart = "on-failure";
         RestartSec = 5;
       };
@@ -174,7 +189,7 @@ pkgs.testers.nixosTest {
         if (action.id == "org.freedesktop.systemd1.manage-units" &&
             subject.user == "testuser") {
           var unit = action.lookup("unit");
-          if (unit && (unit.indexOf("agent-mcp@") == 0)) {
+          if (unit && (unit.indexOf("conexus@") == 0)) {
             return polkit.Result.YES;
           }
         }
@@ -188,7 +203,7 @@ pkgs.testers.nixosTest {
   testScript = ''
     start_all()
     machine.wait_for_unit("fake-openai.service")
-    machine.wait_for_unit("agent-mcp-router.service")
+    machine.wait_for_unit("conexus-router.service")
     machine.wait_for_open_port(${toString ports.routerPort})
 
     # Log in the sentinel operator (ADR 0014: admin REST surface is
@@ -232,7 +247,7 @@ pkgs.testers.nixosTest {
     # Wait for the per-project backend to come up and the sqlite DB
     # to be created. The backend creates .agent/mcp_state.db on
     # lifespan startup.
-    machine.wait_for_unit("agent-mcp@idle-test.service")
+    machine.wait_for_unit("conexus@idle-test.service")
     machine.wait_until_succeeds(
         "test -f /home/testuser/projects/idle-test/.agent/mcp_state.db",
         timeout=60,
