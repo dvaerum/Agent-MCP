@@ -58,6 +58,24 @@
 //! embed in a cycle — this module doesn't implement that policy
 //! itself, only exposes the read/write primitives it needs.
 //!
+//! Phase G (sea-orm migration): every read + `embeddings_table_exists`
+//! is sea-orm-backed. `bulk_index_chunks`/`delete_chunks_for`/
+//! `set_meta` stay rusqlite-only, but NOT as a hot-path/transaction-
+//! bound classification the way most of this crate's remaining sync
+//! functions are — they have no real production caller anywhere in
+//! the workspace today, since the R31 indexing loop
+//! (`run_rag_indexing_periodically`) they exist to serve is itself
+//! not yet ported (a still-open, un-answered operator question,
+//! tracked separately from this repository's own conversion status).
+//! Converting them now, with no real caller to convert alongside,
+//! would violate this migration's own "convert callers together"
+//! rule for lack of a caller to convert — revisit once that loop is
+//! built. `purge_source` DOES stay permanently sync for the usual
+//! reason: its two real callers (`task_tools::DeleteTaskTool`'s
+//! cascade, `project_context_tools`'s delete path) both run it inside
+//! or alongside an in-flight write, one of them a literal
+//! `rusqlite::Transaction`.
+//!
 //! ## Phase G (sea-orm migration): reads converted, writes deliberately not
 //! `embeddings_table_exists`/`get_last_indexed`/`get_all_meta`/
 //! `get_chunk_by_id`/`fetch_recent_context`/`search_similar` are
