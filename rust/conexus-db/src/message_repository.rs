@@ -39,8 +39,12 @@
 //!   composition layer adds that.)
 
 use rusqlite::{Connection, OptionalExtension, Result, Row, ToSql};
+use sea_orm::{
+    ColumnTrait, DatabaseConnection, DbErr, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
+};
 use std::collections::HashMap;
 
+use crate::entity::message;
 use crate::pagination_cache::StableOrderCache;
 use crate::sql_util::{in_placeholders, to_sql_refs};
 
@@ -106,6 +110,26 @@ fn row_to_message(row: &Row) -> rusqlite::Result<MessageRow> {
         subject: row.get(9)?,
         parent_message_id: row.get(10)?,
     })
+}
+
+/// [`MessageRow`] from a sea-orm [`message::Model`] — the async
+/// counterpart of [`row_to_message`], used by the 3 sea-orm-converted
+/// functions below (matches `agent_repository::agent_row_from_model`'s
+/// own precedent).
+fn message_row_from_model(m: message::Model) -> MessageRow {
+    MessageRow {
+        message_id: m.message_id,
+        sender_id: m.sender_id,
+        recipient_id: m.recipient_id,
+        message_content: m.message_content,
+        message_type: m.message_type,
+        priority: m.priority,
+        timestamp: m.timestamp,
+        delivered: m.delivered,
+        read: m.read,
+        subject: m.subject,
+        parent_message_id: m.parent_message_id,
+    }
 }
 
 pub fn get_by_id(conn: &Connection, message_id: &str) -> Result<Option<MessageRow>> {
@@ -739,12 +763,22 @@ pub fn rename_participant(conn: &Connection, old_id: &str, new_id: &str) -> Resu
 
 /// `DELETE`s read messages older than `cutoff_timestamp` — the
 /// background cleanup sweep. Returns the count removed.
-pub fn prune_read_before(conn: &Connection, cutoff_timestamp: &str) -> Result<i64> {
-    let changed = conn.execute(
-        "DELETE FROM agent_messages WHERE read = 1 AND timestamp < ?1",
-        [cutoff_timestamp],
-    )?;
-    Ok(changed as i64)
+///
+/// Phase G (sea-orm migration): sea-orm-backed (`async`, `db: &
+/// sea_orm::DatabaseConnection`) — PR 1/5 of this repository's own
+/// conversion sequence. Built via `Entity::delete_many`, same idiom
+/// `agent_repository::AgentRepository::delete` already establishes for
+/// a bulk DELETE.
+pub async fn prune_read_before(
+    db: &DatabaseConnection,
+    cutoff_timestamp: &str,
+) -> std::result::Result<i64, DbErr> {
+    let result = message::Entity::delete_many()
+        .filter(message::Column::Read.eq(true))
+        .filter(message::Column::Timestamp.lt(cutoff_timestamp))
+        .exec(db)
+        .await?;
+    Ok(result.rows_affected as i64)
 }
 
 /// Bulk INSERT — a straight loop of parameterized inserts (rusqlite
@@ -782,26 +816,60 @@ pub fn bulk_send(conn: &Connection, rows: &[NewMessage]) -> Result<i64> {
 /// Root messages (`parent_message_id IS NULL AND subject IS NULL`),
 /// oldest-first, capped at `limit` — feeds the Phase-2 subject-backfill
 /// sweep.
-pub fn fetch_null_subject_roots(conn: &Connection, limit: i64) -> Result<Vec<MessageRow>> {
-    let sql = format!(
-        "SELECT {COLUMNS} FROM agent_messages WHERE parent_message_id IS NULL AND subject IS NULL \
-         ORDER BY timestamp ASC LIMIT ?1"
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map([limit], row_to_message)?;
-    rows.collect()
+///
+/// Phase G (sea-orm migration): sea-orm-backed (`async`, `db: &
+/// sea_orm::DatabaseConnection`) — PR 1/5 of this repository's own
+/// conversion sequence. Built via the typed query builder
+/// (`order_by_asc` + `limit`), same idiom `agent_repository::
+/// AgentRepository::list_all_bounded` already establishes for a
+/// bounded, sorted, single-table read. A negative `limit` clamps to 0
+/// rows here (`as u64` saturates to 0), unlike rusqlite's raw `LIMIT
+/// ?` (SQLite treats a negative bound parameter as "no limit") —
+/// every real caller (`background_tasks::subject_backfill`) already
+/// only ever passes a positive value, so this divergence is
+/// unreachable in practice.
+pub async fn fetch_null_subject_roots(
+    db: &DatabaseConnection,
+    limit: i64,
+) -> std::result::Result<Vec<MessageRow>, DbErr> {
+    let rows = message::Entity::find()
+        .filter(message::Column::ParentMessageId.is_null())
+        .filter(message::Column::Subject.is_null())
+        .order_by_asc(message::Column::Timestamp)
+        .limit(limit.max(0) as u64)
+        .all(db)
+        .await?;
+    Ok(rows.into_iter().map(message_row_from_model).collect())
 }
 
 /// Backfill write-back: sets a currently-NULL subject to a real one.
 /// `false` if the message doesn't exist OR already has a non-NULL
 /// subject — this never overwrites a real subject, only fills a
 /// placeholder.
-pub fn set_message_subject(conn: &Connection, message_id: &str, subject: &str) -> Result<bool> {
-    let changed = conn.execute(
-        "UPDATE agent_messages SET subject = ?1 WHERE message_id = ?2 AND subject IS NULL",
-        (subject, message_id),
-    )?;
-    Ok(changed > 0)
+///
+/// Phase G (sea-orm migration): sea-orm-backed (`async`, `db: &
+/// sea_orm::DatabaseConnection`) — PR 1/5 of this repository's own
+/// conversion sequence. Built via `Entity::update_many` + `col_expr`,
+/// the same single-column-UPDATE idiom `agent_repository::
+/// AgentRepository::seed_manager_profile`/`review_profile` already
+/// establish; the "never overwrites a real subject" guarantee is
+/// expressed as a second `filter` (`Subject.is_null()`) rather than a
+/// raw `AND subject IS NULL` clause.
+pub async fn set_message_subject(
+    db: &DatabaseConnection,
+    message_id: &str,
+    subject: &str,
+) -> std::result::Result<bool, DbErr> {
+    let result = message::Entity::update_many()
+        .col_expr(
+            message::Column::Subject,
+            sea_orm::sea_query::Expr::value(subject),
+        )
+        .filter(message::Column::MessageId.eq(message_id))
+        .filter(message::Column::Subject.is_null())
+        .exec(db)
+        .await?;
+    Ok(result.rows_affected > 0)
 }
 
 /// One `agents` row as [`list_participants`] projects it.
@@ -1715,9 +1783,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn prune_read_before_deletes_only_old_read_messages() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn prune_read_before_deletes_only_old_read_messages() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         seed_agent(&conn, "alice");
         seed_agent(&conn, "bob");
         seed_msg(&conn, "old-read", "alice", "bob", "2026-01-01T00:00:00Z");
@@ -1726,7 +1794,9 @@ mod tests {
         seed_msg(&conn, "new-read", "alice", "bob", "2026-02-01T00:00:00Z");
         mark_read(&conn, "new-read", true).unwrap();
 
-        let pruned = prune_read_before(&conn, "2026-01-15T00:00:00Z").unwrap();
+        let pruned = prune_read_before(&db, "2026-01-15T00:00:00Z")
+            .await
+            .unwrap();
         assert_eq!(pruned, 1);
         assert_eq!(get_by_id(&conn, "old-read").unwrap(), None);
         assert!(
@@ -1754,9 +1824,9 @@ mod tests {
         assert!(get_by_id(&conn, "m2").unwrap().is_some());
     }
 
-    #[test]
-    fn fetch_null_subject_roots_excludes_replies_and_subjected_messages() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn fetch_null_subject_roots_excludes_replies_and_subjected_messages() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         seed_agent(&conn, "alice");
         seed_agent(&conn, "bob");
         send(&conn, new_msg("root-no-subject", "alice", "bob", "x")).unwrap();
@@ -1767,13 +1837,13 @@ mod tests {
         reply.parent_message_id = Some("root-no-subject");
         send(&conn, reply).unwrap();
 
-        let roots = fetch_null_subject_roots(&conn, 10).unwrap();
+        let roots = fetch_null_subject_roots(&db, 10).await.unwrap();
         assert_eq!(ids(&roots), vec!["root-no-subject"]);
     }
 
-    #[test]
-    fn set_message_subject_only_fills_a_null_subject_never_overwrites() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn set_message_subject_only_fills_a_null_subject_never_overwrites() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         seed_agent(&conn, "alice");
         seed_agent(&conn, "bob");
         send(&conn, new_msg("m1", "alice", "bob", "x")).unwrap();
@@ -1781,13 +1851,15 @@ mod tests {
         with_subject.subject = Some("already set");
         send(&conn, with_subject).unwrap();
 
-        assert!(set_message_subject(&conn, "m1", "backfilled").unwrap());
+        assert!(set_message_subject(&db, "m1", "backfilled").await.unwrap());
         assert_eq!(
             get_by_id(&conn, "m1").unwrap().unwrap().subject.as_deref(),
             Some("backfilled")
         );
 
-        assert!(!set_message_subject(&conn, "m2", "should not apply").unwrap());
+        assert!(!set_message_subject(&db, "m2", "should not apply")
+            .await
+            .unwrap());
         assert_eq!(
             get_by_id(&conn, "m2").unwrap().unwrap().subject.as_deref(),
             Some("already set")

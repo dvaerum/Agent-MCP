@@ -27,6 +27,7 @@ pub mod file_metadata;
 pub mod group_capability;
 pub mod group_membership;
 pub mod groups;
+pub mod message;
 pub mod pending_directive;
 pub mod project_context;
 pub mod project_membership;
