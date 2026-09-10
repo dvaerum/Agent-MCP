@@ -1364,9 +1364,9 @@ impl conexus_auth::Tool for GetAgentMessagesTool {
     fn call<'a>(
         principal: Option<&'a Principal>,
         arguments: &'a Value,
-        conn: &'a AsyncMutex<Connection>,
+        _conn: &'a AsyncMutex<Connection>,
         _now: &'a str,
-        _ctx: &'a ToolCallContext<'a>,
+        ctx: &'a ToolCallContext<'a>,
     ) -> conexus_auth::BoxFuture<'a, ToolResult> {
         Box::pin(async move {
             let principal =
@@ -1405,9 +1405,8 @@ impl conexus_auth::Tool for GetAgentMessagesTool {
                 };
             }
 
-            let guard = conn.lock().await;
             let messages = match conexus_db::message_repository::list_recent_for_agent(
-                &guard,
+                ctx.sea_orm_db,
                 agent_id,
                 &conexus_db::message_repository::RecentMessagesFilters {
                     include_sent,
@@ -1416,7 +1415,9 @@ impl conexus_auth::Tool for GetAgentMessagesTool {
                     unread_only,
                     limit,
                 },
-            ) {
+            )
+            .await
+            {
                 Ok(rows) => rows,
                 Err(e) => {
                     return ToolResult::Failed {
@@ -1433,13 +1434,13 @@ impl conexus_auth::Tool for GetAgentMessagesTool {
                     .collect();
                 if !received_ids.is_empty() {
                     let _ = conexus_db::message_repository::mark_read_by_ids(
-                        &guard,
+                        ctx.sea_orm_db,
                         &received_ids,
                         Some(agent_id),
-                    );
+                    )
+                    .await;
                 }
             }
-            drop(guard);
 
             if messages.is_empty() {
                 return ToolResult::Ok {
@@ -1574,6 +1575,31 @@ mod tests {
             .await
             .unwrap();
         (dir, db)
+    }
+
+    /// Phase G: `GetAgentMessagesTool::call` now reads/writes
+    /// `agent_messages` exclusively through `ctx.sea_orm_db`
+    /// (`list_recent_for_agent`/`mark_read_by_ids`), while messages are
+    /// still seeded through the legacy rusqlite `send` (unconverted).
+    /// Unlike [`test_sea_orm_db`] above, a SEPARATE temp file is NOT
+    /// fine for these tests: `agent_messages` must be visible on BOTH
+    /// connection handles, so both must point at the SAME real temp
+    /// file -- an in-memory `:memory:` database can't be shared across
+    /// two separate connection handles the way a real file can.
+    /// Mirrors `message_repository::tests::test_conn_with_sea_orm`.
+    async fn test_conn_and_sea_orm_db_same_file() -> (
+        tempfile::TempDir,
+        AsyncMutex<Connection>,
+        sea_orm::DatabaseConnection,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn).unwrap();
+        let db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        (dir, AsyncMutex::new(conn), db)
     }
 
     // The `start_paused = true` counterpart of `test_sea_orm_db` above
@@ -2559,7 +2585,7 @@ mod tests {
     #[tokio::test]
     async fn get_agent_messages_returns_and_marks_received_messages_read() {
         use conexus_auth::Tool;
-        let conn = test_conn();
+        let (_dir, conn, sea_orm_db) = test_conn_and_sea_orm_db_same_file().await;
         seed_agent(&conn, "alice").await;
         seed_agent(&conn, "bob").await;
         {
@@ -2584,7 +2610,6 @@ mod tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -2618,7 +2643,7 @@ mod tests {
     #[tokio::test]
     async fn get_agent_messages_mark_as_read_false_leaves_messages_unread() {
         use conexus_auth::Tool;
-        let conn = test_conn();
+        let (_dir, conn, sea_orm_db) = test_conn_and_sea_orm_db_same_file().await;
         seed_agent(&conn, "alice").await;
         seed_agent(&conn, "bob").await;
         {
@@ -2643,7 +2668,6 @@ mod tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -2680,7 +2704,7 @@ mod tests {
     #[tokio::test]
     async fn get_agent_messages_type_filter_does_not_mark_other_types_read() {
         use conexus_auth::Tool;
-        let conn = test_conn();
+        let (_dir, conn, sea_orm_db) = test_conn_and_sea_orm_db_same_file().await;
         seed_agent(&conn, "alice").await;
         seed_agent(&conn, "bob").await;
         {
@@ -2722,7 +2746,6 @@ mod tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -2761,7 +2784,7 @@ mod tests {
     #[tokio::test]
     async fn get_agent_messages_limit_does_not_mark_beyond_the_page_read() {
         use conexus_auth::Tool;
-        let conn = test_conn();
+        let (_dir, conn, sea_orm_db) = test_conn_and_sea_orm_db_same_file().await;
         seed_agent(&conn, "alice").await;
         seed_agent(&conn, "bob").await;
         {
@@ -2792,7 +2815,6 @@ mod tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,
@@ -2832,7 +2854,7 @@ mod tests {
     #[tokio::test]
     async fn get_agent_messages_never_marks_a_sent_message_read() {
         use conexus_auth::Tool;
-        let conn = test_conn();
+        let (_dir, conn, sea_orm_db) = test_conn_and_sea_orm_db_same_file().await;
         seed_agent(&conn, "alice").await;
         seed_agent(&conn, "bob").await;
         {
@@ -2857,7 +2879,6 @@ mod tests {
         }
         let registry = WaiterRegistry::new();
         let file_map = FileMap::new();
-        let (_sea_orm_dir, sea_orm_db) = test_sea_orm_db().await;
         let ctx = ToolCallContext::off_wire(
             &registry,
             &file_map,

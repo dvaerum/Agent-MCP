@@ -40,7 +40,8 @@
 
 use rusqlite::{Connection, OptionalExtension, Result, Row, ToSql};
 use sea_orm::{
-    ColumnTrait, DatabaseConnection, DbErr, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
+    ColumnTrait, Condition, DatabaseConnection, DbErr, EntityTrait, QueryFilter, QueryOrder,
+    QuerySelect,
 };
 use std::collections::HashMap;
 
@@ -322,28 +323,32 @@ pub fn mark_read_for_recipient(conn: &Connection, recipient_id: &str) -> Result<
 /// Flips `read = 1` on exactly the enumerated ids (still-unread only),
 /// optionally scoped to one recipient. A no-op (no query run) for an
 /// empty slice.
-pub fn mark_read_by_ids(
-    conn: &Connection,
+///
+/// Phase G (sea-orm migration): sea-orm-backed (`async`, `db: &
+/// sea_orm::DatabaseConnection`) — PR 2/5 of this repository's own
+/// conversion sequence. Built via `Entity::update_many` + `col_expr`,
+/// the same single-column-UPDATE idiom `set_message_subject` (PR 1/5)
+/// already establishes; the id-set filter is `MessageId.is_in(...)`
+/// rather than the raw `IN (...)` placeholder string the rusqlite
+/// version needed.
+pub async fn mark_read_by_ids(
+    db: &DatabaseConnection,
     message_ids: &[&str],
     recipient_id: Option<&str>,
-) -> Result<i64> {
+) -> std::result::Result<i64, DbErr> {
     if message_ids.is_empty() {
         return Ok(0);
     }
 
-    let mut sql = format!(
-        "UPDATE agent_messages SET read = 1 WHERE read = 0 AND message_id IN ({})",
-        in_placeholders(message_ids.len())
-    );
-    let mut owned_params: Vec<String> = message_ids.iter().map(|id| id.to_string()).collect();
+    let mut query = message::Entity::update_many()
+        .col_expr(message::Column::Read, sea_orm::sea_query::Expr::value(true))
+        .filter(message::Column::Read.eq(false))
+        .filter(message::Column::MessageId.is_in(message_ids.iter().map(|id| id.to_string())));
     if let Some(rid) = recipient_id {
-        sql.push_str(" AND recipient_id = ?");
-        owned_params.push(rid.to_string());
+        query = query.filter(message::Column::RecipientId.eq(rid));
     }
-
-    let params = to_sql_refs(&owned_params);
-    let changed = conn.execute(&sql, params.as_slice())?;
-    Ok(changed as i64)
+    let result = query.exec(db).await?;
+    Ok(result.rows_affected as i64)
 }
 
 pub fn delete(conn: &Connection, message_id: &str) -> Result<bool> {
@@ -376,49 +381,44 @@ pub struct RecentMessagesFilters<'a> {
 /// `!include_sent && !include_received` `Invalid` case, which never
 /// reaches this function at all (matching Python's own early return
 /// before the query is built).
-pub fn list_recent_for_agent(
-    conn: &Connection,
+///
+/// Phase G (sea-orm migration): sea-orm-backed (`async`, `db: &
+/// sea_orm::DatabaseConnection`) — PR 2/5 of this repository's own
+/// conversion sequence. The either-direction `(recipient_id = ? OR
+/// sender_id = ?)` case is built with `Condition::any`, the same
+/// idiom `scheduled_directive_repository::soonest_due_at`/
+/// `collect_due_and_fire` already establish for an OR filter; the
+/// `(false, false)` short-circuit stays a plain early return, never
+/// reaching the query builder, matching the rusqlite version exactly.
+pub async fn list_recent_for_agent(
+    db: &DatabaseConnection,
     agent_id: &str,
-    filters: &RecentMessagesFilters,
-) -> Result<Vec<MessageRow>> {
-    let mut conditions: Vec<String> = Vec::new();
-    let mut params: Vec<String> = Vec::new();
-
-    match (filters.include_received, filters.include_sent) {
-        (true, true) => {
-            conditions.push("(recipient_id = ? OR sender_id = ?)".to_string());
-            params.push(agent_id.to_string());
-            params.push(agent_id.to_string());
-        }
-        (true, false) => {
-            conditions.push("recipient_id = ?".to_string());
-            params.push(agent_id.to_string());
-        }
-        (false, true) => {
-            conditions.push("sender_id = ?".to_string());
-            params.push(agent_id.to_string());
-        }
+    filters: &RecentMessagesFilters<'_>,
+) -> std::result::Result<Vec<MessageRow>, DbErr> {
+    let mut query = match (filters.include_received, filters.include_sent) {
+        (true, true) => message::Entity::find().filter(
+            Condition::any()
+                .add(message::Column::RecipientId.eq(agent_id))
+                .add(message::Column::SenderId.eq(agent_id)),
+        ),
+        (true, false) => message::Entity::find().filter(message::Column::RecipientId.eq(agent_id)),
+        (false, true) => message::Entity::find().filter(message::Column::SenderId.eq(agent_id)),
         (false, false) => return Ok(Vec::new()),
-    }
+    };
 
     if let Some(mt) = filters.message_type {
-        conditions.push("message_type = ?".to_string());
-        params.push(mt.to_string());
+        query = query.filter(message::Column::MessageType.eq(mt));
     }
     if filters.unread_only {
-        conditions.push("read = 0".to_string());
+        query = query.filter(message::Column::Read.eq(false));
     }
 
-    let where_clause = conditions.join(" AND ");
-    let sql = format!(
-        "SELECT {COLUMNS} FROM agent_messages WHERE {where_clause} \
-         ORDER BY timestamp DESC LIMIT ?"
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let mut bind_params = to_sql_refs(&params);
-    bind_params.push(&filters.limit);
-    let rows = stmt.query_map(bind_params.as_slice(), row_to_message)?;
-    rows.collect()
+    let rows = query
+        .order_by_desc(message::Column::Timestamp)
+        .limit(filters.limit.max(0) as u64)
+        .all(db)
+        .await?;
+    Ok(rows.into_iter().map(message_row_from_model).collect())
 }
 
 /// Filters accepted by [`MessageRepository::query`]/
@@ -749,16 +749,35 @@ pub fn fetch_thread(conn: &Connection, message_id: &str) -> Result<Vec<MessageRo
 /// messages at a `[deleted-<id>]` tombstone row instead of orphaning
 /// them. Not a delete. Returns the total rows touched across both
 /// columns.
-pub fn rename_participant(conn: &Connection, old_id: &str, new_id: &str) -> Result<i64> {
-    let sender_changed = conn.execute(
-        "UPDATE agent_messages SET sender_id = ?1 WHERE sender_id = ?2",
-        (new_id, old_id),
-    )?;
-    let recipient_changed = conn.execute(
-        "UPDATE agent_messages SET recipient_id = ?1 WHERE recipient_id = ?2",
-        (new_id, old_id),
-    )?;
-    Ok((sender_changed + recipient_changed) as i64)
+///
+/// Phase G (sea-orm migration): sea-orm-backed (`async`, `db: &
+/// sea_orm::DatabaseConnection`) — PR 2/5 of this repository's own
+/// conversion sequence. Two separate `Entity::update_many` + `col_expr`
+/// calls (one per column), matching the rusqlite version's own
+/// two-UPDATE shape exactly rather than combining them into one
+/// OR'd statement.
+pub async fn rename_participant(
+    db: &DatabaseConnection,
+    old_id: &str,
+    new_id: &str,
+) -> std::result::Result<i64, DbErr> {
+    let sender_result = message::Entity::update_many()
+        .col_expr(
+            message::Column::SenderId,
+            sea_orm::sea_query::Expr::value(new_id),
+        )
+        .filter(message::Column::SenderId.eq(old_id))
+        .exec(db)
+        .await?;
+    let recipient_result = message::Entity::update_many()
+        .col_expr(
+            message::Column::RecipientId,
+            sea_orm::sea_query::Expr::value(new_id),
+        )
+        .filter(message::Column::RecipientId.eq(old_id))
+        .exec(db)
+        .await?;
+    Ok((sender_result.rows_affected + recipient_result.rows_affected) as i64)
 }
 
 /// `DELETE`s read messages older than `cutoff_timestamp` — the
@@ -1197,31 +1216,33 @@ mod tests {
         assert_eq!(mark_read_for_recipient(&conn, "bob").unwrap(), 0);
     }
 
-    #[test]
-    fn mark_read_by_ids_empty_slice_is_a_noop() {
-        let conn = test_conn();
-        assert_eq!(mark_read_by_ids(&conn, &[], None).unwrap(), 0);
+    #[tokio::test]
+    async fn mark_read_by_ids_empty_slice_is_a_noop() {
+        let (_dir, _conn, db) = test_conn_with_sea_orm().await;
+        assert_eq!(mark_read_by_ids(&db, &[], None).await.unwrap(), 0);
     }
 
-    #[test]
-    fn mark_read_by_ids_flips_only_the_enumerated_still_unread_ids() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn mark_read_by_ids_flips_only_the_enumerated_still_unread_ids() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         seed_agent(&conn, "alice");
         seed_agent(&conn, "bob");
         send(&conn, new_msg("m1", "alice", "bob", "x")).unwrap();
         send(&conn, new_msg("m2", "alice", "bob", "y")).unwrap();
         send(&conn, new_msg("m3", "alice", "bob", "z")).unwrap();
 
-        let changed = mark_read_by_ids(&conn, &["m1", "m2", "does-not-exist"], None).unwrap();
+        let changed = mark_read_by_ids(&db, &["m1", "m2", "does-not-exist"], None)
+            .await
+            .unwrap();
         assert_eq!(changed, 2);
         assert!(get_by_id(&conn, "m1").unwrap().unwrap().read);
         assert!(get_by_id(&conn, "m2").unwrap().unwrap().read);
         assert!(!get_by_id(&conn, "m3").unwrap().unwrap().read);
     }
 
-    #[test]
-    fn mark_read_by_ids_recipient_scoping_excludes_other_recipients_messages() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn mark_read_by_ids_recipient_scoping_excludes_other_recipients_messages() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         seed_agent(&conn, "alice");
         seed_agent(&conn, "bob");
         seed_agent(&conn, "carol");
@@ -1230,7 +1251,9 @@ mod tests {
 
         // Scoped to "bob" -- m2 (addressed to carol) must not flip
         // even though its id was explicitly listed.
-        let changed = mark_read_by_ids(&conn, &["m1", "m2"], Some("bob")).unwrap();
+        let changed = mark_read_by_ids(&db, &["m1", "m2"], Some("bob"))
+            .await
+            .unwrap();
         assert_eq!(changed, 1);
         assert!(get_by_id(&conn, "m1").unwrap().unwrap().read);
         assert!(!get_by_id(&conn, "m2").unwrap().unwrap().read);
@@ -1269,35 +1292,38 @@ mod tests {
         }
     }
 
-    #[test]
-    fn list_recent_for_agent_neither_direction_returns_empty_without_querying() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn list_recent_for_agent_neither_direction_returns_empty_without_querying() {
+        let (_dir, _conn, db) = test_conn_with_sea_orm().await;
         let filters = RecentMessagesFilters {
             include_sent: false,
             include_received: false,
             ..default_filters()
         };
-        assert!(list_recent_for_agent(&conn, "bob", &filters)
+        assert!(list_recent_for_agent(&db, "bob", &filters)
+            .await
             .unwrap()
             .is_empty());
     }
 
-    #[test]
-    fn list_recent_for_agent_received_only_excludes_sent_messages() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn list_recent_for_agent_received_only_excludes_sent_messages() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         seed_agent(&conn, "alice");
         seed_agent(&conn, "bob");
         seed_msg(&conn, "m1", "alice", "bob", "2026-01-01T00:00:01Z");
         seed_msg(&conn, "m2", "bob", "alice", "2026-01-01T00:00:02Z");
 
-        let rows = list_recent_for_agent(&conn, "bob", &default_filters()).unwrap();
+        let rows = list_recent_for_agent(&db, "bob", &default_filters())
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].message_id, "m1");
     }
 
-    #[test]
-    fn list_recent_for_agent_both_directions_returns_newest_first() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn list_recent_for_agent_both_directions_returns_newest_first() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         seed_agent(&conn, "alice");
         seed_agent(&conn, "bob");
         seed_msg(&conn, "m1", "alice", "bob", "2026-01-01T00:00:01Z");
@@ -1308,15 +1334,15 @@ mod tests {
             include_received: true,
             ..default_filters()
         };
-        let rows = list_recent_for_agent(&conn, "bob", &filters).unwrap();
+        let rows = list_recent_for_agent(&db, "bob", &filters).await.unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].message_id, "m2", "newest first");
         assert_eq!(rows[1].message_id, "m1");
     }
 
-    #[test]
-    fn list_recent_for_agent_filters_by_message_type() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn list_recent_for_agent_filters_by_message_type() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         seed_agent(&conn, "alice");
         seed_agent(&conn, "bob");
         let mut m1 = new_msg("m1", "alice", "bob", "x");
@@ -1328,32 +1354,32 @@ mod tests {
             message_type: Some("assistance_request"),
             ..default_filters()
         };
-        let rows = list_recent_for_agent(&conn, "bob", &filters).unwrap();
+        let rows = list_recent_for_agent(&db, "bob", &filters).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].message_id, "m1");
     }
 
-    #[test]
-    fn list_recent_for_agent_unread_only_excludes_read_messages() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn list_recent_for_agent_unread_only_excludes_read_messages() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         seed_agent(&conn, "alice");
         seed_agent(&conn, "bob");
         seed_msg(&conn, "m1", "alice", "bob", "2026-01-01T00:00:01Z");
         seed_msg(&conn, "m2", "alice", "bob", "2026-01-01T00:00:02Z");
-        mark_read_by_ids(&conn, &["m1"], None).unwrap();
+        mark_read_by_ids(&db, &["m1"], None).await.unwrap();
 
         let filters = RecentMessagesFilters {
             unread_only: true,
             ..default_filters()
         };
-        let rows = list_recent_for_agent(&conn, "bob", &filters).unwrap();
+        let rows = list_recent_for_agent(&db, "bob", &filters).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].message_id, "m2");
     }
 
-    #[test]
-    fn list_recent_for_agent_respects_the_limit() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn list_recent_for_agent_respects_the_limit() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         seed_agent(&conn, "alice");
         seed_agent(&conn, "bob");
         for i in 0..5 {
@@ -1369,7 +1395,7 @@ mod tests {
             limit: 2,
             ..default_filters()
         };
-        let rows = list_recent_for_agent(&conn, "bob", &filters).unwrap();
+        let rows = list_recent_for_agent(&db, "bob", &filters).await.unwrap();
         assert_eq!(rows.len(), 2);
     }
 
@@ -1754,15 +1780,17 @@ mod tests {
         assert_eq!(fetch_thread(&conn, "nope").unwrap(), Vec::new());
     }
 
-    #[test]
-    fn rename_participant_rewrites_both_sender_and_recipient_columns() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn rename_participant_rewrites_both_sender_and_recipient_columns() {
+        let (_dir, conn, db) = test_conn_with_sea_orm().await;
         seed_agent(&conn, "alice");
         seed_agent(&conn, "bob");
         send(&conn, new_msg("m1", "alice", "bob", "a to b")).unwrap();
         send(&conn, new_msg("m2", "bob", "alice", "b to a")).unwrap();
 
-        let touched = rename_participant(&conn, "alice", "[deleted-alice]").unwrap();
+        let touched = rename_participant(&db, "alice", "[deleted-alice]")
+            .await
+            .unwrap();
         assert_eq!(touched, 2);
         assert_eq!(
             get_by_id(&conn, "m1").unwrap().unwrap().sender_id,
@@ -1774,11 +1802,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rename_participant_no_match_returns_zero() {
-        let conn = test_conn();
+    #[tokio::test]
+    async fn rename_participant_no_match_returns_zero() {
+        let (_dir, _conn, db) = test_conn_with_sea_orm().await;
         assert_eq!(
-            rename_participant(&conn, "nobody", "[deleted-nobody]").unwrap(),
+            rename_participant(&db, "nobody", "[deleted-nobody]")
+                .await
+                .unwrap(),
             0
         );
     }
