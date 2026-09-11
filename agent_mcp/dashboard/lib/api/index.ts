@@ -1,24 +1,20 @@
 // API client for Agent-MCP backend — barrel.
 //
-// PR-W3 (ORM big-bang, v5.0.19): the canonical row shapes for every
-// persistent table live in `../api-types.generated.ts`, emitted by
-// `scripts/generate_ts_types.py` from the Pydantic mirrors in
-// `agent_mcp/db/pydantic_mirrors.py`. New dashboard code should
-// prefer those interfaces (suffixed `Mirror`) because they are
-// guaranteed to stay column-accurate with the ORM via the CI
-// invariant in tests/test_orm_is_source_of_truth.py.
-//
-// The hand-maintained `Agent` / `Task` / `Memory` etc interfaces
-// declared in the per-resource modules are kept for back-compat. They
-// add richer literal unions (status: 'pending' | 'running' | ...) the
-// bare DB column types can't express.
+// The `Agent` / `Task` / `Memory` etc interfaces declared in the
+// per-resource modules are the canonical row shapes. They add richer
+// literal unions (status: 'pending' | 'running' | ...) a bare DB
+// column type can't express. (Phase F: the generated
+// `api-types.generated.ts` "Mirror" interfaces this barrel used to
+// also re-export here were produced from a Python pipeline that
+// nothing in the dashboard actually imported and had already drifted
+// stale -- deleted, not ported; see docs/learnings/
+// ts-type-generation-deferred.md.)
 //
 // W6-followup F1 (api-layer split): the old 1.5k-line `lib/api.ts`
 // God-module was split into `lib/api/{client,agents,tasks,memories,
 // messages,system,schedules,settings,instance}.ts`. This barrel
 // re-exports the whole public surface so every existing
 // `import { … } from '@/lib/api'` keeps resolving unchanged.
-export * from '../api-types.generated'
 
 // Shared request core + typed errors.
 export {

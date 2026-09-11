@@ -31,9 +31,9 @@ export interface Task {
  *
  * TY-2: `child_tasks` / `depends_on_tasks` are polymorphic on the
  * wire. The `/all-data` + `/tasks` envelopes serialize them as
- * JSON-encoded strings (see `TaskMirror.child_tasks: string | null`
- * in api-types.generated.ts), but some code paths / already-normalized
- * callers hand back a real `string[]`, and legacy/empty rows send
+ * JSON-encoded strings (the raw DB column is `Option<String>`), but
+ * some code paths / already-normalized callers hand back a real
+ * `string[]`, and legacy/empty rows send
  * `null`. Rather than leak that `string | string[] | null` union to
  * every consumer (which forced each component to carry its own
  * `parseJsonField` defensive parse), `normalizeTask` collapses both
