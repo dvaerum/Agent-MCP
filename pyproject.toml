@@ -31,10 +31,6 @@ dependencies = [
     "sqlite-vec",
     "sqlalchemy>=2.0",
     "alembic",
-    # db/pydantic_mirrors.py uses ConfigDict (pydantic v2 API) --
-    # previously reached only transitively via fastapi, never declared
-    # directly despite being imported directly.
-    "pydantic>=2",
 ]
 
 [project.optional-dependencies]

@@ -18,8 +18,7 @@ Adding a new model:
 2. Subclass `agent_mcp.db.engine.Base`.
 3. Re-export it here so `from agent_mcp.db.models import Widget`
    works and the metadata picks it up at import time.
-4. Add a Pydantic mirror in `agent_mcp.db.pydantic_mirrors`.
-5. Generate an Alembic revision under `migrations/versions/`.
+4. Generate an Alembic revision under `migrations/versions/`.
 """
 
 from .agent import Agent
