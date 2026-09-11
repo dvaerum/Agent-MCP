@@ -651,6 +651,7 @@ dependencies = [
  "conexus-core",
  "conexus-db",
  "conexus-tools",
+ "conexus-vec",
  "conexus-wakeloop",
  "futures-util",
  "hyper",
@@ -659,6 +660,7 @@ dependencies = [
  "rusqlite",
  "sea-orm",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
 ]
