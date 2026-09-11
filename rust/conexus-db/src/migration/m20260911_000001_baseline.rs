@@ -14,8 +14,15 @@
 //!
 //! 1. `mcp_sessions` -- created by Alembic 0004/0005, entirely absent
 //!    from `schema.rs` and from every sea-orm `Entity`. Added here
-//!    with its real ORM shape (`agent_mcp/db/models/mcp_session.py`)
-//!    and its FK to `agents.agent_id` (Alembic 0008).
+//!    with its real ORM shape (`agent_mcp/db/models/mcp_session.py`).
+//!    Deliberately WITHOUT the FK to `agents.agent_id` that model's
+//!    own docstring claims Alembic 0008 added: confirmed live against
+//!    both real production databases (`PRAGMA foreign_key_list
+//!    (mcp_sessions)` returns empty on both) that migration 0014
+//!    explicitly drops it (its own module doc names `mcp_sessions.
+//!    agent_id` in the "cookie-injected system bearer" FK-drop list)
+//!    and it is never re-added -- the model's docstring describes
+//!    0008's original intent, not the real post-0014 final state.
 //! 2. Three FK constraints Alembic 0007/0008/0012 added and 0014
 //!    never dropped, omitted from `schema.rs` only because the Python
 //!    ORM models ALSO omit them (by explicit, documented design --
@@ -136,7 +143,7 @@ impl MigrationTrait for Migration {
             -- added.
             CREATE TABLE IF NOT EXISTS mcp_sessions (
                 session_id          TEXT PRIMARY KEY,
-                agent_id            TEXT NOT NULL REFERENCES agents(agent_id),
+                agent_id            TEXT NOT NULL,
                 opened_at           TEXT NOT NULL,
                 last_seen_at        TEXT NOT NULL,
                 bearer_token_hash   TEXT NOT NULL,

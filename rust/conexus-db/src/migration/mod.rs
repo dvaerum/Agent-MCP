@@ -32,6 +32,7 @@
 
 mod m20260911_000001_baseline;
 mod m20260911_000002_router_baseline;
+pub mod verify;
 
 pub use sea_orm_migration::prelude::*;
 
@@ -161,6 +162,32 @@ mod tests {
             parent, None,
             "ON DELETE SET NULL must clear the reply's parent_message_id"
         );
+    }
+
+    /// Regression pin: an earlier draft of this baseline added a FK
+    /// from `mcp_sessions.agent_id` to `agents.agent_id`, following
+    /// `agent_mcp/db/models/mcp_session.py`'s own docstring claim
+    /// ("FK to agents.agent_id (PR-G1 / migration 0008)"). Confirmed
+    /// live against both real production databases
+    /// (`PRAGMA foreign_key_list(mcp_sessions)` returns empty on
+    /// both) that Alembic migration 0014 explicitly drops this FK
+    /// (its own module doc names `mcp_sessions.agent_id` in the
+    /// "cookie-injected system bearer" FK-drop list) and it is never
+    /// re-added -- the model's docstring describes migration 0008's
+    /// original intent, not the real post-0014 shape. A stray
+    /// `agent_id` value referencing a deleted/purged agent must not
+    /// be rejected by this table.
+    #[tokio::test]
+    async fn per_project_baseline_mcp_sessions_agent_id_has_no_fk() {
+        let db = fresh_db().await;
+        Migrator::up(&db, None).await.unwrap();
+
+        db.execute_unprepared(
+            "INSERT INTO mcp_sessions (session_id, agent_id, opened_at, last_seen_at, bearer_token_hash) \
+             VALUES ('s1', 'no-such-agent', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'hash')",
+        )
+        .await
+        .expect("mcp_sessions.agent_id must NOT enforce a FK to agents.agent_id");
     }
 
     #[tokio::test]
