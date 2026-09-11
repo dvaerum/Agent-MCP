@@ -13,6 +13,7 @@
 
 mod backup;
 mod create_operator;
+mod migrate;
 
 use clap::{Parser, Subcommand};
 
@@ -34,6 +35,14 @@ enum Command {
         /// Overwrite OUTPUT_PATH if it already exists.
         #[arg(long)]
         force: bool,
+    },
+    /// Bring a project's database up to date against the sea-orm-
+    /// migration schema authority (idempotent -- safe on both a
+    /// fresh and an already-migrated database; see
+    /// `conexus_db::migration`'s own module doc).
+    Migrate {
+        /// Directory containing `.agent/mcp_state.db`.
+        project_dir: std::path::PathBuf,
     },
     /// Router-scoped operator-management subcommands.
     Router {
@@ -57,6 +66,12 @@ enum RouterCommand {
         #[arg(long)]
         password_stdin: bool,
     },
+    /// Bring `router.db` up to date against the sea-orm-migration
+    /// schema authority (idempotent, matching the per-project
+    /// `migrate` command). Path resolution matches
+    /// `router create-operator`'s own `AGENT_MCP_ROUTER_DB`-or-
+    /// production-default rule.
+    Migrate,
 }
 
 // `#[tokio::main]`, matching `conexus-router`'s/`conexus-backend`'s own
@@ -83,6 +98,7 @@ async fn main() -> anyhow::Result<()> {
             output_path,
             force,
         } => backup::run(&project_dir, &output_path, force),
+        Command::Migrate { project_dir } => migrate::run_project(&project_dir).await,
         Command::Router {
             command:
                 RouterCommand::CreateOperator {
@@ -91,5 +107,11 @@ async fn main() -> anyhow::Result<()> {
                     password_stdin,
                 },
         } => create_operator::run(&username, email.as_deref(), password_stdin).await,
+        Command::Router {
+            command: RouterCommand::Migrate,
+        } => {
+            let db_path = create_operator::router_db_path(|k| std::env::var(k).ok());
+            migrate::run_router(&db_path).await
+        }
     }
 }
