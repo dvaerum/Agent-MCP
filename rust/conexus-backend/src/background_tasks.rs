@@ -1,6 +1,9 @@
 //! Per-project background maintenance loops (Phase F, prancy-napping-pie
-//! -- 1 of the 4 background loops the operator approved porting,
-//! 2026-09-07). Every loop here runs for the lifetime of the process;
+//! -- 3 of the 4 originally-approved background loops (2026-09-07),
+//! plus `rag_indexing` (the separately-flagged "6th finding" found
+//! while porting `test_sec_r31_rag_watermark.py`, resumed 2026-09-11
+//! once its design was confirmed already-decided). Every loop here
+//! runs for the lifetime of the process;
 //! `conexus-backend` has no in-process graceful-shutdown coordination
 //! (unlike Python's `g.server_running` flag, needed there because one
 //! Python process serves several concerns cooperatively) -- this
@@ -358,6 +361,665 @@ mod claude_session_monitor {
     }
 }
 
+/// Port of `agent_mcp/features/rag/indexing.py::run_rag_indexing_
+/// periodically` (recovered from git history -- deleted in PR #1010's
+/// bulk Python deletion, before this Rust replacement existed; see
+/// `conexus_tools::rag_chunking`'s own module doc for the recovery
+/// procedure this crate now shares).
+///
+/// **Simple-mode only, and that's a real, evidence-based scope cut,
+/// not a corner cut**: Python's periodic cycle also scans code files
+/// and tasks, but ONLY when `AGENT_MCP_EMBEDDING_DIMENSION`/`--advanced`
+/// puts the deployment in "advanced" mode -- confirmed directly against
+/// the real deploy repo's own config (`home-manager-config/common/
+/// user/agent-mcp/default.nix`) that neither is ever set, so that
+/// whole branch (and the ~584-LOC code-aware chunker it would need)
+/// has zero real production call site today. Markdown files + project
+/// context are scanned unconditionally in both modes and are the only
+/// two sources this port covers.
+///
+/// **R10-F2 (Python's own WAL-write-lock-starvation fix) is
+/// architecturally eliminated here, not re-derived**: Python's
+/// `_delete_stale_chunks_and_commit` needed an explicit, unconditional
+/// `conn.commit()` because its shared `sqlite3.Connection` opens an
+/// implicit multi-statement transaction the instant any statement
+/// executes, and that transaction (and the WAL write lock it holds)
+/// would otherwise stay open across the embedding-await phase that
+/// follows. This port never opens an explicit `rusqlite::Transaction`
+/// spanning delete+embed+insert -- every repository call here runs in
+/// rusqlite's own per-statement autocommit mode, so there is no
+/// multi-statement transaction for an await to hold open in the first
+/// place. The OTHER real hazard -- holding `shared.conn`'s own
+/// `tokio::sync::Mutex` guard across the (slow, network-bound)
+/// embedding call, which would stall every other tool call on this
+/// process for the cycle's duration -- is avoided the ordinary way
+/// this crate already uses elsewhere: the guard is taken fresh for
+/// each synchronous DB phase (delete, then later insert) and dropped
+/// before/around the `embed().await` in between.
+mod rag_indexing {
+    use super::*;
+    use conexus_tools::embedding_client;
+    use conexus_tools::rag_chunking::simple_chunker;
+    use sha2::{Digest, Sha256};
+    use std::path::{Path, PathBuf};
+
+    /// Python's own default -- see this module's own doc for why the
+    /// real cycle-to-cycle sleep is a fraction of this, not this value
+    /// directly.
+    pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(300);
+
+    /// Matches `simple_chunker(content)`'s own bare-call defaults --
+    /// the ONLY chunker call real (simple-mode) production ever makes.
+    const CHUNK_SIZE: usize = 500;
+    const CHUNK_OVERLAP: usize = 50;
+
+    const IGNORE_DIRS: &[&str] = &[
+        "node_modules",
+        "__pycache__",
+        "venv",
+        "env",
+        ".venv",
+        ".env",
+        "dist",
+        "build",
+        "site-packages",
+        ".git",
+        ".idea",
+        ".vscode",
+        "bin",
+        "obj",
+        "target",
+        ".pytest_cache",
+        ".ipynb_checkpoints",
+        ".agent",
+    ];
+
+    /// One `sources_to_check` entry -- a source row that was scanned
+    /// this cycle, whether or not its hash turned out to have changed.
+    struct ScannedSource {
+        source_type: &'static str,
+        source_ref: String,
+        content: String,
+        /// UTC epoch seconds this source was last modified. Both real
+        /// source types (a file's real mtime, `project_context.
+        /// updated_at` parsed) collapse to this one representation --
+        /// a deliberate simplification over Python's own mixed
+        /// float-epoch-for-files/ISO-string-for-context typing, valid
+        /// because this port is the only reader AND writer of the
+        /// `last_indexed_<type>` watermark it produces (see this
+        /// module's own doc on the UTC-RFC3339 convention every other
+        /// Rust-authored timestamp in this codebase already uses).
+        mod_time: f64,
+        hash: String,
+    }
+
+    fn sha256_hex(content: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(content.as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+
+    fn is_ignored_component(name: &str) -> bool {
+        IGNORE_DIRS.contains(&name) || (name.starts_with('.') && name != "." && name != "..")
+    }
+
+    /// Recursively finds every `*.md` file under `project_dir`, skipping
+    /// any path component that matches [`IGNORE_DIRS`] or looks hidden
+    /// -- port of the real `glob.glob("**/*.md", recursive=True)` +
+    /// per-component ignore filter Python's own scan loop applies.
+    /// Read errors on an individual subdirectory are skipped, not
+    /// fatal to the whole scan -- matches Python's own per-file
+    /// `try/except` tolerance one level up.
+    fn find_markdown_files(project_dir: &Path) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        let mut stack = vec![project_dir.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if is_ignored_component(name) {
+                    continue;
+                }
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
+                    found.push(path);
+                }
+            }
+        }
+        found
+    }
+
+    /// Port of the context-scan branch's `content_for_embedding`
+    /// formatting -- byte-for-byte the same three-line shape Python
+    /// builds, since it's both hashed AND embedded and must stay
+    /// identical between the two source-type branches' shared
+    /// treatment downstream.
+    fn format_context_for_embedding(key: &str, description: &str, value_json: &str) -> String {
+        format!("Context Key: {key}\nDescription: {description}\nValue: {value_json}")
+    }
+
+    /// Everything a completed cycle needs to report -- purely for
+    /// `eprintln!`/test-assertion purposes, not consumed by any other
+    /// code path.
+    #[derive(Debug, Default, PartialEq, Eq)]
+    pub struct CycleReport {
+        pub skipped_no_vss: bool,
+        pub sources_scanned: usize,
+        pub sources_updated: usize,
+        pub chunks_indexed: i64,
+        pub sources_failed: usize,
+    }
+
+    /// One indexing cycle. See this module's own doc for the R10-F2/
+    /// lock-scope reasoning and the simple-mode-only scope cut.
+    pub async fn run_indexing_cycle(
+        conn: &tokio::sync::Mutex<rusqlite::Connection>,
+        sea_orm_db: &sea_orm::DatabaseConnection,
+        project_dir: &Path,
+        get_env: &impl Fn(&str) -> Option<String>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<CycleReport> {
+        if !conexus_db::rag_repository::embeddings_table_exists(sea_orm_db).await? {
+            return Ok(CycleReport {
+                skipped_no_vss: true,
+                ..Default::default()
+            });
+        }
+
+        let meta = conexus_db::rag_repository::get_all_meta(sea_orm_db).await?;
+        let epoch_iso = "1970-01-01T00:00:00Z";
+        let last_md_watermark = meta
+            .get("last_indexed_markdown")
+            .cloned()
+            .unwrap_or_else(|| epoch_iso.to_string());
+        let last_ctx_watermark = meta
+            .get("last_indexed_context")
+            .cloned()
+            .unwrap_or_else(|| epoch_iso.to_string());
+        let last_md_epoch = chrono::DateTime::parse_from_rfc3339(&last_md_watermark)
+            .map(|dt| dt.timestamp() as f64)
+            .unwrap_or(0.0);
+        let last_ctx_epoch = chrono::DateTime::parse_from_rfc3339(&last_ctx_watermark)
+            .map(|dt| dt.timestamp() as f64)
+            .unwrap_or(0.0);
+
+        let mut sources: Vec<ScannedSource> = Vec::new();
+        let mut max_md_epoch = last_md_epoch;
+        let mut max_ctx_epoch = last_ctx_epoch;
+
+        // 1. Markdown files -- gated the same way Python's own
+        // DISABLE_AUTO_INDEXING flag does, resolved fresh each cycle
+        // so a runtime env change is honoured immediately.
+        let auto_indexing_disabled = get_env("AGENT_MCP_DISABLE_AUTO_INDEXING")
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+        if !auto_indexing_disabled {
+            for path in find_markdown_files(project_dir) {
+                let Ok(metadata) = std::fs::metadata(&path) else {
+                    continue;
+                };
+                let Ok(modified) = metadata.modified() else {
+                    continue;
+                };
+                let mod_epoch = chrono::DateTime::<chrono::Utc>::from(modified).timestamp() as f64;
+                let Ok(content) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let Ok(rel_path) = path.strip_prefix(project_dir) else {
+                    continue;
+                };
+                let source_ref = rel_path.to_string_lossy().replace('\\', "/");
+                let hash = sha256_hex(&content);
+                if mod_epoch > max_md_epoch {
+                    max_md_epoch = mod_epoch;
+                }
+                sources.push(ScannedSource {
+                    source_type: "markdown",
+                    source_ref,
+                    content,
+                    mod_time: mod_epoch,
+                    hash,
+                });
+            }
+        }
+
+        // 2. Project context -- always scanned, both modes.
+        let ctx_rows = conexus_db::project_context_repository::list_all(sea_orm_db).await?;
+        for row in &ctx_rows {
+            if row.updated_at.as_str() <= last_ctx_watermark.as_str() {
+                continue;
+            }
+            let row_epoch = chrono::DateTime::parse_from_rfc3339(&row.updated_at)
+                .map(|dt| dt.timestamp() as f64)
+                .unwrap_or(last_ctx_epoch);
+            if row_epoch > max_ctx_epoch {
+                max_ctx_epoch = row_epoch;
+            }
+            let content = format_context_for_embedding(
+                &row.context_key,
+                row.description.as_deref().unwrap_or(""),
+                &row.value,
+            );
+            let hash = sha256_hex(&content);
+            sources.push(ScannedSource {
+                source_type: "context",
+                source_ref: row.context_key.clone(),
+                content,
+                mod_time: row_epoch,
+                hash,
+            });
+        }
+
+        let sources_scanned = sources.len();
+
+        // 3. Filter by hash comparison against the stored watermark.
+        let to_process: Vec<ScannedSource> = sources
+            .into_iter()
+            .filter(|s| {
+                let key = format!("hash_{}_{}", s.source_type, s.source_ref);
+                meta.get(&key) != Some(&s.hash)
+            })
+            .collect();
+
+        if to_process.is_empty() {
+            advance_watermarks(
+                conn,
+                &meta,
+                last_md_watermark_epoch_pair(last_md_epoch, max_md_epoch, auto_indexing_disabled),
+                (last_ctx_epoch, max_ctx_epoch),
+                &[],
+                &[],
+            )
+            .await?;
+            return Ok(CycleReport {
+                sources_scanned,
+                ..Default::default()
+            });
+        }
+
+        // 4. Delete stale chunks for every source about to be
+        // reprocessed -- each `delete_chunks_for` call autocommits on
+        // its own (see this module's own doc); the guard is dropped
+        // the instant this block ends, well before the embedding call.
+        {
+            let guard = conn.lock().await;
+            for s in &to_process {
+                conexus_db::rag_repository::delete_chunks_for(
+                    &guard,
+                    s.source_type,
+                    &s.source_ref,
+                )?;
+            }
+        }
+
+        // 5. Chunk every source (simple_chunker only -- see module
+        // doc), then embed everything in one pass. Sequential batches,
+        // not Python's 25-way-concurrent task group: this deployment's
+        // real Ollama endpoint runs `-np 1` (hard single-request
+        // concurrency), so concurrent batches would only queue FIFO on
+        // the server side anyway -- sequential batching gets the exact
+        // same real throughput with far simpler code, not a corner cut.
+        struct ChunkEntry {
+            source_idx: usize,
+            text: String,
+        }
+        let mut chunk_entries: Vec<ChunkEntry> = Vec::new();
+        for (idx, s) in to_process.iter().enumerate() {
+            for chunk in simple_chunker(&s.content, CHUNK_SIZE, CHUNK_OVERLAP) {
+                if chunk.trim().is_empty() {
+                    continue;
+                }
+                chunk_entries.push(ChunkEntry {
+                    source_idx: idx,
+                    text: chunk,
+                });
+            }
+        }
+
+        let client = embedding_client::resolve(get_env);
+        const EMBED_BATCH_SIZE: usize = 50;
+        let mut embeddings: Vec<Option<Vec<f32>>> = vec![None; chunk_entries.len()];
+        for batch_start in (0..chunk_entries.len()).step_by(EMBED_BATCH_SIZE) {
+            let batch_end = (batch_start + EMBED_BATCH_SIZE).min(chunk_entries.len());
+            let batch_texts: Vec<String> = chunk_entries[batch_start..batch_end]
+                .iter()
+                .map(|e| e.text.clone())
+                .collect();
+            match client.embed(&batch_texts).await {
+                Ok(vectors) => {
+                    for (i, v) in vectors.into_iter().enumerate() {
+                        embeddings[batch_start + i] = Some(v);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("conexus-backend: RAG embedding batch failed: {e}");
+                    // Left as None -- this batch's sources are marked
+                    // failed below (BL-R31-1), never silently dropped.
+                }
+            }
+        }
+
+        // 6. Per-source outcome (BL-R31-1): a source counts as fully
+        // embedded only when EVERY one of its chunks produced a
+        // vector.
+        let mut source_failed = vec![false; to_process.len()];
+        for (chunk_idx, entry) in chunk_entries.iter().enumerate() {
+            if embeddings[chunk_idx].is_none() {
+                source_failed[entry.source_idx] = true;
+            }
+        }
+
+        // 7. Insert successfully-embedded chunks + advance hashes only
+        // for fully-embedded sources.
+        let now_iso = now.to_rfc3339();
+        let mut chunks_indexed = 0i64;
+        {
+            let guard = conn.lock().await;
+            for (chunk_idx, entry) in chunk_entries.iter().enumerate() {
+                let Some(embedding) = &embeddings[chunk_idx] else {
+                    continue;
+                };
+                let source = &to_process[entry.source_idx];
+                let n = conexus_db::rag_repository::bulk_index_chunks(
+                    &guard,
+                    source.source_type,
+                    &source.source_ref,
+                    &[conexus_db::NewChunk {
+                        chunk_text: &entry.text,
+                        metadata: None,
+                        embedding: Some(embedding),
+                    }],
+                    &now_iso,
+                )?;
+                chunks_indexed += n;
+            }
+            // Group hash updates by source_type -- `set_meta` writes
+            // one source_type's worth of hashes per call.
+            let mut by_type: std::collections::HashMap<&'static str, Vec<(&str, &str)>> =
+                std::collections::HashMap::new();
+            for (idx, source) in to_process.iter().enumerate() {
+                if !source_failed[idx] {
+                    by_type
+                        .entry(source.source_type)
+                        .or_default()
+                        .push((source.source_ref.as_str(), source.hash.as_str()));
+                }
+            }
+            for (source_type, hashes) in &by_type {
+                conexus_db::rag_repository::set_meta(&guard, source_type, None, Some(hashes))?;
+            }
+        }
+
+        let sources_failed = source_failed.iter().filter(|&&f| f).count();
+
+        // 8. Watermark advance, capped below the earliest failed
+        // source (BL-R31-1) so a failed row is re-scanned next cycle
+        // instead of being skipped forever.
+        let failed_refs: Vec<(&str, f64)> = to_process
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| source_failed[*idx])
+            .map(|(_, s)| (s.source_type, s.mod_time))
+            .collect();
+        let fully_embedded_refs: Vec<(&str, f64)> = to_process
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| !source_failed[*idx])
+            .map(|(_, s)| (s.source_type, s.mod_time))
+            .collect();
+
+        advance_watermarks(
+            conn,
+            &meta,
+            last_md_watermark_epoch_pair(last_md_epoch, max_md_epoch, auto_indexing_disabled),
+            (last_ctx_epoch, max_ctx_epoch),
+            &failed_refs,
+            &fully_embedded_refs,
+        )
+        .await?;
+
+        Ok(CycleReport {
+            skipped_no_vss: false,
+            sources_scanned,
+            sources_updated: to_process.len(),
+            chunks_indexed,
+            sources_failed,
+        })
+    }
+
+    /// `None` when auto-indexing is disabled -- the markdown watermark
+    /// must not advance for a source type this cycle never scanned.
+    fn last_md_watermark_epoch_pair(last: f64, max: f64, disabled: bool) -> Option<(f64, f64)> {
+        if disabled {
+            None
+        } else {
+            Some((last, max))
+        }
+    }
+
+    /// Port of `_watermark_after_failures`. When this source_type has
+    /// no failures this cycle, the uncapped max passes straight
+    /// through. Otherwise the watermark can advance no further than
+    /// `max(old_watermark, every fully-embedded same-type source's
+    /// mod_time strictly below the earliest failure)` -- the exact
+    /// same three-way `candidates` reduction Python's own function
+    /// performs, not a simplified approximation of it (an earlier
+    /// draft of this port used an ad hoc "earliest_failed - 1s"
+    /// formula instead; caught by re-deriving directly against
+    /// Python's real source rather than trusting the paraphrase).
+    fn watermark_after_failures(
+        old_watermark: f64,
+        uncapped_max: f64,
+        source_type: &str,
+        failed_refs: &[(&str, f64)],
+        fully_embedded_refs: &[(&str, f64)],
+    ) -> f64 {
+        let earliest_failed = failed_refs
+            .iter()
+            .filter(|(t, _)| *t == source_type)
+            .map(|(_, mt)| *mt)
+            .fold(f64::INFINITY, f64::min);
+        if !earliest_failed.is_finite() {
+            return uncapped_max;
+        }
+        fully_embedded_refs
+            .iter()
+            .filter(|(t, mt)| *t == source_type && *mt < earliest_failed)
+            .map(|(_, mt)| *mt)
+            .fold(old_watermark, f64::max)
+    }
+
+    /// Caps `max` below the earliest failed same-type source's
+    /// `mod_time` (BL-R31-1), then writes `last_indexed_<type>` via
+    /// [`conexus_db::rag_repository::set_meta`]. A no-op for a `None`
+    /// markdown pair (auto-indexing disabled this cycle).
+    async fn advance_watermarks(
+        conn: &tokio::sync::Mutex<rusqlite::Connection>,
+        _meta: &std::collections::HashMap<String, String>,
+        markdown: Option<(f64, f64)>,
+        context: (f64, f64),
+        failed_refs: &[(&str, f64)],
+        fully_embedded_refs: &[(&str, f64)],
+    ) -> anyhow::Result<()> {
+        let cap = |source_type: &str, last: f64, max: f64| -> f64 {
+            watermark_after_failures(last, max, source_type, failed_refs, fully_embedded_refs)
+        };
+
+        let guard = conn.lock().await;
+        if let Some((last, max)) = markdown {
+            let capped = cap("markdown", last, max);
+            let iso = chrono::DateTime::<chrono::Utc>::from_timestamp(capped as i64, 0)
+                .unwrap_or_default()
+                .to_rfc3339();
+            conexus_db::rag_repository::set_meta(&guard, "markdown", Some(&iso), None)?;
+        }
+        let (ctx_last, ctx_max) = context;
+        let ctx_capped = cap("context", ctx_last, ctx_max);
+        let ctx_iso = chrono::DateTime::<chrono::Utc>::from_timestamp(ctx_capped as i64, 0)
+            .unwrap_or_default()
+            .to_rfc3339();
+        conexus_db::rag_repository::set_meta(&guard, "context", Some(&ctx_iso), None)?;
+        Ok(())
+    }
+
+    pub async fn run_periodically(shared: Arc<SharedState>, interval: Duration) {
+        let get_env = |key: &str| std::env::var(key).ok();
+        // Python's own real cycle-to-cycle sleep -- NOT `interval`
+        // itself, a 1/5th fraction of it with a 30s floor. Preserved
+        // exactly, not "fixed" into something more intuitive; see this
+        // module's own `DEFAULT_INTERVAL` doc.
+        let sleep_duration = (interval / 5).max(Duration::from_secs(30));
+        loop {
+            match run_indexing_cycle(
+                &shared.conn,
+                &shared.sea_orm_db,
+                &shared.project_dir,
+                &get_env,
+                chrono::Utc::now(),
+            )
+            .await
+            {
+                Ok(report) if report.skipped_no_vss => {}
+                Ok(report) if report.sources_updated == 0 => {}
+                Ok(report) => {
+                    eprintln!(
+                        "conexus-backend: RAG index cycle: {} source(s) updated, {} chunk(s) indexed, {} failed",
+                        report.sources_updated, report.chunks_indexed, report.sources_failed
+                    );
+                }
+                Err(e) => {
+                    eprintln!("conexus-backend: RAG indexing cycle failed: {e}");
+                }
+            }
+            tokio::time::sleep(sleep_duration).await;
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn sha256_hex_is_stable_and_content_sensitive() {
+            let a = sha256_hex("hello");
+            let b = sha256_hex("hello");
+            let c = sha256_hex("hellp");
+            assert_eq!(a, b);
+            assert_ne!(a, c);
+            assert_eq!(a.len(), 64, "hex-encoded sha256 is 64 chars");
+        }
+
+        #[test]
+        fn is_ignored_component_matches_the_real_ignore_list_and_hidden_dirs() {
+            assert!(is_ignored_component("node_modules"));
+            assert!(is_ignored_component(".git"));
+            assert!(is_ignored_component(".hidden"));
+            assert!(!is_ignored_component("."));
+            assert!(!is_ignored_component(".."));
+            assert!(!is_ignored_component("docs"));
+            assert!(!is_ignored_component("README.md"));
+        }
+
+        #[test]
+        fn find_markdown_files_recurses_and_skips_ignored_dirs() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("root.md"), "root").unwrap();
+            let sub = dir.path().join("docs");
+            std::fs::create_dir(&sub).unwrap();
+            std::fs::write(sub.join("nested.md"), "nested").unwrap();
+            let ignored = dir.path().join("node_modules");
+            std::fs::create_dir(&ignored).unwrap();
+            std::fs::write(ignored.join("skip.md"), "skip").unwrap();
+            std::fs::write(dir.path().join("not-markdown.txt"), "nope").unwrap();
+
+            let mut found: Vec<String> = find_markdown_files(dir.path())
+                .into_iter()
+                .map(|p| {
+                    p.strip_prefix(dir.path())
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect();
+            found.sort();
+            assert_eq!(
+                found,
+                vec!["docs/nested.md".to_string(), "root.md".to_string()]
+            );
+        }
+
+        #[test]
+        fn format_context_for_embedding_matches_the_real_three_line_shape() {
+            assert_eq!(
+                format_context_for_embedding("k", "d", "\"v\""),
+                "Context Key: k\nDescription: d\nValue: \"v\""
+            );
+        }
+
+        #[test]
+        fn last_md_watermark_epoch_pair_is_none_when_auto_indexing_disabled() {
+            assert_eq!(last_md_watermark_epoch_pair(1.0, 2.0, true), None);
+            assert_eq!(
+                last_md_watermark_epoch_pair(1.0, 2.0, false),
+                Some((1.0, 2.0))
+            );
+        }
+
+        #[test]
+        fn watermark_after_failures_passes_through_uncapped_max_with_no_failures() {
+            assert_eq!(
+                watermark_after_failures(0.0, 100.0, "markdown", &[], &[("markdown", 50.0)]),
+                100.0
+            );
+        }
+
+        #[test]
+        fn watermark_after_failures_caps_below_the_earliest_same_type_failure() {
+            // fully-embedded sources at 10/40/90; failure at 50 -- must
+            // cap at 40 (the highest fully-embedded mod_time strictly
+            // below the earliest failure), not the old watermark or the
+            // uncapped max.
+            let fully_embedded = [("markdown", 10.0), ("markdown", 40.0), ("markdown", 90.0)];
+            let failed = [("markdown", 50.0)];
+            assert_eq!(
+                watermark_after_failures(0.0, 100.0, "markdown", &failed, &fully_embedded),
+                40.0
+            );
+        }
+
+        #[test]
+        fn watermark_after_failures_falls_back_to_old_watermark_when_nothing_qualifies() {
+            // Every fully-embedded source is at/after the earliest
+            // failure -- nothing to advance to, so the OLD watermark
+            // wins, never regressing below it.
+            let fully_embedded = [("markdown", 60.0)];
+            let failed = [("markdown", 50.0)];
+            assert_eq!(
+                watermark_after_failures(5.0, 100.0, "markdown", &failed, &fully_embedded),
+                5.0
+            );
+        }
+
+        #[test]
+        fn watermark_after_failures_ignores_other_source_types() {
+            // A "context" failure must never cap the "markdown"
+            // watermark -- each source_type's watermark is independent.
+            let fully_embedded = [("markdown", 40.0)];
+            let failed = [("context", 10.0)];
+            assert_eq!(
+                watermark_after_failures(0.0, 100.0, "markdown", &failed, &fully_embedded),
+                100.0
+            );
+        }
+    }
+}
+
 /// Spawns every approved background maintenance loop. Called once from
 /// `main()` after `SharedState` is constructed; each loop gets its own
 /// detached task (never joined -- see this module's own doc on why no
@@ -375,6 +1037,10 @@ pub fn spawn_all(shared: &Arc<SharedState>) {
     tokio::spawn(claude_session_monitor::run_periodically(
         shared.clone(),
         claude_session_monitor::DEFAULT_INTERVAL,
+    ));
+    tokio::spawn(rag_indexing::run_periodically(
+        shared.clone(),
+        rag_indexing::DEFAULT_INTERVAL,
     ));
 }
 
@@ -880,5 +1546,351 @@ mod claude_session_monitor_tests {
             .unwrap();
         assert_eq!(row.status.as_deref(), Some("inactive"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod rag_indexing_tests {
+    use super::rag_indexing::{run_indexing_cycle, CycleReport};
+    use conexus_db::schema::{init_rag_embeddings_table, init_schema};
+    use rusqlite::Connection;
+    use std::collections::HashMap;
+    use std::sync::Once;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// `register_sqlite_vec` is a real, process-wide, one-way
+    /// registration -- safe to call more than once, pointless to
+    /// repeat per test. Same precedent as `rag_repository`'s own test
+    /// module.
+    static VEC_REGISTERED: Once = Once::new();
+
+    /// A real temp-file DB, both as a rusqlite `Connection` (what
+    /// `run_indexing_cycle` locks for its delete/insert phases) and a
+    /// sea-orm `DatabaseConnection` (what it reads meta/context rows
+    /// through) -- `:memory:` can't be shared across two connection
+    /// handles, same rationale as every other Phase G test fixture in
+    /// this crate.
+    async fn test_db(
+        with_vec: bool,
+    ) -> (
+        tempfile::TempDir,
+        tokio::sync::Mutex<Connection>,
+        sea_orm::DatabaseConnection,
+    ) {
+        if with_vec {
+            VEC_REGISTERED.call_once(|| {
+                assert!(
+                    conexus_vec::register_sqlite_vec(),
+                    "sqlite-vec must be loadable in the test environment"
+                );
+            });
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn).unwrap();
+        if with_vec {
+            init_rag_embeddings_table(&conn, 3).unwrap();
+        }
+        let sea_orm_db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        (dir, tokio::sync::Mutex::new(conn), sea_orm_db)
+    }
+
+    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + Clone {
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |key| map.get(key).cloned()
+    }
+
+    /// A throwaway `/embeddings` server returning a fixed 3-dim vector
+    /// for every request, matching this crate's own established
+    /// real-bound-TCP-listener precedent (Phase D2's RAG clients,
+    /// `subject_backfill_tests`) over mocking `reqwest` itself.
+    async fn embed_server() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = [0u8; 65536];
+                let Ok(n) = socket.read(&mut buf).await else {
+                    continue;
+                };
+                // Reply once per request with as many 3-dim vectors as
+                // the request's "input" array asked for -- parsed as
+                // real JSON (not a string-splitting guess) so a batch
+                // spanning multiple chunk texts gets the correct count.
+                let body_str = String::from_utf8_lossy(&buf[..n]);
+                let json_start = body_str.find('{').unwrap_or(0);
+                let request: serde_json::Value =
+                    serde_json::from_str(&body_str[json_start..]).unwrap();
+                let input_count = request["input"]
+                    .as_array()
+                    .map(|a| a.len())
+                    .unwrap_or(1)
+                    .max(1);
+                let items: Vec<String> = (0..input_count)
+                    .map(|_| r#"{"embedding":[0.1,0.2,0.3]}"#.to_string())
+                    .collect();
+                let body = format!(r#"{{"data":[{}]}}"#, items.join(","));
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        (format!("http://{addr}/v1"), handle)
+    }
+
+    fn embed_env(base_url: &str) -> Vec<(&'static str, String)> {
+        vec![
+            ("AGENT_MCP_LLM_BASE_URL", base_url.to_string()),
+            ("AGENT_MCP_EMBEDDING_DIMENSION", "3".to_string()),
+        ]
+    }
+
+    #[tokio::test]
+    async fn skipped_when_no_rag_embeddings_table() {
+        let (_dir, conn, sea_orm_db) = test_db(false).await;
+        let project_dir = tempfile::tempdir().unwrap();
+        let report = run_indexing_cycle(
+            &conn,
+            &sea_orm_db,
+            project_dir.path(),
+            &env(&[]),
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            report,
+            CycleReport {
+                skipped_no_vss: true,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn indexes_a_markdown_file_and_a_context_row_end_to_end() {
+        let (_dir, conn, sea_orm_db) = test_db(true).await;
+        let project_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project_dir.path().join("notes.md"),
+            "hello from a real markdown file",
+        )
+        .unwrap();
+        conexus_db::project_context_repository::create_new(
+            &sea_orm_db,
+            "config_deploy_target",
+            "\"prod\"",
+            Some("where we deploy"),
+            "tester",
+            "2026-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let (base_url, server) = embed_server().await;
+        let pairs = embed_env(&base_url);
+        let get_env = env(&pairs
+            .iter()
+            .map(|(k, v)| (*k, v.as_str()))
+            .collect::<Vec<_>>());
+
+        let report = run_indexing_cycle(
+            &conn,
+            &sea_orm_db,
+            project_dir.path(),
+            &get_env,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!report.skipped_no_vss);
+        assert_eq!(
+            report.sources_scanned, 2,
+            "one markdown file + one context row"
+        );
+        assert_eq!(report.sources_updated, 2);
+        assert_eq!(report.sources_failed, 0);
+        assert!(report.chunks_indexed >= 2, "at least one chunk per source");
+
+        let guard = conn.lock().await;
+        let chunk_count: i64 = guard
+            .query_row("SELECT COUNT(*) FROM rag_chunks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(chunk_count, report.chunks_indexed);
+        let markdown_chunks: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM rag_chunks WHERE source_type = 'markdown' AND source_ref = 'notes.md'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(markdown_chunks >= 1);
+        drop(guard);
+
+        let meta = conexus_db::rag_repository::get_all_meta(&sea_orm_db)
+            .await
+            .unwrap();
+        assert!(meta.contains_key("last_indexed_markdown"));
+        assert!(meta.contains_key("last_indexed_context"));
+        assert!(meta.contains_key("hash_markdown_notes.md"));
+        assert!(meta.contains_key("hash_context_config_deploy_target"));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_second_cycle_with_unchanged_content_is_a_no_op() {
+        let (_dir, conn, sea_orm_db) = test_db(true).await;
+        let project_dir = tempfile::tempdir().unwrap();
+        std::fs::write(project_dir.path().join("notes.md"), "stable content").unwrap();
+
+        let (base_url, server) = embed_server().await;
+        let pairs = embed_env(&base_url);
+        let get_env = env(&pairs
+            .iter()
+            .map(|(k, v)| (*k, v.as_str()))
+            .collect::<Vec<_>>());
+
+        let first = run_indexing_cycle(
+            &conn,
+            &sea_orm_db,
+            project_dir.path(),
+            &get_env,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.sources_updated, 1);
+
+        let second = run_indexing_cycle(
+            &conn,
+            &sea_orm_db,
+            project_dir.path(),
+            &get_env,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            second,
+            CycleReport {
+                sources_scanned: 1,
+                ..Default::default()
+            },
+            "unchanged content hashes identically, so nothing is reprocessed"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn disabled_auto_indexing_skips_markdown_but_still_scans_context() {
+        let (_dir, conn, sea_orm_db) = test_db(true).await;
+        let project_dir = tempfile::tempdir().unwrap();
+        std::fs::write(project_dir.path().join("notes.md"), "should be skipped").unwrap();
+        conexus_db::project_context_repository::create_new(
+            &sea_orm_db,
+            "config_still_scanned",
+            "\"yes\"",
+            None,
+            "tester",
+            "2026-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let (base_url, server) = embed_server().await;
+        let mut pairs = embed_env(&base_url);
+        pairs.push(("AGENT_MCP_DISABLE_AUTO_INDEXING", "true".to_string()));
+        let get_env = env(&pairs
+            .iter()
+            .map(|(k, v)| (*k, v.as_str()))
+            .collect::<Vec<_>>());
+
+        let report = run_indexing_cycle(
+            &conn,
+            &sea_orm_db,
+            project_dir.path(),
+            &get_env,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.sources_scanned, 1, "markdown scan skipped entirely");
+        assert_eq!(report.sources_updated, 1);
+
+        let meta = conexus_db::rag_repository::get_all_meta(&sea_orm_db)
+            .await
+            .unwrap();
+        assert!(
+            !meta.contains_key("last_indexed_markdown"),
+            "the markdown watermark must not advance for a source type this cycle never scanned"
+        );
+        assert!(meta.contains_key("last_indexed_context"));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_failed_embedding_batch_leaves_the_source_reindexable_next_cycle() {
+        // No server bound at all -- every embed call fails, matching
+        // the real "batch failed" degrade path (BL-R31-1): the source
+        // is counted failed, its hash watermark is NOT advanced, so a
+        // later cycle will genuinely retry it rather than skipping it
+        // forever.
+        let (_dir, conn, sea_orm_db) = test_db(true).await;
+        let project_dir = tempfile::tempdir().unwrap();
+        std::fs::write(project_dir.path().join("notes.md"), "will fail to embed").unwrap();
+
+        let get_env = env(&[
+            ("AGENT_MCP_LLM_BASE_URL", "http://127.0.0.1:1/v1"),
+            ("AGENT_MCP_EMBEDDING_DIMENSION", "3"),
+        ]);
+
+        let report = run_indexing_cycle(
+            &conn,
+            &sea_orm_db,
+            project_dir.path(),
+            &get_env,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.sources_updated, 1);
+        assert_eq!(report.sources_failed, 1);
+        assert_eq!(report.chunks_indexed, 0);
+
+        let guard = conn.lock().await;
+        let chunk_count: i64 = guard
+            .query_row("SELECT COUNT(*) FROM rag_chunks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(chunk_count, 0);
+        drop(guard);
+
+        let meta = conexus_db::rag_repository::get_all_meta(&sea_orm_db)
+            .await
+            .unwrap();
+        assert!(
+            !meta.contains_key("hash_markdown_notes.md"),
+            "a failed source's hash must not be recorded, so it's re-scanned next cycle"
+        );
     }
 }
