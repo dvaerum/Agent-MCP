@@ -6,6 +6,7 @@ pub mod file_metadata_repository;
 pub mod group_capability_repository;
 pub mod group_membership_repository;
 pub mod message_repository;
+pub mod migration;
 pub mod pagination_cache;
 pub mod pending_directive_repository;
 pub mod project_context_repository;

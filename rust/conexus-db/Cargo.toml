@@ -34,6 +34,17 @@ sea-orm = { version = "2", default-features = false, features = [
     "sqlx-sqlite",
     "runtime-tokio-rustls",
 ] }
+# Phase F (schema-authority replacement, see the plan's own
+# "Migration-tool detail: sea-orm-migration" decision -- this
+# operator-decided replacement for Alembic, not a design still to be
+# picked). Same feature set as `sea-orm` above; `sea-orm-migration`
+# re-exports its own pinned `sea-orm` internally, so the version here
+# must track it (see this crate's own migration module doc for the
+# exact compatibility note once verified).
+sea-orm-migration = { version = "2", default-features = false, features = [
+    "sqlx-sqlite",
+    "runtime-tokio-rustls",
+] }
 # Phase G PR 5: `project_context_repository` is the first repository
 # genuinely rewritten onto sea-orm, and `bin/conexus-db-differential.rs`
 # -- a real production binary, not a test -- drives it directly, so a
