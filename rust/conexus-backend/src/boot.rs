@@ -14,6 +14,40 @@ use anyhow::{Context, Result};
 use conexus_db::migration::{Migrator, MigratorTrait};
 use rusqlite::Connection;
 
+/// Registers the `sqlite-vec` extension process-wide via
+/// `sqlite3_auto_extension` (see `conexus_vec`'s own module doc for
+/// the mechanism) so that EVERY connection this process opens
+/// afterward -- both [`open_and_init_db`]'s rusqlite one and `main.rs`'s
+/// sea-orm one -- can actually query/write the `rag_embeddings`
+/// virtual table, not just see it listed in `sqlite_master`.
+///
+/// **A found, currently-live production gap, fixed here**: nothing in
+/// `conexus-backend`'s real boot sequence ever called this. Confirmed
+/// directly (not assumed) by opening a real production database copy
+/// with a bare `rusqlite::Connection` — no registration call at all,
+/// matching what `main()` actually did before this fix — and querying
+/// `rag_embeddings`: `no such module: vec0`. `ask_project_rag`'s
+/// vector search (Phase D2) has been silently degrading to its
+/// recency-only `fetch_recent_context` fallback on every real call
+/// since the Rust cutover, on both live projects, with no error
+/// surfaced anywhere (a graceful degrade masking a real gap, not a
+/// crash). Must run before ANY connection in this process opens —
+/// call this first in `main()`, before [`open_and_init_db`].
+///
+/// A `false` return (extension missing/corrupt) is logged, not fatal
+/// — matches this crate's own established RAG degrade contract
+/// (`rag_repository`'s own module doc): a host without a loadable
+/// sqlite-vec extension still serves every other tool correctly, RAG
+/// vector search just stays degraded.
+pub fn register_vector_extension() {
+    if !conexus_vec::register_sqlite_vec() {
+        eprintln!(
+            "conexus-backend: sqlite-vec extension not loadable -- RAG vector search and \
+             indexing will stay degraded (recency-only context, no chunk embeddings)"
+        );
+    }
+}
+
 /// `<project_dir>/.agent/mcp_state.db` -- the fixed per-project DB
 /// path, matching Python's own layout.
 pub fn db_path(project_dir: &Path) -> PathBuf {
@@ -93,6 +127,25 @@ pub fn load_forwarding_hmac_key(path: Option<&Path>) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression pin for the found gap this module's own doc
+    /// describes: without calling `register_vector_extension()`
+    /// first, a query against `rag_embeddings` fails with `no such
+    /// module: vec0` on a real connection -- confirmed directly
+    /// against a real production database copy before landing this
+    /// fix, not assumed. This test proves the FIX (registration makes
+    /// the table genuinely queryable), matching this crate's own
+    /// convention of pinning the fixed behavior rather than the bug.
+    #[test]
+    fn register_vector_extension_makes_rag_embeddings_actually_queryable() {
+        register_vector_extension();
+        let conn = Connection::open_in_memory().unwrap();
+        conexus_db::schema::init_rag_embeddings_table(&conn, 4).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM rag_embeddings", [], |r| r.get(0))
+            .expect("rag_embeddings must be queryable once the extension is registered");
+        assert_eq!(count, 0);
+    }
 
     #[test]
     fn ensure_project_dirs_creates_project_dir_and_dot_agent() {

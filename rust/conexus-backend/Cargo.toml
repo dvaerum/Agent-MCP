@@ -17,6 +17,16 @@ conexus-auth = { path = "../conexus-auth" }
 conexus-tools = { path = "../conexus-tools" }
 # SharedState::waiter_registry (Phase D3 wait_for_events).
 conexus-wakeloop = { path = "../conexus-wakeloop" }
+# Real (not dev) dependency: `main()`'s boot sequence must actually
+# call `register_sqlite_vec()` for ANY connection this process opens
+# to be able to query/write the `rag_embeddings` virtual table --
+# found missing entirely (conexus-db only carries this as a
+# dev-dependency for its own repository tests, on the documented
+# assumption that "production rag_repository code never calls into
+# conexus-vec itself" is the whole story; the real gap was that
+# nothing else ever assumed the OTHER half -- actually registering the
+# extension at boot -- either).
+conexus-vec = { path = "../conexus-vec" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 # SharedState::sea_orm_db (Phase G) -- opened once at boot alongside
 # the existing rusqlite connection, threaded into every real
@@ -63,6 +73,11 @@ hyper-util = { version = "0.1", features = ["tokio", "server", "service"] }
 # tokio/hyper/rmcp) -- adding it directly changes no version, just the
 # dependency edge.
 futures-util = "0.3"
+# RAG periodic indexer's content-hash watermark (background_tasks::
+# rag_indexing) -- same version this workspace already resolves
+# (conexus-auth/conexus-db/conexus-router all pin "0.10" for the
+# identical reason: dedup to one resolved sha2, don't add a second).
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

@@ -91,6 +91,10 @@ async fn main() -> Result<()> {
         );
     }
 
+    // Must run before ANY connection in this process opens -- see this
+    // fn's own doc for the real, previously-live gap it closes.
+    boot::register_vector_extension();
+
     boot::ensure_project_dirs(&cli.project_dir)?;
     let conn = boot::open_and_init_db(&cli.project_dir)?;
     // Phase G (sea-orm migration): a second, sea-orm-flavored handle
