@@ -14,6 +14,7 @@
 mod backup;
 mod create_operator;
 mod migrate;
+mod seed_baseline;
 
 use clap::{Parser, Subcommand};
 
@@ -43,6 +44,23 @@ enum Command {
     Migrate {
         /// Directory containing `.agent/mcp_state.db`.
         project_dir: std::path::PathBuf,
+    },
+    /// Adopt an EXISTING, already-Alembic-migrated database into the
+    /// sea-orm-migration schema authority: verifies DB_PATH's real
+    /// on-disk schema structurally matches the baseline before ever
+    /// writing anything, and refuses (never applies) on a mismatch.
+    /// Defaults to a dry run; pass `--apply` to actually write the
+    /// tracking row.
+    SeedBaseline {
+        /// Path to the SQLite file to adopt.
+        db_path: std::path::PathBuf,
+        /// Which baseline DB_PATH should be checked against.
+        #[arg(long, value_enum)]
+        kind: seed_baseline::Kind,
+        /// Actually write the `seaql_migrations` tracking row (dry
+        /// run / report-only otherwise).
+        #[arg(long)]
+        apply: bool,
     },
     /// Router-scoped operator-management subcommands.
     Router {
@@ -99,6 +117,11 @@ async fn main() -> anyhow::Result<()> {
             force,
         } => backup::run(&project_dir, &output_path, force),
         Command::Migrate { project_dir } => migrate::run_project(&project_dir).await,
+        Command::SeedBaseline {
+            db_path,
+            kind,
+            apply,
+        } => seed_baseline::run(&db_path, kind, apply).await,
         Command::Router {
             command:
                 RouterCommand::CreateOperator {
