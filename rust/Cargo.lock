@@ -675,6 +675,7 @@ dependencies = [
  "rpassword",
  "rusqlite",
  "sea-orm",
+ "sea-orm-migration",
  "tokio",
 ]
 

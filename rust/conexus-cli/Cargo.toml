@@ -38,6 +38,15 @@ sea-orm = { version = "2", default-features = false, features = [
     "sqlx-sqlite",
     "runtime-tokio-rustls",
 ] }
+# `seed-baseline` needs `sea_orm_migration::seaql_migrations`'s
+# Entity/ActiveModel directly (conexus-db::migration only re-exports
+# the trait prelude, not this module) -- same version/feature set as
+# conexus-db's own entry, since sea-orm-migration re-exports a pinned
+# sea-orm internally that must track it.
+sea-orm-migration = { version = "2", default-features = false, features = [
+    "sqlx-sqlite",
+    "runtime-tokio-rustls",
+] }
 # Interactive password prompt (hidden input, matching Python's
 # `click.prompt(hide_input=True)`/getpass) -- no existing workspace
 # precedent, same "genuinely new, no fork to resolve" shape as this
