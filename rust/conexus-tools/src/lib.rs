@@ -22,6 +22,7 @@ pub mod project_context_tools;
 pub mod project_settings_tools;
 pub mod prompts;
 mod python_compat;
+pub mod rag_chunking;
 pub mod rag_tools;
 pub mod registry;
 pub mod resources;
