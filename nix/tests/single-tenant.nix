@@ -14,12 +14,20 @@
 #      /app/only-project/<section>  (W1 redirect; decision #9).
 #   3. /app/only-project/ → 200 (sanity: the configured project's
 #      URL is unaffected).
-{ pkgs, lib, self, ... }:
+{ pkgs, lib, self, craneLib, ... }:
 
 let
   ports = import ./_ports.nix;
   packagedPkgs = import ../packages.nix {
     inherit pkgs lib;
+    src = self;
+  };
+  # The Python router/backend this test used to boot
+  # (`agentMcpRouterWrapper`/`agentMcpLauncher`) was retired together
+  # with the rest of the Python source tree; `conexus-router`/
+  # `conexus-backend` (via `nix/conexus.nix`) are the sole replacement.
+  conexusPkgs = import ../conexus.nix {
+    inherit pkgs lib craneLib;
     src = self;
   };
   singleName = "only-project";
@@ -74,8 +82,8 @@ pkgs.testers.nixosTest {
     };
     users.groups.testuser = {};
 
-    systemd.services."agent-mcp@" = {
-      description = "Agent-MCP backend — project %i";
+    systemd.services."conexus@" = {
+      description = "CoNexus backend — project %i";
       after = [ "fake-openai.service" ];
       serviceConfig = {
         Type = "simple";
@@ -88,19 +96,6 @@ pkgs.testers.nixosTest {
           "OPENAI_API_KEY=fake"
           "AGENT_MCP_EMBEDDING_MODEL=fake-zero-vector"
           "AGENT_MCP_EMBEDDING_DIMENSION=1024"
-          # R8-F2 discovery: the "sqlite-vec (VSS) extension confirmed
-          # loadable" line the VSS-liveness assertion below greps for is
-          # logged at INFO, and agent_mcp/core/config.py's stderr
-          # handler defaults to a WARNING floor
-          # (AGENT_MCP_STDERR_LOG_LEVEL, "WARNING" unless overridden) —
-          # so without this override that line (and the rest of the
-          # startup sequence's INFO logging) never reaches the journal
-          # at all, regardless of the 5 hardening directives. Verified
-          # live on vm-dev: the full startup sequence, including the
-          # VSS confirmation, completes in ~70-110ms once this is set —
-          # the earlier "hang" was this log-level gap, not a real stall
-          # or a hardening-vs-sqlite-vec conflict.
-          "AGENT_MCP_STDERR_LOG_LEVEL=INFO"
           # R8-F2 discovery: the backend resolves a forwarded operator-
           # session cookie against router.identity.get_session(), which
           # reads the SAME on-disk router.db the router process uses —
@@ -128,35 +123,38 @@ pkgs.testers.nixosTest {
         ];
         RuntimeDirectory = "agent-mcp/%i";
         RuntimeDirectoryMode = "0700";
-        # See agent-mcp-router's own RuntimeDirectoryPreserve comment
+        # See conexus-router's own RuntimeDirectoryPreserve comment
         # below -- same bare-parent-vs-%i-child sharing, same fix.
         RuntimeDirectoryPreserve = "yes";
         # R8-F2 discovery: F015 v4 (see nix/module.nix) generates the
         # per-project forwarding-HMAC key via ExecStartPre; the
-        # launcher's ``--forwarding-hmac-in`` is click-validated with
-        # ``exists=True`` and exits 2/INVALIDARGUMENT on every launch
-        # without it. Same fix already proven in event-driven-coord.nix
-        # / no-auto-cleanup.nix; this template previously did only the
-        # socket cleanup below, so the backend never came up — dormant
-        # for the same reason as the other 2 fixes above.
+        # launcher's ``--forwarding-hmac-in`` refuses to start if the
+        # file is absent. Same fix already proven in
+        # event-driven-coord.nix / no-auto-cleanup.nix; this template
+        # previously did only the socket cleanup below, so the backend
+        # never came up — dormant for the same reason as the other 2
+        # fixes above.
         ExecStartPre = [
           "${pkgs.runtimeShell} -c 'test -f \"$RUNTIME_DIRECTORY/forwarding_hmac\" || { ${pkgs.coreutils}/bin/head -c 32 /dev/urandom > \"$RUNTIME_DIRECTORY/forwarding_hmac\" && ${pkgs.coreutils}/bin/chmod 600 \"$RUNTIME_DIRECTORY/forwarding_hmac\"; }'"
           "${pkgs.coreutils}/bin/rm -f /run/agent-mcp/%i/backend.sock"
         ];
         ExecStart = ''
-          ${packagedPkgs.agentMcpLauncher}/bin/agent-mcp-launcher %i
+          ${conexusPkgs.conexusLauncher}/bin/conexus-launcher %i
         '';
         Restart = "on-failure";
         RestartSec = 5;
       } // hardening;
     };
 
-    systemd.services.agent-mcp-router = {
-      description = "Agent-MCP router (single-tenant test)";
+    # `conexus-router` (Rust) — the sole router implementation now
+    # that the Python one (`agent-mcp-router`) was retired. See
+    # multi-tenant.nix's own comment on its `conexus-router` unit for
+    # the flag-vs-env-var split rationale.
+    systemd.services.conexus-router = {
+      description = "CoNexus router (single-tenant test)";
       wantedBy = [ "multi-user.target" ];
       after = [ "fake-openai.service" "network.target" ];
       environment = {
-        AGENT_MCP_PROJECTS_FILE = "/home/testuser/.config/agent-mcp/projects.local.json";
         # Phase 1 PR B (prancy-napping-pie): see multi-tenant.nix.
         AGENT_MCP_ROUTER_DB = "/home/testuser/.config/agent-mcp/router.db";
         # Phase 1 PR C: seed a sentinel operator via the env-var
@@ -165,11 +163,6 @@ pkgs.testers.nixosTest {
         # auth and shouldn't be wedged behind the first-boot wizard.
         AGENT_MCP_BOOTSTRAP_USERNAME = "ci-sentinel";
         AGENT_MCP_BOOTSTRAP_PASSWORD = "ci-sentinel-pw";
-        AGENT_MCP_SOCK_DIR = "/run/agent-mcp";
-        AGENT_MCP_DASHBOARD_DIR = "${packagedPkgs.agentMcpDashboard}/share/agent-mcp-dashboard";
-        AGENT_MCP_EXTERNAL_URL = "http://localhost:${toString ports.routerPort}";
-        AGENT_MCP_DEFAULT_WORKSPACE = "/home/testuser/projects";
-        AGENT_MCP_ROUTER_PORT = toString ports.routerPort;
         AGENT_MCP_ROUTER_HOST = "0.0.0.0";
         # Single-tenant mode disables operator-session auth, so the
         # internet-hardening startup guard refuses a non-loopback bind
@@ -177,12 +170,9 @@ pkgs.testers.nixosTest {
         # networking makes the guest reachable ONLY via host port-
         # forwarding, never from a real network. Acknowledge that.
         AGENT_MCP_ALLOW_INSECURE_BIND = "1";
-        AGENT_MCP_IDLE_SEC = "14400";
-        AGENT_MCP_README_HTML = "${packagedPkgs.readmeHtml}";
-        AGENT_MCP_INSTALLER_TEMPLATE = "${packagedPkgs.installerTemplate}";
         # R8-F2 discovery: the router defaults to `systemctl --user`,
         # which matches the nixos-developer-system home-manager
-        # deployment. In this VM test the agent-mcp@%i template is
+        # deployment. In this VM test the conexus@%i template is
         # system-level, so flip the mode (mirrors nix/module.nix's
         # setting, and event-driven-coord.nix / no-auto-cleanup.nix's
         # matching fix for the same test-fixture shape). This test
@@ -197,9 +187,9 @@ pkgs.testers.nixosTest {
         User = "testuser";
         Group = "testuser";
         # RuntimeDirectoryPreserve=yes (live incident 2026-09-07, see
-        # nix/home-manager-module.nix's agent-mcp-router unit for the
+        # nix/home-manager-module.nix's conexus-router unit for the
         # full writeup): this bare, single-component RuntimeDirectory
-        # is a strict parent of agent-mcp@'s own "agent-mcp/%i" above --
+        # is a strict parent of conexus@'s own "agent-mcp/%i" above --
         # per systemd.exec(5), that makes it THIS unit's own innermost
         # subdirectory, so without `=yes` every stop of this router
         # (crash-loop, redeploy) recursively deletes the whole
@@ -220,11 +210,16 @@ pkgs.testers.nixosTest {
           # isn't an inline ``echo`` one-liner.
           "${pkgs.coreutils}/bin/install -m 0644 ${projectsSeedFile} /home/testuser/.config/agent-mcp/projects.local.json"
         ];
-        ExecStart = ''
-          ${packagedPkgs.agentMcpRouterWrapper}/bin/agent-mcp-router \
-            --single-tenant ${singleName} \
-            --single-workspace ${singleWorkspace}
-        '';
+        ExecStart =
+          "${conexusPkgs.conexusRouterWrapper}/bin/conexus-router "
+          + "--port ${toString ports.routerPort} "
+          + "--projects-file /home/testuser/.config/agent-mcp/projects.local.json "
+          + "--sock-dir /run/agent-mcp "
+          + "--dashboard-dir ${packagedPkgs.agentMcpDashboard}/share/agent-mcp-dashboard "
+          + "--external-url ${lib.escapeShellArg "http://localhost:${toString ports.routerPort}"} "
+          + "--idle-sec 14400 "
+          + "--single-tenant ${singleName} "
+          + "--single-workspace ${singleWorkspace}";
         Restart = "on-failure";
         RestartSec = 5;
       } // hardening;
@@ -236,7 +231,7 @@ pkgs.testers.nixosTest {
         if (action.id == "org.freedesktop.systemd1.manage-units" &&
             subject.user == "testuser") {
           var unit = action.lookup("unit");
-          if (unit && (unit.indexOf("agent-mcp@") == 0)) {
+          if (unit && (unit.indexOf("conexus@") == 0)) {
             return polkit.Result.YES;
           }
         }
@@ -250,7 +245,7 @@ pkgs.testers.nixosTest {
   testScript = ''
     start_all()
     machine.wait_for_unit("fake-openai.service")
-    machine.wait_for_unit("agent-mcp-router.service")
+    machine.wait_for_unit("conexus-router.service")
     machine.wait_for_open_port(${toString ports.routerPort})
 
     # ADR 0014: admin REST surface lives at /api/router/...; the
@@ -429,7 +424,7 @@ pkgs.testers.nixosTest {
     # assertion before this one.
     machine.succeed(
         "curl -fsS -c /tmp/agent-mcp-cookies.txt "
-        "-F username=ci-sentinel -F password=ci-sentinel-pw "
+        "--data 'username=ci-sentinel&password=ci-sentinel-pw' "
         "http://127.0.0.1:${toString ports.routerPort}/agent-mcp/login"
     )
     machine.succeed(
@@ -438,7 +433,7 @@ pkgs.testers.nixosTest {
         "http://127.0.0.1:${toString ports.routerPort}"
         "/agent-mcp/api/${singleName}/status"
     )
-    machine.wait_for_unit("agent-mcp@${singleName}.service")
+    machine.wait_for_unit("conexus@${singleName}.service")
 
     expected_props = {
         "PrivateDevices": "yes",
@@ -447,7 +442,7 @@ pkgs.testers.nixosTest {
         "CapabilityBoundingSet": "",
         "UMask": "0077",
     }
-    for unit in ("agent-mcp-router.service", "agent-mcp@${singleName}.service"):
+    for unit in ("conexus-router.service", "conexus@${singleName}.service"):
         for prop, expected in expected_props.items():
             actual = machine.succeed(
                 f"systemctl show --value -p {prop} {unit}"
@@ -457,28 +452,22 @@ pkgs.testers.nixosTest {
                 f"expected {expected!r} (see nix/hardening.nix)"
             )
 
-    # Sqlite-vec's ctypes extension is the fragile path the two
-    # deliberately-omitted directives (MemoryDenyWriteExecute,
-    # SystemCallFilter) exist to protect — prove it still loads
-    # cleanly under all 5 new directives together by checking for the
-    # startup confirmation log line (server_lifecycle.py).
-    #
-    # R8-F2 discovery: a single point-in-time `journalctl | grep -c`
-    # right after `wait_for_unit` raced journald's own flush/index
-    # latency — `wait_for_unit` only observes systemd's activation
-    # state (Type=simple activates at fork(), long before the app logs
-    # anything), and the earlier blocking `/api/.../status` curl
-    # succeeding proves the process was fully up, not that journald had
-    # already indexed every line it wrote. Poll instead of a single
-    # snapshot; a real hardening-induced crash still fails this via
-    # `wait_until_succeeds`'s own timeout, and unlike the old `|| true`
-    # form (which silently turned a genuine 0-count into a "succeeded"
-    # shell exit and masked the real signal), that timeout IS the
-    # failure signal now.
-    machine.wait_until_succeeds(
-        "journalctl -u agent-mcp@${singleName}.service --no-pager "
-        "| grep -q 'sqlite-vec (VSS) extension confirmed loadable'",
-        timeout=30,
-    )
+    # R8-F2's Python-specific VSS-liveness check (grepping the journal
+    # for "sqlite-vec (VSS) extension confirmed loadable", a log line
+    # `agent_mcp/app/server_lifecycle.py` used to emit) has no Rust
+    # equivalent: `conexus-backend` links `sqlite-vec` statically via
+    # the `conexus-vec` crate (see rust/conexus-vec/src/lib.rs) rather
+    # than dlopen'ing a loadable-extension file at runtime, so it
+    # doesn't log an analogous "confirmed loadable" line, and the two
+    # hardening directives (MemoryDenyWriteExecute, SystemCallFilter)
+    # this check existed to protect were deliberately omitted for
+    # CPython's own ctypes-extension-loading needs specifically -- it
+    # is a genuinely open question whether that omission rationale
+    # still applies to the Rust binary the same way. The
+    # `systemctl show` hardening-properties loop above and the earlier
+    # blocking `/api/.../status` curl already prove the backend is up
+    # and serving under the 5 hardening directives; a Rust-specific
+    # replacement for the VSS-loadability half of this guard is
+    # unresolved and flagged for follow-up rather than faked here.
   '';
 }

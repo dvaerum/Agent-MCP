@@ -447,10 +447,11 @@ pub fn decide_create_project(
     // Phase F (prancy-napping-pie): a brand-new project always gets
     // the Rust backend -- the Python implementation is fully
     // superseded in production and staged for deletion. This is
-    // deliberately NOT `project_registry::DEFAULT_BACKEND_IMPL`
-    // ("python"), which is a DIFFERENT concern: how to interpret a
-    // truly legacy on-disk record with no `backend_impl` key at all
-    // (predating this field), not the default for a new one.
+    // deliberately its own inlined `"rust"` literal, not a reuse of
+    // `project_registry::DEFAULT_BACKEND_IMPL` (which now also
+    // resolves to `"rust"`), since that constant is a DIFFERENT
+    // concern: how to interpret a truly legacy on-disk record with no
+    // `backend_impl` key at all, not the default for a brand-new one.
     match registry.register(&name, &workspace.to_string_lossy(), "rust", now) {
         Ok(_) => {}
         Err(e @ (RegistryError::ProjectNameTaken(_) | RegistryError::AliasCollision(_))) => {

@@ -49,6 +49,108 @@ pub fn open_and_init_router_db(path: &std::path::Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// Port of `identity.py::init_router_db`'s env-var-bootstrap half
+/// (Phase F, prancy-napping-pie -- found missing while retiring the
+/// Python router: this path was documented in `login.rs`'s own module
+/// doc as "app-wiring's job (PR 23)" but PR 23 never actually wired
+/// it, a real gap invisible until the Python router -- which DID
+/// implement it -- was retired and a VM test's env-var-seeded
+/// `ci-sentinel` login started failing for real).
+///
+/// Bootstrap fires only when both `AGENT_MCP_BOOTSTRAP_USERNAME` and
+/// `AGENT_MCP_BOOTSTRAP_PASSWORD` are set (one alone is a typo, not a
+/// half-bootstrap) AND the `users` table is empty. Both env vars are
+/// stripped from the process environment afterwards regardless of
+/// outcome (mirrors Python's own `try/finally` -- a leaked bootstrap
+/// password sitting in this process's env for its whole lifetime is
+/// exactly the exposure surface the original fix existed to close).
+///
+/// Deliberately simpler than Python's own two-step dance
+/// (`create_user()` then a separate `bootstrap_first_operator_as_
+/// sysadmin()` promotion pass): this crate's `identity::create_user`
+/// already takes `bootstrap_sysadmin` as a first-class parameter
+/// (Phase G, `conexus-cli router create-operator`'s own established
+/// call shape), so the empty-table check and the sysadmin crowning
+/// happen atomically in one call, not two.
+///
+/// `unset_env` mirrors `get_env`'s own explicit-closure convention
+/// (every function in this module takes reads this way; nothing here
+/// reaches into real process env directly) -- production passes
+/// `std::env::remove_var`, tests pass a fake that records calls
+/// instead of mutating real global state, avoiding the exact
+/// shared-global-under-parallel-tests hazard this workspace has hit
+/// (and fixed) twice before.
+pub async fn bootstrap_operator_from_env(
+    db: &sea_orm::DatabaseConnection,
+    registered_projects: &[String],
+    get_env: impl Fn(&str) -> Option<String>,
+    unset_env: impl Fn(&str),
+) -> Result<()> {
+    let username = get_env("AGENT_MCP_BOOTSTRAP_USERNAME");
+    let password = get_env("AGENT_MCP_BOOTSTRAP_PASSWORD");
+
+    let result = if let (Some(username), Some(password)) = (&username, &password) {
+        bootstrap_operator(db, username, password, registered_projects).await
+    } else {
+        Ok(())
+    };
+
+    // Strip even on error/never-attempted-but-one-var-set -- a
+    // present bootstrap password must never survive into this
+    // process's later lifetime regardless of what happened.
+    unset_env("AGENT_MCP_BOOTSTRAP_USERNAME");
+    unset_env("AGENT_MCP_BOOTSTRAP_PASSWORD");
+
+    result
+}
+
+async fn bootstrap_operator(
+    db: &sea_orm::DatabaseConnection,
+    username: &str,
+    password: &str,
+    registered_projects: &[String],
+) -> Result<()> {
+    if !crate::identity::users_table_is_empty(db)
+        .await
+        .context("check users table emptiness for bootstrap")?
+    {
+        eprintln!(
+            "conexus-router: bootstrap env vars set, but the users table is non-empty -- \
+             skipping bootstrap."
+        );
+        return Ok(());
+    }
+
+    // Canonical single-source policy check -- every path that mints a
+    // NEW operator password calls this first (matches Python's own
+    // rationale and this crate's `conexus-cli router create-operator`
+    // precedent).
+    crate::identity::validate_password_strength(password)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .context("bootstrap password failed the strength policy")?;
+
+    let now = chrono::Utc::now().to_rfc3339();
+    crate::identity::create_user(
+        db,
+        username,
+        password,
+        None,
+        false,
+        true,
+        registered_projects,
+        &now,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))
+    .context("create bootstrap operator")?;
+
+    eprintln!(
+        "conexus-router: bootstrapped first operator {username:?} from \
+         AGENT_MCP_BOOTSTRAP_USERNAME/PASSWORD env vars."
+    );
+    Ok(())
+}
+
 /// A resolved bind host -- port of `_resolve_bind_host`'s own
 /// single-string-or-list return shape. A comma-separated
 /// `AGENT_MCP_ROUTER_HOST` binds MULTIPLE explicit hosts (tighter than
@@ -338,5 +440,198 @@ mod tests {
             env_map(&[("AGENT_MCP_EXTERNAL_URL", "https://agent-mcp.example.test")])
         )
         .is_none());
+    }
+
+    // -- bootstrap_operator_from_env -------------------------------------
+    //
+    // Phase F regression coverage: this is the exact gap a real Nix VM
+    // test caught (a Python-router-only feature, never ported, only
+    // documented as "someone else's job"). A file-backed sea-orm DB is
+    // needed (not `:memory:`) so `identity::create_user`'s own writes
+    // and this test's own `users_table_is_empty` read-back see the
+    // same database.
+
+    async fn router_db() -> (tempfile::TempDir, sea_orm::DatabaseConnection) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("boot_test.db");
+        let conn = Connection::open(&path).unwrap();
+        conexus_db::schema::init_router_schema(&conn).unwrap();
+        drop(conn);
+        let db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        (dir, db)
+    }
+
+    /// Records every key `unset_env` was called with, standing in for
+    /// `std::env::remove_var` without touching real process state.
+    fn recording_unsetter() -> (std::sync::Arc<std::sync::Mutex<Vec<String>>>, impl Fn(&str)) {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let calls_clone = std::sync::Arc::clone(&calls);
+        (calls, move |key: &str| {
+            calls_clone.lock().unwrap().push(key.to_string());
+        })
+    }
+
+    #[tokio::test]
+    async fn bootstraps_the_first_operator_when_both_vars_are_set_and_the_table_is_empty() {
+        let (_dir, db) = router_db().await;
+        let (calls, unset) = recording_unsetter();
+
+        bootstrap_operator_from_env(
+            &db,
+            &["proj-a".to_string()],
+            env_map(&[
+                ("AGENT_MCP_BOOTSTRAP_USERNAME", "ci-sentinel"),
+                (
+                    "AGENT_MCP_BOOTSTRAP_PASSWORD",
+                    "correct horse battery staple",
+                ),
+            ]),
+            unset,
+        )
+        .await
+        .unwrap();
+
+        assert!(!crate::identity::users_table_is_empty(&db).await.unwrap());
+        let user = crate::identity::get_user_by_username(&db, "ci-sentinel")
+            .await
+            .unwrap()
+            .expect("bootstrapped user should be readable back");
+        assert!(
+            user.is_sysadmin,
+            "the first operator must be crowned sysadmin"
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                "AGENT_MCP_BOOTSTRAP_USERNAME".to_string(),
+                "AGENT_MCP_BOOTSTRAP_PASSWORD".to_string()
+            ],
+            "both bootstrap env vars must be unset after a successful bootstrap"
+        );
+    }
+
+    #[tokio::test]
+    async fn skips_silently_when_the_users_table_is_already_non_empty() {
+        let (_dir, db) = router_db().await;
+        crate::identity::create_user(
+            &db,
+            "existing-operator",
+            "an-already-strong-password",
+            None,
+            false,
+            true,
+            &[],
+            "2026-01-01T00:00:00.000+00:00",
+        )
+        .await
+        .unwrap();
+        let (calls, unset) = recording_unsetter();
+
+        bootstrap_operator_from_env(
+            &db,
+            &[],
+            env_map(&[
+                ("AGENT_MCP_BOOTSTRAP_USERNAME", "ci-sentinel"),
+                (
+                    "AGENT_MCP_BOOTSTRAP_PASSWORD",
+                    "correct horse battery staple",
+                ),
+            ]),
+            unset,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            crate::identity::get_user_by_username(&db, "ci-sentinel")
+                .await
+                .unwrap()
+                .is_none(),
+            "must not create a second operator once the table is non-empty"
+        );
+        // Still unset -- a skip is not an error, the vars must not
+        // linger either way.
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                "AGENT_MCP_BOOTSTRAP_USERNAME".to_string(),
+                "AGENT_MCP_BOOTSTRAP_PASSWORD".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn does_nothing_when_only_one_of_the_two_vars_is_set() {
+        let (_dir, db) = router_db().await;
+        let (calls, unset) = recording_unsetter();
+
+        bootstrap_operator_from_env(
+            &db,
+            &[],
+            env_map(&[("AGENT_MCP_BOOTSTRAP_USERNAME", "ci-sentinel")]),
+            unset,
+        )
+        .await
+        .unwrap();
+
+        assert!(crate::identity::users_table_is_empty(&db).await.unwrap());
+        // Deliberate improvement over Python (documented on the
+        // function's own doc): Python's `finally` only runs inside the
+        // `if both set` branch, so a lone half-set var lingers forever
+        // in its process env. This port always attempts the unset,
+        // regardless of whether a bootstrap was even attempted.
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                "AGENT_MCP_BOOTSTRAP_USERNAME".to_string(),
+                "AGENT_MCP_BOOTSTRAP_PASSWORD".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn does_nothing_when_neither_var_is_set() {
+        let (_dir, db) = router_db().await;
+        let (_calls, unset) = recording_unsetter();
+
+        bootstrap_operator_from_env(&db, &[], env_map(&[]), unset)
+            .await
+            .unwrap();
+
+        assert!(crate::identity::users_table_is_empty(&db).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn rejects_a_weak_bootstrap_password_but_still_unsets_the_env_vars() {
+        let (_dir, db) = router_db().await;
+        let (calls, unset) = recording_unsetter();
+
+        let err = bootstrap_operator_from_env(
+            &db,
+            &[],
+            env_map(&[
+                ("AGENT_MCP_BOOTSTRAP_USERNAME", "ci-sentinel"),
+                ("AGENT_MCP_BOOTSTRAP_PASSWORD", "short"),
+            ]),
+            unset,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(format!("{err:#}").contains("strength policy"));
+        assert!(
+            crate::identity::users_table_is_empty(&db).await.unwrap(),
+            "a rejected weak password must not create a row"
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                "AGENT_MCP_BOOTSTRAP_USERNAME".to_string(),
+                "AGENT_MCP_BOOTSTRAP_PASSWORD".to_string()
+            ],
+            "the vars must still be stripped even when bootstrap fails (matches Python's own try/finally)"
+        );
     }
 }

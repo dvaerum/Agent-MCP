@@ -335,6 +335,24 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| default_projects_file(get_env));
     let registry = project_registry::ProjectRegistry::new(projects_file);
 
+    // Env-var first-operator bootstrap (ADR-0013's OTHER first-operator
+    // path, alongside the /setup wizard) -- see `boot::
+    // bootstrap_operator_from_env`'s own doc for why this call exists
+    // at all (a real gap this PR's own Python-router retirement found:
+    // the Rust router never got this feature, only a doc comment
+    // saying someone else's PR would add it).
+    let registered_projects: Vec<String> = registry
+        .list()
+        .context("list registered projects for bootstrap")?
+        .into_iter()
+        .map(|p| p.name)
+        .collect();
+    boot::bootstrap_operator_from_env(&sea_orm_db, &registered_projects, get_env, |key| {
+        std::env::remove_var(key)
+    })
+    .await
+    .context("env-var operator bootstrap")?;
+
     let rate_limit_config = rate_limit::RateLimitConfig::resolve_from_process_env();
     let ensure_config = orchestrator::ensure::EnsureConfig::from_env(get_env);
     let max_streams_per_agent = get_env("AGENT_MCP_MAX_SSE_PER_AGENT")

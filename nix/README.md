@@ -11,15 +11,17 @@ host or anywhere on a tailnet.
 
 Three groups of user-scope systemd units:
 
-- **`agent-mcp-router.service`** — always-on URL-keyed HTTP router on
-  loopback (default `127.0.0.1:1337`). Serves the Next.js dashboard
-  at `/agent-mcp/__dashboard/`, proxies MCP traffic to per-project
-  backends, lazy-starts/stops them by activity, and exposes the
-  add/remove/rename REST endpoints.
-- **`agent-mcp@<name>.service`** (systemd template) — one instance
-  per registered project, started lazily by the router on first MCP
-  request, stopped after `services.agent-mcp.router.idleSec` seconds
-  of inactivity. Listens on a Unix domain socket under
+- **`conexus-router.service`** (the CoNexus Rust router; the retired
+  Python one was `agent-mcp-router.service`) — always-on URL-keyed
+  HTTP router on loopback (default `127.0.0.1:1337`). Serves the
+  Next.js dashboard at `/agent-mcp/__dashboard/`, proxies MCP traffic
+  to per-project backends, lazy-starts/stops them by activity, and
+  exposes the add/remove/rename REST endpoints.
+- **`conexus@<name>.service`** (systemd template; the retired Python
+  one was `agent-mcp@<name>.service`) — one instance per registered
+  project, started lazily by the router on first MCP request, stopped
+  after `services.agent-mcp.router.idleSec` seconds of inactivity.
+  Listens on a Unix domain socket under
   `$XDG_RUNTIME_DIR/agent-mcp/<name>/backend.sock`.
 - **`agent-mcp-daemon-agent@<project>--<agent_id>.service`** (systemd
   template) — one instance per entry in
@@ -209,7 +211,7 @@ build artifact serves any deployment URL.
   mounted at a different prefix (e.g. `/tools/`) is a one-line
   change. Set `AGENT_MCP_ASSET_PREFIX=/tools` in the router unit's
   `environment`, or pass `--asset-prefix /tools` on the
-  `agent-mcp-router` command line. No rebuild required.
+  `conexus-router` command line. No rebuild required.
 
 Substitution is Content-Type-gated: only `text/html`,
 `text/css`, and `application/javascript` responses are eligible.

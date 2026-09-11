@@ -1,5 +1,5 @@
 """Regression guard: the home-manager module's per-project backend
-template (``agent-mcp@<name>.service``) must generate the
+template (``conexus@<name>.service``) must generate the
 ``forwarding_hmac`` key file in an ExecStartPre, the same way the NixOS
 module does (PRs #214, #216, #217).
 
@@ -45,6 +45,12 @@ shape as the NixOS module, adapted for user-scope:
   parent dir exists with the right owner/mode.
 - The existing socket-removal ExecStartPre must still be present (the
   pre-existing defensive cleanup).
+
+Retirement note: the per-project backend template was ``agent-mcp@``
+(Python) when these fixes landed; it is ``conexus@`` (Rust) now that
+the Python implementation was retired, but the ExecStartPre shape these
+tests pin is unchanged -- the forwarding-HMAC contract is implementation-
+agnostic (both backends read the same file via ``--forwarding-hmac-in``).
 """
 
 from __future__ import annotations
@@ -57,20 +63,22 @@ _HM_MODULE = _REPO_ROOT / "nix" / "home-manager-module.nix"
 
 
 def _extract_backend_template_block(text: str) -> str:
-    """Return the raw nix source of the ``"agent-mcp@"`` systemd user
-    service block, from its opening brace to the close of the Service
-    attrset.
-
-    Anchors:
-      - opening marker: ``"agent-mcp@" = {``
-      - closing marker: the next ``"agent-mcp-router" = {`` (next entry
-        in the systemd.user.services attrset).
-    """
-    open_marker = '"agent-mcp@" = {'
-    close_marker = '"agent-mcp-router" = {'
-    start = text.index(open_marker)
-    end = text.index(close_marker, start)
-    return text[start:end]
+    """Return the raw nix source of the ``"conexus@" = lib.mkIf … { … };``
+    systemd user service block, tracked by brace depth (the block
+    contains its own nested ``{ … }``, so a naive "next sibling key"
+    string search is not a safe anchor)."""
+    marker = '"conexus@" = lib.mkIf'
+    start = text.index(marker)
+    brace_start = text.index("{", start)
+    depth = 1
+    i = brace_start + 1
+    while depth > 0:
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+        i += 1
+    return text[brace_start:i]
 
 
 def test_backend_template_declares_runtime_directory() -> None:
@@ -81,7 +89,7 @@ def test_backend_template_declares_runtime_directory() -> None:
     text = _HM_MODULE.read_text()
     block = _extract_backend_template_block(text)
     assert re.search(r'RuntimeDirectory\s*=\s*"agent-mcp/%i"', block), (
-        'home-manager-module.nix: "agent-mcp@" service must set '
+        'home-manager-module.nix: "conexus@" service must set '
         'RuntimeDirectory = "agent-mcp/%i" so the parent dir exists '
         "before ExecStartPre tries to write forwarding_hmac into it."
     )
@@ -102,7 +110,7 @@ def test_backend_template_generates_forwarding_hmac() -> None:
     # $RUNTIME_DIRECTORY env var that systemd sets when
     # RuntimeDirectory= is configured.
     assert "forwarding_hmac" in block, (
-        'home-manager-module.nix: "agent-mcp@" service must contain an '
+        'home-manager-module.nix: "conexus@" service must contain an '
         "ExecStartPre that generates the forwarding_hmac key file. The "
         "NixOS module gained this in PR #214 (F015 v4); the home-manager "
         "template was never updated, causing backend crash-loop with "
@@ -156,7 +164,7 @@ def test_backend_template_uses_runtime_shell_for_execstartpre() -> None:
     ]
     assert code_lines == [], (
         "home-manager-module.nix: ${pkgs.coreutils}/bin/sh in the "
-        '"agent-mcp@" service breaks every start with status=203/EXEC. '
+        '"conexus@" service breaks every start with status=203/EXEC. '
         "Use ${pkgs.runtimeShell} instead (PR #216 / F015 v6). "
         f"Bad lines: {code_lines!r}"
     )
@@ -192,7 +200,7 @@ def test_backend_template_keeps_socket_cleanup() -> None:
     text = _HM_MODULE.read_text()
     block = _extract_backend_template_block(text)
     assert re.search(r"rm\s+-f[^\"]*backend\.sock", block), (
-        'home-manager-module.nix: "agent-mcp@" service must still '
+        'home-manager-module.nix: "conexus@" service must still '
         "remove a stale backend.sock in ExecStartPre. The HMAC-generator "
         "addition must not regress the existing socket cleanup."
     )

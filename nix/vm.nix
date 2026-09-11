@@ -1,6 +1,12 @@
 { config, lib, pkgs, modulesPath, src ? null, mode ? "multi", craneLib ? null, ... }@vmArgs:
-# NixOS configuration consumed by `lib.nixosSystem`. The flake builds
-# one derivation per mode (`multi`, `single`). Storage is layered:
+# NixOS configuration consumed by `lib.nixosSystem`. `mode` is a
+# vestigial parameter kept only for caller signature compatibility
+# (nix/vm-dev.nix passes `mode = "multi"` explicitly) — it no longer
+# selects anything, since the "single" bare-TCP-port backend shape it
+# used to pick between has no Rust equivalent and was retired
+# alongside the rest of the Python implementation (see
+# nix/module.nix's own module-doc comment for the full story). The
+# flake now builds exactly one derivation shape. Storage is layered:
 #
 #   - agent-mcp state    → /var/lib/agent-mcp on the qcow2 scratch
 #     disk (real ext4; SQLite WAL needs fcntl locks 9p can't fake).
@@ -69,8 +75,15 @@
 # raises CompletionConfigError when a key is set without it.
 
 let
-  inVmHostPort =
-    if mode == "multi" then 1337 else 8080;
+  # `mode` used to select between the multi-tenant router shape and a
+  # single-backend bare-TCP-port shape ("single"), both retained here
+  # for signature compatibility with callers (nix/vm-dev.nix passes
+  # `mode = "multi"` explicitly) even though "single" no longer has a
+  # working implementation to select -- see nix/module.nix's own
+  # module-doc comment for why (the Python single-backend shape was
+  # retired with the rest of the Python tree, and conexus-backend has
+  # no bare-TCP-port serving mode to replace it with).
+  inVmHostPort = 1337;
 
   # ── external-LLM parameters ───────────────────────────────────────
   # Read off `@vmArgs` with `or` rather than declared in the function
@@ -100,9 +113,8 @@ let
   embeddingBaseUrl = "http://${llmHost}:${toString llmEmbeddingPort}/v1";
 
   # Applied to whichever unit actually runs agent-mcp (the lazily
-  # spawned `agent-mcp@` backends in multi mode, the always-on
-  # `agent-mcp-backend` in single mode). The router is a pure proxy
-  # and never embeds or completes, so it needs none of this.
+  # spawned `conexus@` backends). The router is a pure proxy and never
+  # embeds or completes, so it needs none of this.
   externalLlmEnvironment = {
     # Non-empty sentinel: selects the OpenAI-shaped client on both
     # seams and suppresses the in-guest-ollama setdefault fallback.
@@ -119,11 +131,19 @@ let
 
   # CoNexus Rust backend (Phase D1 step 5) — `null` when the caller
   # doesn't pass `craneLib` (e.g. nix/vm-dev.nix's plain-function call
-  # site), which just means the `conexus@<name>.service` template is
-  # omitted (see module.nix's `conexusLauncherPackage` option doc).
-  conexusLauncher =
+  # site), which just means the `conexus@<name>.service` / `conexus-router`
+  # units are omitted (see module.nix's `conexusLauncherPackage`/
+  # `conexusRouterPackage` option docs). Both units are now the ONLY
+  # implementation module.nix has (the Python router/backend pair was
+  # retired), so a caller that never passes `craneLib` gets NO agent-mcp
+  # deployment at all -- there is no Python fallback left.
+  conexusPkgsForVm =
     if craneLib == null then null
-    else (import ./conexus.nix { inherit pkgs lib craneLib; src = src; }).conexusLauncher;
+    else import ./conexus.nix { inherit pkgs lib craneLib; src = src; };
+  conexusLauncher =
+    if conexusPkgsForVm == null then null else conexusPkgsForVm.conexusLauncher;
+  conexusRouterWrapper =
+    if conexusPkgsForVm == null then null else conexusPkgsForVm.conexusRouterWrapper;
 in
 {
   imports = [
@@ -309,22 +329,14 @@ in
     })
 
     # Point the LLM consumers at the host, and make the probe a hard
-    # dependency of theirs. Deliberately NOT gating
-    # agent-mcp-router.service: it never embeds or completes, and a
-    # router that refuses to bind gives the developer a bare
-    # "connection refused" instead of a dashboard plus an explicit
-    # "backend failed to start" — strictly less diagnostic for the
-    # same guarantee. Everything that could produce a
-    # silently-degraded RAG result is gated.
-    (lib.optionalAttrs (!internalLlm && mode == "multi") {
-      "agent-mcp@" = {
-        environment = externalLlmEnvironment;
-        requires = [ llmEndpointCheckUnit ];
-        after = [ llmEndpointCheckUnit ];
-      };
-    })
-    (lib.optionalAttrs (!internalLlm && mode == "single") {
-      agent-mcp-backend = {
+    # dependency of theirs. Deliberately NOT gating conexus-router: it
+    # never embeds or completes, and a router that refuses to bind
+    # gives the developer a bare "connection refused" instead of a
+    # dashboard plus an explicit "backend failed to start" — strictly
+    # less diagnostic for the same guarantee. Everything that could
+    # produce a silently-degraded RAG result is gated.
+    (lib.optionalAttrs (!internalLlm) {
+      "conexus@" = {
         environment = externalLlmEnvironment;
         requires = [ llmEndpointCheckUnit ];
         after = [ llmEndpointCheckUnit ];
@@ -334,9 +346,9 @@ in
 
   services.agent-mcp = {
     enable = true;
-    mode = mode;
     src = src;
     conexusLauncherPackage = conexusLauncher;
+    conexusRouterPackage = conexusRouterWrapper;
     externalUrl = "http://localhost:5454";
     # /var/lib lives on the qcow2 disk, which the wrapper places in
     # the user's persist dir so it survives between runs.

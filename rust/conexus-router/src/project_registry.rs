@@ -59,9 +59,21 @@ use conexus_db::scheduled_directive_repository::parse_flexible;
 /// caller passes neither `expires_at` nor `grace_days`.
 pub const DEFAULT_ALIAS_GRACE_DAYS: i64 = 30;
 
-/// Every project defaults to this (today's only Python implementation)
-/// until a canary cutover explicitly flips it.
-pub const DEFAULT_BACKEND_IMPL: &str = "python";
+/// Interprets a truly legacy on-disk record with no `backend_impl`
+/// key at all (predating this field, e.g. a bare-string
+/// `{"name": "/workspace"}` entry). Phase F (prancy-napping-pie): the
+/// Python implementation is fully deleted from this Nix module now --
+/// there is no longer any on-disk record, legacy or otherwise, that
+/// `"python"` could meaningfully resolve to (the `agent-mcp@` unit
+/// template it would select no longer exists), so this defaults to
+/// `"rust"`. Kept as its own named constant (not inlined) for the
+/// same reason `backend_impl_for`'s own "unknown project" fallback
+/// stays a separate concern from this one, even though both now
+/// resolve to the identical value: they answer different questions
+/// (interpreting an existing-but-incomplete record vs. a lookup that
+/// found nothing at all) that happen to coincide today, not because
+/// they're the same thing.
+pub const DEFAULT_BACKEND_IMPL: &str = "rust";
 const VALID_BACKEND_IMPLS: [&str; 2] = ["python", "rust"];
 
 /// Kept in sync with `path_policy.rs`'s own project-name-segment

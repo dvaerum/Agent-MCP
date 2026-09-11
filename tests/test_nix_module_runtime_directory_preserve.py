@@ -16,7 +16,7 @@ including every live per-project ``conexus@<project>``/
 still own and are actively listening on.
 
 Confirmed live: a stray, still-enabled ``agent-mcp-router`` (the legacy
-Python router, meant to be inert once ``router.impl = "rust"`` clears its
+Python router, meant to be inert once ``router.impl = "rust"`` cleared its
 ``Install.WantedBy``) was crash-looping every ~10s (``address already in
 use`` against the real, already-bound ``conexus-router``). Each crash
 wiped ``%t/agent-mcp/`` out from under both live per-project backends --
@@ -26,12 +26,16 @@ failed, indistinguishable from "backend not ready" at every layer above
 this. The dashboard's per-project pages were non-functional on BOTH live
 projects for the full duration.
 
-``RuntimeDirectoryPreserve = "yes"`` on the two router units (matching
-what ``nix/module.nix``'s system-mode template already carries on ITS
-units) stops a unit's own stop from ever touching the tree, closing this
-off regardless of which router process crashes, restarts, or coexists
-mid-flip. This test pins that setting on all four RuntimeDirectory-
-declaring units so it can't silently regress back out.
+``RuntimeDirectoryPreserve = "yes"`` on the router unit (matching what
+``nix/module.nix``'s system-mode template already carries on ITS units)
+stops a unit's own stop from ever touching the tree. The Python router
+(``agent-mcp-router``) and the per-project Python backend
+(``agent-mcp@``) were retired together with the rest of the Python
+implementation, together with the ``router.impl`` A/B flip that used to
+let both router units briefly coexist mid-flip -- `conexus-router`/
+`conexus@` are the only two RuntimeDirectory-declaring units left, and
+this test pins the setting on both so it can't silently regress back
+out.
 """
 
 from __future__ import annotations
@@ -89,7 +93,7 @@ def runtime_directory_preserve() -> dict[str, str | None]:
 
 @pytest.mark.parametrize(
     "unit",
-    ["agent-mcp-router", "conexus-router", "agent-mcp@", "conexus@"],
+    ["conexus-router", "conexus@"],
 )
 def test_runtime_directory_is_preserved_across_a_stop(
     runtime_directory_preserve: dict[str, str | None], unit: str

@@ -25,7 +25,7 @@ use chrono::{DateTime, Utc};
 
 use crate::orchestrator::primitives::{backend_impl_for, run_systemctl, unit_name, SystemctlMode};
 use crate::orchestrator::runtime::RuntimeStore;
-use crate::project_registry::{ProjectRegistry, DEFAULT_BACKEND_IMPL};
+use crate::project_registry::ProjectRegistry;
 use conexus_db::scheduled_directive_repository::parse_flexible;
 
 /// One pass of the idle-reaper logic: stop every `(name, role)` whose
@@ -55,8 +55,14 @@ pub async fn reaper_tick(
             if elapsed <= idle {
                 continue;
             }
-            let backend_impl = backend_impl_for(registry, &name)
-                .unwrap_or_else(|_| DEFAULT_BACKEND_IMPL.to_string());
+            // Phase F (prancy-napping-pie): "rust", inlined rather
+            // than reused from DEFAULT_BACKEND_IMPL (a separate
+            // concern that happens to also be "rust" now) -- see
+            // `backend_impl_for`'s own doc for why a registry-read
+            // error here must not resolve to a unit template
+            // (`agent-mcp@`) that no longer exists in Nix.
+            let backend_impl =
+                backend_impl_for(registry, &name).unwrap_or_else(|_| "rust".to_string());
             let Ok(unit) = unit_name(&name, &role, &backend_impl) else {
                 continue;
             };

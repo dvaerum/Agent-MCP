@@ -257,15 +257,40 @@ fn schedule_backend_warm(state: &Arc<RouterState>, name: &str) {
 /// alike; only the spawn is authorization-gated, closing the
 /// arbitrary-tenant-activation gap a plain `GET /agent-mcp/app/<victim>/`
 /// would otherwise open for any authenticated non-member.
+// 8 args: private, single-call-shape helper shared by the two real
+// axum handlers below (bare `/app/{name}/` vs `/app/{name}/{*rest}`,
+// axum's own lack of an optional-trailing-wildcard extractor forces
+// two entry points) -- a struct would just move the same 8 fields
+// one level of indirection without adding a real invariant to name.
+#[allow(clippy::too_many_arguments)]
 async fn dashboard_handler_impl(
     state: &Arc<RouterState>,
     addr: SocketAddr,
     uri_path: &str,
+    uri_query: Option<&str>,
     headers: &HeaderMap,
     name: &str,
     warm_authorized: bool,
     rest: &str,
 ) -> Response {
+    // Phase F (prancy-napping-pie): W1 single-tenant redirect --
+    // port of `dashboard_handler`'s own `_maybe_single_tenant_redirect`
+    // call site (`agent_mcp/router/app.py`, the third of three; the
+    // other two -- `backend_mcp_handler`/`backend_api_handler` -- were
+    // already ported via `mcp_handler::maybe_single_tenant_redirect`,
+    // this dashboard call site was missed). Checked before the warm
+    // start / dashboard-file serve so a wrong-name URL never spawns a
+    // backend or serves a shell for the wrong project.
+    if !name.is_empty() {
+        if let Some(resp) = crate::mcp_handler::maybe_single_tenant_redirect(
+            &state.mcp_handler_config,
+            name,
+            uri_path,
+            uri_query,
+        ) {
+            return resp.into_response();
+        }
+    }
     if !name.is_empty() && warm_authorized {
         schedule_backend_warm(state, name);
     }
@@ -291,6 +316,7 @@ pub async fn dashboard_index_handler(
         &state,
         addr,
         uri.path(),
+        uri.query(),
         &headers,
         &name,
         warm_authorized,
@@ -312,6 +338,7 @@ pub async fn dashboard_handler(
         &state,
         addr,
         uri.path(),
+        uri.query(),
         &headers,
         &name,
         warm_authorized,
@@ -357,6 +384,87 @@ mod tests {
             },
         ));
         (dir, state)
+    }
+
+    /// Same as [`real_state`], configured for single-tenant mode
+    /// (Phase F regression coverage: `dashboard_handler`'s own W1
+    /// redirect call site was missed when this file was ported --
+    /// `mcp_handler::maybe_single_tenant_redirect` existed and was
+    /// tested for the other two call sites, but this one just served
+    /// the wrong project's shell with a 200 instead of redirecting).
+    async fn real_state_single_tenant(name: &str) -> (tempfile::TempDir, Arc<RouterState>) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_router_schema(&conn).unwrap();
+        let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
+        let sea_orm_db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
+        let state = Arc::new(RouterState::new(
+            conn,
+            sea_orm_db,
+            registry,
+            RateLimitConfig::resolve(|_| None),
+            EnsureConfig::from_env(|_| None),
+            RouterStateConfig {
+                sock_dir: dir.path().join("sockets"),
+                dashboard_dir: None,
+                external_url: None,
+                idle_sec: 14400,
+                asset_prefix: None,
+                single_tenant_name: Some(name.to_string()),
+                single_tenant_workspace: None,
+                max_streams_per_agent: 4,
+                max_streams_global: 64,
+                default_workspace_parent: dir.path().join("projects"),
+                token_dir: None,
+            },
+        ));
+        (dir, state)
+    }
+
+    #[tokio::test]
+    async fn dashboard_handler_impl_w1_redirects_a_wrong_project_name_in_single_tenant_mode() {
+        let (_dir, state) = real_state_single_tenant("only-project").await;
+        let resp = dashboard_handler_impl(
+            &state,
+            addr(),
+            "/agent-mcp/app/wrong-name/",
+            None,
+            &HeaderMap::new(),
+            "wrong-name",
+            true,
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), 302);
+        let location = resp
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap();
+        assert_eq!(location, "/agent-mcp/app/only-project/");
+        // A real gap this same missing check would have opened: the
+        // wrong-name path must NEVER warm-start a backend either.
+        assert!(state.runtime.snapshot("wrong-name").is_none());
+    }
+
+    #[tokio::test]
+    async fn dashboard_handler_impl_serves_normally_for_the_configured_single_tenant_project() {
+        let (_dir, state) = real_state_single_tenant("only-project").await;
+        let resp = dashboard_handler_impl(
+            &state,
+            addr(),
+            "/agent-mcp/app/only-project/",
+            None,
+            &HeaderMap::new(),
+            "only-project",
+            true,
+            "",
+        )
+        .await;
+        // No dashboard_dir configured in this fixture -> 404, not a
+        // redirect -- proves the CORRECT name falls through to the
+        // ordinary serve path instead of being redirected.
+        assert_eq!(resp.status(), 404);
     }
 
     #[test]
@@ -439,6 +547,7 @@ mod tests {
             &state,
             addr(),
             "/agent-mcp/app/victim/",
+            None,
             &HeaderMap::new(),
             "victim",
             false,
@@ -464,6 +573,7 @@ mod tests {
             &state,
             addr(),
             "/agent-mcp/app/shared/",
+            None,
             &HeaderMap::new(),
             "shared",
             true,

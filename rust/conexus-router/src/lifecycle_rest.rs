@@ -65,6 +65,31 @@ fn cookie_header(headers: &HeaderMap) -> Option<&str> {
     headers.get("cookie").and_then(|v| v.to_str().ok())
 }
 
+/// Defensive fallback for a write-lifecycle handler that reached its
+/// body with no `GateIdentity` extension present. Should be
+/// UNREACHABLE in a correctly configured deploy: the only way
+/// `session_gate_layer` admits a request without inserting an
+/// identity is `SessionGateOutcome::PassThrough` from single-tenant
+/// mode's `bypasses_operator_gate` (`single_tenant.rs`'s own doc:
+/// literally the same `single_tenant_name.is_some()` check as
+/// `disables_write_endpoint`), which every one of this file's write
+/// handlers now checks BEFORE touching identity at all -- so by the
+/// time this fallback could fire, `disables_write_endpoint` would
+/// already have returned the real 410 first. Kept anyway (never trust
+/// a sibling module's invariant to hold forever) rather than
+/// `.expect()`-panicking a genuinely malformed request into a 500.
+fn missing_identity_response() -> Response {
+    HandlerResponse {
+        status: 401,
+        headers: Vec::new(),
+        body: HandlerBody::Json(serde_json::json!({
+            "success": false,
+            "error": "unauthenticated",
+        })),
+    }
+    .into_response()
+}
+
 /// Port of `health_handler`. Genuinely unauthenticated -- see this
 /// module's own doc for why no `Extension<GateIdentity>` is taken.
 pub async fn health_handler(State(state): State<Arc<RouterState>>) -> Response {
@@ -104,21 +129,29 @@ pub async fn list_projects_handler(
 /// tenant deploy's `create_project` should always 410, and didn't.
 pub async fn create_project_handler(
     State(state): State<Arc<RouterState>>,
-    Extension(identity): Extension<GateIdentity>,
+    identity: Option<Extension<GateIdentity>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let single_tenant_name = state.mcp_handler_config.single_tenant_name.as_deref();
+    // Phase F (prancy-napping-pie): checked BEFORE identity is even
+    // required -- single-tenant mode's session gate never inserts a
+    // `GateIdentity` at all (see `missing_identity_response`'s own
+    // doc), so a hard `Extension<GateIdentity>` extractor 500s every
+    // single-tenant call to this route before this line ever runs.
+    if crate::single_tenant::disables_write_endpoint(single_tenant_name) {
+        return crate::single_tenant::single_tenant_disabled_response(single_tenant_name)
+            .into_response();
+    }
+    let Some(Extension(identity)) = identity else {
+        return missing_identity_response();
+    };
     if let Err(resp) = project_gate::require_capability(
         &identity,
         single_tenant_name,
         Capability::SystemProjectsManage,
     ) {
         return resp.into_response();
-    }
-    if crate::single_tenant::disables_write_endpoint(single_tenant_name) {
-        return crate::single_tenant::single_tenant_disabled_response(single_tenant_name)
-            .into_response();
     }
 
     let conn = state.conn.lock().await;
@@ -225,22 +258,28 @@ async fn systemctl_on_backend(
 /// step of any kind can run before it.
 pub async fn delete_project_handler(
     State(state): State<Arc<RouterState>>,
-    Extension(identity): Extension<GateIdentity>,
+    identity: Option<Extension<GateIdentity>>,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
     let single_tenant_name = state.mcp_handler_config.single_tenant_name.as_deref();
+    // Phase F: see `create_project_handler`'s identical comment --
+    // checked before identity is required, since single-tenant mode's
+    // session gate never inserts one.
+    if crate::single_tenant::disables_write_endpoint(single_tenant_name) {
+        return crate::single_tenant::single_tenant_disabled_response(single_tenant_name)
+            .into_response();
+    }
+    let Some(Extension(identity)) = identity else {
+        return missing_identity_response();
+    };
     if let Err(resp) = project_gate::require_capability(
         &identity,
         single_tenant_name,
         Capability::SystemProjectsManage,
     ) {
         return resp.into_response();
-    }
-    if crate::single_tenant::disables_write_endpoint(single_tenant_name) {
-        return crate::single_tenant::single_tenant_disabled_response(single_tenant_name)
-            .into_response();
     }
 
     let workspace = {
@@ -500,16 +539,24 @@ async fn systemctl_is_active(state: &RouterState, name: &str) -> bool {
 /// the two calls.
 pub async fn rename_project_handler(
     State(state): State<Arc<RouterState>>,
-    Extension(identity): Extension<GateIdentity>,
+    identity: Option<Extension<GateIdentity>>,
     Path(old_name): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let single_tenant_name = state.mcp_handler_config.single_tenant_name.as_deref();
+    // Phase F: see `create_project_handler`'s identical comment --
+    // already checked first here (this handler's own established
+    // ordering), but the extractor itself still needed widening to
+    // `Option` so single-tenant mode reaches this check instead of
+    // 500ing at extraction time.
     if crate::single_tenant::disables_write_endpoint(single_tenant_name) {
         return crate::single_tenant::single_tenant_disabled_response(single_tenant_name)
             .into_response();
     }
+    let Some(Extension(identity)) = identity else {
+        return missing_identity_response();
+    };
 
     let now = Utc::now();
     let now_str = now.to_rfc3339();
@@ -789,20 +836,24 @@ pub async fn overview_handler(
 /// closes the membership-rank half; this closes the capability half.
 pub async fn remove_alias_handler(
     State(state): State<Arc<RouterState>>,
-    Extension(identity): Extension<GateIdentity>,
+    identity: Option<Extension<GateIdentity>>,
     Path((name, alias)): Path<(String, String)>,
 ) -> Response {
     let single_tenant_name = state.mcp_handler_config.single_tenant_name.as_deref();
+    // Phase F: see `create_project_handler`'s identical comment.
+    if crate::single_tenant::disables_write_endpoint(single_tenant_name) {
+        return crate::single_tenant::single_tenant_disabled_response(single_tenant_name)
+            .into_response();
+    }
+    let Some(Extension(identity)) = identity else {
+        return missing_identity_response();
+    };
     if let Err(resp) = project_gate::require_capability(
         &identity,
         single_tenant_name,
         Capability::SystemProjectsManage,
     ) {
         return resp.into_response();
-    }
-    if crate::single_tenant::disables_write_endpoint(single_tenant_name) {
-        return crate::single_tenant::single_tenant_disabled_response(single_tenant_name)
-            .into_response();
     }
     let conn = state.conn.lock().await;
     match project_reads::decide_remove_alias(
@@ -981,6 +1032,34 @@ mod handler_tests {
         (dir, state)
     }
 
+    /// Same as [`test_state`], configured for single-tenant mode
+    /// (Phase F regression coverage: `session_gate_layer` never
+    /// inserts a `GateIdentity` extension for a single-tenant
+    /// `PassThrough` -- see `missing_identity_response`'s own doc for
+    /// why every write handler must check `disables_write_endpoint`
+    /// before requiring one).
+    async fn test_state_single_tenant(name: &str) -> (tempfile::TempDir, Arc<RouterState>) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("router.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        init_router_schema(&conn).unwrap();
+        let registry = ProjectRegistry::new(dir.path().join("projects.local.json"));
+        let sea_orm_db = sea_orm::Database::connect(format!("sqlite://{}", db_path.display()))
+            .await
+            .unwrap();
+        let mut cfg = test_state_config(dir.path());
+        cfg.single_tenant_name = Some(name.to_string());
+        let state = Arc::new(RouterState::new(
+            conn,
+            sea_orm_db,
+            registry,
+            RateLimitConfig::resolve_from_process_env(),
+            EnsureConfig::from_env(|_| None),
+            cfg,
+        ));
+        (dir, state)
+    }
+
     /// Builds a `GateIdentity` directly, exactly like
     /// `project_gate.rs`'s own `identity_with` helper -- `require_
     /// capability` is a pure in-memory check on `principal.
@@ -1073,7 +1152,7 @@ mod handler_tests {
         let identity = identity_for("vera", false, HashSet::new());
         let resp = delete_project_handler(
             State(state.clone()),
-            Extension(identity),
+            Some(Extension(identity)),
             Path("proj-a".to_string()),
             Query(HashMap::from([(
                 "delete_workspace".to_string(),
@@ -1145,7 +1224,7 @@ mod handler_tests {
         let identity = identity_for("vera", false, HashSet::new());
         let resp = remove_alias_handler(
             State(state.clone()),
-            Extension(identity),
+            Some(Extension(identity)),
             Path(("victim".to_string(), "oldname".to_string())),
         )
         .await;
@@ -1232,7 +1311,7 @@ mod handler_tests {
         let identity = identity_for(&uid, true, HashSet::new());
         let resp = delete_project_handler(
             State(state.clone()),
-            Extension(identity),
+            Some(Extension(identity)),
             Path("proj-a".to_string()),
             Query(HashMap::new()),
             HeaderMap::new(),
@@ -1263,7 +1342,7 @@ mod handler_tests {
         let identity = identity_for(&uid, true, HashSet::new());
         let resp = delete_project_handler(
             State(state.clone()),
-            Extension(identity),
+            Some(Extension(identity)),
             Path("gone".to_string()),
             Query(HashMap::new()),
             HeaderMap::new(),
@@ -1292,7 +1371,7 @@ mod handler_tests {
         let identity = identity_for(&uid, true, HashSet::new());
         let resp = rename_project_handler(
             State(state.clone()),
-            Extension(identity),
+            Some(Extension(identity)),
             Path("old-name".to_string()),
             HeaderMap::new(),
             Bytes::from_static(br#"{"name": "new-name", "grace_days": 7}"#),
@@ -1327,7 +1406,7 @@ mod handler_tests {
         let identity = identity_for(&uid, true, HashSet::new());
         let resp = rename_project_handler(
             State(state.clone()),
-            Extension(identity),
+            Some(Extension(identity)),
             Path("old-name".to_string()),
             HeaderMap::new(),
             Bytes::from_static(br#"{"name": "old-name", "grace_days": 7}"#), // collides with itself
@@ -1495,7 +1574,7 @@ mod handler_tests {
         let task = tokio::spawn(async move {
             delete_project_handler(
                 State(state2),
-                Extension(identity),
+                Some(Extension(identity)),
                 Path("racer-del".to_string()),
                 Query(HashMap::new()),
                 HeaderMap::new(),
@@ -1537,7 +1616,7 @@ mod handler_tests {
         let task = tokio::spawn(async move {
             rename_project_handler(
                 State(state2),
-                Extension(identity),
+                Some(Extension(identity)),
                 Path("racer-ren".to_string()),
                 HeaderMap::new(),
                 Bytes::from_static(br#"{"name": "racer-ren-2"}"#),
@@ -1616,7 +1695,7 @@ mod handler_tests {
         let task = tokio::spawn(async move {
             delete_project_handler(
                 State(state2),
-                Extension(identity),
+                Some(Extension(identity)),
                 Path("race-delete-project".to_string()),
                 Query(HashMap::new()),
                 HeaderMap::new(),
@@ -1694,7 +1773,7 @@ mod handler_tests {
         let task = tokio::spawn(async move {
             rename_project_handler(
                 State(state2),
-                Extension(identity),
+                Some(Extension(identity)),
                 Path("race-rename-lock".to_string()),
                 HeaderMap::new(),
                 Bytes::from_static(br#"{"name": "renamed-race-lock", "grace_days": 7}"#),
@@ -1742,7 +1821,7 @@ mod handler_tests {
         let task = tokio::spawn(async move {
             rename_project_handler(
                 State(state2),
-                Extension(identity),
+                Some(Extension(identity)),
                 Path("race-rename-lock-membership".to_string()),
                 HeaderMap::new(),
                 Bytes::from_static(br#"{"name": "renamed-race-lock-membership", "grace_days": 7}"#),
@@ -1849,7 +1928,7 @@ mod handler_tests {
         let identity = identity_for(&uid, true, HashSet::new());
         let resp = rename_project_handler(
             State(state.clone()),
-            Extension(identity),
+            Some(Extension(identity)),
             Path("ephemeral".to_string()),
             HeaderMap::new(),
             Bytes::from_static(br#"{"name": "renamed"}"#),
@@ -1875,7 +1954,7 @@ mod handler_tests {
         let identity = identity_for(&uid, true, HashSet::new());
         let resp = rename_project_handler(
             State(state.clone()),
-            Extension(identity),
+            Some(Extension(identity)),
             Path("runt".to_string()),
             HeaderMap::new(),
             Bytes::from_static(br#"{"name": "grown"}"#),
@@ -2034,7 +2113,7 @@ exit 0
         let winner = tokio::spawn(async move {
             rename_project_handler(
                 State(winner_state),
-                Extension(winner_identity),
+                Some(Extension(winner_identity)),
                 Path("contended".to_string()),
                 HeaderMap::new(),
                 Bytes::from_static(br#"{"name": "winner"}"#),
@@ -2051,7 +2130,7 @@ exit 0
         let loser = tokio::spawn(async move {
             rename_project_handler(
                 State(loser_state),
-                Extension(loser_identity),
+                Some(Extension(loser_identity)),
                 Path("contended".to_string()),
                 HeaderMap::new(),
                 Bytes::from_static(br#"{"name": "loser"}"#),
@@ -2117,7 +2196,7 @@ exit 0
         let loser = tokio::spawn(async move {
             rename_project_handler(
                 State(loser_state),
-                Extension(loser_identity),
+                Some(Extension(loser_identity)),
                 Path("losesrc".to_string()),
                 HeaderMap::new(),
                 Bytes::from_static(br#"{"name": "shared"}"#),
@@ -2131,7 +2210,7 @@ exit 0
         let winner_identity = identity_for(&uid, true, HashSet::new());
         let winner_resp = rename_project_handler(
             State(state.clone()),
-            Extension(winner_identity),
+            Some(Extension(winner_identity)),
             Path("winsrc".to_string()),
             HeaderMap::new(),
             Bytes::from_static(br#"{"name": "shared"}"#),
@@ -2182,7 +2261,7 @@ exit 0
         let rename_task = tokio::spawn(async move {
             rename_project_handler(
                 State(rename_state),
-                Extension(rename_identity),
+                Some(Extension(rename_identity)),
                 Path("mover".to_string()),
                 HeaderMap::new(),
                 Bytes::from_static(br#"{"name": "fresh"}"#),
@@ -2195,7 +2274,7 @@ exit 0
         let create_identity = identity_for(&uid, true, HashSet::new());
         let create_resp = create_project_handler(
             State(state.clone()),
-            Extension(create_identity),
+            Some(Extension(create_identity)),
             HeaderMap::new(),
             Bytes::from_static(br#"{"name": "fresh"}"#),
         )
@@ -2248,7 +2327,7 @@ exit 0
 
         let resp = create_project_handler(
             State(state.clone()),
-            Extension(identity),
+            Some(Extension(identity)),
             HeaderMap::new(),
             Bytes::from(deep_body),
         )
@@ -2269,7 +2348,7 @@ exit 0
 
         let resp = create_project_handler(
             State(state.clone()),
-            Extension(identity),
+            Some(Extension(identity)),
             HeaderMap::new(),
             Bytes::from_static(br#"{"name": "proj-new"}"#),
         )
@@ -2303,7 +2382,7 @@ exit 0
         let identity = identity_for(&uid, true, HashSet::new());
         let resp = rename_project_handler(
             State(state.clone()),
-            Extension(identity),
+            Some(Extension(identity)),
             Path("old-name".to_string()),
             HeaderMap::new(),
             Bytes::from_static(br#"{"name": "new-name", "grace_days": 7}"#),
@@ -2351,7 +2430,7 @@ exit 0
         let identity = identity_for(&uid, true, HashSet::new());
         let resp = delete_project_handler(
             State(state.clone()),
-            Extension(identity),
+            Some(Extension(identity)),
             Path("proj-a".to_string()),
             Query(HashMap::new()),
             HeaderMap::new(),
@@ -2366,5 +2445,66 @@ exit 0
                 .is_none(),
             "delete must purge every project_membership row via sea-orm"
         );
+    }
+
+    // -- Phase F regression: single-tenant write endpoints must 410,
+    // not 500, for a genuinely UNAUTHENTICATED caller (the real bug a
+    // Nix VM test caught -- `session_gate_layer` never inserts a
+    // `GateIdentity` extension in single-tenant `PassThrough` mode, so
+    // a hard `Extension<GateIdentity>` extractor panicked at the axum
+    // framework level before any handler code -- including the
+    // `disables_write_endpoint` check itself -- ever ran). -----------
+
+    #[tokio::test]
+    async fn create_project_handler_410s_without_identity_in_single_tenant_mode() {
+        let (_dir, state) = test_state_single_tenant("onlyproj").await;
+        let resp = create_project_handler(
+            State(state.clone()),
+            None,
+            HeaderMap::new(),
+            Bytes::from(r#"{"name": "newproj"}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), 410, "{:?}", json_body(resp).await);
+    }
+
+    #[tokio::test]
+    async fn delete_project_handler_410s_without_identity_in_single_tenant_mode() {
+        let (_dir, state) = test_state_single_tenant("onlyproj").await;
+        let resp = delete_project_handler(
+            State(state.clone()),
+            None,
+            Path("onlyproj".to_string()),
+            Query(HashMap::new()),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(resp.status(), 410, "{:?}", json_body(resp).await);
+    }
+
+    #[tokio::test]
+    async fn rename_project_handler_410s_without_identity_in_single_tenant_mode() {
+        let (_dir, state) = test_state_single_tenant("onlyproj").await;
+        let resp = rename_project_handler(
+            State(state.clone()),
+            None,
+            Path("onlyproj".to_string()),
+            HeaderMap::new(),
+            Bytes::from(r#"{"name": "other"}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), 410, "{:?}", json_body(resp).await);
+    }
+
+    #[tokio::test]
+    async fn remove_alias_handler_410s_without_identity_in_single_tenant_mode() {
+        let (_dir, state) = test_state_single_tenant("onlyproj").await;
+        let resp = remove_alias_handler(
+            State(state.clone()),
+            None,
+            Path(("onlyproj".to_string(), "some-alias".to_string())),
+        )
+        .await;
+        assert_eq!(resp.status(), 410, "{:?}", json_body(resp).await);
     }
 }

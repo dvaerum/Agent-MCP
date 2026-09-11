@@ -36,12 +36,20 @@
 #
 # Mirror counterpart: ./single-tenant.nix (same harness, opposite
 # toggle assertions).
-{ pkgs, lib, self, ... }:
+{ pkgs, lib, self, craneLib, ... }:
 
 let
   ports = import ./_ports.nix;
   packagedPkgs = import ../packages.nix {
     inherit pkgs lib;
+    src = self;
+  };
+  # The Python router/backend this test used to boot
+  # (`agentMcpRouterWrapper`/`agentMcpLauncher`) was retired together
+  # with the rest of the Python source tree; `conexus-router`/
+  # `conexus-backend` (via `nix/conexus.nix`) are the sole replacement.
+  conexusPkgs = import ../conexus.nix {
+    inherit pkgs lib craneLib;
     src = self;
   };
 in
@@ -65,9 +73,9 @@ pkgs.testers.nixosTest {
     users.groups.testuser = {};
 
     # ── Per-project backend template ────────────────────────────────
-    # Lazy-spawned by the router (`systemctl start agent-mcp@<name>`).
-    systemd.services."agent-mcp@" = {
-      description = "Agent-MCP backend — project %i";
+    # Lazy-spawned by the router (`systemctl start conexus@<name>`).
+    systemd.services."conexus@" = {
+      description = "CoNexus backend — project %i";
       after = [ "fake-openai.service" ];
       serviceConfig = {
         Type = "simple";
@@ -89,7 +97,7 @@ pkgs.testers.nixosTest {
         ];
         RuntimeDirectory = "agent-mcp/%i";
         RuntimeDirectoryMode = "0700";
-        # See agent-mcp-router's own RuntimeDirectoryPreserve comment
+        # See conexus-router's own RuntimeDirectoryPreserve comment
         # below -- same bare-parent-vs-%i-child sharing, same fix.
         RuntimeDirectoryPreserve = "yes";
         # R8-F2 class-sweep: same forwarding-HMAC fix as single-tenant.nix
@@ -100,7 +108,7 @@ pkgs.testers.nixosTest {
           "${pkgs.coreutils}/bin/rm -f /run/agent-mcp/%i/backend.sock"
         ];
         ExecStart = ''
-          ${packagedPkgs.agentMcpLauncher}/bin/agent-mcp-launcher %i
+          ${conexusPkgs.conexusLauncher}/bin/conexus-launcher %i
         '';
         Restart = "on-failure";
         RestartSec = 5;
@@ -108,16 +116,27 @@ pkgs.testers.nixosTest {
     };
 
     # ── Router unit (multi-tenant) ───────────────────────────────────
-    systemd.services.agent-mcp-router = {
-      description = "Agent-MCP router (multi-tenant test)";
+    # `conexus-router` (Rust) — the sole router implementation now
+    # that the Python one (`agent-mcp-router`) was retired. Most of
+    # Python's env-var-only config surface is a real CLI flag on
+    # `conexus-router` (see its own `Cli` struct doc in rust/
+    # conexus-router/src/main.rs); `AGENT_MCP_ROUTER_HOST`/
+    # `AGENT_MCP_SYSTEMCTL_MODE`/`AGENT_MCP_BOOTSTRAP_*`/
+    # `AGENT_MCP_ROUTER_DB` have no CLI-flag equivalent (env-var-only
+    # on the Python router too) and stay environment variables.
+    # `AGENT_MCP_README_HTML`/`AGENT_MCP_INSTALLER_TEMPLATE` are
+    # dropped -- `conexus-router` doesn't consume them yet, and
+    # neither `readmeHtml` nor `installerTemplate` exist in
+    # packages.nix any more (Python-router-only assets).
+    systemd.services.conexus-router = {
+      description = "CoNexus router (multi-tenant test)";
       wantedBy = [ "multi-user.target" ];
       after = [ "fake-openai.service" "network.target" ];
       environment = {
-        AGENT_MCP_PROJECTS_FILE = "/home/testuser/.config/agent-mcp/projects.local.json";
-        # Phase 1 PR B (prancy-napping-pie): router runs Alembic
-        # against this DB at startup. Default /var/lib/agent-mcp is
-        # not writable by testuser; point at testuser's home so the
-        # ExecStartPre mkdir below covers both.
+        # Phase 1 PR B (prancy-napping-pie): router runs its schema
+        # migrations against this DB at startup. Default
+        # /var/lib/agent-mcp is not writable by testuser; point at
+        # testuser's home so the ExecStartPre mkdir below covers both.
         AGENT_MCP_ROUTER_DB = "/home/testuser/.config/agent-mcp/router.db";
         # Phase 1 PR C: seed a sentinel operator via env-var bootstrap
         # so the empty-users redirect middleware is dormant — this
@@ -126,18 +145,15 @@ pkgs.testers.nixosTest {
         # the first-boot wizard.
         AGENT_MCP_BOOTSTRAP_USERNAME = "ci-sentinel";
         AGENT_MCP_BOOTSTRAP_PASSWORD = "ci-sentinel-pw";
-        AGENT_MCP_SOCK_DIR = "/run/agent-mcp";
-        AGENT_MCP_DASHBOARD_DIR = "${packagedPkgs.agentMcpDashboard}/share/agent-mcp-dashboard";
-        AGENT_MCP_EXTERNAL_URL = "http://localhost:${toString ports.routerPort}";
-        AGENT_MCP_DEFAULT_WORKSPACE = "/home/testuser/projects";
-        AGENT_MCP_ROUTER_PORT = toString ports.routerPort;
         AGENT_MCP_ROUTER_HOST = "0.0.0.0";
-        AGENT_MCP_IDLE_SEC = "14400";
-        AGENT_MCP_README_HTML = "${packagedPkgs.readmeHtml}";
-        AGENT_MCP_INSTALLER_TEMPLATE = "${packagedPkgs.installerTemplate}";
+        # `--default-workspace` has no CLI-flag equivalent on
+        # `conexus-router` (env-var-only); without it, projects created
+        # via __create/api/router/projects would land under the wrong
+        # fallback path (see home-manager-module.nix's own comment).
+        AGENT_MCP_DEFAULT_WORKSPACE = "/home/testuser/projects";
         # R8-F2 class-sweep: same dormant mismatch fixed in
         # single-tenant.nix — the router defaults to `systemctl
-        # --user`, but this VM's agent-mcp@%i template is a
+        # --user`, but this VM's conexus@%i template is a
         # system-level unit. This test's own docstring notes it never
         # actually exercises the backend (no `_ensure`/systemctl-start
         # call happens), so the wrong default has been silently inert
@@ -151,9 +167,9 @@ pkgs.testers.nixosTest {
         User = "testuser";
         Group = "testuser";
         # RuntimeDirectoryPreserve=yes (live incident 2026-09-07, see
-        # nix/home-manager-module.nix's agent-mcp-router unit for the
+        # nix/home-manager-module.nix's conexus-router unit for the
         # full writeup): this bare, single-component RuntimeDirectory
-        # is a strict parent of agent-mcp@'s own "agent-mcp/%i" above --
+        # is a strict parent of conexus@'s own "agent-mcp/%i" above --
         # per systemd.exec(5), that makes it THIS unit's own innermost
         # subdirectory, so without `=yes` every stop of this router
         # (crash-loop, redeploy) recursively deletes the whole
@@ -164,14 +180,21 @@ pkgs.testers.nixosTest {
         RuntimeDirectoryMode = "0700";
         RuntimeDirectoryPreserve = "yes";
         ExecStartPre = "${pkgs.coreutils}/bin/mkdir -p /home/testuser/.config/agent-mcp /home/testuser/projects";
-        ExecStart = "${packagedPkgs.agentMcpRouterWrapper}/bin/agent-mcp-router";
+        ExecStart =
+          "${conexusPkgs.conexusRouterWrapper}/bin/conexus-router "
+          + "--port ${toString ports.routerPort} "
+          + "--projects-file /home/testuser/.config/agent-mcp/projects.local.json "
+          + "--sock-dir /run/agent-mcp "
+          + "--dashboard-dir ${packagedPkgs.agentMcpDashboard}/share/agent-mcp-dashboard "
+          + "--external-url ${lib.escapeShellArg "http://localhost:${toString ports.routerPort}"} "
+          + "--idle-sec 14400";
         Restart = "on-failure";
         RestartSec = 5;
       };
     };
 
     # The router runs as testuser but the per-project template starts
-    # via the system bus; testuser needs to manage agent-mcp@* units
+    # via the system bus; testuser needs to manage conexus@* units
     # via polkit (no sudo prompt).
     security.polkit.enable = true;
     security.polkit.extraConfig = ''
@@ -179,7 +202,7 @@ pkgs.testers.nixosTest {
         if (action.id == "org.freedesktop.systemd1.manage-units" &&
             subject.user == "testuser") {
           var unit = action.lookup("unit");
-          if (unit && (unit.indexOf("agent-mcp@") == 0)) {
+          if (unit && (unit.indexOf("conexus@") == 0)) {
             return polkit.Result.YES;
           }
         }
@@ -193,7 +216,7 @@ pkgs.testers.nixosTest {
   testScript = ''
     start_all()
     machine.wait_for_unit("fake-openai.service")
-    machine.wait_for_unit("agent-mcp-router.service")
+    machine.wait_for_unit("conexus-router.service")
     machine.wait_for_open_port(${toString ports.routerPort})
 
     # Phase 1 PR D (prancy-napping-pie): the router now requires an
@@ -203,7 +226,7 @@ pkgs.testers.nixosTest {
     # the cookie jar persists across the rest of the test.
     machine.succeed(
         "curl -fsS -c /tmp/agent-mcp-cookies.txt "
-        "-F username=ci-sentinel -F password=ci-sentinel-pw "
+        "--data 'username=ci-sentinel&password=ci-sentinel-pw' "
         "http://127.0.0.1:${toString ports.routerPort}/agent-mcp/login"
     )
 
