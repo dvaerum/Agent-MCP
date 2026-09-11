@@ -78,17 +78,17 @@ pub fn ensure_forwarding_hmac_key(
 /// propagating an error) preserves today's only-attempt-a-stop
 /// behavior.
 ///
-/// Deliberately NOT `project_registry::DEFAULT_BACKEND_IMPL` (Phase F,
-/// prancy-napping-pie): that constant is a DIFFERENT concern -- how to
-/// interpret a truly legacy on-disk record with no `backend_impl` key
-/// at all (predating the field, back when Python genuinely was the
-/// only implementation) -- not the fallback for a project this lookup
-/// can't find at all. Since the Nix `agent-mcp@` unit template no
-/// longer exists (the Python implementation itself is deleted, same
-/// `decide_create_project` rationale as `project_gate.rs`), defaulting
-/// this fallback to `"python"` would resolve to a unit that can never
-/// exist; `"rust"` is the only implementation a stop/reaper attempt
-/// could ever meaningfully target.
+/// Deliberately its own inlined `"rust"` literal, not a reuse of
+/// `project_registry::DEFAULT_BACKEND_IMPL` (which now also resolves
+/// to `"rust"`, Phase F, prancy-napping-pie): that constant answers a
+/// DIFFERENT question -- how to interpret a truly legacy on-disk
+/// record with no `backend_impl` key at all -- not the fallback for a
+/// project this lookup can't find at all. The two happen to agree
+/// today only because the Python implementation is fully deleted (the
+/// `agent-mcp@` unit template no longer exists, same
+/// `decide_create_project` rationale as `project_gate.rs`), so
+/// `"rust"` is the only implementation either fallback could ever
+/// meaningfully target -- not because they're the same concern.
 pub fn backend_impl_for(registry: &ProjectRegistry, name: &str) -> Result<String, RegistryError> {
     Ok(registry
         .get(name)?

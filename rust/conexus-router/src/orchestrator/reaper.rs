@@ -55,8 +55,9 @@ pub async fn reaper_tick(
             if elapsed <= idle {
                 continue;
             }
-            // Phase F (prancy-napping-pie): "rust", not
-            // DEFAULT_BACKEND_IMPL ("python") -- see
+            // Phase F (prancy-napping-pie): "rust", inlined rather
+            // than reused from DEFAULT_BACKEND_IMPL (a separate
+            // concern that happens to also be "rust" now) -- see
             // `backend_impl_for`'s own doc for why a registry-read
             // error here must not resolve to a unit template
             // (`agent-mcp@`) that no longer exists in Nix.
