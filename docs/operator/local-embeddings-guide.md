@@ -234,8 +234,7 @@ OLLAMA_MODEL=qwen3-embedding:0.6b
 OLLAMA_URL=http://localhost:11434
 
 # Project Settings — normally set by `--project-dir` on the CLI.
-# Only export manually for advanced cases (e.g. running Alembic
-# migrations outside the CLI; see agent_mcp/db/README.md).
+# Only export manually for advanced cases.
 # MCP_PROJECT_DIR=.
 ```
 

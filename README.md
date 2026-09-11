@@ -101,13 +101,13 @@ paths:
    ```bash
    export AGENT_MCP_BOOTSTRAP_USERNAME="dennis"
    export AGENT_MCP_BOOTSTRAP_PASSWORD="..."
-   uv run -m agent_mcp.router
+   conexus-router --port 5454
    ```
 
    The router creates the first operator on startup and unsets the
    env vars in-process so the password doesn't leak into subprocess
    spawns.
-3. **CLI** — `uv run -m agent_mcp.router create-operator --username
+3. **CLI** — `conexus-cli router create-operator --username
    alice` (prompts for password). Useful for adding subsequent
    operators after first boot.
 

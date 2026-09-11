@@ -18,31 +18,28 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    # Phase F (prancy-napping-pie): agent_mcp/ is now schema/ORM/
-    # migrations only (the app, router, and tool-catalogue code that
-    # needed click/openai/fastapi/starlette/sse-starlette/aiohttp/
-    # uvicorn/uvloop/httptools/jinja2/python-dotenv/httpx/requests/mcp/
-    # argon2-cffi/authlib is deleted, fully superseded by the Rust
-    # conexus-* workspace) -- this list is the real, minimal import
-    # surface of what's left, not a snapshot to prune later. Verified
-    # by grepping every surviving agent_mcp/**/*.py for its actual
-    # top-level imports before trimming, not assumed from memory.
-    "anyio",
-    "sqlite-vec",
-    "sqlalchemy>=2.0",
-    "alembic",
+    # Phase F (prancy-napping-pie): the schema/ORM/migrations code
+    # that needed anyio/sqlite-vec/sqlalchemy/alembic (agent_mcp/db,
+    # agent_mcp/migrations, agent_mcp/router, agent_mcp/core) is
+    # deleted -- schema authority moved to the Rust conexus-*
+    # workspace's sea-orm-migration baseline, live in production.
+    # agent_mcp/ is now just a version-metadata __init__.py plus the
+    # (JS, not Python) dashboard/ frontend -- genuinely zero runtime
+    # dependencies left, not a snapshot to prune later.
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest",
     "pytest-asyncio",
-    # Parallel test execution across CPU cores. The suite pays a
-    # ~4s lifespan-startup cost on the first test in each worker
-    # (sqlite-vec load + Alembic upgrade + RAG init), but per-test
-    # cost is tiny — so splitting across workers wins wall-clock
-    # time on multi-core machines. See [tool.pytest.ini_options]
-    # below for the default `-n auto` config and override notes.
+    # Parallel test execution across CPU cores. Phase F deleted the
+    # Python app that used to dominate this cost (lifespan startup:
+    # sqlite-vec load + Alembic upgrade + RAG init) -- the remaining
+    # suite's real cost driver is the several tests/test_nix_*.py
+    # files' real `nix build`/`nix eval` invocations, which still
+    # benefit from running in parallel across workers rather than
+    # serially. See [tool.pytest.ini_options] below for the default
+    # `-n auto` config and override notes.
     "pytest-xdist>=3.0",
     # Pinned exactly: the CI lint gate installs dev deps by
     # re-resolving pyproject (not from uv.lock), so an unpinned ruff
@@ -62,21 +59,6 @@ py-modules = []
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["agent_mcp*"]
-
-[tool.setuptools.package-data]
-"agent_mcp" = [
-    "migrations/*.py",
-    "migrations/*.mako",
-    "migrations/README",
-    "migrations/versions/*.py",
-    # Router-level identity migrations (Phase 1 PR B,
-    # prancy-napping-pie). Separate Alembic tree from the per-project
-    # migrations/ above — same packaging story.
-    "router/migrations/*.py",
-    "router/migrations/*.mako",
-    "router/migrations/README",
-    "router/migrations/versions/*.py",
-]
 
 [tool.rye]
 managed = true

@@ -17,7 +17,8 @@ You should have received a copy of the GNU Affero General Public License
 along with this program. If not, see <https://www.gnu.org/licenses/>.
 """
 
-from importlib.metadata import PackageNotFoundError, version as _version
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _version
 
 # pyproject.toml is the single source of truth for the version; read it back
 # from the installed package metadata rather than duplicating a literal here
