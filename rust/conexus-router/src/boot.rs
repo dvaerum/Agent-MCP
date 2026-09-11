@@ -5,18 +5,19 @@
 //! `_resolve_bind_host`/`_host_is_loopback`/`_assert_startup_safe`
 //! plus `migrations_runner.py::get_router_db_path`.
 //!
-//! **Alembic stays the authoritative migration owner for a REAL
-//! router.db** until every Python router is decommissioned (Phase F,
-//! matching `conexus_db::schema`'s own module doc and
-//! `conexus-backend::boot::open_and_init_db`'s identical precedent):
-//! [`open_and_init_router_db`] calls `init_router_schema`, which is
-//! `CREATE TABLE IF NOT EXISTS` -- a no-op against an already-migrated
-//! database, exactly like Python's own `init_router_db()` (Alembic
-//! upgrade, itself idempotent) being safe to re-run at every boot.
+//! **Schema authority is `conexus_db::migration::RouterMigrator`**
+//! (sea-orm-migration), matching `conexus-backend::boot`'s identical
+//! Phase F cutover: [`open_and_init_router_db`] only opens the file
+//! now; [`apply_baseline_migration`] runs the real migration against
+//! the sea-orm connection `main.rs` opens right after, a no-op
+//! against an already-migrated `router.db` (whether adopted via
+//! `conexus-cli seed-baseline` or by a prior run of this exact
+//! function).
 
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use conexus_db::migration::{MigratorTrait, RouterMigrator};
 use rusqlite::Connection;
 
 use crate::rate_limit;
@@ -35,18 +36,23 @@ pub fn router_db_path(get_env: impl Fn(&str) -> Option<String>) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(DEFAULT_ROUTER_DB))
 }
 
-/// Open (creating if absent) the router DB and apply this crate's
-/// schema.
+/// Open (creating if absent) the router DB. Schema authority is
+/// [`apply_baseline_migration`], run separately -- see this module's
+/// own doc.
 pub fn open_and_init_router_db(path: &std::path::Path) -> Result<Connection> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create router DB directory {}", parent.display()))?;
     }
-    let conn = Connection::open(path)
-        .with_context(|| format!("open router database {}", path.display()))?;
-    conexus_db::schema::init_router_schema(&conn)
-        .with_context(|| format!("initialize schema at {}", path.display()))?;
-    Ok(conn)
+    Connection::open(path).with_context(|| format!("open router database {}", path.display()))
+}
+
+/// Apply the real schema-authority baseline against `sea_orm_db` (the
+/// same file [`open_and_init_router_db`] just opened/created).
+pub async fn apply_baseline_migration(sea_orm_db: &sea_orm::DatabaseConnection) -> Result<()> {
+    RouterMigrator::up(sea_orm_db, None)
+        .await
+        .context("apply the sea-orm-migration schema-authority baseline")
 }
 
 /// Port of `identity.py::init_router_db`'s env-var-bootstrap half
@@ -287,6 +293,57 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         move |key: &str| map.get(key).cloned()
+    }
+
+    // -- open_and_init_router_db / apply_baseline_migration --------------
+
+    #[test]
+    fn open_and_init_router_db_creates_the_file_with_no_schema_yet() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("router.db");
+        let conn = open_and_init_router_db(&path).unwrap();
+        assert!(path.is_file());
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn apply_baseline_migration_creates_the_full_router_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("router.db");
+        open_and_init_router_db(&path).unwrap();
+        let sea_orm_db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        apply_baseline_migration(&sea_orm_db).await.unwrap();
+
+        let conn = Connection::open(&path).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='users'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn apply_baseline_migration_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("router.db");
+        open_and_init_router_db(&path).unwrap();
+        let sea_orm_db = sea_orm::Database::connect(format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        apply_baseline_migration(&sea_orm_db).await.unwrap();
+        apply_baseline_migration(&sea_orm_db).await.unwrap();
     }
 
     // -- router_db_path --------------------------------------------------

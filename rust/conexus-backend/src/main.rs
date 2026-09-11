@@ -110,6 +110,20 @@ async fn main() -> Result<()> {
                 sea_orm_db_path.display()
             )
         })?;
+    // Phase F schema-authority cutover: sea-orm-migration's `Migrator`
+    // is now the boot-time schema authority (replacing Alembic for a
+    // real production database, and `schema::init_schema`'s own
+    // already-behind DDL for a genuinely fresh one) -- a no-op against
+    // this project's real database, already adopted via
+    // `conexus-cli seed-baseline`.
+    boot::apply_baseline_migration(&sea_orm_db)
+        .await
+        .with_context(|| {
+            format!(
+                "apply schema-authority baseline at {}",
+                sea_orm_db_path.display()
+            )
+        })?;
     let forwarding_hmac_key = boot::load_forwarding_hmac_key(cli.forwarding_hmac_in.as_deref());
     if cli.forwarding_hmac_in.is_some() && forwarding_hmac_key.is_none() {
         eprintln!(

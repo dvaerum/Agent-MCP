@@ -328,6 +328,13 @@ async fn main() -> Result<()> {
                 db_path.display()
             )
         })?;
+    // Phase F schema-authority cutover: `RouterMigrator` is now the
+    // boot-time schema authority for `router.db` (replacing Alembic) --
+    // a no-op against this router's real database, already adopted via
+    // `conexus-cli seed-baseline`.
+    boot::apply_baseline_migration(&sea_orm_db)
+        .await
+        .with_context(|| format!("apply schema-authority baseline at {}", db_path.display()))?;
 
     let projects_file = cli
         .projects_file
