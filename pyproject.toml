@@ -18,83 +18,29 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
+    # Phase F (prancy-napping-pie): agent_mcp/ is now schema/ORM/
+    # migrations only (the app, router, and tool-catalogue code that
+    # needed click/openai/fastapi/starlette/sse-starlette/aiohttp/
+    # uvicorn/uvloop/httptools/jinja2/python-dotenv/httpx/requests/mcp/
+    # argon2-cffi/authlib is deleted, fully superseded by the Rust
+    # conexus-* workspace) -- this list is the real, minimal import
+    # surface of what's left, not a snapshot to prune later. Verified
+    # by grepping every surviving agent_mcp/**/*.py for its actual
+    # top-level imports before trimming, not assumed from memory.
     "anyio",
-    "click",
-    "openai",
-    "fastapi",
-    "starlette",
-    # Battle-tested SSE transport (ping keepalive + disconnect-driven
-    # generator cancellation) for the operator live-update stream
-    # (GET /api/events). Already present transitively via `mcp`; pinned
-    # here as an explicit direct dependency since we import it directly.
-    "sse-starlette",
-    # The router's entire HTTP server: agent_mcp/router/*.py does
-    # `from aiohttp import web` in a dozen modules. Until now this was
-    # NOT declared here and reached the resolved tree only via the
-    # `pytest-aiohttp` *dev* extra — so a non-dev `pip install agent-mcp`
-    # produced a package whose `router` subcommand cannot import. Same
-    # class as the `sse-starlette` omission above. nix/packages.nix has
-    # always listed it explicitly, which is why the deployed closure
-    # worked and the gap stayed invisible.
-    "aiohttp",
-    # NOT `uvicorn[standard]`: that extra also drags in watchfiles
-    # (--reload, dev only) and colorama (Windows console colours),
-    # neither of which belongs in a Linux server closure — and the
-    # blanket alias hides which parts are actually load-bearing.
-    # uvicorn's Config defaults to loop="auto"/http="auto", so these
-    # two are picked up automatically when present and silently
-    # fall back to asyncio/h11 when not. app/main_app.py reasons
-    # explicitly about "a httptools-based uvicorn (the production
-    # build)" — which was NOT true of the deployed closure until
-    # these were declared here (2026-08-09).
-    "uvicorn",
-    "uvloop",
-    "httptools",
-    "jinja2",
-    "python-dotenv",
     "sqlite-vec",
-    "httpx",
-    "requests",
-    # Capped below 2.0: the CI test jobs resolve this range fresh from
-    # pyproject (not from uv.lock), and mcp 2.0.0 (2026-07-28) is a
-    # breaking major — `mcp.server.lowlevel.server.request_ctx` and the
-    # session/transport surfaces this codebase builds on all moved.
-    # Lifting the cap is a deliberate migration PR, not a resolver
-    # accident. uv.lock pins the in-range version we actually ship.
-    # Floor is 1.27.0, not 1.8.1: earlier versions raise an unhandled
-    # ClosedResourceError out of the SDK's own task group when a client
-    # disconnects mid-request (python-sdk#2306, fixed in 1.27.0). Seen live.
-    # nix/packages.nix carries a version-gated override so this floor is
-    # satisfiable on channels that still ship 1.26 — the two MUST move
-    # together or nixpkgs' pythonRuntimeDepsCheckHook fails the build.
-    "mcp>=1.27.0,<2",
     "sqlalchemy>=2.0",
     "alembic",
-    # Router-side identity store (Phase 1 PR B of prancy-napping-pie).
-    # argon2id is the recommended modern password-hashing scheme; the
-    # default PasswordHasher params (time_cost=2, memory_cost=64 MiB,
-    # parallelism=4) match OWASP guidance for 2024+.
-    "argon2-cffi",
-    # SSO via OIDC (Phase 3 Wave 3 of prancy-napping-pie). Authlib's
-    # ``integrations.requests_client.OAuth2Session`` gives us a sync
-    # client for the authorization-code flow + JWT id-token decode +
-    # discovery-document fetch. We only use the sync surface (the
-    # aiohttp surface lives under a separate optional dep that pulls
-    # ``httpx``); the callback handler runs the token exchange in a
-    # thread executor so it doesn't block the event loop.
-    "authlib>=1.3.0",
+    # db/pydantic_mirrors.py uses ConfigDict (pydantic v2 API) --
+    # previously reached only transitively via fastapi, never declared
+    # directly despite being imported directly.
+    "pydantic>=2",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest",
     "pytest-asyncio",
-    # pytest-aiohttp gives us the `aiohttp_client` fixture +
-    # `TestClient`/`TestServer` glue used by tests/router/ to exercise
-    # the vendored aiohttp router (router.py + project_registry.py from
-    # the deploy repo, vendored under tests/router/_fixtures/ for
-    # Phase 0 of the router-upstream plan).
-    "pytest-aiohttp",
     # Parallel test execution across CPU cores. The suite pays a
     # ~4s lifespan-startup cost on the first test in each worker
     # (sqlite-vec load + Alembic upgrade + RAG init), but per-test
@@ -123,15 +69,10 @@ include = ["agent_mcp*"]
 
 [tool.setuptools.package-data]
 "agent_mcp" = [
-    "py.typed",
-    "templates/**/*",
-    "static/**/*",
     "migrations/*.py",
     "migrations/*.mako",
     "migrations/README",
     "migrations/versions/*.py",
-    "prompts/*.json",
-    "router/*.in",
     # Router-level identity migrations (Phase 1 PR B,
     # prancy-napping-pie). Separate Alembic tree from the per-project
     # migrations/ above — same packaging story.
@@ -139,10 +80,6 @@ include = ["agent_mcp*"]
     "router/migrations/*.mako",
     "router/migrations/README",
     "router/migrations/versions/*.py",
-    # Router-level login + setup-wizard templates (Phase 1 PR C,
-    # prancy-napping-pie). Jinja loads these via FileSystemLoader
-    # rooted at agent_mcp/router/templates/.
-    "router/templates/*.html",
 ]
 
 [tool.rye]
@@ -153,16 +90,6 @@ dev-dependencies = [
     # above — see the rationale there.
     "ruff==0.16.1",
 ]
-
-[tool.rye.scripts]
-# Default run, assumes server mode
-run = { cmd = "uv run -m agent-mcp.cli -- server --port 8080 --project-dir ." }
-start = { cmd = "uv run -m agent-mcp.cli -- server --port 8080 --project-dir ." }
-cli = { cmd = "uv run -m agent-mcp.cli --" }
-test = { cmd = "pytest" }
-lint = { cmd = "ruff check ." }
-format = { cmd = "ruff format ." }
-index = { cmd = "uv run -m agent-mcp.features.rag.indexing -- --project-dir ." }
 
 [tool.pytest.ini_options]
 # `-n auto` runs one worker per CPU. On CI runners (2-4 cores) this
@@ -186,13 +113,6 @@ line_length = 88
 
 [tool.ruff]
 # ... existing code ...
-# Phase 0 of the router-upstream plan vendored two source files into
-# tests/router/_fixtures/. They are a one-time verbatim snapshot of the
-# deploy repo's router.py + project_registry.py; the whole directory is
-# deleted in Phase 1 when those files move to their permanent in-tree
-# home. Until then we exclude them from lint so the snapshot stays
-# byte-identical to its upstream.
-extend-exclude = ["tests/router/_fixtures"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["agent-mcp"]
@@ -226,16 +146,3 @@ known-first-party = ["agent-mcp"]
     "DTZ003",
     "DTZ005",
 ]
-# PLE2502 (bidirectional-unicode) fires on the RTL-override / BOM /
-# zero-width characters this file embeds — they ARE the subject under
-# test (it pins that /api/memories rejects spoofable context keys), so
-# the file cannot exist without them. Scoped to this one file rather
-# than tests/** so the rule keeps guarding every other test. A `noqa`
-# is not an option: two of the five hits are inside the module
-# docstring, where a trailing comment is just more string content.
-"tests/test_memories_unsafe_unicode_key.py" = ["PLE2502"]
-# R14-F3: same reasoning as the ignore above, for the same reason —
-# this file's RTLO/LRI/RLI/FSI/PDI/word-joiner/variation-selector
-# literals are the exact spoofing payload sanitize_json_input must now
-# strip (agent_mcp/utils/json_utils.py), not incidental content.
-"tests/test_sec_r13_f2_hidden_unicode_fast_paths.py" = ["PLE2502"]
