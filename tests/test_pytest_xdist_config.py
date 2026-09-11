@@ -1,9 +1,10 @@
 """Regression guard: keep pytest-xdist wired up.
 
-The full test suite has a one-time ~4s lifespan startup cost (sqlite-vec
-load, Alembic upgrade, RAG init, write_queue start) that dominates serial
-runs. pytest-xdist parallelizes across cores so the cost is paid per worker
-in parallel, not once sequentially.
+Phase F deleted the Python app whose lifespan-startup cost (sqlite-vec
+load, Alembic upgrade, RAG init) used to dominate a serial run. The
+remaining suite's real cost driver is the several tests/test_nix_*.py
+files' real `nix build`/`nix eval` invocations -- pytest-xdist still
+parallelizes those across cores rather than paying them sequentially.
 
 This test asserts the two pieces a future commit would have to silently
 remove to lose the speedup:

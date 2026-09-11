@@ -135,7 +135,7 @@ Pick the bootstrap path that matches your deploy shape:
 
 ```bash
 # Start the router (multi-tenant), then browse to the dashboard.
-uv run -m agent_mcp.router
+conexus-router --port 5454
 # Open http://localhost:5454/agent-mcp/
 ```
 
@@ -151,7 +151,7 @@ export AGENT_MCP_BOOTSTRAP_USERNAME="dennis"
 # `EnvironmentFile=` — anything that doesn't leak into the
 # command line / `ps`-readable args.
 export AGENT_MCP_BOOTSTRAP_PASSWORD="$(cat /run/secrets/agent-mcp-bootstrap-pw)"
-uv run -m agent_mcp.router
+conexus-router --port 5454
 ```
 
 The router creates the first operator on startup, then unsets both
@@ -162,10 +162,10 @@ subprocesses (per agent.create_user → init_router_db).
 
 ```bash
 # Interactive password prompt:
-uv run -m agent_mcp.router create-operator --username alice
+conexus-cli router create-operator --username alice
 
 # Non-interactive (piped):
-echo "$NEW_PW" | uv run -m agent_mcp.router create-operator \
+echo "$NEW_PW" | conexus-cli router create-operator \
     --username alice --password-stdin
 ```
 

@@ -102,10 +102,8 @@ manually as part of release verification — **not** part of CI here.
 `.github/workflows/ci.yml` runs:
 
 - `pytest` (everything under `tests/`)
-- `ruff check tests/` (scope is `tests/` only for now — legacy
-  `agent_mcp/` has ~2300 existing ruff errors that we don't gate CI on;
-  PRs that touch `agent_mcp/` files should manually `ruff check <file>`
-  and clean them up incrementally)
+- `ruff check .` (the whole repo — Phase F deleted the Python app whose
+  ~2300 pre-existing errors used to keep this scoped to `tests/` only)
 
   ruff is pinned exactly in `[project.optional-dependencies] dev`. The
   lint job installs dev deps by re-resolving `pyproject.toml`, not from
