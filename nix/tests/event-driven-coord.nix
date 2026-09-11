@@ -216,13 +216,24 @@ pkgs.testers.nixosTest {
     machine.succeed("systemctl start conexus@coord-test.service")
     machine.wait_for_unit("conexus@coord-test.service")
 
-    # Poll the backend's DB file until it exists (the unit's
-    # "active" state can precede DB initialisation). The workspace
-    # path is what the create handler wrote to projects.local.json,
-    # which is AGENT_MCP_DEFAULT_WORKSPACE / <name> =
-    # /home/testuser/projects/coord-test.
+    # Poll the backend's UDS socket until it exists -- NOT the sqlite
+    # file's mere existence (the unit's "active" state can precede DB
+    # initialisation, but so can `rusqlite::Connection::open()` itself:
+    # SQLite creates the file lazily at connection-open time, strictly
+    # BEFORE any `CREATE TABLE` statement runs, so `test -f
+    # mcp_state.db` can observe a real, on-disk, but SCHEMA-LESS file
+    # -- exactly the "no such table: agents" failure this test hit
+    # once locally). `conexus-backend::main()` binds this socket as
+    # its literal last step, strictly AFTER `boot::open_and_init_db()`
+    # completes -- the same socket-readiness idiom
+    # `orchestrator::ensure::socket_ready()` already uses on the
+    # router side. The workspace path is what the create handler
+    # wrote to projects.local.json, which is AGENT_MCP_DEFAULT_WORKSPACE
+    # / <name> = /home/testuser/projects/coord-test.
+    sock_path = "/run/agent-mcp/coord-test/backend.sock"
+    machine.wait_until_succeeds(f"test -S {sock_path}", timeout=60)
+
     db_path = "/home/testuser/projects/coord-test/.agent/mcp_state.db"
-    machine.wait_until_succeeds(f"test -f {db_path}", timeout=60)
 
     # Stop the backend before SQL inserts: the backend holds the
     # sqlite file with WAL mode and SQLITE_BUSY errors otherwise.
@@ -320,7 +331,28 @@ pkgs.testers.nixosTest {
         "/agent-mcp/mcp/coord-test"
     )
 
+    # `conexus-backend`'s rmcp transport is STATEFUL (a real
+    # `LocalSessionManager`, not the stateless mode this test's own
+    # bare fire-and-forget curl calls originally assumed): the FIRST
+    # request on a given `Mcp-Session-Id` MUST be `initialize`, and
+    # every later request for that same logical connection must carry
+    # the session id `initialize`'s response returned -- a bare
+    # `tools/call` with no session id is correctly rejected `422
+    # Unexpected message, expect initialize request`, confirmed live
+    # as the actual root cause of a second CI failure that looked like
+    # a missing/empty MCP response. Track one session per bearer token
+    # here and auto-establish it on a token's first non-initialize
+    # call, closing over the dict rather than threading it through
+    # every call site.
+    sessions: dict[str, str] = {}
+
     def mcp_call(token: str, method: str, params: dict, jid: int = 1) -> dict:
+        if method != "initialize" and token not in sessions:
+            mcp_call(token, "initialize", {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "vm-test", "version": "0"},
+            })
         body = json.dumps({
             "jsonrpc": "2.0", "id": jid,
             "method": method, "params": params,
@@ -331,19 +363,39 @@ pkgs.testers.nixosTest {
             "cat > /tmp/mcp-body.json <<'JSONBODY'\n"
             + body + "\nJSONBODY"
         )
+        session_header = (
+            f"-H 'Mcp-Session-Id: {sessions[token]}' " if token in sessions else ""
+        )
         out = machine.succeed(
-            f"curl -fsS -X POST "
+            f"curl -fsS -D /tmp/mcp-hdrs.txt -X POST "
             f"-H 'Authorization: Bearer {token}' "
             f"-H 'Content-Type: application/json' "
             f"-H 'Accept: application/json, text/event-stream' "
+            f"{session_header}"
             f"--data @/tmp/mcp-body.json {MCP_URL}"
         )
+        if method == "initialize":
+            hdrs = machine.succeed("cat /tmp/mcp-hdrs.txt")
+            for hline in hdrs.splitlines():
+                if hline.lower().startswith("mcp-session-id:"):
+                    sessions[token] = hline.split(":", 1)[1].strip()
+                    break
         # When the server replies with SSE, the JSON body is on a
-        # `data:` line. Strip that prefix uniformly.
+        # `data:` line -- but rmcp's StreamableHttpService opens EVERY
+        # SSE response with a blank keep-alive/retry-hint frame first
+        # ("data: \nid: 0\nretry: 3000\n\n", no payload), before the
+        # real event. Returning on the FIRST `data:`-prefixed line
+        # (this helper's own original logic) returns that empty hint
+        # instead, crashing json.loads("") with "Expecting value: line
+        # 1 column 1" -- confirmed live as the actual root cause of a
+        # CI failure that looked like an empty/missing MCP response.
+        # Skip any `data:` line with no payload after the prefix.
         for line in out.splitlines():
             line = line.strip()
             if line.startswith("data:"):
-                return json.loads(line[5:].strip())
+                payload = line[5:].strip()
+                if payload:
+                    return json.loads(payload)
         return json.loads(out)
 
     def tool_call(token: str, name: str, args: dict) -> dict:

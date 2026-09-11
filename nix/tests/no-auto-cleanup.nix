@@ -244,12 +244,20 @@ pkgs.testers.nixosTest {
         "http://127.0.0.1:${toString ports.routerPort}/agent-mcp/app/idle-test/"
     )
 
-    # Wait for the per-project backend to come up and the sqlite DB
-    # to be created. The backend creates .agent/mcp_state.db on
-    # lifespan startup.
+    # Wait for the per-project backend to come up AND finish schema
+    # init before touching its DB directly. Poll the UDS socket, not
+    # the sqlite file's mere existence: `rusqlite::Connection::open()`
+    # creates the file lazily at connection-open time, strictly BEFORE
+    # any `CREATE TABLE` statement runs, so `test -f mcp_state.db` can
+    # observe a real, on-disk, but SCHEMA-LESS file (confirmed live --
+    # this exact race produced a genuine "no such table: agents"
+    # failure in event-driven-coord.nix's sibling check). The socket
+    # binds as `conexus-backend::main()`'s literal last step, strictly
+    # AFTER schema init completes -- the same readiness idiom
+    # `orchestrator::ensure::socket_ready()` already uses router-side.
     machine.wait_for_unit("conexus@idle-test.service")
     machine.wait_until_succeeds(
-        "test -f /home/testuser/projects/idle-test/.agent/mcp_state.db",
+        "test -S /run/agent-mcp/idle-test/backend.sock",
         timeout=60,
     )
 
