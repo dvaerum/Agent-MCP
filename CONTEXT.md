@@ -1,10 +1,18 @@
 # CONTEXT.md — identity & authorization vocabulary
 
 This is the canonical glossary for "who is calling, and what can they
-do" across Agent-MCP. It exists because the same handful of concepts
-have accumulated 3-5 competing names across files as the authorization
-model evolved through Waves 6-9 and several pentest rounds (see
-`docs/proposals/security-authz-architecture-hardening.md`, Finding H).
+do" across Agent-MCP. It originally documented the Python
+implementation's authorization model as it evolved through Waves 6-9
+and several pentest rounds; that Python implementation (and the
+`docs/proposals/security-authz-architecture-hardening.md` findings
+that hardened it) is now fully deleted (Phase F of the Rust
+migration — see `~/.claude/plans/prancy-napping-pie.md`). This
+revision describes the **Rust** equivalent (`conexus-core`,
+`conexus-auth`, `conexus-tools`, `conexus-backend`, `conexus-router`),
+faithfully ported from that Python model — most predicates below are
+byte-for-byte behavioral ports, a few are deliberate, documented
+improvements the migration made along the way (noted where they
+occur).
 
 **Rule going forward: check here before introducing a new term for an
 identity/authz concept. If a concept already has a canonical name
@@ -14,345 +22,387 @@ concept, add an entry here in the same PR.
 This file documents what the code actually does; it does not itself
 change any behavior. Where multiple names compete for one concept, one
 is picked as canonical here and the others are flagged as deprecated
-synonyms — grep-replacing them over time is left to future PRs, not
-done by this one.
+synonyms.
 
 ## Core identity
 
 ### Principal
 
 **Canonical term for "the authenticated identity making this call."**
-An immutable dataclass: `agent_mcp/core/principal.py:58` (`Principal`).
-Fields: `kind`, `user_id`, `agent_id`, `sysadmin`, `project_name`,
+An immutable struct: `rust/conexus-core/src/principal.rs:39`
+(`Principal`). Fields: `kind`, `user_id`, `agent_id`, `project_name`,
 `project_role`, `agent_role`, `can_wake_loop`, `source_token`,
-`capabilities`. Built once at the outermost auth seam (router
-`auth_middleware.py` for the cookie/forwarding path, `app/main_app.py`
-for the MCP bearer path) and threaded through every downstream
-decision point — it is never re-derived mid-request. Authorization
-decisions are method calls on it: `principal.has_capability(cap)`
-(`agent_mcp/core/principal.py:128`).
+`capabilities`. Built once at the outermost auth seam — the backend's
+`principal_resolve.rs` for the MCP bearer/forwarding-header path, the
+router's `session_gate.rs` for the cookie/proxy-header path — and
+threaded through every downstream decision point; it is never
+re-derived mid-request. Authorization decisions are method calls on
+it: `principal.has_capability(cap)`
+(`conexus-core/src/principal.rs:79`).
+
+**Real, deliberate divergence from the Python source**: there is no
+separate `sysadmin: bool` field. Sysadmin is instead one of the two
+variants of `capabilities` itself (`Capabilities::Sysadmin`, see
+"Capability vocabulary" below) — a real type-system improvement over
+Python's `frozenset({"*"})` sentinel-in-a-set encoding, which needed
+its own defense-in-depth filter everywhere a capability set was built
+from untrusted data. There is no string a caller could smuggle into a
+`HashSet<Capability>` that would ever compare equal to the `Sysadmin`
+variant.
 
 **Do not call this**: "auth dict", "caller", "actor", "identity
-object" — all four names appear informally in comments/docstrings
-across the codebase referring to this same concept on the MCP side.
-Use `Principal`.
+object". Use `Principal`.
 
 ### RestPrincipal
 
 **Canonical term for "which backend-REST door admitted this caller, and
-what did that door prove about them?"** An immutable dataclass:
-`agent_mcp/app/rest_principal.py` (`RestPrincipal`). Fields: `kind`,
-`user`, `operator_id`, `project_role`, `sysadmin`. Returned by
-`agent_mcp/app/deps.py` (`require_operator_session`) and threaded into
-the ~40 backend REST handlers.
+what did that door prove about them?"** An enum:
+`rust/conexus-backend/src/rest_principal.rs:53` (`RestPrincipal`), with
+exactly **two** variants — `Forwarding { operator_id, project_role }`
+and `OperatorBearer { bearer_token }`.
 
-Finding D (`docs/proposals/security-authz-architecture-hardening.md`,
-Phase 5) replaced what this glossary previously described as the "REST
-auth dict" — a plain `dict[str, Any]` with three undeclared shapes plus
-a `contextvars.ContextVar` side-channel (`_forwarding_route_role`)
-carrying the forwarding caller's signed `(project_role, sysadmin)` out
-of band. **Both are gone**; do not reintroduce either term or shape.
+**Real, deliberate scope narrowing from the Python source**: Python's
+`RestPrincipal` had a THIRD door, `kind="session"` (an
+`agent_mcp_session` cookie resolved via a live `router.db` lookup).
+That door is NOT ported here — the operator's own 2026-09-05 decision
+(`prancy-napping-pie.md`, Phase E1) keeps the per-project backend
+router-DB-blind, exactly like `/mcp` auth. Python's own `deps.py`
+docstring called that cookie path "defence in depth for a
+misconfiguration that bypassed the router middleware"; this backend is
+UDS-only and reachable only through the router's proxy in every real
+deployment, so there is no real "bypassed the router" caller to
+protect. (The router itself DOES resolve cookie sessions — see
+`GateIdentity`/`evaluate_session_gate` below, a genuinely different
+type serving a genuinely different door.)
 
-`RestPrincipal` and `Principal` are **deliberately distinct types**, not
-a naming inconsistency to collapse:
+`RestPrincipal` and `Principal` remain **deliberately distinct types**,
+same reasoning as the Python source:
 
-* `RestPrincipal` is an **admission record** — its `kind` values
-  (`session` / `forwarding` / `operator_bearer`) name REST doors, and
-  `operator_bearer` has no `Principal` analogue meaning the same thing
-  (see `PrincipalKind` below).
-* `Principal` is an **authorization subject** — it carries a resolved
-  `capabilities` frozenset and answers `has_capability`.
+* `RestPrincipal` is an **admission record** — which REST door, what
+  did it prove.
+* `Principal` is an **authorization subject** — a resolved
+  `capabilities` set, answers `has_capability`.
 
 There is exactly one conversion between them:
-`agent_mcp/app/_dispatch_helpers.py` (`_build_route_principal`). Say
-**"REST principal"** for the former and **"Principal"** for the latter;
-never "auth dict".
+`build_dispatch_principal` (`conexus-backend/src/rest_principal.rs`),
+mirroring Python's `_build_route_principal`. Say **"REST principal"**
+for the former and **"Principal"** for the latter.
 
-### PrincipalKind — the four authentication MODES
+### PrincipalKind — the three authentication MODES
 
-`agent_mcp/core/principal.py:54`: `Literal["operator_session",
-"agent_bearer", "forwarding_header"]` — three MCP-side values, plus a
-fourth REST-only mode below. These are the distinct ways a `Principal`
-(or a `RestPrincipal`) can be constructed; a request is authenticated
-through exactly one of them.
+`rust/conexus-core/src/principal.rs:14`: `enum PrincipalKind {
+OperatorSession, AgentBearer, ForwardingHeader }` — the three ways a
+`Principal` can be constructed; a request is authenticated through
+exactly one of them. (Python had a fourth, REST-only mode,
+`operator_bearer`; here that concept lives entirely on the separate
+`RestPrincipal` type as `RestPrincipal::OperatorBearer`, never as a
+`PrincipalKind` variant — see `RestPrincipal` above.)
 
-* **`agent_bearer`** — a per-agent token on `Authorization: Bearer`,
+* **`AgentBearer`** — a per-agent token on `Authorization: Bearer`,
   minted at `register_agent` time and stored in the `agents` table.
-  Resolves to a `worker` or `manager` `agent_role`. Built by
-  `agent_mcp/core/principal_builder.py:54`
-  (`build_agent_bearer_principal`).
-* **`operator_session`** — the dashboard cookie path (ADR-0013). A
-  human operator logged in via `POST /agent-mcp/login`; the session
-  cookie resolves to a `users` row + `project_membership.role`. Built
-  by `agent_mcp/core/principal_builder.py:110`
-  (`build_operator_principal`).
-* **`forwarding_header`** — the signed `X-Agent-MCP-Forwarded-Operator`
-  header the router attaches when proxying a cookie-authenticated
-  dashboard request through to a per-project backend (ADR-0020: router
-  is mount-agnostic, so the backend can't see the original cookie).
-  Also built by `build_operator_principal`, with `kind="forwarding_header"`.
-* **`operator_bearer`** (REST-only, not a `PrincipalKind` value — a
-  `RestPrincipal.kind` / `RestAuthKind` discriminator) — a per-agent
-  manager/admin-role bearer token presented directly to a backend REST
-  endpoint instead of a cookie. See
-  `agent_mcp/app/deps.py` (`require_operator_session`). Named
-  `"admin_token"` before retire-system-token Wave 5; renamed because it
-  never carried a god-key admin token post-Wave-1, only per-agent
-  manager-tier tokens. Do not confuse this REST-only discriminator with
-  the MCP `agent_bearer` `PrincipalKind` — they overlap in meaning (a
-  bearer token identifying an agent) but they are **not
-  interchangeable**: `operator_bearer` is pre-filtered to manager/admin
-  by `deps._is_operator_tier_bearer`, whereas `agent_bearer` also covers
-  workers and therefore needs a separate `agent_role` check before it
-  counts as operator tier (`core/operator_tier.py`). Collapsing the two
-  spellings would change who is confirmed operator tier.
+  Resolves to a `Worker` or `Manager` `AgentRole`.
+* **`OperatorSession`** — the dashboard cookie path (ADR-0013),
+  resolved by the router's `session_gate.rs`.
+* **`ForwardingHeader`** — the signed
+  `X-Agent-MCP-Forwarded-Operator` header the router attaches when
+  proxying a cookie-authenticated dashboard request through to a
+  per-project backend (ADR-0020: router is mount-agnostic).
 
-**Do not call these** "auth modes", "login types", or "identity
-sources" interchangeably with `PrincipalKind` values — use the exact
-literal (`agent_bearer`, `operator_session`, `forwarding_header`) or
-the REST discriminator (`operator_bearer`) verbatim.
+**Do not call these** "auth modes" or "login types" interchangeably
+with `PrincipalKind` values — use the exact variant name
+(`AgentBearer`, `OperatorSession`, `ForwardingHeader`), or the
+REST-only discriminator (`RestPrincipal::OperatorBearer`) verbatim.
 
 ## Operator-tier vocabulary — three distinct, non-interchangeable concepts
 
-This is the area with the most historical drift. Three predicates
-answer three different questions; none of them is a synonym for
-either of the others, even though all three sometimes evaluate `True`
-for the same caller.
+Three predicates answer three different questions; none of them is a
+synonym for either of the others, even though all three sometimes
+evaluate `true` for the same caller.
 
 ### `is_operator_tier` — "does this caller carry the operator write marker?"
 
-`agent_mcp/core/principal_builder.py:162` (`is_operator_tier`). Single
-definition (collapsed from two copies that had drifted — see the
-function's own docstring). Returns `True` iff:
+`rust/conexus-core/src/principal.rs:122` (`is_operator_tier`). Returns
+`true` iff:
 
-* `principal.has_capability("system.config.write")` (present in
-  `PROJECT_ROLE_BUNDLES["operator"]`, short-circuited by the sysadmin
+* `principal.has_capability(Capability::SystemConfigWrite)` (present
+  in `project_role_bundle(Operator)`, short-circuited by the sysadmin
   wildcard), **or**
-* `principal.agent_id == "admin"` — the legacy pseudo-agent label the
-  test harness seeds for a manager-role row named `admin`. Production
-  post-Wave-4 has no such row; this branch collapses to the capability
+* `principal.agent_id == Some("admin")` — the legacy pseudo-agent
+  label the test harness seeds for a manager-role row named `admin`.
+  Production has no such row; this branch collapses to the capability
   check in real deployments.
 
-This is a coarse-grained, capability-derived predicate. It answers
-"can this caller mutate project config", nothing more specific.
+A coarse-grained, capability-derived predicate. Answers "can this
+caller mutate project config", nothing more specific.
 
-### `is_sysadmin` — "does this caller hold the wildcard capability?"
+### `sysadmin` — "does this caller hold the wildcard capability?"
 
-Not a function — a field: `principal.sysadmin: bool`
-(`agent_mcp/core/principal.py:112`), and the resolution rule in
-`agent_mcp/core/capabilities.py:261` (`resolve_capabilities`): when
-`sysadmin=True` is passed in, the Principal's `capabilities` becomes
-exactly `frozenset({SYSADMIN_WILDCARD})` (`"*"`,
-`agent_mcp/core/capabilities.py:205`), which
-`Principal.has_capability` (`agent_mcp/core/principal.py:154`)
-short-circuits to admit *any* capability string unconditionally. This
-is deployment-wide: a sysadmin is not scoped to one project the way an
-`operator` project-role is.
+Not a field — a `capabilities` variant:
+`Capabilities::Sysadmin` (`conexus-core/src/capability.rs:194`, see
+"Real, deliberate divergence" under `Principal` above).
+`Principal::has_capability` (`conexus-core/src/principal.rs:79`)
+short-circuits on this variant to admit *any* capability
+unconditionally, checked FIRST and unconditionally — before the
+project-membership check — a real bug this migration caught and fixed
+during the port (Phase A: a sysadmin with no `project_role` set was
+being wrongly denied every non-system capability by the original
+branch order).
 
-**A sysadmin is always operator-tier** (the wildcard trivially
-satisfies `is_operator_tier`'s capability check), **but operator-tier
-does not imply sysadmin** — a caller with `project_role == "operator"`
-in one project satisfies `is_operator_tier` without ever setting
-`sysadmin=True`.
+**A sysadmin is always operator-tier**, **but operator-tier does not
+imply sysadmin** — a caller with `project_role == Operator` in one
+project satisfies `is_operator_tier` without ever holding the wildcard.
 
 ### `catalog_role()` — the narrower, MCP-catalog-specific concept
 
-`agent_mcp/core/principal_builder.py:183` (`catalog_role`). Returns
-`CatalogRole = Literal["admin", "worker", "anonymous"]`
-(`agent_mcp/core/principal_builder.py:39`). This is **not** a synonym
-for `is_operator_tier` or `sysadmin` — it is a third, deliberately
-narrower vocabulary used for exactly one purpose: deciding what a
-caller sees in the three MCP catalog-listing surfaces —
-`tools/list` (`agent_mcp/tools/registry.py`'s
-`list_available_tools`), `prompts/list`/`prompts/get`, and
-`resources/list`/`resources/read` (`agent_mcp/resources/__init__.py`).
+`rust/conexus-core/src/principal.rs:169` (`catalog_role`). Returns
+`CatalogRole { Anonymous, Admin, Worker }`
+(`conexus-core/src/principal.rs:139`). This is **not** a synonym for
+`is_operator_tier` or sysadmin — it is a third, deliberately narrower
+vocabulary used for exactly one purpose: deciding what a caller sees
+in the three MCP catalog-listing surfaces — `tools/list`
+(`conexus-tools::access`), `prompts/list`/`prompts/get`
+(`conexus-tools::prompts`), and `resources/list`/`resources/read`
+(`conexus-tools::resources`).
 
-Mapping (`agent_mcp/core/principal_builder.py:196-212`):
+Mapping:
 
-* `None` (no authenticated Principal in flight) → `"anonymous"`.
-* `is_operator_tier(principal)` → `"admin"`.
+* `None` (no authenticated Principal in flight) → `Anonymous`.
+* `is_operator_tier(principal)` → `Admin`.
 * any other authenticated Principal (agent bearer, or a viewer-tier
-  operator/forwarding-header caller) → `"worker"` — an authenticated
-  non-admin. Note this collapses a viewer-tier *operator* and a
-  worker-tier *agent* into the same catalog bucket; that is
-  intentional for catalog visibility (both should see the
-  non-admin-only surface) even though they are very different
-  Principals for every other authorization decision in the system.
+  operator/forwarding-header caller) → `Worker` — an authenticated
+  non-admin. This deliberately collapses a viewer-tier *operator* and
+  a worker-tier *agent* into the same catalog bucket even though they
+  are very different Principals for every other authorization
+  decision.
 
-Before arch-r3 #1+5 PR-B, the three catalog surfaces each re-derived
-this independently and disagreed (a viewer-tier `forwarding_header`
-caller resolved to `"anonymous"` for `tools/list`, `"worker"` for
-prompts, and an `agent_id` string-match for resources). `catalog_role`
-is now the single source every catalog surface calls — see
-`agent_mcp/resources/__init__.py:206` for one live call site.
+Before this function existed in the Python source, the three catalog
+surfaces each re-derived "is this caller an admin" independently and
+disagreed (a viewer-tier `ForwardingHeader` caller resolved to
+`Anonymous` for `tools/list` but `Worker` for prompts) — `catalog_role`
+is the single source every catalog surface now calls, closing that
+drift class structurally, and is pinned by a dedicated regression test
+(`a_viewer_tier_forwarding_header_caller_resolves_to_worker_not_anonymous`).
 
-**Do not use `catalog_role()`'s `"admin"` value as a general
-stand-in for `is_operator_tier` or `sysadmin` outside catalog-listing
-code** — it is defined only in terms of those two, never the other way
-around, and it discards information (it cannot distinguish a viewer
-from a worker-role agent) that other authorization decisions need.
+**Do not use `catalog_role()`'s `Admin` value as a general stand-in for
+`is_operator_tier` or sysadmin outside catalog-listing code** — it is
+defined only in terms of those two, never the other way around, and it
+discards information (it cannot distinguish a viewer from a
+worker-role agent) that other authorization decisions need.
 
-### `catalog role "admin"` vs. project-membership `role = "admin"`
+### `catalog role "admin"` vs. project-membership role
 
-There is a fourth, DB-level, unrelated meaning of the string
-`"admin"`: `PROJECT_ROLE_BUNDLES`
-(`agent_mcp/core/capabilities.py:127`) recognizes exactly two
-project-membership roles, `"viewer"` and `"operator"` — **there is no
-`"admin"` project-membership role**. Where `"admin"` appears as a
-`visibility=` kwarg value in tool registration
-(`agent_mcp/tools/access.py:96-97`, `:206-209`), it is documented
-explicitly as **"a legacy synonym for `operator`"** — both collapse to
-the same `"operator"` tools/list tier. So: `catalog_role()`'s
-`"admin"` return value, the legacy `visibility="admin"` tools/list
-synonym for `"operator"`, and "sysadmin" are three different things
-that all happen to use or mean something adjacent to the word
-"admin". None of them is a project-membership role — that vocabulary
-only has `viewer` / `operator`.
+There is a second, DB-level, unrelated meaning of the string
+`"admin"`: `ProjectRole` (`conexus-core/src/capability.rs:223`) has
+exactly two variants, `Viewer` and `Operator` — **there is no `Admin`
+project-membership role**. So: `CatalogRole::Admin`'s string form and
+"sysadmin" are two different things that both happen to use or mean
+something adjacent to the word "admin". Neither is a project-membership
+role — that vocabulary only has `Viewer`/`Operator`.
 
 ### `is_confirmed_operator_tier` — a fourth, narrower, defense-in-depth predicate
 
-Not one of the three above — a separate, stricter check with its own
-module: `agent_mcp/core/operator_tier.py:71`
-(`is_confirmed_operator_tier`). Answers a different question than
-`is_operator_tier`: "may this caller receive **plaintext secrets**
-(agent bearer tokens, project secrets), or must those be masked?" It
-sits *behind* the coarse capability gate as defense-in-depth — a
-caller who already passed `is_operator_tier` (or the cap gate
-directly) can still fail this stricter check and get secrets
-redacted.
+Not one of the three above — a separate, stricter check, and (a real,
+documented divergence from the Python source's single shared function)
+now **two** separate implementations for the **two** identity types
+that need it, since `Principal` and `RestPrincipal` can't represent
+each other's admission shapes:
 
-Confirmed operator tier iff EITHER:
+* `conexus-core/src/principal.rs:203` — the MCP-side predicate, over
+  `Principal`.
+* `conexus-backend/src/rest_principal.rs:198` — the REST-side
+  predicate, over `RestPrincipal`.
+
+Both answer the same question: "may this caller receive **plaintext
+secrets** (agent bearer tokens, project secrets), or must those be
+masked?" — a defense-in-depth check sitting *behind* the coarse
+capability gate. Confirmed operator tier iff EITHER:
 
 1. the caller authenticated via a **verifiable per-agent operator-tier
-   bearer** (REST `operator_bearer` kind, or MCP `agent_bearer` with
-   `agent_role in {"manager", "admin"}`), OR
-2. the backend can **see** a resolved operator identity — `sysadmin`,
-   or `project_role == "operator"`.
+   bearer** (`RestPrincipal::OperatorBearer`, or MCP `AgentBearer` with
+   `agent_role == Manager`), OR
+2. the backend can **see** a resolved operator identity — sysadmin, or
+   `project_role == Operator`.
 
-This module exists because the policy was implemented twice
-(`app/routers/composition.py`'s REST copy and
-`tools/admin_tools.py`'s MCP copy) and the two DRIFTED — see the
-module docstring in `agent_mcp/core/operator_tier.py:10-25` for the
-exact before/after disagreement. Do not reimplement this check inline
-anywhere; both surfaces now call the one function, adapting their
-native identity representation (`RestPrincipal` vs. `Principal`) into
-its keyword arguments.
+Both implementations preserve ADR-0025's forwarding-tier-exclusion
+principle bit-for-bit: a `ForwardingHeader`/`RestPrincipal::Forwarding`
+caller is deliberately NEVER given clause-1 treatment even though it
+carries a signed role — pinned by
+`forwarding_header_never_gets_clause_1_treatment`. Do not reimplement
+this check inline anywhere; both surfaces call their own type's one
+function.
 
 ## Capability vocabulary — three distinct layers
 
-### Capability (the string)
+### Capability (the string, now a closed enum)
 
-A single authorization atom, e.g. `"agents.terminate"`,
-`"tasks.assign"`, `"system.config.write"`. The complete vocabulary is
-the frozen 29-element set `KNOWN_CAPABILITIES`
-(`agent_mcp/core/capabilities.py:81`). Format: AWS-IAM-style,
-per-resource × verb, matching `^[a-z]+(\.[a-z_]+)+$`. `system.*` caps
-are project-membership-ungated (deployment-wide router-admin verbs);
-every other cap requires the caller to have a project membership
-(`project_role is not None`) or be an `agent_bearer`
-(`Principal.has_capability`, `agent_mcp/core/principal.py:128`).
-Adding/removing a capability is a design change (Wave 9 grilling,
-locked 2026-06-30), not a routine PR.
+A single authorization atom, e.g. `Capability::AgentsTerminate`,
+`Capability::TasksAssign`, `Capability::SystemConfigWrite`. The
+complete vocabulary is the closed `enum Capability`
+(`conexus-core/src/capability.rs:43`, `Capability::ALL`).
+
+**Real, deliberate improvement over the Python source**: capability
+strings were stringly-typed in Python (a `frozenset[str]` validated
+only by a regex convention + a smoke test); here they're a real,
+closed `enum` — an unknown/typo'd capability is a `FromStr` parse
+error at the boundary (config load, DB row, API body) instead of a
+runtime string that silently never matches anything.
+
+`system.*` caps are project-membership-ungated
+(`Capability::is_system_tier`, `conexus-core/src/capability.rs:153`,
+deployment-wide router-admin verbs); every other cap requires the
+caller to have a project membership (`project_role.is_some()`) or be
+an `AgentBearer` (`Principal::has_capability`,
+`conexus-core/src/principal.rs:79`). Adding/removing a capability is a
+design change (Wave 9 grilling, locked 2026-06-30, preserved through
+the migration), not a routine PR.
 
 ### Role bundle (a set of capabilities granted by a role)
 
-Two dicts, both in `agent_mcp/core/capabilities.py`:
+Two functions, both in `conexus-core/src/capability.rs` (functions,
+not dicts — a real, deliberate shape change since Rust has no
+module-level mutable dict idiom to port; the meaning is identical):
 
-* `PROJECT_ROLE_BUNDLES` (line 127) — caps granted to
-  operator-tier callers (`operator_session` / `forwarding_header`
-  Principals) by `project_membership.role`: `"viewer"` (read-only) or
-  `"operator"` (viewer + write surfaces + `system.config.write` +
-  `rag.*`).
-* `AGENT_ROLE_BUNDLES` (line 165) — caps granted to `agent_bearer`
-  Principals by `agents.agent_role`: `"worker"` (baseline) or
-  `"manager"` (worker + `tasks.assign` + `memories.update`).
+* `project_role_bundle(role: ProjectRole)` (line 261) — caps granted
+  to operator-tier callers (`OperatorSession`/`ForwardingHeader`
+  Principals) by `project_membership.role`: `Viewer` (read-only) or
+  `Operator` (viewer + write surfaces + `SystemConfigWrite` + `rag.*`).
+* `agent_role_bundle(role: AgentRole)` (line 233) — caps granted to
+  `AgentBearer` Principals by `agents.agent_role`: `Worker` (baseline)
+  or `Manager` (worker + `TasksAssign` + `MemoriesUpdate`).
+  `AgentsRotateToken` is deliberately in NEITHER bundle — an agent
+  must never rotate a peer's, or its own, bearer.
 
-A bundle is a **set of capability strings**, resolved once per request
-by `resolve_capabilities()` (`agent_mcp/core/capabilities.py:211`) and
-attached to the Principal. It is not itself a visibility tier — see
-below for that distinct, derived concept.
+A bundle is a **set of capabilities**, resolved once per request by
+`conexus_auth::capabilities::resolve_capabilities` and attached to the
+Principal. It is not itself a visibility tier — see below for that
+distinct, derived concept.
 
 **Do not call a role bundle a "capability"** (singular) — a bundle is
-a set of many; a capability is one string. Do not call it a "role"
-either without qualifying which vocabulary — see the next section for
-why "role" alone is ambiguous in this codebase.
+a set of many; a capability is one enum value.
 
 ### `tools/list` visibility tier (access level)
 
-A **third, distinct, and DERIVED** concept: the string used to decide
-whether a given tool/resource/prompt appears in a catalog listing for
-a given caller. Defined and computed in
-`agent_mcp/tools/access.py:141` (`_derive_access_level`), feeding the
-module-level `TOOL_ACCESS` map. Values, from most to least
-restrictive: `"operator"` (== legacy synonym `"admin"`), `"manager"`,
-`"worker"`, `"any"`, or the parametrized `"worker-if-toggled:<config_key>[,<config_key>...]"`.
+A **third, distinct, and DERIVED** concept: the value used to decide
+whether a given tool appears in a catalog listing for a given caller.
+Defined and computed in `conexus-tools/src/access.rs:114`
+(`access_tier`), feeding the module-level `TIER_OVERRIDES` table.
+Values: `enum AccessTier { Operator, Worker, Any,
+WorkerIfToggled(&[&str], bool) }` (`conexus-tools/src/access.rs:41`).
 
-This is derived (not hand-maintained) from whichever of these three
-signals is present, in priority order:
+**Real, confirmed finding from the migration (not a design change,
+a fact about the real Python call graph)**: there is deliberately **no
+`Manager` variant**. Python's `is_visible_to_role` carried a full
+4-role model including `"manager"`, but `catalog_role()` — the ONLY
+function that ever supplies a role to it — only ever returns
+`admin`/`worker`/`anonymous`; a manager agent bearer collapses to
+`worker` there. A tool whose capability derives to "manager" tier was
+therefore already invisible to every role except admin in the code
+that actually executed, identical to "operator" tier — confirmed by
+grepping every real call site before porting, not assumed.
 
-1. the tool impl's `_required_capability` (stamped by
-   `@requires_capability`, `agent_mcp/core/authorize.py:166`) → mapped
-   to a tier via `_visibility_for_capability`
-   (`agent_mcp/tools/access.py:104`: cap in the worker bundle →
-   `"worker"`; cap only in the manager bundle → `"manager"`; cap in
-   neither agent bundle → `"operator"`);
-2. the impl's `_required_policy_keys` (stamped by `@requires_policy`)
-   → renders to `"worker-if-toggled:<keys>"`;
-3. the registry entry's `visibility=` kwarg (`declared_visibility`) —
-   the only signal for tools whose cap check is in-body rather than
-   decorator-stamped, and otherwise usable only to *tighten* (never
-   loosen) the derived tier.
+Derived (not hand-maintained) from whichever of these signals is
+present, in priority order:
+
+1. the tool's `Requirement::Cap` → mapped to a tier (cap in the worker
+   bundle → `Worker`; cap only in the manager bundle → the
+   operator-equivalent tier per the finding above; cap in neither
+   agent bundle → `Operator`);
+2. `Requirement::Policy` → renders to `WorkerIfToggled(keys, default)`
+   — the SAME `default` the call-time gate itself uses (one source,
+   can't drift, unlike Python's separate `_TOGGLE_DEFAULTS` table);
+3. `TIER_OVERRIDES` (`conexus-tools/src/access.rs:76`) — a small,
+   hand-reviewed, tighten-only table, ported ONLY where it changes the
+   outcome; every entry traces to a real Python `visibility=` kwarg,
+   confirmed by reading the Python source directly before it was
+   deleted, not assumed. Two Python kwargs (`update_task`,
+   `delete_task`) were confirmed REDUNDANT (merely echoing the
+   already-derived tier) and correctly NOT ported.
 
 **Do not confuse this with `catalog_role()`** (above) — `catalog_role`
-classifies the *caller* into `admin`/`worker`/`anonymous`; the
-`tools/list` visibility tier classifies the *tool* into
-`operator`/`manager`/`worker`/`any`/`worker-if-toggled:...`. A tool's
-tier and a caller's catalog role are compared (via
-`is_visible_to_role`, `agent_mcp/tools/access.py:409`) to decide
-listing membership — they are two different vocabularies that happen
-to share the substring "admin"/"operator" in places, which is exactly
-the kind of collision this document exists to prevent.
+classifies the *caller*; the `tools/list` tier classifies the *tool*.
+They are compared (via `is_visible_to_role`,
+`conexus-tools/src/access.rs`) to decide listing membership.
 
-The generic `Registry[T].list_visible()` visibility sentinel
-(`agent_mcp/core/registry.py:76`: `Literal["any", "admin"]` or a
-callable) is a related but *coarser* mechanism used by resources and
-prompts (which have no capability-driven derivation) — a 2-valued
-subset of the same idea, not identical to the 5-shape `tools/list`
-tier string above. When writing new code against the shared
-`Registry`, use its own `"any"`/`"admin"`/callable vocabulary as
-documented in `agent_mcp/core/registry.py`; do not assume it accepts
-the fuller `tools/access.py` tier strings.
+**Real, deliberate simplification over the Python source**: Python's
+generic `Registry[T].list_visible()` visibility mechanism (a 2-valued
+`"any"`/`"admin"`-or-callable sentinel, used by resources and prompts)
+was **not ported at all**. `conexus-tools::resources::resolve_read_scope`
+is a purpose-built function for exactly the resources catalogue's two
+entries instead — building the generic engine for a two-variant case
+would have been over-engineering; the prompts catalogue similarly uses
+a plain "any"/"admin" string comparison inline, not a shared generic
+type.
 
 ## Authentication MODES — how a Principal gets built
 
-See "PrincipalKind" above for the four modes by name. For quick
-cross-reference, the phrase-level vocabulary used in prose/comments
-maps onto them as:
+See "PrincipalKind" above for the three MCP-side modes. For quick
+cross-reference:
 
-* **"agent bearer"** = `PrincipalKind == "agent_bearer"`: a per-agent
-  MCP token on `Authorization: Bearer`.
-* **"forwarding header"** = `PrincipalKind == "forwarding_header"`:
-  the router's signed `X-Agent-MCP-Forwarded-Operator` header, built
-  by `app/main_app.py`'s `AuthHeaderMiddleware`
-  and consulted by `app/deps.py` (`require_operator_session`).
-* **"cookie session"** = `PrincipalKind == "operator_session"` (MCP
-  side) / `RestPrincipal.kind == "session"` (`app/deps.py`):
+* **"agent bearer"** = `PrincipalKind::AgentBearer`: a per-agent MCP
+  token on `Authorization: Bearer`, resolved in
+  `conexus-backend/src/principal_resolve.rs`.
+* **"forwarding header"** = `PrincipalKind::ForwardingHeader`: the
+  router's signed `X-Agent-MCP-Forwarded-Operator` header
+  (`conexus-auth::forwarding_header`), verified in
+  `conexus-backend/src/principal_resolve.rs` and (for REST) in
+  `conexus-backend/src/rest_principal.rs`.
+* **"cookie session"** = `PrincipalKind::OperatorSession` (MCP side —
+  proxied by the router as a `ForwardingHeader` to the backend) /
+  `GateIdentity` (`conexus-router/src/session_gate.rs:125`, the
+  router's own resolved cookie identity, evaluated by
+  `evaluate_session_gate`, `conexus-router/src/session_gate.rs:313`):
   the dashboard's `agent_mcp_session` cookie (ADR-0013).
-* **"operator_bearer"** = the REST-only `RestPrincipal.kind` value (see
-  above) — not a `PrincipalKind` value, a per-agent manager/admin
-  bearer presented straight to a REST endpoint.
+* **`RestPrincipal::OperatorBearer`** — the REST-only variant (see
+  above) — not a `PrincipalKind` value, a per-agent manager-role
+  bearer presented straight to a backend REST endpoint.
+
+## Authorization gate vocabulary — `Requirement`
+
+A concept with **no Python analogue to name** — Python's tool
+registration stamped a capability/policy/predicate via decorators
+whose gate logic was scattered across three separate check functions
+(`check_capability_gate`/`check_policy_gate`/`check_predicate_gate`).
+The Rust port unifies these into one closed enum,
+`conexus-auth/src/requirement.rs:98` (`Requirement`), with one
+`Requirement::check()` match:
+
+* `Cap { cap, reason }` — gated on exactly one capability.
+* `Policy { keys, default }` — the worker-toggle policy: an
+  agent-bearer caller passes iff at least one of `keys` resolves
+  truthy (an explicit per-project override, via a `PolicySource`, else
+  `default`); operator-tier callers always bypass this gate.
+* `Predicate { check, reason }` — an arbitrary boolean predicate over
+  the (possibly absent) Principal, with a mandatory human-readable
+  denial reason.
+* `Public` — no gate at all. The ONLY way to declare an ungated tool,
+  deliberately named so it greps, and cross-checked against a
+  hand-reviewed allowlist (`conexus-tools::registry`'s
+  `PUBLIC_TOOL_ALLOWLIST` arch test) wherever `all_tools()` is walked.
+
+Every `Tool` impl (`conexus-auth/src/tool.rs:173`) declares exactly
+one `Requirement` as an associated const — the single declaration
+site; `dispatch()` (`conexus-auth/src/tool.rs:285`) checks it before
+ever calling the tool body. This closes a real Python-source
+cross-check mechanism (`ToolRequirement.verify(impl)`, needed there
+because a tool's authorization lived in TWO disconnected places — the
+decorator's stamp and the registration site's `requires=` kwarg — that
+could drift) that has no Rust equivalent to port: with one declaration
+site, there is nothing left to cross-check.
 
 ## Summary table
 
 | Term | What it answers | Type | Defined at |
 |---|---|---|---|
-| `Principal` | who is calling (MCP side) | frozen dataclass | `core/principal.py:58` |
-| `RestPrincipal` | which REST door admitted the caller | frozen dataclass | `app/rest_principal.py` |
-| `PrincipalKind` | which auth mode built this Principal | `Literal[...]` | `core/principal.py:54` |
-| capability | one authorization atom | `str`, member of `KNOWN_CAPABILITIES` | `core/capabilities.py:81` |
-| role bundle | caps granted by a role | `frozenset[str]` | `core/capabilities.py:127,165` |
-| `tools/list` tier | catalog-listing visibility for a *tool* | `str` (5 shapes) | `tools/access.py:141` |
-| `catalog_role()` | catalog-listing bucket for a *caller* | `Literal["admin","worker","anonymous"]` | `core/principal_builder.py:183` |
-| `is_operator_tier` | can this caller write project config | `bool` | `core/principal_builder.py:162` |
-| `sysadmin` | does this caller hold the wildcard cap | `bool` field | `core/principal.py:112` |
-| `is_confirmed_operator_tier` | may this caller see plaintext secrets | `bool` | `core/operator_tier.py:71` |
+| `Principal` | who is calling (MCP side) | struct | `conexus-core/src/principal.rs:39` |
+| `RestPrincipal` | which REST door admitted the caller | enum (2 variants) | `conexus-backend/src/rest_principal.rs:53` |
+| `PrincipalKind` | which auth mode built this Principal | enum (3 variants) | `conexus-core/src/principal.rs:14` |
+| `Capability` | one authorization atom | closed `enum` | `conexus-core/src/capability.rs:43` |
+| `Capabilities` | a Principal's resolved cap set (or the sysadmin wildcard) | `enum { Sysadmin, Set(...) }` | `conexus-core/src/capability.rs:194` |
+| role bundle | caps granted by a role | `fn -> HashSet<Capability>` | `conexus-core/src/capability.rs:233,261` |
+| `AccessTier` | catalog-listing visibility for a *tool* | enum (4 shapes, no `Manager`) | `conexus-tools/src/access.rs:41` |
+| `CatalogRole` | catalog-listing bucket for a *caller* | enum (3 variants) | `conexus-core/src/principal.rs:139` |
+| `is_operator_tier` | can this caller write project config | `fn -> bool` | `conexus-core/src/principal.rs:122` |
+| sysadmin | does this caller hold the wildcard cap | `Capabilities::Sysadmin` variant | `conexus-core/src/capability.rs:194` |
+| `is_confirmed_operator_tier` | may this caller see plaintext secrets | `fn -> bool` (×2: MCP + REST) | `conexus-core/src/principal.rs:203`, `conexus-backend/src/rest_principal.rs:198` |
+| `Requirement` | what a tool demands of the caller | enum (4 shapes) | `conexus-auth/src/requirement.rs:98` |
+| `GateIdentity` | the router's own resolved cookie identity | struct | `conexus-router/src/session_gate.rs:125` |
