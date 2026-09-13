@@ -7,28 +7,29 @@ const withBundleAnalyzer = require('@next/bundle-analyzer')({
   enabled: process.env.ANALYZE === 'true',
 })
 
-// Product version shown in the UI (sidebar footer). pyproject.toml is the
-// single source of truth; this NEVER hardcodes a literal (the sidebar used
-// to carry a frozen "v3.4.0" that drifted far behind the real version).
+// Product version shown in the UI (sidebar footer). package.json is the
+// single source of truth (moved off pyproject.toml once the Python
+// implementation was deleted wholesale, Phase F: prancy-napping-pie);
+// this NEVER hardcodes a literal (the sidebar used to carry a frozen
+// "v3.4.0" that drifted far behind the real version).
 //
 // Resolution order:
 //   1. NEXT_PUBLIC_AGENT_MCP_VERSION from the environment — the Nix build
-//      passes it (sourced from pyproject) so the sandboxed build, which has
-//      no repo-root pyproject in scope, still gets the right number.
-//   2. Read ../../pyproject.toml at build time — covers plain `npm run
-//      dev` / `npm run build` from the dashboard dir (pyproject is two
-//      levels up: agent_mcp/dashboard -> repo root).
+//      passes it (sourced from this package's own package.json) so the
+//      sandboxed build still gets the right number even if it only has
+//      this directory in scope.
+//   2. Read ./package.json at build time — covers plain `npm run dev` /
+//      `npm run build` from the dashboard dir.
 //   3. "dev" — last-resort fallback if neither is available.
 function resolveVersion(): string {
   const fromEnv = process.env.NEXT_PUBLIC_AGENT_MCP_VERSION
   if (fromEnv) return fromEnv
   try {
-    const pyproject = readFileSync(join(__dirname, "..", "..", "pyproject.toml"), "utf8")
-    const m = pyproject.match(/^\s*version\s*=\s*"([^"]+)"/m)
-    if (m?.[1]) return m[1]
+    const pkg = JSON.parse(readFileSync(join(__dirname, "package.json"), "utf8"))
+    if (pkg?.version) return pkg.version
   } catch {
-    // pyproject not reachable (e.g. sandboxed build without the env var) —
-    // fall through to the dev sentinel.
+    // package.json not reachable (e.g. sandboxed build without the env
+    // var) — fall through to the dev sentinel.
   }
   return "dev"
 }
@@ -36,7 +37,7 @@ function resolveVersion(): string {
 const AGENT_MCP_VERSION = resolveVersion()
 
 const nextConfig: NextConfig = {
-  // Enable static export for serving through Python backend (only in production)
+  // Enable static export for serving through the router (only in production)
   output: process.env.NODE_ENV === 'production' ? 'export' : undefined,
   
   // Output directory for the production static export. Keep the build

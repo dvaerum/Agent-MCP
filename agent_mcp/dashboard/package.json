@@ -1,6 +1,6 @@
 {
   "name": "dashboard",
-  "version": "0.1.0",
+  "version": "5.80.0",
   "private": true,
   "engines": {
     "node": ">=18.0.0",

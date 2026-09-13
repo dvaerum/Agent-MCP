@@ -11,85 +11,75 @@ Welcome to Agent-MCP! This guide will take you from installation to your first s
 - **AI assistant experience** (Claude Code, Cursor, or similar)
 
 ### Required Software
-- **Python 3.8+** with pip/uv
-- **Node.js 18+** with npm
+- **Rust** (stable toolchain) — the backend/router implementation
+- **Node.js 22+** with npm — the dashboard
+- **Nix** with flakes enabled — the real production deployment path
+  (systemd units, per-project process management); also the easiest
+  way to build everything below without hand-managing flags
 - **Git** for version control
 - **AI Coding Assistant** (Claude Code recommended)
 
 ### Recommended Setup
 - **VS Code** with SQLite Viewer extension
 - **Terminal multiplexer** (tmux or similar)
-- **OpenAI API key** for embeddings
+- **OpenAI API key** for embeddings (or the bundled local Ollama
+  default — see "Environment variables" below)
 
 ---
 
-## ⚡ Quick Install (5 Minutes)
+## ⚡ Quick Install
 
-### 1. Clone and Setup
+The original Python implementation's standalone single-process mode
+(`uv run -m agent_mcp.cli`) doesn't have a direct Rust equivalent —
+`conexus-backend` is deliberately UDS-only and reachable through
+`conexus-router`'s proxy in every real deployment, matching the
+architecture the production Nix/home-manager module actually runs.
+The realistic quick path is therefore through Nix, which builds and
+wires all three pieces (router, backend, dashboard) the same way the
+real deployment does:
+
+### 1. Clone and build
 ```bash
-# Clone the repository
-git clone https://github.com/rinadelph/Agent-MCP.git
+git clone https://github.com/dvaerum/Agent-MCP.git
 cd Agent-MCP
 
-# Install dependencies
-uv venv && uv pip install -e .
-
-# (Optional) Switch to OpenAI cloud. When OPENAI_API_KEY is unset, the
-# server defaults to a local Ollama endpoint (qwen3:1.7b) — see the
-# "Environment variables" section below.
-# export OPENAI_API_KEY=sk-...
-
-# Configure Claude Code hooks for multi-agent file locking
-./setup-claude-hooks.sh
+nix build .#conexus-backend    # the per-project backend binary
+nix build .#conexus-router     # the always-on router binary
+nix build .#agent-mcp-dashboard  # the dashboard static export
 ```
 
-### 2. Start MCP Server
+For local backend/router development without Nix, `cargo build
+--release` in `rust/` produces the same three binaries under
+`target/release/`; see [CONTRIBUTING.md](../../CONTRIBUTING.md) for
+the full build/test loop.
+
+### 2. Register a project and start the router
 ```bash
-# Start the MCP server (replace with your project path)
-uv run -m agent_mcp.cli --project-dir /path/to/your/project
+# A project registry is a JSON file mapping project name -> workspace path.
+echo '{"my-project": "/path/to/your/project"}' > projects.json
 
-# You'll see output like:
-# 📡 Server running on http://localhost:8080
-# 📊 Dashboard: Start with 'cd agent_mcp/dashboard && npm run dev'
+# Apply the schema-authority baseline to the project's own DB.
+mkdir -p /path/to/your/project/.agent
+./result/bin/conexus-cli migrate /path/to/your/project
+
+./result/bin/conexus-router \
+  --port 5454 \
+  --projects-file projects.json \
+  --sock-dir /tmp/agent-mcp-sockets \
+  --dashboard-dir ./result/share/agent-mcp-dashboard
 ```
 
-> The project-wide "admin token" that used to be printed at
-> startup was retired in PRs #208–#211. External MCP clients
-> authenticate with a per-agent bearer token provisioned from
-> the dashboard — see
-> [`docs/integrations/external-mcp-client.md`](../integrations/external-mcp-client.md).
+The router lazily starts `conexus-backend` for a project on its first
+request (spawning it against the matching entry in `--projects-file`)
+and stops it again after `--idle-sec` (default 4h) of inactivity — you
+don't start the backend directly.
 
-### 3. Configure Multi-Agent File Locking
+### 3. First-boot operator login
 
-Agent-MCP requires Claude Code hooks for proper multi-agent coordination. The setup script configures these automatically:
+See "First-boot setup (operator login)" below — the router creates
+the first operator account on its own first boot.
 
-```bash
-# If you missed it in step 1, run:
-./setup-claude-hooks.sh
-```
-
-**What this does:**
-- Configures PreToolUse hooks to check file locks before editing
-- Configures PostToolUse hooks to log activity and release locks
-- Creates necessary directories (`.agent-locks`, `.agent-activity`)
-- Prevents file conflicts when multiple agents work simultaneously
-
-**Troubleshooting:**
-- If you see "MODULE_NOT_FOUND" errors when editing files, the hooks aren't configured properly
-- Run the setup script again: `./setup-claude-hooks.sh`
-- Ensure you're running Claude Code from the Agent-MCP project root directory
-
-### 4. Launch Dashboard (Optional but Recommended)
-```bash
-# In a new terminal
-cd agent_mcp/dashboard
-npm install  # First time only
-npm run dev
-
-# Dashboard available at http://localhost:3847
-```
-
-### 5. Connect AI Assistant
+### 4. Connect AI Assistant
 
 After provisioning a per-agent token from the dashboard (see
 [`docs/integrations/external-mcp-client.md`](../integrations/external-mcp-client.md)),
