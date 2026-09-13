@@ -34,16 +34,15 @@
 
 let
   # ── Dashboard version ─────────────────────────────────────────────
-  # Read from pyproject.toml at evaluation time (single-line
-  # `version = "X.Y.Z"`) so a version bump there doesn't need a mirror
-  # edit here. This used to be `agentMcpPy.version`, which read the
-  # exact same file — inlined directly now that `agentMcpPy` is gone.
-  version =
-    let
-      py = builtins.readFile "${src}/pyproject.toml";
-      m = builtins.match ".*\nversion = \"([^\"]+)\".*" py;
-    in
-      if m == null then "0.0.0-unknown" else builtins.head m;
+  # Read from the dashboard's own package.json at evaluation time so a
+  # version bump there doesn't need a mirror edit here. This used to
+  # read pyproject.toml's `version = "X.Y.Z"` (the single source of
+  # truth while the Python implementation existed); package.json is
+  # the direct replacement now that Python packaging is gone entirely
+  # (Phase F: prancy-napping-pie) -- same "one file, everything else
+  # derives" shape, just relocated to the one manifest this package
+  # set still has.
+  version = (builtins.fromJSON (builtins.readFile "${src}/agent_mcp/dashboard/package.json")).version;
 
   # ── Dashboard static export ──────────────────────────────────────
   # Next.js 15 project with `output: 'export'`. The router serves the
@@ -68,10 +67,11 @@ let
     NEXT_PUBLIC_AUTO_CONNECT = "false";
     NEXT_PUBLIC_DEFAULT_SERVER_HOST = "";
     NEXT_PUBLIC_DEFAULT_SERVER_PORT = "";
-    # Product version shown in the sidebar footer. Sourced from pyproject
-    # (via the `version` let-binding above) so the sandboxed build —
-    # which can't see the repo-root pyproject.toml — still bakes the
-    # right number. See dashboard/next.config.ts resolveVersion().
+    # Product version shown in the sidebar footer. Sourced from the
+    # dashboard's own package.json (via the `version` let-binding
+    # above) so this build's baked-in number always matches what a
+    # plain `npm run build` from the dashboard dir would also read.
+    # See dashboard/next.config.ts resolveVersion().
     NEXT_PUBLIC_AGENT_MCP_VERSION = version;
     installPhase = ''
       runHook preInstall

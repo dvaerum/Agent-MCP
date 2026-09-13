@@ -16,31 +16,52 @@ sha `13d98b2` if you want the generic OSS-onboarding view.
 
 ## Development setup
 
+The backend/router implementation (`rust/` — `conexus-backend`,
+`conexus-router`, `conexus-tools`, `conexus-db`, `conexus-auth`,
+`conexus-core`, `conexus-wakeloop`, `conexus-cli`,
+`conexus-daemon-agent`, `conexus-vec`) is Rust. The dashboard
+(`agent_mcp/dashboard/`) is a Next.js/TypeScript frontend, unrelated
+to that migration — it was never Python and didn't need to move. Both
+implementations were originally Python; see
+`~/.claude/plans/prancy-napping-pie.md` (or its final state in this
+repo's history) for the full migration record if you're curious why
+the tree is shaped this way.
+
 Prerequisites:
 
-- **Python 3.11+** with [uv](https://github.com/astral-sh/uv)
-- **Node.js 22.x** (for the dashboard build)
+- **Rust** (stable toolchain — `rustup toolchain install stable
+  --component rustfmt --component clippy`)
+- **Node.js 22.x** (for the dashboard)
+- **Nix** with flakes enabled (for packaging/deployment checks —
+  optional unless you're touching `nix/`)
 - **Ollama** with a small embedding model (`qwen3-embedding:0.6b`
   recommended; or any OpenAI-compatible embedding endpoint via
-  `OPENAI_BASE_URL` / `OPENAI_API_KEY`)
+  `OPENAI_BASE_URL` / `OPENAI_API_KEY`) — only needed for the RAG
+  indexer/query path
 
 ```sh
 git clone https://github.com/dvaerum/Agent-MCP.git
 cd Agent-MCP
 
-uv venv && uv pip install -e .[dev]
+# Backend/router (rust/)
+cd rust
+cargo build --workspace --locked
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo fmt --all --check
+cargo audit
+cd ..
 
-# Dashboard (only needed if you're touching the dashboard)
-( cd agent_mcp/dashboard && npm ci )
+# Dashboard (agent_mcp/dashboard/)
+cd agent_mcp/dashboard
+npm ci
+npm test          # vitest — source-grep regression guards, no jsdom
+npm run lint
+npm run build
+cd ../..
 
-# Run tests
-pytest
-
-# Lint
-ruff check .
-
-# Dashboard build (CI does this)
-( cd agent_mcp/dashboard && npm run build )
+# Nix/home-manager-module regression checks
+bash nix/tests/checks/run-all.sh
 ```
 
 OpenAI API key not required — local Ollama works fine. Set
@@ -87,11 +108,22 @@ Every PR with behavioral change must include:
 Build-only PRs (Nix build hygiene, CI config, font/asset changes) are
 exempt — they just need to keep CI green.
 
-Tests live in `tests/`. The default surface is **integration tests**:
-spin up agent-mcp as an in-process ASGI app via the httpx test client,
-hit it with real MCP-over-SSE / JSON-RPC, assert. Unit tests are fine
-for pure-logic bits (regex, schema generation). End-to-end tests
-against a real systemd + Ollama deployment live in
+Backend/router tests live alongside the code they test, `#[cfg(test)]
+mod tests` in the same file (the convention throughout `rust/`) — not
+a separate `tests/` tree. Prefer a real fixture over a mock: a real
+temp-file-backed SQLite connection (`rusqlite`/`sea-orm` both point at
+the same file when a test needs both), a real bound TCP listener for
+an HTTP dependency, a real subprocess for a CLI/systemd contract —
+this project's own established discipline, not a stylistic preference.
+Dashboard tests live in `agent_mcp/dashboard/tests/` (vitest) — mostly
+source-text regression guards (no jsdom/RTL setup in this repo), since
+most of what they pin is a property of the source, not runtime
+behaviour. Nix/home-manager regression checks live at
+`nix/tests/checks/*.sh` (run via `bash nix/tests/checks/run-all.sh`).
+There is no repo-root `tests/` tree anymore — every test lives next to
+what it tests.
+
+End-to-end tests against a real systemd + Ollama deployment live in
 [nixos-developer-system/users/dennis/agent-mcp/tests/] and are run
 manually as part of release verification — **not** part of CI here.
 
@@ -99,27 +131,27 @@ manually as part of release verification — **not** part of CI here.
 
 ## CI must pass
 
-`.github/workflows/ci.yml` runs:
+`.github/workflows/ci.yml` runs, per job:
 
-- `pytest` (everything under `tests/`)
-- `ruff check .` (the whole repo — Phase F deleted the Python app whose
-  ~2300 pre-existing errors used to keep this scoped to `tests/` only)
-
-  ruff is pinned exactly in `[project.optional-dependencies] dev`. The
-  lint job installs dev deps by re-resolving `pyproject.toml`, not from
-  `uv.lock`, so an unpinned ruff lets an upstream release red `main`
-  with no repo change — ruff 0.16.0 did exactly that when it grew the
-  default rule set from 59 rules to 413. Bump the pin in its own PR
-  that also clears whatever the new version flags.
-- `ruff check --select F821 agent_mcp/` (undefined names ONLY, over the
-  otherwise-ungated package). Not a style gate: F821 is a guaranteed
-  `NameError` at runtime, and it hides best in the branches tests
-  exercise least — 5.74.0 shipped three `logger.debug(...)` calls in a
-  module whose logger is `log`, inside peer-disconnect `except` blocks,
-  so every benign client disconnect logged an ERROR traceback in
-  production. The package is at zero F821, so the pre-existing style
-  debt above can never trip this.
-- `( cd agent_mcp/dashboard && npm ci && npm run build )`
+- **`conexus` / `aoe-bridge`** (Rust) — `cargo fmt --check`,
+  `cargo clippy --all-targets --locked -- -D warnings`,
+  `cargo test --locked`, `cargo audit`, each over its own workspace
+  (`rust/`, `aoe-bridge/` — unrelated release cadences, deliberately
+  separate jobs/caches).
+- **`dashboard`** — `npm ci`, `npm test` (vitest), `npm run lint`,
+  `npm run build`, plus a CSS-bundle-size sanity check (a dead
+  `@import` can make `next build` exit 0 while silently emitting a
+  near-empty stylesheet — see
+  `docs/learnings/next-build-swallows-unresolvable-css-import.md`).
+- **`nix-checks`** — `bash nix/tests/checks/run-all.sh` (Nix
+  eval/build regression guards + a couple of bash-script/`.gitignore`
+  contract checks that have nothing to do with Nix specifically but
+  live there now that there's no Python interpreter to run them
+  under).
+- **`nix-flake-check`** — the 4 nixosTest VM checks (sharded, one per
+  runner), exercising a full server boot + real HTTP assertions.
+- **`dependency-audit`** — `npm audit` (dashboard deps; Rust's own
+  `cargo audit` runs inside the `conexus`/`aoe-bridge` jobs above).
 
 Red CI blocks merge.
 
@@ -130,8 +162,16 @@ Fill in every section that applies. "I'll add tests later" is a no.
 
 ## Upstreaming a fix to rinadelph/Agent-MCP
 
+Upstream is still Python; this fork's backend/router is now Rust
+(`rust/`). A `git cherry-pick` of a backend/router fix genuinely
+applies only if upstream's equivalent Python code still exists in
+the same shape — check before assuming it applies. Dashboard fixes
+(`agent_mcp/dashboard/`) are unaffected by the language split and
+cherry-pick the same way they always did.
+
 When a fix is general (i.e. anyone running upstream could use it,
-not just our deployment), open a PR against upstream too:
+not just our deployment) and still applies as a literal patch, open
+a PR against upstream too:
 
 ```sh
 git fetch upstream
@@ -147,10 +187,15 @@ is that our patches are upstream-shaped if/when they wake up.
 
 ## Tree layout reminder
 
-This repo's implementation lives in `agent_mcp/` (Python, what the
-NixOS deployment runs). The upstream's Node/TypeScript rewrite is
-not carried in this fork. PRs target Python; CI builds + tests
-Python only.
+This repo's backend/router implementation lives in `rust/` (the
+`conexus-*` crates, Rust — what the NixOS deployment runs; the
+original Python implementation was deleted wholesale once the Rust
+rewrite reached functional completeness). The dashboard lives in
+`agent_mcp/dashboard/` (Next.js/TypeScript, unrelated to that
+migration — it predates it and was never Python). PRs target
+whichever of the two the change actually touches; CI gates both
+independently (see "CI must pass" above), plus a Nix/home-manager
+regression suite covering neither.
 
 ## Out of scope for this fork
 

@@ -1,5 +1,12 @@
 # Running `pytest -n auto` on a shared dev box
 
+Historical: the Python test suite (and `pyproject.toml`'s `addopts`)
+this doc's pytest-specific mechanics describe no longer exists — the
+whole suite was ported to Rust/vitest/bash once the Python
+implementation was retired. Kept for the still-relevant lesson (shared-
+host CPU/RAM contention, and the Ollama `-np 1` queuing behavior below)
+generalizes to concurrent `cargo test`/`npm test` runs on the same box.
+
 Notes from the pentest-all security loop, where 2-3 fix agents ran
 their local test suites concurrently in separate git worktrees on the
 same machine other unrelated sessions were also using.
