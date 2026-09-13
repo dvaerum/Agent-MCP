@@ -50,37 +50,21 @@ Monitor every agent's status, assigned tasks, and recent activity. The system au
 
 ## Quick Start
 
-### Python Implementation (Recommended)
+This is a maintained fork ([dvaerum/Agent-MCP](https://github.com/dvaerum/Agent-MCP))
+with a Rust backend/router (`rust/` — the original Python
+implementation was retired once the rewrite reached functional
+completeness); the dashboard (`agent_mcp/dashboard/`) is Next.js/
+TypeScript and unaffected by that. See
+[`docs/operator/getting-started.md`](docs/operator/getting-started.md)
+for the full install-to-first-project walkthrough (Nix build, project
+registration, router startup, operator login) and
+[`CONTRIBUTING.md`](CONTRIBUTING.md) for the dev/build/test loop.
 
 ```bash
-# Clone and setup
-git clone https://github.com/rinadelph/Agent-MCP.git
+git clone https://github.com/dvaerum/Agent-MCP.git
 cd Agent-MCP
 
-# Check version requirements
-python --version  # Should be >=3.11
-node --version    # Should be >=18.0.0
-npm --version     # Should be >=9.0.0
-
-# If using nvm for Node.js version management (the .nvmrc lives next
-# to the dashboard, since that's the only Node code in the repo)
-(cd agent_mcp/dashboard && nvm use)
-
-# Install
-uv venv
-uv pip install -e .
-
-# (Optional) point at OpenAI cloud instead of the bundled local
-# Ollama default. With OPENAI_API_KEY unset, the server falls back
-# to http://127.0.0.1:11434/v1 (qwen3:1.7b) automatically — see
-# docs/operator/getting-started.md for the full env-var reference.
-# export OPENAI_API_KEY="sk-..."
-
-# Start the server
-uv run -m agent_mcp.cli --port 8080 --project-dir path-to-directory
-
-# Launch dashboard (recommended for full experience)
-cd agent_mcp/dashboard && npm install && npm run dev
+nix build .#conexus-backend .#conexus-router .#agent-mcp-dashboard
 ```
 
 ### First-boot setup (operator login)
@@ -639,10 +623,13 @@ Watch your AI team work in real-time through the dashboard. Every action is logg
 
 ## System Requirements
 
-- **Python**: 3.11+ with pip or uv
-- **Node.js**: 18.0.0+ (recommended: 22.16.0)
+- **Rust**: stable toolchain (backend/router, `rust/`)
+- **Node.js**: 22.0.0+ (dashboard, recommended: 22.16.0)
 - **npm**: 9.0.0+ (recommended: 10.9.2)
-- **OpenAI API key** (for embeddings and RAG)
+- **Nix** with flakes enabled (the real deployment path; also the
+  easiest way to build the Rust binaries + dashboard together)
+- **OpenAI API key**, or the bundled local Ollama default (for
+  embeddings and RAG)
 - **RAM**: 4GB minimum
 - **AI coding assistant**: Claude Code or Cursor
 
@@ -653,9 +640,9 @@ For consistent development environment:
 (cd agent_mcp/dashboard && nvm use)  # Automatically uses Node v22.16.0 from .nvmrc
 
 # Or manually check versions
-node --version  # Should be >=18.0.0
-npm --version   # Should be >=9.0.0
-python --version  # Should be >=3.11
+node --version    # Should be >=22.0.0
+npm --version     # Should be >=9.0.0
+rustc --version   # stable toolchain
 ```
 
 ## Troubleshooting

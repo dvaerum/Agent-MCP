@@ -25,8 +25,11 @@ only" here.
 - Failing test commit: <sha or test name>
 - Passing test commit: <sha or test name>
 
-If the tests live in `tests/test_<thing>.py`, name them so a reviewer
-can run them locally.
+Backend/router tests live alongside the code (`#[cfg(test)] mod
+tests` in the same `.rs` file); dashboard tests live in
+`agent_mcp/dashboard/tests/*.test.ts`; Nix/home-manager tests live in
+`nix/tests/checks/*.sh`. Name the specific test(s) so a reviewer can
+run them locally.
 -->
 
 ## Upstream issue link (if applicable)
@@ -37,27 +40,12 @@ can run them locally.
 - Upstream issue / PR (rinadelph/Agent-MCP): <URL if filed>
 -->
 
-## Router side-effect (if applicable)
-
-<!--
-Does this PR enable retiring a router workaround in
-`nixos-developer-system/users/dennis/agent-mcp/router.py`? Name the
-function(s) that can go away when this lands. Skip if no router
-effect.
-
-Examples:
-- Retires `_redact_tokens_in_event` (issue I worker→admin escalation
-  fix in `view_project_context`).
-- Retires synthetic `send_peer_message` (issue K worker→worker
-  messaging fix).
--->
-
 ## Checklist
 
 - [ ] Tests added (or "n/a — build only" above)
-- [ ] `ruff check .` clean
-- [ ] `pytest` green locally
-- [ ] Dashboard build green (`cd agent_mcp/dashboard && npm run build`) — if touching dashboard
+- [ ] Rust: `cargo fmt --check` / `cargo clippy --all-targets --locked -- -D warnings` / `cargo test --locked` clean (in `rust/`, `aoe-bridge/`, or both — whichever this PR touches)
+- [ ] Dashboard: `npm test` / `npm run lint` / `npm run build` green (`cd agent_mcp/dashboard`) — if touching the dashboard
+- [ ] `bash nix/tests/checks/run-all.sh` green — if touching `nix/`
 - [ ] CI green on this PR
 - [ ] Branch name matches `fix/…`, `feat/…`, `chore/…`, or `upstream/…`
 - [ ] Targeting `main` (not directly pushing)
